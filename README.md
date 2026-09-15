@@ -54,8 +54,16 @@ written by marimo itself, never edited behind the kernel's back.
 
 ## Installation
 
+From a checkout of this repository:
+
 ```bash
 uv sync
+```
+
+Released versions are on PyPI:
+
+```bash
+uv tool install hailer     # or: pip install hailer
 ```
 
 Optional sample data (six months of synthetic PRA101-style files, later months gain a column):
@@ -326,6 +334,25 @@ uv run pytest
 The suite is offline: it needs no API key, no marimo server, no Codex process and no network. The marimo
 protocol is exercised against a local fake server, the Codex SDK against a fake client, and the credential
 store against an in-memory backend.
+
+## Releasing
+
+```bash
+uv run python -m scripts.release            # patch bump: 0.1.0 -> 0.1.1
+uv run python -m scripts.release minor      # 0.1.0 -> 0.2.0
+uv run python -m scripts.release major      # 0.1.0 -> 1.0.0
+uv run python -m scripts.release --dry-run  # preflight checks and the plan, nothing changed
+```
+
+Run it from a clean `main` that matches `origin/main`. The script writes the new version to `pyproject.toml`,
+`src/hailer/__init__.py` and `uv.lock`, then runs the test suite. If the tests fail, the version files are
+restored and nothing is committed. If they pass, it commits `Release vX.Y.Z`, tags `vX.Y.Z` and pushes the
+branch and tag atomically. The tag triggers `.github/workflows/release.yml`, which builds the sdist and
+wheel, publishes them to PyPI through the `pypi` environment (trusted publishing, no token to store) and
+creates the GitHub release with the files attached.
+
+`--no-push` stops after the local commit and tag, `--version X.Y.Z` releases an exact version (pre-releases
+such as `1.2.0rc1` are accepted), and arguments after `--` are passed to pytest.
 
 ## Security
 
