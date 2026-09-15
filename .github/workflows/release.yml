@@ -1,9 +1,10 @@
 # Publish a release to PyPI.
 #
 # Triggered by the vX.Y.Z tag that `uv run python -m scripts.release` pushes after the
-# tests pass locally. Builds the sdist and wheel, publishes them through the "pypi"
-# environment using PyPI trusted publishing (OIDC, no API token to store), then
-# creates the GitHub release with the distributions attached.
+# tests pass locally. Runs the test suite again on every supported platform
+# (test.yml) and builds the sdist and wheel; only if both succeed does it publish
+# through the "pypi" environment using PyPI trusted publishing (OIDC, no API token
+# to store) and then create the GitHub release with the distributions attached.
 #
 # PyPI's trusted publisher for this project is configured as:
 #   owner OpenAfterHours, repository hailer, workflow release.yml, environment pypi.
@@ -20,6 +21,10 @@ permissions:
   contents: read
 
 jobs:
+  test:
+    name: Tests
+    uses: ./.github/workflows/test.yml
+
   build:
     name: Build distributions
     runs-on: ubuntu-latest
@@ -28,7 +33,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.1.0 # setup-uv publishes no floating major tag
         with:
           python-version: "3.12"
 
@@ -56,7 +61,7 @@ jobs:
 
   publish:
     name: Publish to PyPI
-    needs: build
+    needs: [test, build]
     runs-on: ubuntu-latest
     environment:
       name: pypi
