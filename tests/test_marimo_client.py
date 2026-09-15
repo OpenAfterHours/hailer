@@ -1,0 +1,356 @@
+"""Offline tests for hailer.marimo_client against a local fake marimo server."""
+
+from __future__ import annotations
+
+import json
+import os
+import socket
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+import pytest
+
+from hailer import marimo_client as mc
+from hailer.errors import MarimoExecutionError, MarimoUnavailableError, NoSessionError
+from hailer.models import HailerConfig, MarimoServer, MarimoSession
+
+# --------------------------------------------------------------------------- #
+# Fake server
+# --------------------------------------------------------------------------- #
+
+
+def _sse(events: list[tuple[str, dict]], newline: str = "\n") -> bytes:
+    return "".join(f"event: {name}{newline}data: {json.dumps(data)}{newline}{newline}" for name, data in events).encode()
+
+
+class _Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):  # noqa: D401 - silence
+        pass
+
+    def _send(self, code: int, body: bytes, ctype: str = "application/json") -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _authorised(self) -> bool:
+        srv = self.server
+        if not srv.token:
+            return True
+        return self.headers.get("Authorization") == f"Bearer {srv.token}"
+
+    def do_GET(self):
+        if self.path == "/health":
+            self._send(200, b'{"status":"healthy"}')
+        elif self.path == "/api/sessions":
+            if not self._authorised():
+                self._send(401, b'{"detail":"unauthorised"}')
+                return
+            self._send(200, json.dumps(self.server.sessions).encode())
+        else:
+            self._send(404, b"")
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(n) if n else b""
+        self.server.requests.append({"path": self.path, "headers": dict(self.headers.items()), "body": json.loads(body or b"{}")})
+        if not self._authorised():
+            self._send(401, b'{"detail":"unauthorised"}')
+            return
+        if self.path != "/api/kernel/execute":
+            self._send(404, b"")
+            return
+        mode = self.server.mode
+        if mode == "json_error":
+            self._send(400, b'{"detail":"Session not found: stale"}')
+            return
+        if mode == "plain_json_200":
+            self._send(200, b'{"detail":"not a stream"}')
+            return
+        newline = "\r\n" if mode == "crlf" else "\n"
+        events: list[tuple[str, dict]]
+        if mode in ("success", "crlf"):
+            events = [("stdout", {"data": "hello "}), ("stdout", {"data": "world\n"}), ("done", {"success": True, "output": {"mimetype": "text/plain", "data": "42"}})]
+        elif mode == "stderr":
+            events = [("stderr", {"data": "Traceback: boom\n"}), ("done", {"success": False, "output": {"mimetype": "text/plain", "data": ""}})]
+        elif mode == "nodone":
+            events = [("stdout", {"data": "partial"})]
+        else:
+            raise AssertionError(mode)
+        self._send(200, _sse(events, newline), "text/event-stream")
+
+
+class FakeMarimo(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self):
+        super().__init__(("127.0.0.1", 0), _Handler)
+        self.sessions: dict[str, dict] = {}
+        self.mode = "success"
+        self.token: str | None = None
+        self.requests: list[dict] = []
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.server_address[1]}"
+
+
+@pytest.fixture
+def fake():
+    srv = FakeMarimo()
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield srv
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _config(tmp_path: Path, **overrides) -> HailerConfig:
+    base = dict(
+        workspace=tmp_path,
+        notebook=tmp_path / "notebooks" / "analysis.py",
+        data_dir=tmp_path / "data",
+        context_dir=tmp_path / ".config" / "hailer" / "context",
+        skills_dir=tmp_path / ".config" / "hailer" / "skills",
+        prompts_dir=tmp_path / ".config" / "hailer" / "prompts",
+    )
+    base.update(overrides)
+    return HailerConfig(**base)
+
+
+# --------------------------------------------------------------------------- #
+# health / sessions
+# --------------------------------------------------------------------------- #
+
+
+def test_health_true_and_false(fake):
+    assert mc.MarimoClient(fake.url).health() is True
+    assert mc.MarimoClient(f"http://127.0.0.1:{_free_port()}").health() is False
+
+
+def test_sessions_parsed(fake, tmp_path):
+    nb = tmp_path / "notebooks" / "analysis.py"
+    fake.sessions = {"s1": {"filename": "notebooks/analysis.py", "path": str(nb)}, "s2": {"filename": None, "path": None}}
+    sessions = mc.MarimoClient(fake.url).sessions()
+    assert sessions == [
+        MarimoSession("s1", "notebooks/analysis.py", str(nb)),
+        MarimoSession("s2", None, None),
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# execute
+# --------------------------------------------------------------------------- #
+
+
+def test_execute_success_collects_stdout_and_output(fake):
+    seen: list[str] = []
+    result = mc.MarimoClient(fake.url).execute("print('x')", session_id="s1", on_stdout=seen.append)
+    assert result.success is True
+    assert result.stdout == "hello world\n"
+    assert result.output == "42"
+    assert result.mimetype == "text/plain"
+    assert seen == ["hello ", "world\n"]
+    req = fake.requests[-1]
+    assert req["headers"]["Marimo-Session-Id"] == "s1"
+    assert req["headers"]["Content-Type"] == "application/json"
+    assert req["body"] == {"code": "print('x')"}
+    assert "hello world" in result.as_text() and "42" in result.as_text()
+
+
+def test_execute_crlf_stream(fake):
+    fake.mode = "crlf"
+    result = mc.MarimoClient(fake.url).execute("1", session_id="s1")
+    assert result.success and result.stdout == "hello world\n" and result.output == "42"
+
+
+def test_execute_stderr_and_failure(fake):
+    fake.mode = "stderr"
+    errs: list[str] = []
+    result = mc.MarimoClient(fake.url).execute("boom", session_id="s1", on_stderr=errs.append)
+    assert result.success is False
+    assert "boom" in result.stderr and errs == ["Traceback: boom\n"]
+    assert "[stderr]" in result.as_text()
+
+
+def test_execute_json_error_body(fake):
+    fake.mode = "json_error"
+    with pytest.raises(MarimoExecutionError) as exc:
+        mc.MarimoClient(fake.url).execute("1", session_id="stale")
+    assert "Session not found: stale" in str(exc.value)
+    assert exc.value.hint
+
+
+def test_execute_non_stream_200(fake):
+    fake.mode = "plain_json_200"
+    with pytest.raises(MarimoExecutionError) as exc:
+        mc.MarimoClient(fake.url).execute("1", session_id="s1")
+    assert "not a stream" in str(exc.value)
+
+
+def test_execute_stream_without_done(fake):
+    fake.mode = "nodone"
+    with pytest.raises(MarimoExecutionError) as exc:
+        mc.MarimoClient(fake.url).execute("1", session_id="s1")
+    assert "without a result" in str(exc.value)
+
+
+def test_execute_resolves_session_when_not_given(fake, tmp_path):
+    nb = tmp_path / "notebooks" / "analysis.py"
+    fake.sessions = {"abc": {"filename": "notebooks/analysis.py", "path": str(nb)}}
+    result = mc.MarimoClient(fake.url, notebook=nb, workspace=tmp_path).execute("1")
+    assert result.success
+    assert fake.requests[-1]["headers"]["Marimo-Session-Id"] == "abc"
+
+
+def test_bearer_token_sent_and_401_mapped(fake):
+    fake.token = "secret-token"
+    fake.sessions = {"s1": {"filename": "a.py", "path": "a.py"}}
+    ok = mc.MarimoClient(fake.url, token="secret-token")
+    assert ok.sessions()[0].session_id == "s1"
+    ok.execute("1", session_id="s1")
+    assert fake.requests[-1]["headers"]["Authorization"] == "Bearer secret-token"
+    with pytest.raises(MarimoUnavailableError) as exc:
+        mc.MarimoClient(fake.url, token="wrong").sessions()
+    assert "HAILER_MARIMO_TOKEN" in exc.value.hint
+
+
+def test_connection_refused_hint_has_launch_command(tmp_path):
+    nb = tmp_path / "notebooks" / "analysis.py"
+    client = mc.MarimoClient(f"http://127.0.0.1:{_free_port()}", notebook=nb, workspace=tmp_path)
+    with pytest.raises(MarimoUnavailableError) as exc:
+        client.sessions()
+    assert "uv run marimo edit notebooks/analysis.py --no-token" in exc.value.hint
+    assert "uv run hailer" in exc.value.hint
+
+
+# --------------------------------------------------------------------------- #
+# resolve_session
+# --------------------------------------------------------------------------- #
+
+
+def test_resolve_no_sessions(fake, tmp_path):
+    nb = tmp_path / "notebooks" / "analysis.py"
+    with pytest.raises(NoSessionError) as exc:
+        mc.MarimoClient(fake.url, notebook=nb, workspace=tmp_path).resolve_session(nb)
+    assert "not open in a browser" in str(exc.value)
+    assert exc.value.hint.startswith("Open ") and "?file=notebooks/analysis.py" in exc.value.hint
+
+
+def test_resolve_by_absolute_path_and_case(fake, tmp_path):
+    nb = tmp_path / "notebooks" / "analysis.py"
+    stored = str(nb).upper() if os.name == "nt" else str(nb)
+    fake.sessions = {"other": {"filename": "x.py", "path": str(tmp_path / "x.py")}, "mine": {"filename": "notebooks/analysis.py", "path": stored}}
+    assert mc.MarimoClient(fake.url).resolve_session(nb).session_id == "mine"
+
+
+def test_resolve_by_filename_only(fake, tmp_path):
+    nb = tmp_path / "notebooks" / "analysis.py"
+    fake.sessions = {"mine": {"filename": "analysis.py", "path": None}}
+    assert mc.MarimoClient(fake.url).resolve_session(nb).session_id == "mine"
+
+
+def test_resolve_multiple_no_match_lists_sessions(fake, tmp_path):
+    nb = tmp_path / "notebooks" / "analysis.py"
+    fake.sessions = {"a": {"filename": "one.py", "path": str(tmp_path / "one.py")}, "b": {"filename": "two.py", "path": str(tmp_path / "two.py")}}
+    with pytest.raises(NoSessionError) as exc:
+        mc.MarimoClient(fake.url).resolve_session(nb)
+    assert "one.py" in exc.value.hint and "two.py" in exc.value.hint
+
+
+def test_resolve_single_session_without_notebook(fake):
+    fake.sessions = {"only": {"filename": "n.py", "path": "n.py"}}
+    assert mc.MarimoClient(fake.url).resolve_session(None).session_id == "only"
+
+
+# --------------------------------------------------------------------------- #
+# registry discovery / find_server
+# --------------------------------------------------------------------------- #
+
+
+def _write_entry(directory: Path, name: str, **entry) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / name).write_text(json.dumps(entry), encoding="utf-8")
+
+
+def test_discover_servers_filters_dead_and_garbage(fake, tmp_path):
+    reg = tmp_path / "servers"
+    live_port = fake.server_address[1]
+    _write_entry(reg, "127.0.0.1_live.json", server_id=f"127.0.0.1:{live_port}", pid=1234, host="127.0.0.1", port=live_port, base_url="", started_at="x", version="0.24.2")
+    _write_entry(reg, "0.0.0.0_dead.json", server_id="0.0.0.0:1", pid=1, host="0.0.0.0", port=_free_port(), base_url="", started_at="x", version="0.23.9")
+    (reg / "garbage.json").write_text("{not json", encoding="utf-8")
+    found = mc.discover_servers(reg)
+    assert [s.url for s in found] == [fake.url]
+    assert found[0].pid == 1234 and found[0].version == "0.24.2" and found[0].source == "registry"
+
+
+def test_discover_servers_missing_dir(tmp_path):
+    assert mc.discover_servers(tmp_path / "nope") == []
+
+
+def test_url_from_entry_bind_all_becomes_loopback():
+    assert mc._url_from_entry({"host": "0.0.0.0", "port": 2718, "base_url": "/nb/"}) == "http://127.0.0.1:2718/nb"
+    assert mc._url_from_entry({"host": "::", "port": 2718}) == "http://[::1]:2718"
+    assert mc._url_from_entry({"host": "localhost", "port": "bad"}) is None
+
+
+def test_find_server_prefers_config(fake, tmp_path):
+    cfg = _config(tmp_path, marimo_url="http://localhost:9999/")
+    server = mc.find_server(cfg, registry=tmp_path / "servers")
+    assert server == MarimoServer(url="http://localhost:9999", source="config")
+
+
+def test_find_server_single_registry_entry(fake, tmp_path):
+    reg = tmp_path / "servers"
+    port = fake.server_address[1]
+    _write_entry(reg, "a.json", server_id="a", pid=1, host="127.0.0.1", port=port, base_url="", started_at="", version="")
+    assert mc.find_server(_config(tmp_path), registry=reg).url == fake.url
+    _write_entry(reg, "b.json", server_id="b", pid=1, host="127.0.0.1", port=port, base_url="", started_at="", version="")
+    assert mc.find_server(_config(tmp_path), registry=reg) is None  # ambiguous
+
+
+# --------------------------------------------------------------------------- #
+# helpers
+# --------------------------------------------------------------------------- #
+
+
+def test_open_notebook_url(tmp_path):
+    nb = tmp_path / "notebooks" / "my analysis.py"
+    url = mc.open_notebook_url(MarimoServer(url="http://127.0.0.1:2718"), nb, tmp_path)
+    assert url == "http://127.0.0.1:2718/?file=notebooks/my%20analysis.py"
+
+
+def test_notebook_launch_command(tmp_path):
+    cfg = _config(tmp_path)
+    assert mc.notebook_launch_command(cfg) == ["uv", "run", "marimo", "edit", "notebooks/analysis.py", "--no-token"]
+    assert mc.notebook_launch_command(cfg, port=2718)[-2:] == ["--port", "2718"]
+
+
+def test_snippets_are_valid_python():
+    import ast
+
+    for snippet in (mc.CM_HELP_CODE, mc.LIST_CELLS_CODE, mc.NOTEBOOK_GLOBALS_CODE):
+        ast.parse(snippet)
+    code = mc.build_create_cell_code("df = pl.DataFrame({'a': [1]})\ndf", name="demo")
+    # top-level `async with` is only valid in the scratchpad; wrap to check syntax
+    ast.parse("async def _():\n" + "\n".join("    " + line for line in code.splitlines()))
+    assert "hide_code=False" in code and "name='demo'" in code and "ctx.run_cell(cid)" in code
+
+
+def test_sse_parser_handles_comments_and_multiline_data():
+    lines = [b": comment\r\n", b"event: stdout\r\n", b"data: {\"data\":\r\n", b"data: \"x\"}\r\n", b"\r\n", b"event: done\n", b"data: {\"success\": true, \"output\": {\"data\": \"\", \"mimetype\": \"text/plain\"}}\n", b"\n"]
+    events = list(mc._iter_sse(iter(lines)))
+    assert events[0][0] == "stdout" and json.loads(events[0][1]) == {"data": "x"}
+    assert events[1][0] == "done"
