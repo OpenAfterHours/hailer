@@ -1,0 +1,1039 @@
+"""Hailer command line: the conversational control plane.
+
+``uv run hailer``            chat with the agent (default)
+``uv run hailer notebook``   launch ``marimo edit`` for the configured notebook
+``uv run hailer exec``       run code in the live kernel (debugging / scripting)
+``uv run hailer status``     show configuration, credentials source and marimo state
+``uv run hailer doctor``     run the preflight checks and print a table
+``uv run hailer login``      store an API key in the OS credential store
+``uv run hailer logout``     remove it
+``uv run hailer init``       write a starter hailer.toml and .config/hailer skeleton
+
+Collaborators (config, marimo client, agent, secrets, context) are reached through
+small module-level factory functions so tests can replace them.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import sys
+import traceback
+import webbrowser
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable
+
+import typer
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+
+from hailer import __version__
+from hailer.errors import (
+    ConfigError,
+    CredentialsError,
+    HailerError,
+    MarimoUnavailableError,
+    NoSessionError,
+)
+from hailer.models import (
+    AgentEvent,
+    Check,
+    ContextBundle,
+    HailerConfig,
+    MarimoServer,
+    MarimoSession,
+    ProviderConfig,
+    SessionState,
+    SkillInfo,
+    TurnSummary,
+)
+from hailer.session import (
+    COMMANDS,
+    EXIT_COMMANDS,
+    help_text,
+    load_session,
+    parse_command,
+    save_session,
+)
+
+app = typer.Typer(
+    add_completion=False,
+    no_args_is_help=False,
+    invoke_without_command=True,
+    help="Hailer: conversational local data analysis with a live marimo notebook.",
+)
+
+PROMPT = "You > "
+ANSWER_HEADER = "Hailer >"
+
+
+# --------------------------------------------------------------------------- #
+# Options and injectable collaborators
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class CliOptions:
+    verbose: bool = False
+    config_path: Path | None = None
+    workspace: Path | None = None
+    new_thread: bool = False
+
+
+def console_factory() -> Console:
+    return Console(highlight=False, soft_wrap=True)
+
+
+def _load_config(opts: CliOptions) -> HailerConfig:
+    from hailer.config import load_config
+
+    return load_config(workspace=opts.workspace, config_path=opts.config_path)
+
+
+def _validate_config(config: HailerConfig) -> list[str]:
+    from hailer.config import validate
+
+    return validate(config)
+
+
+def _setup_logging(config: HailerConfig, opts: CliOptions) -> None:
+    from hailer.log import setup_logging
+
+    setup_logging(config.log_level, verbose=opts.verbose)
+
+
+def _find_server(config: HailerConfig) -> MarimoServer | None:
+    from hailer.marimo_client import find_server
+
+    return find_server(config)
+
+
+def _make_client(server: MarimoServer, config: HailerConfig) -> Any:
+    from hailer.marimo_client import MarimoClient
+
+    return MarimoClient(server.url, config.marimo_token)
+
+
+def _notebook_url(server: MarimoServer, config: HailerConfig) -> str:
+    from hailer.marimo_client import open_notebook_url
+
+    return open_notebook_url(server, config.notebook, config.workspace)
+
+
+def _launch_command(config: HailerConfig, port: int | None = None) -> list[str]:
+    from hailer.marimo_client import notebook_launch_command
+
+    return notebook_launch_command(config, port=port)
+
+
+def _cm_help_code() -> str:
+    from hailer.marimo_client import CM_HELP_CODE
+
+    return CM_HELP_CODE
+
+
+def _resolve_key(provider: ProviderConfig) -> tuple[str | None, str]:
+    from hailer.secrets import resolve_provider_key
+
+    return resolve_provider_key(provider)
+
+
+def _store_key(provider: ProviderConfig, value: str) -> None:
+    from hailer.secrets import store_provider_key
+
+    store_provider_key(provider, value)
+
+
+def _delete_key(provider: ProviderConfig) -> bool:
+    from hailer.secrets import delete_provider_key
+
+    return delete_provider_key(provider)
+
+
+def _load_context(config: HailerConfig) -> ContextBundle:
+    from hailer.context import load_context
+
+    return load_context(config)
+
+
+def _render_prompt(config: HailerConfig, name: str, args: str) -> str:
+    from hailer.context import render_prompt
+
+    return render_prompt(config, name, args)
+
+
+def _make_agent(config: HailerConfig, bundle: ContextBundle) -> Any:
+    from hailer.agent import HailerAgent
+
+    return HailerAgent(config, bundle)
+
+
+def _open_browser(url: str) -> None:
+    try:
+        webbrowser.open(url)
+    except Exception:  # pragma: no cover - platform dependent
+        pass
+
+
+def _spawn_detached(cmd: list[str], cwd: Path) -> None:
+    """Start a long-running process in a new console (Windows) or the foreground (elsewhere)."""
+    if os.name == "nt":
+        flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+        subprocess.Popen(cmd, cwd=str(cwd), creationflags=flags)
+    else:
+        subprocess.run(cmd, cwd=str(cwd), check=False)
+
+
+def _write_default_config(path: Path) -> None:
+    from hailer.config import write_default_config
+
+    write_default_config(path)
+
+
+# --------------------------------------------------------------------------- #
+# Output helpers
+# --------------------------------------------------------------------------- #
+
+
+def _print_error(console: Console, err: HailerError, *, verbose: bool = False) -> None:
+    console.print(f"[red]{err}[/red]", markup=True)
+    if err.hint:
+        for line in str(err.hint).splitlines():
+            console.print(f"    {line}", markup=False)
+    if verbose:
+        console.print(traceback.format_exc(), markup=False)
+
+
+def _print_unexpected(console: Console, exc: BaseException, *, verbose: bool) -> None:
+    console.print(f"[red]Unexpected error: {type(exc).__name__}: {exc}[/red]", markup=True)
+    if verbose:
+        console.print(traceback.format_exc(), markup=False)
+    else:
+        console.print("    Run with --verbose for details.")
+
+
+def _provider_line(config: HailerConfig) -> str:
+    try:
+        provider = config.provider
+    except KeyError:
+        return f"{config.model.provider} (not declared in hailer.toml)"
+    if provider.base_url:
+        return f"{provider.id} ({provider.base_url})"
+    return provider.id
+
+
+def _web_line(config: HailerConfig) -> str:
+    domains = list(config.web.allowed_domains)
+    if not domains:
+        return "none"
+    shown = ", ".join(domains[:4])
+    if len(domains) > 4:
+        shown += f" (+{len(domains) - 4} more)"
+    shell = " (shell too)" if config.web.allow_shell_network else ""
+    return shown + shell
+
+
+def _relative(path: Path, workspace: Path) -> str:
+    try:
+        return str(Path(path).relative_to(workspace))
+    except ValueError:
+        return str(path)
+
+
+def _startup_panel(console: Console, config: HailerConfig) -> None:
+    body = "\n".join(
+        [
+            f"Model:      {config.model.name}",
+            f"Provider:   {_provider_line(config)}",
+            f"Notebook:   {_relative(config.notebook, config.workspace)}",
+            f"Workspace:  {config.workspace}",
+            f"Web access: {_web_line(config)}",
+        ]
+    )
+    console.print(Panel(body, title="Hailer", expand=False))
+    console.print("Type /help for commands.\n")
+
+
+# --------------------------------------------------------------------------- #
+# Preflight
+# --------------------------------------------------------------------------- #
+
+
+def _marimo_state(config: HailerConfig) -> tuple[MarimoServer | None, MarimoSession | None, HailerError | None]:
+    """(server, session, error) without raising."""
+    try:
+        server = _find_server(config)
+    except HailerError as err:
+        return None, None, err
+    if server is None:
+        return None, None, None
+    try:
+        client = _make_client(server, config)
+        if not client.health():
+            return None, None, None
+        session = client.resolve_session(config.notebook)
+        return server, session, None
+    except NoSessionError as err:
+        return server, None, err
+    except HailerError as err:
+        return server, None, err
+
+
+def _launch_hint(config: HailerConfig) -> str:
+    cmd = " ".join(_launch_command(config))
+    return f"Start it with:\n\n    {cmd}\n\nThen run Hailer again:\n\n    uv run hailer"
+
+
+def preflight(config: HailerConfig) -> list[Check]:
+    """Startup checks. Fatal failures stop the chat; the rest are printed as warnings."""
+    checks: list[Check] = []
+
+    problems = _validate_config(config)
+    fatal = [p for p in problems if not p.lower().startswith("warning")]
+    warnings = [p for p in problems if p.lower().startswith("warning")]
+    if fatal:
+        checks.append(Check("config", False, "; ".join(fatal), hint="Fix hailer.toml (run: uv run hailer init  to write a starter file).", fatal=True))
+    else:
+        summary = "ok" if not warnings else "; ".join(warnings)
+        checks.append(Check("config", True, summary, fatal=False))
+
+    if config.notebook.exists():
+        checks.append(Check("notebook", True, _relative(config.notebook, config.workspace)))
+    else:
+        checks.append(
+            Check(
+                "notebook",
+                False,
+                f"not found: {config.notebook}",
+                hint="Create the notebook (uv run marimo edit <path>) or fix [hailer].notebook in hailer.toml.",
+            )
+        )
+
+    try:
+        provider = config.provider
+    except KeyError:
+        checks.append(
+            Check(
+                "credentials",
+                False,
+                f"provider {config.model.provider!r} is not declared",
+                hint="Add a [model_providers.<id>] table to hailer.toml or set [model].provider.",
+            )
+        )
+    else:
+        value, source = _resolve_key(provider)
+        del value
+        if source != "missing":
+            checks.append(Check("credentials", True, f"{provider.env_key or 'API key'} from {source}", fatal=False))
+        elif provider.is_builtin_openai:
+            checks.append(
+                Check(
+                    "credentials",
+                    False,
+                    "no OPENAI_API_KEY found; Codex will use its existing ChatGPT login if you have one",
+                    hint="If the agent fails to authenticate, run: uv run hailer login openai",
+                    fatal=False,
+                )
+            )
+        else:
+            checks.append(
+                Check(
+                    "credentials",
+                    False,
+                    f"{provider.env_key} is not set (required by provider {provider.id!r})",
+                    hint=f"Store it once with:\n\n    uv run hailer login {provider.id}\n\nor set the {provider.env_key} environment variable in this terminal.",
+                )
+            )
+
+    server, session, err = _marimo_state(config)
+    if server is None:
+        summary = "Marimo is not running." if err is None else str(err)
+        hint = err.hint if err is not None and err.hint else _launch_hint(config)
+        checks.append(Check("marimo", False, summary, hint=hint))
+    else:
+        checks.append(Check("marimo", True, server.url, fatal=False))
+        if session is not None:
+            checks.append(Check("session", True, f"notebook is open (session {session.session_id})", fatal=False))
+        else:
+            url = _notebook_url(server, config)
+            hint = err.hint if err is not None and err.hint else f"Open {url} in your browser."
+            checks.append(Check("session", False, "the notebook is not open in a browser", hint=hint, fatal=False))
+    return checks
+
+
+def _print_checks(console: Console, checks: list[Check], *, only_failures: bool = False) -> None:
+    for check in checks:
+        if check.ok and only_failures:
+            continue
+        if check.ok:
+            console.print(f"[green]ok[/green]    {check.name}: {check.summary}", markup=True)
+            continue
+        label = "[red]FAIL[/red]" if check.fatal else "[yellow]warn[/yellow]"
+        console.print(f"{label}  {check.name}: {check.summary}", markup=True)
+        if check.hint:
+            for line in check.hint.splitlines():
+                console.print(f"        {line}", markup=False)
+
+
+# --------------------------------------------------------------------------- #
+# Chat loop
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class _TurnDisplay:
+    """Drives the progress line and streamed text for one turn."""
+
+    console: Console
+    status: Any = None
+    streamed: list[str] = field(default_factory=list)
+    last_activity: str = ""
+
+    def start(self) -> None:
+        self.status = self.console.status("Thinking...", spinner="dots")
+        self.status.start()
+
+    def stop(self) -> None:
+        if self.status is not None:
+            self.status.stop()
+            self.status = None
+
+    def __call__(self, event: AgentEvent) -> None:
+        if event.kind == "message_delta":
+            if event.text:
+                if not self.streamed:
+                    self.stop()
+                    self.console.print(f"[dim]{ANSWER_HEADER}[/dim]", markup=True)
+                self.streamed.append(event.text)
+                self.console.print(event.text, end="", markup=False)
+            return
+        if event.kind in ("command", "tool_call"):
+            width = max(20, self.console.width - 12)
+            text = event.text.replace("\n", " ")
+            self.last_activity = text[: width - 1] + "…" if len(text) > width else text
+            if self.status is not None:
+                verb = "Running" if event.kind == "command" else "Using"
+                self.status.update(f"{verb}: {self.last_activity}")
+            return
+        if event.kind == "status" and self.status is not None and event.text:
+            self.status.update(event.text)
+
+    def finish(self, summary: TurnSummary) -> None:
+        self.stop()
+        streamed_text = "".join(self.streamed).strip()
+        final = (summary.final_response or "").strip()
+        if streamed_text:
+            self.console.print()
+            if final and final != streamed_text:
+                self.console.print(final, markup=False)
+        elif final:
+            self.console.print(f"[dim]{ANSWER_HEADER}[/dim]", markup=True)
+            self.console.print(final, markup=False)
+        else:
+            self.console.print("[dim](no reply)[/dim]", markup=True)
+        self.console.print()
+
+
+class ChatLoop:
+    def __init__(self, console: Console, config: HailerConfig, opts: CliOptions) -> None:
+        self.console = console
+        self.config = config
+        self.opts = opts
+        self.state: SessionState = load_session(config.workspace)
+        self.bundle: ContextBundle = ContextBundle()
+        self.agent: Any = None
+
+    # -- lifecycle --------------------------------------------------------- #
+
+    def start(self) -> None:
+        self.bundle = _load_context(self.config)
+        self._print_context_warnings()
+        self.agent = _make_agent(self.config, self.bundle)
+        resume = None if self.opts.new_thread else self.state.thread_id
+        thread_id = self.agent.start(resume_thread_id=resume)
+        if resume and thread_id != resume:
+            self.console.print("[dim]Previous conversation could not be resumed; started a new one.[/dim]", markup=True)
+            self.state = SessionState()
+        elif resume:
+            self.console.print(f"[dim]Resumed conversation ({self.state.turns} turns so far). /new starts fresh.[/dim]", markup=True)
+        elif self.opts.new_thread:
+            self.state = SessionState()
+        self.state.thread_id = thread_id
+        self.state.model = self.state.model or self.config.model.name
+        self.state.provider = self.state.provider or self.config.model.provider
+        save_session(self.config.workspace, self.state)
+
+    def close(self) -> None:
+        if self.agent is not None:
+            try:
+                self.agent.close()
+            except Exception:  # pragma: no cover - best effort
+                pass
+
+    def _print_context_warnings(self) -> None:
+        for warning in self.bundle.warnings:
+            self.console.print(f"[yellow]warn[/yellow]  {warning}", markup=True)
+
+    # -- REPL -------------------------------------------------------------- #
+
+    def run(self) -> None:
+        while True:
+            try:
+                line = self.console.input(f"[bold cyan]{PROMPT}[/bold cyan]")
+            except EOFError:
+                self.console.print("\nBye.")
+                return
+            except KeyboardInterrupt:
+                self.console.print("\nBye.")
+                return
+            text = line.strip()
+            if not text:
+                continue
+            command = parse_command(text)
+            try:
+                if command is None:
+                    self._turn(text)
+                    continue
+                if command.name in EXIT_COMMANDS:
+                    self.console.print("Bye.")
+                    return
+                self._command(command)
+            except HailerError as err:
+                _print_error(self.console, err, verbose=self.opts.verbose)
+            except KeyboardInterrupt:
+                self.console.print("\nInterrupted.")
+            except Exception as exc:  # noqa: BLE001 - keep the loop alive
+                _print_unexpected(self.console, exc, verbose=self.opts.verbose)
+
+    # -- turns ------------------------------------------------------------- #
+
+    def _turn(self, text: str, *, skill: SkillInfo | None = None) -> None:
+        display = _TurnDisplay(self.console)
+        display.start()
+        try:
+            summary: TurnSummary = self.agent.run_turn(text, on_event=display, skill=skill)
+        except KeyboardInterrupt:
+            display.stop()
+            try:
+                self.agent.interrupt()
+            except Exception:  # pragma: no cover - best effort
+                pass
+            self.console.print("\nInterrupted.")
+            return
+        except BaseException:
+            display.stop()
+            raise
+        display.finish(summary)
+        self.state.turns += 1
+        self.state.input_tokens += summary.input_tokens or 0
+        self.state.output_tokens += summary.output_tokens or 0
+        if summary.thread_id:
+            self.state.thread_id = summary.thread_id
+        save_session(self.config.workspace, self.state)
+
+    # -- slash commands ---------------------------------------------------- #
+
+    def _command(self, command: Any) -> None:
+        name, args = command.name, command.args
+        if name == "help":
+            self.console.print(help_text(), markup=False)
+        elif name == "status":
+            self._status()
+        elif name == "new":
+            self._new_thread(reason="New conversation started.")
+        elif name == "model":
+            self._model(args)
+        elif name == "notebook":
+            self._notebook()
+        elif name == "clear":
+            self.console.clear()
+        elif name == "context":
+            self._context()
+        elif name == "skill":
+            self._skill(args)
+        elif name == "prompt":
+            self._prompt(args)
+        elif name == "reload":
+            self._reload()
+        elif name == "":
+            self.console.print("Type /help for commands.")
+        else:
+            self.console.print(f"Unknown command /{name}; type /help for commands.")
+
+    def _new_thread(self, *, reason: str) -> None:
+        thread_id = self.agent.new_thread()
+        self.state = SessionState(
+            thread_id=thread_id,
+            model=self.state.model,
+            provider=self.state.provider,
+        )
+        save_session(self.config.workspace, self.state)
+        self.console.print(reason)
+
+    def _status(self) -> None:
+        server, session, _err = _marimo_state(self.config)
+        if server is None:
+            marimo = "not running"
+        elif session is None:
+            marimo = f"{server.url} (notebook not open in a browser)"
+        else:
+            marimo = f"{server.url} (session {session.session_id})"
+        table = Table.grid(padding=(0, 2))
+        table.add_row("Model", f"{self.state.model or self.config.model.name}")
+        table.add_row("Provider", self.state.provider or _provider_line(self.config))
+        table.add_row("Thread", self.state.thread_id or "-")
+        table.add_row("Turns", str(self.state.turns))
+        table.add_row("Tokens", f"{self.state.input_tokens} in / {self.state.output_tokens} out")
+        table.add_row("Marimo", marimo)
+        table.add_row("Notebook", _relative(self.config.notebook, self.config.workspace))
+        table.add_row("Web access", _web_line(self.config))
+        self.console.print(table)
+
+    def _model(self, args: str) -> None:
+        if not args:
+            self.console.print(f"Model: {self.state.model or self.config.model.name}  Provider: {self.state.provider or self.config.model.provider}")
+            self.console.print("Usage: /model <name>  or  /model <provider>:<name>")
+            return
+        provider: str | None = None
+        name = args.strip()
+        if ":" in name:
+            provider, _, name = name.partition(":")
+            provider = provider.strip()
+            name = name.strip()
+        if not name:
+            self.console.print("Usage: /model <name>  or  /model <provider>:<name>")
+            return
+        if provider is not None and provider != "openai" and provider not in self.config.providers:
+            known = ", ".join(sorted({"openai", *self.config.providers}))
+            self.console.print(f"Unknown provider {provider!r}. Declared providers: {known}.")
+            return
+        self.agent.set_model(name, provider)
+        self.state.model = name
+        if provider is not None:
+            self.state.provider = provider
+        self._new_thread(reason=f"Model set to {name}" + (f" ({provider})" if provider else "") + "; started a new thread.")
+
+    def _notebook(self) -> None:
+        self.console.print(f"Notebook: {self.config.notebook}")
+        server, _session, _err = _marimo_state(self.config)
+        if server is not None:
+            self.console.print(f"URL:      {_notebook_url(server, self.config)}")
+        else:
+            self.console.print("Marimo is not running.")
+        self.console.print(f"Launch:   {' '.join(_launch_command(self.config))}")
+
+    def _context(self) -> None:
+        bundle = self.bundle
+        if bundle.context_files:
+            self.console.print("Context files (sent with every session):")
+            for path in bundle.context_files:
+                try:
+                    size = path.stat().st_size
+                except OSError:
+                    size = 0
+                self.console.print(f"  {_relative(path, self.config.workspace)}  ({size} bytes)")
+        else:
+            self.console.print(f"Context files: none ({_relative(self.config.context_dir, self.config.workspace)})")
+        if bundle.skills:
+            self.console.print("Skills:")
+            for skill in bundle.skills:
+                self.console.print(f"  {skill.name}: {skill.description}")
+        else:
+            self.console.print(f"Skills: none ({_relative(self.config.skills_dir, self.config.workspace)})")
+        if bundle.prompts:
+            self.console.print("Prompts: " + ", ".join(sorted(bundle.prompts)))
+        else:
+            self.console.print(f"Prompts: none ({_relative(self.config.prompts_dir, self.config.workspace)})")
+        self.console.print(f"Web access: {_web_line(self.config)}")
+        for warning in bundle.warnings:
+            self.console.print(f"[yellow]warn[/yellow]  {warning}", markup=True)
+
+    def _skill(self, args: str) -> None:
+        if not args:
+            names = ", ".join(s.name for s in self.bundle.skills) or "none"
+            self.console.print(f"Usage: /skill <name> [message]. Available: {names}")
+            return
+        name, _, message = args.partition(" ")
+        skill = next((s for s in self.bundle.skills if s.name == name), None)
+        if skill is None:
+            names = ", ".join(s.name for s in self.bundle.skills) or "none"
+            self.console.print(f"Unknown skill {name!r}. Available: {names}")
+            return
+        message = message.strip() or f"Summarise the '{skill.name}' skill and how you would apply it to this workspace."
+        self._turn(message, skill=skill)
+
+    def _prompt(self, args: str) -> None:
+        if not args:
+            names = ", ".join(sorted(self.bundle.prompts)) or "none"
+            self.console.print(f"Usage: /prompt <name> [args]. Available: {names}")
+            return
+        name, _, rest = args.partition(" ")
+        text = _render_prompt(self.config, name, rest.strip())
+        self._turn(text)
+
+    def _reload(self) -> None:
+        self.bundle = _load_context(self.config)
+        self._print_context_warnings()
+        if hasattr(self.agent, "bundle"):
+            self.agent.bundle = self.bundle
+        self.console.print(
+            f"Reloaded {len(self.bundle.context_files)} context file(s), {len(self.bundle.skills)} skill(s), "
+            f"{len(self.bundle.prompts)} prompt(s). Applies to the next thread (/new)."
+        )
+
+
+def run_chat(opts: CliOptions) -> None:
+    console = console_factory()
+    try:
+        config = _load_config(opts)
+    except ConfigError as err:
+        _print_error(console, err, verbose=opts.verbose)
+        raise typer.Exit(code=1)
+    _setup_logging(config, opts)
+    _startup_panel(console, config)
+
+    checks = preflight(config)
+    _print_checks(console, checks, only_failures=True)
+    if any(not c.ok and c.fatal for c in checks):
+        raise typer.Exit(code=1)
+    session_check = next((c for c in checks if c.name == "session"), None)
+    if session_check is not None and not session_check.ok:
+        server, _s, _e = _marimo_state(config)
+        if server is not None:
+            url = _notebook_url(server, config)
+            console.print(f"Opening {url} in your browser...")
+            _open_browser(url)
+    if any(not c.ok for c in checks):
+        console.print()
+
+    loop = ChatLoop(console, config, opts)
+    try:
+        loop.start()
+    except HailerError as err:
+        _print_error(console, err, verbose=opts.verbose)
+        loop.close()
+        raise typer.Exit(code=1)
+    except Exception as exc:  # noqa: BLE001
+        _print_unexpected(console, exc, verbose=opts.verbose)
+        loop.close()
+        raise typer.Exit(code=1)
+    try:
+        loop.run()
+    finally:
+        loop.close()
+
+
+# --------------------------------------------------------------------------- #
+# Typer wiring
+# --------------------------------------------------------------------------- #
+
+
+def _opts(ctx: typer.Context) -> CliOptions:
+    return ctx.obj if isinstance(ctx.obj, CliOptions) else CliOptions()
+
+
+def _config_or_exit(console: Console, opts: CliOptions) -> HailerConfig:
+    try:
+        config = _load_config(opts)
+    except ConfigError as err:
+        _print_error(console, err, verbose=opts.verbose)
+        raise typer.Exit(code=1)
+    _setup_logging(config, opts)
+    return config
+
+
+def _version_callback(value: bool) -> None:
+    if value:
+        typer.echo(f"hailer {__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def _main(
+    ctx: typer.Context,
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Debug logging and full tracebacks."),
+    config: Path | None = typer.Option(None, "--config", help="Path to hailer.toml.", show_default=False),
+    workspace: Path | None = typer.Option(None, "--workspace", help="Project directory (default: auto-detect).", show_default=False),
+    new: bool = typer.Option(False, "--new", help="Start a new conversation instead of resuming."),
+    version: bool = typer.Option(False, "--version", callback=_version_callback, is_eager=True, help="Show the version and exit."),
+) -> None:
+    del version
+    ctx.obj = CliOptions(verbose=verbose, config_path=config, workspace=workspace, new_thread=new)
+    if ctx.invoked_subcommand is None:
+        run_chat(ctx.obj)
+
+
+@app.command()
+def notebook(
+    ctx: typer.Context,
+    port: int | None = typer.Option(None, "--port", "-p", help="Port for the marimo server."),
+) -> None:
+    """Launch marimo edit for the configured notebook (new console on Windows)."""
+    opts = _opts(ctx)
+    console = console_factory()
+    config = _config_or_exit(console, opts)
+    if not config.notebook.exists():
+        console.print(f"[yellow]Notebook not found:[/yellow] {config.notebook} (marimo will create it).", markup=True)
+    cmd = _launch_command(config, port=port)
+    console.print("Launching: " + " ".join(cmd))
+    try:
+        _spawn_detached(cmd, config.workspace)
+    except OSError as err:
+        console.print(f"[red]Could not start marimo: {err}[/red]", markup=True)
+        raise typer.Exit(code=1)
+    if os.name == "nt":
+        console.print("Marimo is starting in a new console window. When the notebook opens in your browser, run: uv run hailer")
+
+
+@app.command("exec")
+def exec_(
+    ctx: typer.Context,
+    source: str | None = typer.Argument(None, help="Python file to run, or '-' for stdin.", show_default=False),
+    code: str | None = typer.Option(None, "-c", "--code", help="Inline Python to run in the kernel scratchpad."),
+) -> None:
+    """Run Python in the live notebook kernel (scratchpad) and print the result."""
+    opts = _opts(ctx)
+    console = console_factory()
+    config = _config_or_exit(console, opts)
+    if code is None:
+        if source is None:
+            console.print("Give code with -c 'CODE', a file path, or '-' for stdin.")
+            raise typer.Exit(code=2)
+        if source == "-":
+            code = sys.stdin.read()
+        else:
+            path = Path(source)
+            if not path.exists():
+                console.print(f"[red]File not found:[/red] {path}", markup=True)
+                raise typer.Exit(code=1)
+            code = path.read_text(encoding="utf-8")
+    try:
+        server = _find_server(config)
+        if server is None:
+            raise MarimoUnavailableError("Marimo is not running.", hint=_launch_hint(config))
+        client = _make_client(server, config)
+        result = client.execute(
+            code,
+            notebook=config.notebook,
+            on_stdout=lambda s: console.print(s, end="", markup=False),
+            on_stderr=lambda s: console.print(f"[red]{s}[/red]", end="", markup=True) if s else None,
+        )
+    except HailerError as err:
+        _print_error(console, err, verbose=opts.verbose)
+        raise typer.Exit(code=1)
+    if result.output and result.output.strip() and result.output.strip() != result.stdout.strip():
+        console.print(result.output, markup=False)
+    if not result.success:
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def status(ctx: typer.Context) -> None:
+    """Show configuration, credential source, marimo state and loaded context."""
+    opts = _opts(ctx)
+    console = console_factory()
+    config = _config_or_exit(console, opts)
+    _startup_panel(console, config)
+    try:
+        provider = config.provider
+        _value, source = _resolve_key(provider)
+        console.print(f"Credentials: {provider.env_key or 'API key'} from {source}")
+    except KeyError:
+        console.print(f"Credentials: provider {config.model.provider!r} is not declared")
+    server, session, err = _marimo_state(config)
+    if server is None:
+        console.print("Marimo:      not running")
+    elif session is None:
+        console.print(f"Marimo:      {server.url} (notebook not open in a browser)")
+        if err is not None and err.hint:
+            console.print(f"             {err.hint}", markup=False)
+    else:
+        console.print(f"Marimo:      {server.url} (session {session.session_id})")
+    try:
+        bundle = _load_context(config)
+    except HailerError as err:
+        _print_error(console, err, verbose=opts.verbose)
+        return
+    console.print(
+        f"Context:     {len(bundle.context_files)} file(s), {len(bundle.skills)} skill(s), {len(bundle.prompts)} prompt(s)"
+    )
+    for warning in bundle.warnings:
+        console.print(f"[yellow]warn[/yellow]  {warning}", markup=True)
+    if config.config_path:
+        console.print(f"Config:      {config.config_path}")
+    else:
+        console.print("Config:      defaults (no hailer.toml found; run: uv run hailer init)")
+
+
+@app.command()
+def doctor(ctx: typer.Context) -> None:
+    """Run the startup checks and print a table with fixes."""
+    opts = _opts(ctx)
+    console = console_factory()
+    config = _config_or_exit(console, opts)
+    checks = preflight(config)
+    table = Table(title="Hailer doctor", show_lines=False)
+    table.add_column("Check")
+    table.add_column("Result")
+    table.add_column("Details")
+    for check in checks:
+        result = "OK" if check.ok else ("FAIL" if check.fatal else "WARN")
+        details = check.summary
+        if not check.ok and check.hint:
+            details += "\n" + check.hint
+        table.add_row(check.name, result, details)
+    console.print(table)
+
+    server, session, _err = _marimo_state(config)
+    if server is not None and session is not None:
+        try:
+            client = _make_client(server, config)
+            result = client.execute(_cm_help_code(), notebook=config.notebook)
+            if result.success and "get_context" in (result.stdout + result.output):
+                console.print("ok    code mode: marimo._code_mode is available in the kernel")
+            else:
+                console.print("warn  code mode: marimo._code_mode did not respond as expected; check the marimo version (0.24.x expected)")
+        except HailerError as err:
+            console.print(f"warn  code mode: {err}")
+    if any(not c.ok and c.fatal for c in checks):
+        raise typer.Exit(code=1)
+
+
+def _provider_for(config: HailerConfig, provider_id: str) -> ProviderConfig:
+    if provider_id in config.providers:
+        return config.providers[provider_id]
+    if provider_id == "openai":
+        return ProviderConfig(id="openai", env_key="OPENAI_API_KEY", requires_openai_auth=True)
+    known = ", ".join(sorted({"openai", *config.providers}))
+    raise CredentialsError(
+        f"Unknown provider {provider_id!r}.",
+        hint=f"Declared providers: {known}. Add a [model_providers.{provider_id}] table to hailer.toml first.",
+    )
+
+
+@app.command()
+def login(
+    ctx: typer.Context,
+    provider: str = typer.Argument(..., help="Provider id from hailer.toml (or 'openai')."),
+) -> None:
+    """Store the provider's API key in the OS credential store (never in a file)."""
+    opts = _opts(ctx)
+    console = console_factory()
+    config = _config_or_exit(console, opts)
+    try:
+        prov = _provider_for(config, provider)
+        if not prov.env_key:
+            raise CredentialsError(
+                f"Provider {provider!r} has no env_key.",
+                hint=f"Set model_providers.{provider}.env_key in hailer.toml to the variable name Codex should read.",
+            )
+        value = typer.prompt(f"API key for {provider} ({prov.env_key})", hide_input=True)
+        if not value.strip():
+            console.print("Nothing stored (empty key).")
+            raise typer.Exit(code=1)
+        _store_key(prov, value.strip())
+    except HailerError as err:
+        _print_error(console, err, verbose=opts.verbose)
+        raise typer.Exit(code=1)
+    console.print(f"Stored {prov.env_key} for provider {provider!r} in the OS credential store.")
+
+
+@app.command()
+def logout(
+    ctx: typer.Context,
+    provider: str = typer.Argument(..., help="Provider id from hailer.toml (or 'openai')."),
+) -> None:
+    """Remove the provider's API key from the OS credential store."""
+    opts = _opts(ctx)
+    console = console_factory()
+    config = _config_or_exit(console, opts)
+    try:
+        prov = _provider_for(config, provider)
+        removed = _delete_key(prov)
+    except HailerError as err:
+        _print_error(console, err, verbose=opts.verbose)
+        raise typer.Exit(code=1)
+    console.print("Removed." if removed else "No stored key found.")
+
+
+def _example_config_dir() -> Path | None:
+    candidate = Path(__file__).resolve().parents[2] / ".config" / "hailer"
+    return candidate if candidate.is_dir() else None
+
+
+_PLACEHOLDERS: dict[str, str] = {
+    "context/README.md": (
+        "# Project context\n\nMarkdown files in this folder are sent to the model endpoint with every "
+        "Hailer session. Put glossaries, column meanings and house rules here. Never put secrets here.\n"
+    ),
+    "skills/README.md": (
+        "# Skills\n\nEach sub-folder holds a SKILL.md with `name:` and `description:` frontmatter. "
+        "Hailer lists them to the agent and loads one on demand or via /skill <name>.\n"
+    ),
+    "prompts/README.md": "# Prompts\n\nEach `<name>.md` can be sent with /prompt <name> [args]; `{{args}}` is replaced.\n",
+}
+
+
+@app.command()
+def init(
+    ctx: typer.Context,
+    force: bool = typer.Option(False, "--force", help="Overwrite an existing hailer.toml."),
+) -> None:
+    """Write a starter hailer.toml and the .config/hailer folder skeleton."""
+    opts = _opts(ctx)
+    console = console_factory()
+    workspace = opts.workspace or Path.cwd()
+    workspace = workspace.resolve()
+    config_path = workspace / "hailer.toml"
+    if config_path.exists() and not force:
+        console.print(f"{config_path} already exists (use --force to overwrite).")
+    else:
+        from hailer.config import write_default_config
+
+        write_default_config(config_path, overwrite=force)
+        console.print(f"Wrote {config_path}")
+
+    target = workspace / ".config" / "hailer"
+    example = _example_config_dir()
+    created: list[str] = []
+    for sub in ("context", "skills", "prompts"):
+        (target / sub).mkdir(parents=True, exist_ok=True)
+    if example is not None and example != target:
+        for src in example.rglob("*"):
+            if src.is_dir():
+                continue
+            rel = src.relative_to(example)
+            dst = target / rel
+            if dst.exists():
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, dst)
+            created.append(str(rel))
+    else:
+        for rel, text in _PLACEHOLDERS.items():
+            dst = target / rel
+            if not dst.exists():
+                dst.write_text(text, encoding="utf-8")
+                created.append(rel)
+    if created:
+        console.print(f"Created {target} with: " + ", ".join(created))
+    else:
+        console.print(f"{target} already set up.")
+    console.print(
+        "\nNext steps:\n"
+        "  1. Edit hailer.toml (model, provider, notebook).\n"
+        "  2. If you use a custom endpoint: uv run hailer login <provider>\n"
+        "  3. Start marimo:  uv run hailer notebook\n"
+        "  4. Chat:          uv run hailer"
+    )
+
+
+def main() -> None:
+    app()
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()
