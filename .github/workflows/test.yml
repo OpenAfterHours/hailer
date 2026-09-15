@@ -1,0 +1,39 @@
+# Run the test suite.
+#
+# Runs on pushes to main and on pull requests, and is called by release.yml so a
+# release cannot be published to PyPI unless the suite passes on every platform
+# here. The suite is offline (no API key, marimo server, Codex process or network).
+
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: pytest (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+
+      - name: Install the project and the dev dependencies
+        run: uv sync --locked
+
+      - name: Run the tests
+        run: uv run --locked pytest

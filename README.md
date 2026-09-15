@@ -335,6 +335,9 @@ The suite is offline: it needs no API key, no marimo server, no Codex process an
 protocol is exercised against a local fake server, the Codex SDK against a fake client, and the credential
 store against an in-memory backend.
 
+`.github/workflows/test.yml` runs the same suite on Ubuntu and Windows with Python 3.12 and 3.13 for every
+push to `main` and every pull request.
+
 ## Releasing
 
 ```bash
@@ -347,9 +350,10 @@ uv run python -m scripts.release --dry-run  # preflight checks and the plan, not
 Run it from a clean `main` that matches `origin/main`. The script writes the new version to `pyproject.toml`,
 `src/hailer/__init__.py` and `uv.lock`, then runs the test suite. If the tests fail, the version files are
 restored and nothing is committed. If they pass, it commits `Release vX.Y.Z`, tags `vX.Y.Z` and pushes the
-branch and tag atomically. The tag triggers `.github/workflows/release.yml`, which builds the sdist and
-wheel, publishes them to PyPI through the `pypi` environment (trusted publishing, no token to store) and
-creates the GitHub release with the files attached.
+branch and tag atomically. The tag triggers `.github/workflows/release.yml`, which runs the test suite again
+on every platform in `test.yml` and builds the sdist and wheel; only when both succeed does it publish to
+PyPI through the `pypi` environment (trusted publishing, no token to store) and create the GitHub release
+with the files attached.
 
 `--no-push` stops after the local commit and tag, `--version X.Y.Z` releases an exact version (pre-releases
 such as `1.2.0rc1` are accepted), and arguments after `--` are passed to pytest.
