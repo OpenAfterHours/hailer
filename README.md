@@ -80,6 +80,11 @@ runs the chat in the same terminal. When you leave the chat (`/exit`, Ctrl+Z Ent
 prompt) it stops the marimo server it started. If a marimo server is already running with this notebook
 open, it is reused and left running.
 
+The notebook opens in marimo's **app view**: you see the results, tables and charts the agent produces,
+not the code behind them (the URL carries `view-as=present`). To see or edit the code, press `Ctrl+.`
+(`Cmd+.` on macOS) in the notebook, or choose *Toggle app view* from the notebook menu; the same shortcut
+switches back. It is a normal edit session either way, so the agent works in it exactly the same.
+
 Flags: `--port N` (default 2718; a free port is chosen when it is busy), `--no-browser` (print the URL
 instead of opening it), `--keep-marimo` (leave the server running after the chat), `--foreground` (just run
 marimo attached to this terminal, no chat), `--new` (start a fresh conversation).
@@ -356,7 +361,7 @@ when a session exists, confirms that marimo's code-mode API is available in the 
 |---|---|
 | `Marimo is not running.` then `Start everything in one go: uv run hailer notebook`, `Or start it yourself with: uv run marimo edit notebooks/analysis.py --no-token`, `Then run Hailer again: uv run hailer` | No server answered at the configured or discovered URL. `uv run hailer notebook` starts one and runs the chat in the same terminal. Servers started with `--no-token` register themselves so Hailer finds them; otherwise set `marimo_url` in `hailer.toml`. |
 | `Marimo exited early (code N)` or `Marimo did not answer on http://127.0.0.1:2718 within 60 s`, followed by `Log: .hailer\marimo.log` and its last lines | `hailer notebook` could not start marimo. The log tail usually names the cause (port in use by something else, a syntax error in the notebook, marimo not installed in the environment). |
-| `the notebook is not open in a browser` followed by `Open http://... in your browser.` | The server is up but has no kernel session. Open the URL; Hailer opens it for you once at startup. |
+| `the notebook is not open in a browser` followed by `Open http://... in your browser.` | The server is up but has no kernel session. Open the URL; Hailer opens it for you once at startup. The URL ends in `&view-as=present` (app view); `Ctrl+.` in the notebook shows the code. |
 | `not found: <path>` for the notebook | Fix `[hailer].notebook` or create the notebook with `uv run marimo edit <path>`. |
 | `INTERNAL_MODEL_API_KEY is not set (required by provider 'internal')` | Run `uv run hailer login internal` or set the variable in this terminal. |
 | `no OPENAI_API_KEY found; Codex will use its existing ChatGPT login if you have one` | Informational. If the agent then fails to authenticate, `uv run hailer login openai`. |

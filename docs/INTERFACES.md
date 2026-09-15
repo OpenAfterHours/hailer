@@ -113,7 +113,7 @@ class MarimoClient:
     def execute(self, code: str, *, session_id: str | None = None, notebook: Path | None = None,
                 on_stdout: Callable[[str], None] | None = None, on_stderr: Callable[[str], None] | None = None,
                 timeout: float = 600.0) -> ExecResult   # SSE parse; missing `done` → MarimoExecutionError
-def open_notebook_url(server: MarimoServer, notebook: Path, workspace: Path) -> str   # URL the user should open, e.g. http://127.0.0.1:2718/?file=notebooks/analysis.py
+def open_notebook_url(server: MarimoServer, notebook: Path, workspace: Path, *, view: str = "app") -> str   # URL the user should open; view="app" (default) adds &view-as=present so marimo opens in app view (results only; Ctrl+. toggles the editor): http://127.0.0.1:2718/?file=notebooks/analysis.py&view-as=present; view="edit" omits it
 def notebook_launch_command(config: HailerConfig, *, port: int | None = None) -> list[str]  # ["uv","run","marimo","edit",<notebook>,"--no-token", ...]
 ```
 Connection refused/timeout → `MarimoUnavailableError` with the exact `uv run marimo edit ... --no-token`

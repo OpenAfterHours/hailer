@@ -836,6 +836,7 @@ class ChatLoop:
         server, _session, _err = _marimo_state(self.config)
         if server is not None:
             self.console.print(f"URL:      {_notebook_url(server, self.config)}", markup=False)
+            self.console.print("View:     app view (results only); Ctrl+. in the notebook toggles the code editor", markup=False)
         else:
             self.console.print("Marimo is not running.", markup=False)
         self.console.print("Start everything in one go:  uv run hailer notebook", markup=False)
@@ -924,6 +925,7 @@ def run_chat(opts: CliOptions) -> None:
             url = _notebook_url(server, config)
             console.print(f"Opening {url} in your browser...", markup=False)
             _open_browser(url)
+            console.print(APP_VIEW_HINT, markup=False)
     if any(not c.ok for c in checks):
         console.print()
 
@@ -992,6 +994,10 @@ def _main(
 MARIMO_LOG_NAME = "marimo.log"
 HEALTH_TIMEOUT_SEC = 60.0
 SESSION_TIMEOUT_SEC = 90.0
+APP_VIEW_HINT = (
+    "The notebook opens in app view (results only). "
+    "Press Ctrl+. in it, or use Toggle app view, to see and edit the code."
+)
 
 
 def _reusable_server(config: HailerConfig) -> tuple[MarimoServer, MarimoSession | None] | None:
@@ -1059,6 +1065,7 @@ def _wait_for_notebook(console: Console, config: HailerConfig, server: MarimoSer
         _open_browser(url)
     else:
         console.print(f"Open {url} in your browser.", markup=False)
+    console.print(APP_VIEW_HINT, markup=False)
     with console.status("Waiting for the notebook to open..."):
         session = _wait_for_session(client, config.notebook, SESSION_TIMEOUT_SEC)
     if session is None:

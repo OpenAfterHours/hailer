@@ -97,10 +97,26 @@ def launch_hint(notebook: Path | None, workspace: Path | None = None) -> str:
     )
 
 
-def open_notebook_url(server: MarimoServer, notebook: Path, workspace: Path) -> str:
-    """URL the user should open so the kernel gets a session, e.g. ``http://127.0.0.1:2718/?file=notebooks/analysis.py``."""
+APP_VIEW_PARAM = "view-as=present"
+"""Query parameter that makes marimo's edit server open a notebook in app view (outputs only).
+
+The page is still a normal edit session (the kernel gets a session, code mode works); only the
+initial UI mode differs. The reader switches to edit mode with Ctrl+. / Cmd+. ("Toggle app view").
+"""
+
+
+def open_notebook_url(server: MarimoServer, notebook: Path, workspace: Path, *, view: str = "app") -> str:
+    """URL the user should open so the kernel gets a session.
+
+    ``view="app"`` (default) opens the notebook in app view so the chat user sees results, not code:
+    ``http://127.0.0.1:2718/?file=notebooks/analysis.py&view-as=present``. ``view="edit"`` opens the
+    plain editor: ``http://127.0.0.1:2718/?file=notebooks/analysis.py``.
+    """
+    if view not in ("app", "edit"):
+        raise ValueError(f"view must be 'app' or 'edit', not {view!r}")
     rel = _relative_to_workspace(notebook, workspace)
-    return f"{server.url.rstrip('/')}/?file={quote(rel, safe='/:')}"
+    url = f"{server.url.rstrip('/')}/?file={quote(rel, safe='/:')}"
+    return f"{url}&{APP_VIEW_PARAM}" if view == "app" else url
 
 
 def _format_command(cmd: Sequence[str]) -> str:

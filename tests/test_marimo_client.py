@@ -329,10 +329,24 @@ def test_find_server_single_registry_entry(fake, tmp_path):
 # --------------------------------------------------------------------------- #
 
 
-def test_open_notebook_url(tmp_path):
+def test_open_notebook_url_defaults_to_app_view(tmp_path):
     nb = tmp_path / "notebooks" / "my analysis.py"
     url = mc.open_notebook_url(MarimoServer(url="http://127.0.0.1:2718"), nb, tmp_path)
-    assert url == "http://127.0.0.1:2718/?file=notebooks/my%20analysis.py"
+    assert url == "http://127.0.0.1:2718/?file=notebooks/my%20analysis.py&view-as=present"
+
+
+def test_open_notebook_url_edit_view(tmp_path):
+    nb = tmp_path / "notebooks" / "analysis.py"
+    server = MarimoServer(url="http://127.0.0.1:2718/")
+    assert mc.open_notebook_url(server, nb, tmp_path, view="edit") == "http://127.0.0.1:2718/?file=notebooks/analysis.py"
+    with pytest.raises(ValueError):
+        mc.open_notebook_url(server, nb, tmp_path, view="kiosk")
+
+
+def test_client_notebook_url_uses_app_view(fake, tmp_path):
+    nb = tmp_path / "notebooks" / "analysis.py"
+    client = mc.MarimoClient(fake.url, notebook=nb, workspace=tmp_path)
+    assert client.notebook_url().endswith("?file=notebooks/analysis.py&view-as=present")
 
 
 def test_notebook_launch_command(tmp_path):

@@ -33,7 +33,7 @@ from hailer.session import save_session, session_path
 runner = CliRunner()
 SERVER = MarimoServer(url="http://127.0.0.1:2718", server_id="127.0.0.1:2718", version="0.24.2", source="config")
 LAUNCH = ["uv", "run", "marimo", "edit", "notebooks/analysis.py", "--no-token"]
-URL = "http://127.0.0.1:2718/?file=notebooks/analysis.py"
+URL = "http://127.0.0.1:2718/?file=notebooks/analysis.py&view-as=present"
 INTERNAL = ProviderConfig(
     id="internal",
     base_url="https://llm.example.internal/v1",
@@ -603,6 +603,7 @@ def test_notebook_opens_browser_and_waits_for_session(harness, nb):
     assert harness.opened == [URL], "browser opened exactly once"
     assert nb.session_waits == [harness.config.notebook]
     assert "Notebook is open (session s9)" in result.output
+    assert "app view" in result.output and "Ctrl+." in result.output, "tells the user how to reach the code"
 
 
 def test_notebook_no_browser_still_waits_and_continues_without_session(harness, nb):
