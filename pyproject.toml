@@ -1,0 +1,47 @@
+[project]
+name = "hailer"
+version = "0.1.0"
+description = "Hailer: a conversational CLI for local data analysis, with a live Marimo notebook as the visual workspace."
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{ name = "OpenAfterHours" }]
+keywords = ["marimo", "codex", "polars", "duckdb", "data-analysis", "cli"]
+dependencies = [
+    # Codex Python SDK (bundles the codex app-server binary). Pinned: Hailer relies on
+    # config override keys and app-server behaviour verified against this version.
+    "openai-codex==0.154.0",
+    # Pinned: Hailer drives the private marimo._code_mode API and /api/kernel/execute.
+    "marimo==0.24.2",
+    # Hailer's own stdio MCP server exposed to the agent.
+    "mcp>=2.0,<3",
+    "polars>=1.44",
+    "duckdb>=1.5",
+    "typer>=0.27",
+    "rich>=15.0",
+    # OS credential store (Windows Credential Manager on Windows) for API keys.
+    "keyring>=25.6",
+]
+
+[project.scripts]
+hailer = "hailer.cli:main"
+hailer-mcp = "hailer.mcp_server:main"
+
+[project.urls]
+Repository = "https://github.com/openafterhours/hailer"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hailer"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]

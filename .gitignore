@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
+
+# uv / virtualenv
+.venv/
+uv.lock.bak
+
+# Hailer runtime state (thread ids, logs) — never commit
+.hailer/
+*.log
+
+# Data files stay local
+data/*
+!data/.gitkeep
+!data/README.md
+
+# marimo
+__marimo__/
+.marimo/
+
+# Secrets — never commit
+.env
+*.key
+*.pem
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
