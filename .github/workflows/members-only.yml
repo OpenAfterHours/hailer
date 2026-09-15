@@ -1,0 +1,32 @@
+# Close pull requests from outside the organization.
+#
+# GitHub has no setting that stops people opening pull requests on a public
+# repository, so this closes any pull request whose author is not an organization
+# member or a repository collaborator, leaving a short comment. Members' pull
+# requests are untouched (the job is skipped).
+#
+# pull_request_target runs on the base branch with a write token. It never checks
+# out or runs code from the pull request, so that token is not exposed to it.
+
+name: Members only
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  guard:
+    name: Close pull requests from non-members
+    if: ${{ !contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Comment and close
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "Thanks for the interest. This repository only accepts pull requests from members of the OpenAfterHours organization, so this one has been closed automatically. Please open an issue to discuss the change instead."
+          gh pr close "$PR" --repo "$GITHUB_REPOSITORY"
