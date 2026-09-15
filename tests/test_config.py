@@ -337,6 +337,16 @@ def test_validate_notebooks_dir_missing_is_warning(tmp_path: Path) -> None:
     assert any("not inside [hailer].notebooks_dir" in p for p in _errors(problems))
 
 
+def test_validate_notebooks_dir_equal_to_workspace_is_warning(tmp_path: Path) -> None:
+    ws = _make_workspace(tmp_path)
+    (ws / "root_nb.py").write_text("import marimo\napp = marimo.App()\n", encoding="utf-8")
+    problems = validate(load_config(workspace=ws, env={"HAILER_NOTEBOOK": "root_nb.py", "HAILER_NOTEBOOKS_DIR": "."}))
+    assert _errors(problems) == []
+    assert any(p.startswith("Warning:") and "workspace itself" in p and ".venv" in p for p in problems)
+    # the normal layout does not warn
+    assert not any("workspace itself" in p for p in validate(load_config(workspace=ws, env={})))
+
+
 def test_validate_data_dir_missing_is_warning(tmp_path: Path) -> None:
     ws = _make_workspace(tmp_path, data=False)
     problems = validate(load_config(workspace=ws, env={}))

@@ -328,10 +328,41 @@ def test_resolve_by_absolute_path_and_case(fake, tmp_path):
     assert mc.MarimoClient(fake.url).resolve_session(nb).session_id == "mine"
 
 
-def test_resolve_by_filename_only(fake, tmp_path):
+def test_resolve_relative_session_path_against_the_workspace(fake, tmp_path):
     nb = tmp_path / "notebooks" / "analysis.py"
-    fake.sessions = {"mine": {"filename": "analysis.py", "path": None}}
-    assert mc.MarimoClient(fake.url).resolve_session(nb).session_id == "mine"
+    fake.sessions = {"mine": {"filename": "notebooks/analysis.py", "path": None}}
+    assert mc.MarimoClient(fake.url, workspace=tmp_path).resolve_session(nb).session_id == "mine"
+    # a bare filename is not the same notebook: no more matching by name alone
+    fake.sessions = {"other": {"filename": "analysis.py", "path": None}}
+    with pytest.raises(NoSessionError):
+        mc.MarimoClient(fake.url, workspace=tmp_path).resolve_session(nb)
+
+
+def test_resolve_same_filename_in_two_subfolders(fake, tmp_path):
+    a = tmp_path / "notebooks" / "a" / "report.py"
+    b = tmp_path / "notebooks" / "b" / "report.py"
+    fake.sessions = {"sA": {"filename": "a/report.py", "path": str(a)}}
+    with pytest.raises(NoSessionError):
+        mc.MarimoClient(fake.url, workspace=tmp_path).resolve_session(b)
+    fake.sessions = {"sA": {"filename": "a/report.py", "path": str(a)}, "sB": {"filename": "b/report.py", "path": str(b)}}
+    client = mc.MarimoClient(fake.url, workspace=tmp_path)
+    assert client.resolve_session(a).session_id == "sA"
+    assert client.resolve_session(b).session_id == "sB"
+
+
+def test_match_session_ignores_untitled_and_prefers_the_latest(tmp_path):
+    nb = tmp_path / "notebooks" / "analysis.py"
+    sessions = [
+        MarimoSession("untitled", None, None),
+        MarimoSession("old", "notebooks/analysis.py", str(nb)),
+        MarimoSession("other", "x.py", str(tmp_path / "x.py")),
+        MarimoSession("new", "notebooks/analysis.py", str(nb).upper() if os.name == "nt" else str(nb)),
+    ]
+    assert mc.match_session(sessions, nb, tmp_path).session_id == "new"
+    assert mc.match_session(sessions[:1], nb, tmp_path) is None
+    assert mc.match_session([], nb) is None
+    assert mc.match_session([MarimoSession("rel", "notebooks/analysis.py", "notebooks/analysis.py")], nb, tmp_path).session_id == "rel"
+    assert mc.match_session([MarimoSession("rel", "notebooks/analysis.py", "notebooks/analysis.py")], nb, tmp_path / "elsewhere") is None
 
 
 def test_resolve_multiple_no_match_lists_sessions(fake, tmp_path):
@@ -401,15 +432,24 @@ def test_find_server_single_registry_entry(fake, tmp_path):
 def test_notebook_file_key_is_absolute_posix(tmp_path):
     nb = tmp_path / "notebooks" / ".." / "notebooks" / "my analysis.py"
     key = mc.notebook_file_key(nb)
-    assert key == (tmp_path / "notebooks" / "my analysis.py").resolve().as_posix()
+    assert key == Path(os.path.normpath(str((tmp_path / "notebooks" / "my analysis.py").absolute()))).as_posix()
     assert "\\" not in key and ".." not in key
     assert Path(key).is_absolute()
+
+
+def test_notebook_file_key_does_not_resolve_symlinks(tmp_path, monkeypatch):
+    """marimo normalises without resolving links; a key through a junction must stay as given."""
+    nb = tmp_path / "linked" / "nb.py"
+    monkeypatch.setattr(Path, "resolve", lambda self, strict=False: Path(str(self).replace("linked", "real")))
+    assert "linked" in mc.notebook_file_key(nb) and "real" not in mc.notebook_file_key(nb)
+    relative = Path("notebooks") / "x.py"
+    assert mc.notebook_file_key(relative) == (Path.cwd() / relative).as_posix()
 
 
 def test_open_notebook_url_defaults_to_app_view(tmp_path):
     nb = tmp_path / "notebooks" / "my analysis.py"
     url = mc.open_notebook_url(MarimoServer(url="http://127.0.0.1:2718"), nb, tmp_path)
-    key = nb.resolve().as_posix()
+    key = mc.notebook_file_key(nb)
     assert url == f"http://127.0.0.1:2718/?file={quote(key, safe='/:')}&view-as=present"
     assert "my%20analysis.py" in url and "%5C" not in url, "absolute posix key, no backslashes"
     # the workspace no longer influences the key (absolute keys work on folder and single-file servers)
@@ -420,7 +460,7 @@ def test_open_notebook_url_defaults_to_app_view(tmp_path):
 def test_open_notebook_url_edit_view(tmp_path):
     nb = tmp_path / "notebooks" / "analysis.py"
     server = MarimoServer(url="http://127.0.0.1:2718/")
-    expected = f"http://127.0.0.1:2718/?file={quote(nb.resolve().as_posix(), safe='/:')}"
+    expected = f"http://127.0.0.1:2718/?file={quote(mc.notebook_file_key(nb), safe='/:')}"
     assert mc.open_notebook_url(server, nb, tmp_path, view="edit") == expected
     with pytest.raises(ValueError):
         mc.open_notebook_url(server, nb, tmp_path, view="kiosk")

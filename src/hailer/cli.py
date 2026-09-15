@@ -22,7 +22,6 @@ import shutil
 import subprocess
 import sys
 import traceback
-import webbrowser
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -141,11 +140,19 @@ def _load_config(opts: CliOptions) -> HailerConfig:
 
     Every subcommand goes through here, so from this point on ``config.notebook`` means the
     notebook the chat is working in (the state file wins over ``[hailer].notebook``; see
-    :func:`hailer.notebooks.load_active_notebook`).
+    :func:`hailer.notebooks.load_active_notebook`). ``HAILER_NOTEBOOK`` is an explicit choice:
+    it is written to the state file so the tool server (a separate process that reads only the
+    file) and later sessions agree with this one.
     """
     from hailer.config import load_config
 
     config = load_config(workspace=opts.workspace, config_path=opts.config_path)
+    if os.environ.get("HAILER_NOTEBOOK"):
+        try:
+            notebooks.save_active_notebook(config, config.notebook)
+        except OSError:  # pragma: no cover - a read-only workspace must not stop the chat
+            pass
+        return config
     return replace(config, notebook=notebooks.load_active_notebook(config))
 
 
@@ -240,10 +247,9 @@ def _make_agent(config: HailerConfig, bundle: ContextBundle) -> Any:
 
 
 def _open_browser(url: str) -> None:
-    try:
-        webbrowser.open(url)
-    except Exception:  # pragma: no cover - platform dependent
-        pass
+    from hailer.browser import open_url  # os.startfile first on Windows (ignores BROWSER), never raises
+
+    open_url(url)
 
 
 def _marimo_server_command(config: HailerConfig, port: int) -> list[str]:
@@ -421,15 +427,12 @@ def _inside(path: Path, root: Path) -> bool:
     return True
 
 
-def _session_for(sessions: list[MarimoSession], path: Path) -> MarimoSession | None:
-    """The kernel session for ``path`` among ``sessions`` (by path, then by unique filename)."""
-    for session in sessions:
-        for candidate in (session.path, session.filename):
-            if candidate and _same_file(Path(candidate), path):
-                return session
-    name = os.path.normcase(Path(path).name)
-    by_name = [s for s in sessions if os.path.normcase(Path(s.filename or s.path or "").name) == name]
-    return by_name[0] if len(by_name) == 1 else None
+def _session_for(sessions: list[MarimoSession], path: Path, workspace: Path | None = None) -> MarimoSession | None:
+    """The kernel session for ``path`` among ``sessions``: exact path match only (no filename fallback,
+    so two notebooks called ``report.py`` in different folders never share a session)."""
+    from hailer.marimo_client import match_session
+
+    return match_session(sessions, path, workspace)
 
 
 def _plural(count: int, noun: str) -> str:
@@ -745,45 +748,55 @@ class ChatLoop:
         display.start()
         preamble = self._pending_preamble
         try:
-            summary: TurnSummary = self.agent.run_turn(text, on_event=display, skill=skill, preamble=preamble)
-        except KeyboardInterrupt:
-            self._pending_preamble = None  # the notice went out with the interrupted turn
-            display.stop()
             try:
-                self.agent.interrupt()
-            except Exception:  # pragma: no cover - best effort
-                pass
-            self.console.print("\nInterrupted.")
-            return
-        except BaseException:
-            display.stop()
-            raise
-        self._pending_preamble = None
-        display.finish(summary)
-        self.state.turns += 1
-        self.state.input_tokens += summary.input_tokens or 0
-        self.state.output_tokens += summary.output_tokens or 0
-        if summary.thread_id:
-            self.state.thread_id = summary.thread_id
-        save_session(self.config.workspace, self.state)
-        self._sync_active_notebook()
+                summary: TurnSummary = self.agent.run_turn(text, on_event=display, skill=skill, preamble=preamble)
+            except KeyboardInterrupt:
+                self._pending_preamble = None  # the notice went out with the interrupted turn
+                display.stop()
+                try:
+                    self.agent.interrupt()
+                except Exception:  # pragma: no cover - best effort
+                    pass
+                self.console.print("\nInterrupted.")
+                return
+            except BaseException:
+                display.stop()
+                raise
+            self._pending_preamble = None
+            display.finish(summary)
+            self.state.turns += 1
+            self.state.input_tokens += summary.input_tokens or 0
+            self.state.output_tokens += summary.output_tokens or 0
+            if summary.thread_id:
+                self.state.thread_id = summary.thread_id
+            save_session(self.config.workspace, self.state)
+        finally:
+            # Also after Ctrl+C or a failed turn: a notebook_create/notebook_open tool call may have
+            # completed (and switched the state file) before the turn was cut short.
+            self._sync_active_notebook()
 
-    def _sync_active_notebook(self) -> None:
-        """Pick up a switch the model made during the turn (its tools write the same state file)."""
+    def _sync_active_notebook(self, *, open_browser: bool = True) -> bool:
+        """Pick up a switch the model made during a turn (its tools write the same state file).
+
+        Returns True when the active notebook changed. With ``open_browser`` the notebook's URL is
+        opened once when it has no kernel session yet.
+        """
         try:
             active = notebooks.load_active_notebook(self.config)
         except Exception:  # noqa: BLE001 - a bad state file must never spoil a finished turn
-            return
+            return False
         if _same_file(active, self.config.notebook):
-            return
+            return False
         self.config = replace(self.config, notebook=active)
         name = notebooks.notebook_display_name(self.config, active)
         self.console.print(Text(f"Active notebook is now {name}.", style="dim"))
-        server, session, _err = _marimo_state(self.config)
-        if server is not None and session is None:
-            url = _notebook_url(server, self.config)
-            self.console.print(f"Opening {url} in your browser...", markup=False)
-            _open_browser(url)
+        if open_browser:
+            server, session, _err = _marimo_state(self.config)
+            if server is not None and session is None:
+                url = _notebook_url(server, self.config)
+                self.console.print(f"Opening {url} in your browser...", markup=False)
+                _open_browser(url)
+        return True
 
     # -- slash commands ---------------------------------------------------- #
 
@@ -827,6 +840,7 @@ class ChatLoop:
         self.console.print(reason, markup=False)
 
     def _status(self) -> None:
+        self._sync_active_notebook(open_browser=False)  # a late tool call may have switched notebooks
         server, session, _err = _marimo_state(self.config)
         if server is None:
             marimo = "not running"
@@ -914,6 +928,7 @@ class ChatLoop:
     # -- /notebook --------------------------------------------------------- #
 
     def _notebook(self, args: str) -> None:
+        self._sync_active_notebook(open_browser=False)  # act on the current state, not a stale copy
         sub, _, rest = args.strip().partition(" ")
         sub, rest = sub.lower(), rest.strip()
         if not sub:
@@ -937,6 +952,9 @@ class ChatLoop:
         out.print(f"Notebook:  {self._display_name(cfg.notebook)} (active)", markup=False)
         count = len(notebooks.list_notebooks(cfg))
         out.print(f"Notebooks: {self._display_name(cfg.notebooks_root)} ({_plural(count, 'notebook')}; /notebook list)", markup=False)
+        recent = [p for p in notebooks.load_recent(cfg) if not _same_file(p, cfg.notebook)]
+        if recent:
+            out.print("Recent:    " + ", ".join(self._display_name(p) for p in recent[:5]), markup=False)
         server, session, _err = _marimo_state(cfg)
         if server is None:
             out.print("Marimo:    not running", markup=False)
@@ -977,7 +995,7 @@ class ChatLoop:
             markers = []
             if _same_file(info.path, self.config.notebook):
                 markers.append("active")
-            if _session_for(sessions, info.path) is not None:
+            if _session_for(sessions, info.path, self.config.workspace) is not None:
                 markers.append("open")
             modified = datetime.fromtimestamp(info.modified).strftime("%Y-%m-%d %H:%M")
             table.add_row(
@@ -1033,16 +1051,25 @@ class ChatLoop:
         notebooks.save_active_notebook(self.config, path)
         self.config = replace(self.config, notebook=path)
         name = self._display_name(path)
-        session, client = self._ensure_session()
-        detail = how
-        if session is not None:
-            count = self._cell_count(client)
-            if count is not None:
-                detail += f", {_plural(count, 'cell')}"
-        else:
-            detail += ", not open in a browser yet"
-        self._pending_preamble = f"[Hailer] The active notebook is now {name} ({detail}). Call notebook_cells before editing."
-        self.console.print(f"Active notebook: {name}.", markup=False)
+        # Queue the notice first: if the wait for the browser tab is interrupted (Ctrl+C) or marimo
+        # fails, the switch has still happened and the model must hear about it.
+        self._pending_preamble = self._switch_notice(name, f"{how}, not open in a browser yet")
+        try:
+            session, client = self._ensure_session()
+            detail = how
+            if session is not None:
+                count = self._cell_count(client)
+                if count is not None:
+                    detail += f", {_plural(count, 'cell')}"
+            else:
+                detail += ", not open in a browser yet"
+            self._pending_preamble = self._switch_notice(name, detail)
+        finally:
+            self.console.print(f"Active notebook: {name}.", markup=False)
+
+    @staticmethod
+    def _switch_notice(name: str, detail: str) -> str:
+        return f"[Hailer] The active notebook is now {name} ({detail}). Call notebook_cells before editing."
 
     def _ensure_session(self) -> tuple[MarimoSession | None, Any]:
         """Open the active notebook in the browser when it has no kernel session; (session, client)."""

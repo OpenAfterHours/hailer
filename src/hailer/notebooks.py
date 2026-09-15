@@ -16,7 +16,6 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Mapping
 from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
@@ -34,6 +33,11 @@ TEMPLATE_KINDS: tuple[str, ...] = ("starter", "empty")
 
 _SCAN_BYTES = 1024 * 1024  # marimo scans up to 1 MB for the notebook markers
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
+SLUG_MAX_LEN = 64
+#: Windows device names; ``con.py`` would be unusable (or write to the console) on older Windows.
+_RESERVED_NAMES = frozenset(
+    {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}
+)
 _VERSION_PLACEHOLDER = "__HAILER_VERSION__"
 _TITLE_PLACEHOLDER = "__HAILER_TITLE__"
 
@@ -228,15 +232,16 @@ def notebook_display_name(config: HailerConfig, path: Path) -> str:
         return resolved.as_posix()
 
 
-def load_active_notebook(config: HailerConfig, env: Mapping[str, str] = os.environ) -> Path:
-    """The notebook the chat is working in.
+def load_active_notebook(config: HailerConfig) -> Path:
+    """The notebook the chat is working in: the state file's ``active`` entry, else ``config.notebook``.
 
-    ``HAILER_NOTEBOOK`` (an explicit one-off override) wins. Otherwise the state file's
-    ``active`` entry, when it still names an existing notebook inside the notebooks folder;
-    otherwise the configured notebook.
+    Only the state file is consulted, never the environment: ``HAILER_NOTEBOOK`` is inherited
+    by the Codex child and therefore by the MCP server, so an env-wins rule would make the tool
+    server ignore every switch. The CLI persists such an override at startup with
+    :func:`save_active_notebook` instead, so both processes read the same answer. A missing or
+    corrupt file, or an entry that no longer names an existing notebook inside the notebooks
+    folder, falls back to the configured notebook.
     """
-    if env.get("HAILER_NOTEBOOK"):
-        return config.notebook
     active = _from_state_entry(config, _read_state(config.workspace).get("active"))
     return active if active is not None else config.notebook
 
@@ -310,16 +315,21 @@ def list_notebooks(config: HailerConfig) -> list[NotebookInfo]:
 
 
 def slugify(name: str) -> str:
-    """``"Q2 Churn (draft).py"`` -> ``"q2_churn_draft"``. ``ValueError`` when nothing is left."""
+    """``"Q2 Churn (draft).py"`` -> ``"q2_churn_draft"``.
+
+    Lower-case ASCII letters, digits and underscores only. A leading digit or a Windows reserved
+    device name (``con``, ``nul``, ``com1`` ...) gets the prefix ``nb_``; the result is at most
+    ``SLUG_MAX_LEN`` characters. ``ValueError`` when the name has no ASCII letter or digit.
+    """
     text = str(name).strip()
     if text.lower().endswith(".py"):
         text = text[:-3]
     slug = _SLUG_RE.sub("_", text.lower()).strip("_")
     if not slug:
-        raise ValueError(f"notebook name {name!r} has no letters or digits")
-    if not slug[0].isalpha():
+        raise ValueError(f"notebook name {name!r} needs at least one ASCII letter or digit")
+    if not slug[0].isalpha() or slug in _RESERVED_NAMES:
         slug = "nb_" + slug
-    return slug
+    return slug[:SLUG_MAX_LEN].rstrip("_")
 
 
 def _available_hint(config: HailerConfig) -> str:
@@ -336,14 +346,35 @@ def _looks_like_path(text: str, given: Path) -> bool:
     return given.is_absolute() or "/" in text or "\\" in text or text.startswith("..")
 
 
+def _existing_file(candidate: Path) -> Path | None:
+    """``candidate`` resolved when it is an existing file; ``None`` otherwise (never raises)."""
+    try:
+        resolved = candidate.resolve()
+        return resolved if resolved.is_file() else None
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
+def _checked_notebook(config: HailerConfig, resolved: Path) -> Path:
+    if not is_marimo_notebook(resolved):
+        raise NotebookPathError(
+            f"{notebook_display_name(config, resolved)} is not a marimo notebook.",
+            hint="A notebook is a .py file that imports marimo and defines marimo.App.",
+        )
+    return resolved
+
+
 def resolve_notebook(config: HailerConfig, ref: str) -> Path:
     """Map a user's reference to an existing notebook inside the notebooks folder.
 
     Accepted forms: a bare name (``q2 churn``, ``q2_churn``), a filename (``q2_churn.py``), a
-    workspace-relative path (``notebooks/q2_churn.py``), a notebooks-folder-relative path
-    (``sub/x.py``) or an absolute path. Tried in that order, then a case-insensitive unique
-    match on the notebook name. Raises ``NotebookPathError`` for anything outside the folder or
-    not a marimo notebook, ``NotebookNotFoundError`` when nothing matches.
+    notebooks-folder-relative path (``sub/x.py``, ``sub/x``), a workspace-relative path
+    (``notebooks/q2_churn.py``) or an absolute path. Candidates inside the notebooks folder are
+    tried first (with and without ``.py``), then workspace-relative ones, then ``<slug>.py`` under
+    the folder, then a case-insensitive unique match on the notebook name; a file outside the
+    folder can therefore never shadow one inside it. Raises ``NotebookPathError`` when the
+    reference points outside the folder or at a file that is not a marimo notebook, and
+    ``NotebookNotFoundError`` when nothing matches.
     """
     text = (ref or "").strip().strip("\"'").strip()
     if not text:
@@ -351,32 +382,32 @@ def resolve_notebook(config: HailerConfig, ref: str) -> Path:
     root = Path(config.notebooks_root).resolve()
     root_shown = notebook_display_name(config, root)
     given = Path(text).expanduser()
-    candidates: list[Path] = [given] if given.is_absolute() else [Path(config.workspace) / given, root / given]
+    with_py = text if text.lower().endswith(".py") else f"{text}.py"
     try:
         slug: str | None = slugify(text)
     except ValueError:
         slug = None
-    if slug is not None:
-        candidates.append(root / f"{slug}.py")
+    if given.is_absolute():
+        candidates: list[Path] = [given]
+        path_like: list[Path] = [given]
+    else:
+        workspace = Path(config.workspace)
+        candidates = [root / text, root / with_py, workspace / text, workspace / with_py]
+        if slug is not None:
+            candidates.append(root / f"{slug}.py")
+        # A relative path is read relative to the notebooks folder: "../x.py" escapes it and is
+        # refused; "sub/missing" stays inside and is simply not found.
+        path_like = [root / text]
 
+    outside: Path | None = None
     for candidate in candidates:
-        try:
-            resolved = candidate.resolve()
-        except OSError:
+        resolved = _existing_file(candidate)
+        if resolved is None:
             continue
-        if not resolved.is_file():
-            continue
-        if not _inside(resolved, root):
-            raise NotebookPathError(
-                f"{resolved.as_posix()} is outside the notebooks folder.",
-                hint=f"Hailer only opens notebooks under {root_shown}. Move the file there or set [hailer].notebooks_dir.",
-            )
-        if not is_marimo_notebook(resolved):
-            raise NotebookPathError(
-                f"{notebook_display_name(config, resolved)} is not a marimo notebook.",
-                hint="A notebook is a .py file that imports marimo and defines marimo.App.",
-            )
-        return resolved
+        if _inside(resolved, root):
+            return _checked_notebook(config, resolved)
+        if outside is None:
+            outside = resolved
 
     wanted = {text.lower(), text.lower().removesuffix(".py")}
     if slug is not None:
@@ -390,11 +421,16 @@ def resolve_notebook(config: HailerConfig, ref: str) -> Path:
             f"Several notebooks match {text!r}: {shown}.",
             hint="Give the path instead, for example the first one listed.",
         )
+    if outside is not None:
+        raise NotebookPathError(
+            f"{outside.as_posix()} is outside the notebooks folder.",
+            hint=f"Hailer only opens notebooks under {root_shown}. Move the file there or set [hailer].notebooks_dir.",
+        )
     if _looks_like_path(text, given):
-        for candidate in candidates[: 1 if given.is_absolute() else 2]:
+        for candidate in path_like:
             try:
                 resolved = candidate.resolve()
-            except OSError:
+            except (OSError, ValueError, RuntimeError):
                 continue
             if not _inside(resolved, root):
                 raise NotebookPathError(
@@ -444,23 +480,40 @@ def create_notebook(config: HailerConfig, name: str, *, kind: TemplateKind = "st
     except ValueError as err:
         raise NotebookPathError(
             f"{name!r} is not a usable notebook name.",
-            hint="Use letters or digits, for example 'q2 churn' (saved as q2_churn.py).",
+            hint="The name needs at least one ASCII letter or digit, for example 'q2 churn' (saved as q2_churn.py).",
         ) from err
     root = Path(config.notebooks_root)
+    root_shown = notebook_display_name(config, root)
     target = root / f"{slug}.py"
+    exists_error = NotebookExistsError(
+        f"A notebook named {slug}.py already exists in {root_shown}.",
+        hint="Pick another name, or open the existing notebook instead.",
+    )
     if target.exists():
-        raise NotebookExistsError(
-            f"A notebook named {slug}.py already exists in {notebook_display_name(config, root)}.",
-            hint="Pick another name, or open the existing notebook instead.",
-        )
-    root.mkdir(parents=True, exist_ok=True)
-    target.write_text(render_template(kind, title=title), encoding="utf-8", newline="\n")
+        raise exists_error
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        _write_new_file(target, render_template(kind, title=title))
+    except FileExistsError as err:  # appeared between the check and the write: never overwrite
+        raise exists_error from err
+    except OSError as err:
+        raise NotebookPathError(
+            f"Could not create {slug}.py in {root_shown}: {err.strerror or err}.",
+            hint="Try a shorter or simpler name, and check that the notebooks folder is writable.",
+        ) from err
     return target.resolve()
+
+
+def _write_new_file(path: Path, text: str) -> None:
+    """Create ``path`` with ``text``; ``FileExistsError`` when it already exists (no overwrite)."""
+    with open(path, "x", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
 
 
 __all__ = [
     "EMPTY_TEMPLATE",
     "RECENT_LIMIT",
+    "SLUG_MAX_LEN",
     "STARTER_TEMPLATE",
     "STATE_FILENAME",
     "TEMPLATE_KINDS",

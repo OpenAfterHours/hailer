@@ -5,6 +5,7 @@ Everything runs against tmp_path; no marimo, no network, no symlinks.
 
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
 
@@ -47,7 +48,7 @@ def test_state_path_and_default_active(tmp_path):
     cfg = make_config(tmp_path)
     assert nbs.state_path(cfg.workspace) == cfg.workspace / ".hailer" / "notebook.json"
     assert cfg.notebooks_root == cfg.workspace / "notebooks"
-    assert nbs.load_active_notebook(cfg, env={}) == cfg.notebook
+    assert nbs.load_active_notebook(cfg) == cfg.notebook
     assert nbs.load_recent(cfg) == []
 
 
@@ -55,7 +56,7 @@ def test_save_and_load_active_round_trip(tmp_path):
     cfg = make_config(tmp_path)
     other = _write(cfg.notebooks_root / "q2_churn.py")
     nbs.save_active_notebook(cfg, other)
-    assert nbs.load_active_notebook(cfg, env={}) == other.resolve()
+    assert nbs.load_active_notebook(cfg) == other.resolve()
     payload = json.loads(nbs.state_path(cfg.workspace).read_text(encoding="utf-8"))
     assert payload["active"] == "notebooks/q2_churn.py", "stored workspace-relative with forward slashes"
     assert payload["recent"] == ["notebooks/q2_churn.py"]
@@ -67,27 +68,45 @@ def test_active_falls_back_when_state_is_corrupt_or_stale(tmp_path):
     state = nbs.state_path(cfg.workspace)
     state.parent.mkdir(parents=True)
     state.write_text("{not json", encoding="utf-8")
-    assert nbs.load_active_notebook(cfg, env={}) == cfg.notebook
+    assert nbs.load_active_notebook(cfg) == cfg.notebook
     state.write_text(json.dumps(["a list"]), encoding="utf-8")
-    assert nbs.load_active_notebook(cfg, env={}) == cfg.notebook
+    assert nbs.load_active_notebook(cfg) == cfg.notebook
     # deleted notebook
     gone = _write(cfg.notebooks_root / "gone.py")
     nbs.save_active_notebook(cfg, gone)
     gone.unlink()
-    assert nbs.load_active_notebook(cfg, env={}) == cfg.notebook
+    assert nbs.load_active_notebook(cfg) == cfg.notebook
     # a path outside the notebooks folder is ignored even when it exists
     outside = _write(cfg.workspace / "elsewhere" / "x.py")
     state.write_text(json.dumps({"active": "elsewhere/x.py"}), encoding="utf-8")
     assert outside.exists()
-    assert nbs.load_active_notebook(cfg, env={}) == cfg.notebook
+    assert nbs.load_active_notebook(cfg) == cfg.notebook
 
 
-def test_env_override_wins_over_state(tmp_path):
+def test_environment_never_bypasses_the_state_file(tmp_path, monkeypatch):
+    """HAILER_NOTEBOOK is inherited by the MCP server; if it won there, tool calls would ignore
+    every switch. The CLI persists the override into the state file instead."""
     cfg = make_config(tmp_path)
     other = _write(cfg.notebooks_root / "other.py")
     nbs.save_active_notebook(cfg, other)
-    assert nbs.load_active_notebook(cfg, env={"HAILER_NOTEBOOK": "anything"}) == cfg.notebook
-    assert nbs.load_active_notebook(cfg, env={"HAILER_NOTEBOOK": ""}) == other.resolve()
+    monkeypatch.setenv("HAILER_NOTEBOOK", "anything")
+    assert nbs.load_active_notebook(cfg) == other.resolve()
+    assert "env" not in inspect.signature(nbs.load_active_notebook).parameters
+
+
+def test_save_active_notebook_tolerates_a_corrupt_state_file(tmp_path):
+    cfg = make_config(tmp_path)
+    state = nbs.state_path(cfg.workspace)
+    state.parent.mkdir(parents=True)
+    state.write_text("{not json", encoding="utf-8")
+    other = _write(cfg.notebooks_root / "other.py")
+    nbs.save_active_notebook(cfg, other)
+    payload = json.loads(state.read_text(encoding="utf-8"))
+    assert payload == {"active": "notebooks/other.py", "recent": ["notebooks/other.py"]}
+    state.write_text(json.dumps({"active": 3, "recent": "nope"}), encoding="utf-8")
+    nbs.save_active_notebook(cfg, other)
+    assert nbs.load_active_notebook(cfg) == other.resolve()
+    assert nbs.load_recent(cfg) == [other.resolve()]
 
 
 def test_recent_list_is_bounded_unique_and_filtered(tmp_path):
@@ -152,17 +171,36 @@ def test_list_notebooks_missing_root(tmp_path):
         ("a", "a"),
         ("Hello--World__", "hello_world"),
         ("Résumé.PY", "r_sum"),
+        # Windows reserved device names get a prefix, whatever the case or extension
+        ("CON", "nb_con"),
+        ("nul.py", "nb_nul"),
+        ("Aux", "nb_aux"),
+        ("com1", "nb_com1"),
+        ("LPT9.PY", "nb_lpt9"),
+        ("con.txt", "con_txt"),  # the slug is not a bare device name, so it is fine
+        ("console", "console"),
     ],
 )
 def test_slugify(name, slug):
     assert nbs.slugify(name) == slug
 
 
+def test_slugify_caps_the_length():
+    slug = nbs.slugify("x" * 300)
+    assert slug == "x" * nbs.SLUG_MAX_LEN == "x" * 64
+    # the cap never leaves a trailing underscore or exceeds the limit after prefixing
+    assert nbs.slugify("9" + "a" * 100) == ("nb_9" + "a" * 100)[:64]
+    assert not nbs.slugify("a" * 63 + " b").endswith("_")
+
+
 def test_slugify_rejects_empty():
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as info:
         nbs.slugify("___")
+    assert "ASCII letter or digit" in str(info.value)
     with pytest.raises(ValueError):
         nbs.slugify(".py")
+    with pytest.raises(ValueError):
+        nbs.slugify("日本語")
 
 
 def test_resolve_notebook_accepted_forms(tmp_path):
@@ -223,6 +261,35 @@ def test_resolve_notebook_ambiguous_name(tmp_path):
     assert nbs.resolve_notebook(cfg, "a/dup.py") == (cfg.notebooks_root / "a" / "dup.py").resolve()
 
 
+def test_resolve_notebook_prefers_the_folder_over_the_workspace(tmp_path):
+    """A helper script in the workspace root must never shadow a notebook of the same name."""
+    cfg = make_config(tmp_path)
+    _write(cfg.workspace / "main.py", "print('helper')\n")
+    inside = _write(cfg.notebooks_root / "main.py").resolve()
+    assert nbs.resolve_notebook(cfg, "main.py") == inside
+    assert nbs.resolve_notebook(cfg, "main") == inside
+    assert nbs.resolve_notebook(cfg, "notebooks/main.py") == inside
+
+
+def test_resolve_notebook_folder_relative_without_extension(tmp_path):
+    cfg = make_config(tmp_path)
+    report = _write(cfg.notebooks_root / "sub" / "report.py").resolve()
+    assert nbs.resolve_notebook(cfg, "sub/report") == report
+    assert nbs.resolve_notebook(cfg, "sub\\report.py") == report
+    with pytest.raises(NotebookNotFoundError) as info:
+        nbs.resolve_notebook(cfg, "sub/missing")
+    assert "No notebook named" in str(info.value)
+    with pytest.raises(NotebookPathError):
+        nbs.resolve_notebook(cfg, "../sub/report")
+
+
+def test_resolve_notebook_survives_odd_input(tmp_path):
+    cfg = make_config(tmp_path)
+    for odd in ("a\x00b", "q2: churn?", "x" * 400, "..", ".", "\\\\?\\C:\\nope.py"):
+        with pytest.raises((NotebookNotFoundError, NotebookPathError)):
+            nbs.resolve_notebook(cfg, odd)
+
+
 def test_notebook_display_name(tmp_path):
     cfg = make_config(tmp_path)
     assert nbs.notebook_display_name(cfg, cfg.notebook) == "notebooks/analysis.py"
@@ -279,7 +346,7 @@ def test_create_notebook_starter_and_empty(tmp_path):
     empty = nbs.create_notebook(cfg, "scratch", kind="empty")
     assert nbs.is_marimo_notebook(empty) and "hailer.periods" not in empty.read_text(encoding="utf-8")
     assert not nbs.state_path(cfg.workspace).exists(), "creation does not touch the active-notebook state"
-    assert nbs.load_active_notebook(cfg, env={}) == cfg.notebook
+    assert nbs.load_active_notebook(cfg) == cfg.notebook
 
 
 def test_create_notebook_refuses_existing_and_bad_names(tmp_path):
@@ -296,3 +363,37 @@ def test_create_notebook_makes_the_folder(tmp_path):
     created = nbs.create_notebook(cfg, "first")
     assert created.parent == (tmp_path / "ws" / "deep" / "nbs").resolve()
     assert nbs.resolve_notebook(cfg, "first") == created
+
+
+def test_create_notebook_reserved_and_long_names(tmp_path):
+    cfg = make_config(tmp_path)
+    assert nbs.create_notebook(cfg, "CON").name == "nb_con.py"
+    assert nbs.create_notebook(cfg, "nul.py").name == "nb_nul.py"
+    created = nbs.create_notebook(cfg, "very " * 100)
+    assert len(created.stem) <= nbs.SLUG_MAX_LEN and created.is_file()
+    with pytest.raises(NotebookPathError) as info:
+        nbs.create_notebook(cfg, "!!! ???")
+    assert "ASCII letter or digit" in info.value.hint
+
+
+def test_create_notebook_maps_os_errors_to_actionable_errors(tmp_path, monkeypatch):
+    cfg = make_config(tmp_path)
+
+    def boom(path, text):
+        raise OSError(36, "File name too long")
+
+    monkeypatch.setattr(nbs, "_write_new_file", boom)
+    with pytest.raises(NotebookPathError) as info:
+        nbs.create_notebook(cfg, "whatever")
+    assert "Could not create whatever.py" in str(info.value) and "File name too long" in str(info.value)
+    assert "shorter or simpler name" in info.value.hint
+
+
+def test_create_notebook_never_overwrites_a_file_that_appears_late(tmp_path, monkeypatch):
+    """The exists() pre-check can be raced; the exclusive-create open is the real guard."""
+    cfg = make_config(tmp_path)
+    original = cfg.notebook.read_text(encoding="utf-8")
+    monkeypatch.setattr(Path, "exists", lambda self: False)
+    with pytest.raises(NotebookExistsError):
+        nbs.create_notebook(cfg, "analysis")
+    assert cfg.notebook.read_text(encoding="utf-8") == original

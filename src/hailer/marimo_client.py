@@ -123,8 +123,13 @@ def notebook_file_key(notebook: Path) -> str:
     An absolute key works whether the server was started on the notebooks folder (keys would
     otherwise resolve against that folder) or on a single file (keys would resolve against the
     server's working directory); verified live on marimo 0.24.2 in both modes.
+
+    The key is normalised the way marimo normalises paths (absolute, ``..`` and ``.`` removed,
+    symlinks and junctions NOT resolved), so a workspace reached through a junction still yields
+    a key marimo considers inside its folder.
     """
-    return Path(notebook).expanduser().resolve().as_posix()
+    absolute = os.path.normpath(str(Path(notebook).expanduser().absolute()))
+    return Path(absolute).as_posix()
 
 
 def open_notebook_url(server: MarimoServer, notebook: Path, workspace: Path | None = None, *, view: str = "app") -> str:
@@ -322,8 +327,30 @@ def _normalise_path(value: str | Path) -> str:
     return os.path.normcase(os.path.normpath(str(resolved)))
 
 
-def _normalise_name(value: str | Path) -> str:
-    return os.path.normcase(Path(value).name)
+def _session_path(session: MarimoSession, workspace: Path | None) -> str | None:
+    """The normalised absolute path of a session's notebook; ``None`` for untitled sessions."""
+    raw = session.path or session.filename
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    if not path.is_absolute() and workspace is not None:
+        path = Path(workspace) / path
+    return _normalise_path(path)
+
+
+def match_session(sessions: Sequence[MarimoSession], notebook: Path, workspace: Path | None = None) -> MarimoSession | None:
+    """The session whose notebook is ``notebook``, or ``None``.
+
+    A session matches only when its ``path`` (or its ``filename`` when marimo reports no path)
+    names the same file, compared as normalised absolute paths (case-insensitive on Windows).
+    Relative session paths are taken relative to ``workspace``. Untitled sessions never match,
+    and a bare filename never matches a notebook of the same name in another folder. When
+    several sessions name the same file the most recently created one (last in marimo's
+    listing) wins.
+    """
+    target = _normalise_path(notebook)
+    matched = [s for s in sessions if _session_path(s, workspace) == target]
+    return matched[-1] if matched else None
 
 
 def _iter_sse(raw_lines: Iterator[bytes]) -> Iterator[tuple[str, str]]:
@@ -522,17 +549,9 @@ class MarimoClient:
                 "Several notebooks are open; tell Hailer which one via [hailer].notebook.",
                 hint="Open sessions:\n" + self._describe_sessions(sessions),
             )
-        target_path = _normalise_path(notebook)
-        target_name = _normalise_name(notebook)
-        by_path = [s for s in sessions if s.path and _normalise_path(s.path) == target_path]
-        if len(by_path) == 1:
-            return by_path[0]
-        by_file = [s for s in sessions if s.filename and _normalise_path(s.filename) == target_path]
-        if len(by_file) == 1:
-            return by_file[0]
-        by_name = [s for s in sessions if (s.filename and _normalise_name(s.filename) == target_name) or (s.path and _normalise_name(s.path) == target_name)]
-        if len(by_name) == 1:
-            return by_name[0]
+        session = match_session(sessions, notebook, self.workspace)
+        if session is not None:
+            return session
         raise NoSessionError(
             f"No open session matches {Path(notebook).name}.",
             hint=f"Open {self.notebook_url(notebook)} in your browser. Open sessions:\n" + self._describe_sessions(sessions),
@@ -707,6 +726,7 @@ __all__ = [
     "launch_command",
     "launch_hint",
     "marimo_server_command",
+    "match_session",
     "notebook_file_key",
     "notebook_launch_command",
     "open_notebook_url",

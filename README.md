@@ -21,7 +21,8 @@ Terminal ─────► │  Hailer         │   openai-codex Python SDK; s
                          │ MCP (stdio)
                 ┌────────▼────────┐
                 │ hailer-mcp      │   marimo_execute, marimo_status, notebook_cells,
-                │ (Hailer tools)  │   list_periods, load_skill, read_skill_file, fetch_page
+                │ (Hailer tools)  │   notebook_list, notebook_create, notebook_open, notebook_close,
+                │                 │   list_periods, load_skill, read_skill_file, fetch_page
                 └────────┬────────┘
                          │ HTTP + SSE  (/api/sessions, /api/kernel/execute)
                 ┌────────▼────────┐
@@ -191,7 +192,10 @@ Where things live:
   title), so the agent can start analysing straight away. `--empty` gives marimo's plain empty notebook.
 - The active notebook is remembered in `.hailer/notebook.json` (git-ignored, next to `session.json`), so
   the next `uv run hailer` or `uv run hailer notebook` resumes where you left off. Delete the file to go
-  back to `[hailer].notebook`, or set `HAILER_NOTEBOOK=<path>` for a one-off override.
+  back to `[hailer].notebook`. `HAILER_NOTEBOOK=<path>` makes that notebook the active one for this and
+  later sessions: every Hailer command (`hailer`, `hailer notebook`, `hailer exec`, `status`, `doctor`)
+  writes it to the state file at startup, so the agent's tool server sees the same notebook.
+- `/notebook` also lists the notebooks you worked in recently (`Recent:`), most recent first.
 
 ```toml
 [hailer]
@@ -417,7 +421,7 @@ when a session exists, confirms that marimo's code-mode API is available in the 
 | `Marimo is not running.` then `Start everything in one go: uv run hailer notebook`, `Or start it yourself with: uv run marimo edit notebooks --no-token`, `Then run Hailer again: uv run hailer` | No server answered at the configured or discovered URL. `uv run hailer notebook` starts one on the notebooks folder and runs the chat in the same terminal. Servers started with `--no-token` register themselves so Hailer finds them; otherwise set `marimo_url` in `hailer.toml`. |
 | `Marimo exited early (code N)` or `Marimo did not answer on http://127.0.0.1:2718 within 60 s`, followed by `Log: .hailer\marimo.log` and its last lines | `hailer notebook` could not start marimo. The log tail usually names the cause (port in use by something else, a syntax error in the notebook, marimo not installed in the environment). |
 | `the notebook is not open in a browser` followed by `Open http://... in your browser.` | The server is up but has no kernel session. Open the URL; Hailer opens it for you once at startup. The URL ends in `&view-as=present` (app view); `Ctrl+.` in the notebook shows the code. |
-| `not found: <path>` for the notebook | The active notebook file is gone. Fix `[hailer].notebook`, restore the file, or delete `.hailer/notebook.json` to fall back to the configured notebook; new notebooks are created from the chat with `/notebook new <name>`. |
+| `not found: <path>` for the notebook | The configured notebook (`[hailer].notebook`, or `HAILER_NOTEBOOK`) does not exist. Fix the path or restore the file; a deleted *active* notebook is not the cause, because Hailer already falls back to the configured one when the remembered notebook is gone. New notebooks are created from the chat with `/notebook new <name>`. |
 | `No notebook named '...' in notebooks.` or `... is outside the notebooks folder.` | `/notebook open` (or the agent's `notebook_open`) only opens marimo notebooks inside `[hailer].notebooks_dir`; the hint lists the available names. Move the file into the folder or point `notebooks_dir` at it. |
 | `INTERNAL_MODEL_API_KEY is not set (required by provider 'internal')` | Run `uv run hailer login internal` or set the variable in this terminal. |
 | `no OPENAI_API_KEY found; Codex will use its existing ChatGPT login if you have one` | Informational. If the agent then fails to authenticate, `uv run hailer login openai`. |
@@ -434,6 +438,13 @@ when a session exists, confirms that marimo's code-mode API is available in the 
 - `marimo._code_mode` is a private API; Hailer pins marimo 0.24.2 and may need changes for other versions.
 - The notebook must be open in a browser; a headless server without a tab has nothing to execute against.
   Switching notebooks opens a new tab; the old one stays open until you close it or `/notebook close` it.
+  When the agent switches notebooks and the browser is slow to load, the CLI may open the same notebook a
+  second time after the turn (it opens the URL once more when it still sees no kernel session); the extra
+  tab is harmless, close it.
+- If you press Ctrl+C while the agent is in the middle of `notebook_create` / `notebook_open`, that tool call
+  may still finish and switch the active notebook a moment later. Hailer re-reads the state after every
+  turn and before `/notebook` and `/status`, so the next command shows the right notebook; a `/notebook
+  new` typed in that instant can still be overtaken by the late switch.
 - `uv run hailer notebook` starts and stops marimo for you; plain `uv run hailer` expects a running server
   and tells you how to start one.
 - Windows sandbox quirks listed above apply to the agent's shell; the kernel path is unaffected.

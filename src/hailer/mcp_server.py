@@ -19,9 +19,7 @@ import dataclasses
 import datetime as _dt
 import logging
 import os
-import subprocess
 import sys
-import webbrowser
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -110,31 +108,16 @@ def _list_cells_code() -> str:
         return _FALLBACK_LIST_CELLS_CODE
 
 
-def _open_in_browser(url: str) -> bool:
+def _default_open_url(url: str) -> bool:
     """Open ``url`` in the user's browser without touching stdout (the MCP transport).
 
-    On Windows ``webbrowser`` uses ``os.startfile``, which involves no child stdout. Elsewhere
-    the generic launchers (``xdg-open``, ``open``) would inherit this process's stdout, so they
-    are spawned explicitly with their output discarded.
+    ``hailer.browser.open_url`` uses ``os.startfile`` on Windows (so a ``BROWSER`` variable
+    pointing at a non-GUI command cannot turn it into a silent no-op) and spawns the POSIX
+    launchers with their stdio discarded. It never raises.
     """
-    try:
-        if os.name == "nt":
-            return bool(webbrowser.open(url))
-        browser = webbrowser.get()
-        if isinstance(browser, webbrowser.GenericBrowser):
-            cmd = [browser.name, *[arg.replace("%s", url) for arg in browser.args]]
-            subprocess.Popen(  # noqa: S603 - fixed launcher chosen by webbrowser
-                cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-            return True
-        return bool(browser.open(url))
-    except Exception as exc:  # noqa: BLE001 - never fail a tool over the browser
-        log.debug("could not open a browser: %s: %s", type(exc).__name__, exc)
-        return False
+    from .browser import open_url  # lazy: keeps import-time coupling low
+
+    return open_url(url)
 
 
 def _same_file(a: Path | None, b: Path | None) -> bool:
@@ -199,7 +182,7 @@ class _SessionOutcome:
     url: str | None = None
     reused: bool = False  # a session already existed; no browser was opened
     opened: bool = False  # the browser was asked to open the URL
-    marimo_error: MarimoUnavailableError | None = None
+    marimo_error: HailerError | None = None  # marimo unreachable (or answered with an error)
 
 
 class HailerTools:
@@ -216,7 +199,7 @@ class HailerTools:
         self.config = config
         self._client_factory = client_factory or self._default_client
         #: Opens a URL in the user's browser; injectable so tests never launch one.
-        self.open_url: UrlOpener = open_url or _open_in_browser
+        self.open_url: UrlOpener = open_url or _default_open_url
         #: How long to wait for a kernel session after opening the browser.
         self.session_wait_sec = session_wait_sec
 
@@ -290,31 +273,41 @@ class HailerTools:
         outcome = _SessionOutcome()
         try:
             client, server = self._client_factory()
-        except MarimoUnavailableError as err:
+        except HailerError as err:
             outcome.marimo_error = err
             return outcome
         outcome.client = client
         outcome.url = self._open_url(server, notebook)
+        # With a configured marimo_url the server is not health-checked up front, so "marimo is
+        # down" first shows up here. The notebook was already created/switched by then; report it
+        # as a session outcome rather than letting the error replace the whole reply.
         try:
             outcome.session = client.resolve_session(notebook)
             outcome.reused = True
             return outcome
         except NoSessionError:
             pass
+        except HailerError as err:
+            outcome.marimo_error = err
+            return outcome
         try:
             outcome.opened = bool(self.open_url(outcome.url))
         except Exception as exc:  # noqa: BLE001 - the URL is reported instead
             log.debug("browser opener failed: %s: %s", type(exc).__name__, exc)
             outcome.opened = False
         if outcome.opened:
-            outcome.session = mc.wait_for_session(client, notebook, self.session_wait_sec)
+            try:
+                outcome.session = mc.wait_for_session(client, notebook, self.session_wait_sec)
+            except HailerError as err:
+                outcome.marimo_error = err
         return outcome
 
     def _session_lines(self, outcome: _SessionOutcome) -> list[str]:
         if outcome.marimo_error is not None:
             err = outcome.marimo_error
             return [
-                "marimo is not running, so the notebook has no kernel session yet; nothing can run in it until marimo starts.",
+                "marimo is not running (or not reachable), so the notebook has no kernel session yet; "
+                "nothing can run in it until marimo is up. Call marimo_status before running code.",
                 f"{err}",
                 *([err.hint] if err.hint else []),
             ]
@@ -348,18 +341,22 @@ class HailerTools:
         def go() -> str:
             config = self._active_config()
             active_name = self._display(config, config.notebook)
-            try:
-                client, server = self._client_factory()
-            except MarimoUnavailableError as err:
-                return f"marimo: not running\nactive notebook: {active_name}\n{err}\n{err.hint}".rstrip()
-            lines = [f"marimo: running at {server.url}" + (f" (version {server.version})" if server.version else "")]
-            sessions = client.sessions()
             active_session: MarimoSession | None
             try:
-                active_session = client.resolve_session(config.notebook)
+                client, server = self._client_factory()
+                sessions = client.sessions()
+                try:
+                    active_session = client.resolve_session(config.notebook)
+                except NoSessionError:
+                    active_session = None
+            except MarimoUnavailableError as err:
+                # A configured marimo_url is not health-checked up front, so a dead server can
+                # surface here as well as from the factory; the active notebook is named either way.
+                return f"marimo: not running\nactive notebook: {active_name}\n{err}\n{err.hint}".rstrip()
+            lines = [f"marimo: running at {server.url}" + (f" (version {server.version})" if server.version else "")]
+            if active_session is not None:
                 lines.append(f"active notebook: {active_name} -> session {active_session.session_id} (ready)")
-            except NoSessionError:
-                active_session = None
+            else:
                 lines.append(
                     f"active notebook: {active_name} has NO session. "
                     f"Ask the user to open {self._open_url(server, config.notebook)} in a browser."
@@ -478,11 +475,13 @@ class HailerTools:
             config = self._active_config()
             path = notebooks.resolve_notebook(config, notebook) if (notebook or "").strip() else config.notebook
             display = self._display(config, path)
-            client, _ = self._client_factory()
             try:
+                client, _ = self._client_factory()
                 session = client.resolve_session(path)
             except NoSessionError:
                 return f"{display} is not open (no kernel session), so there is nothing to close."
+            except MarimoUnavailableError as err:
+                return f"marimo is not running, so {display} has no kernel session to close.\n{err}\n{err.hint}".rstrip()
             client.shutdown_session(session.session_id)
             lines = [
                 f"Closed the kernel session ({session.session_id}) of {display}; its memory is freed and its browser tab is disconnected."

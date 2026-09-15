@@ -83,10 +83,12 @@ class FakeClient:
 
     def resolve_session(self, notebook):
         if self.open_paths is not None:
-            key = _key(notebook)
-            if key in self.open_paths:
-                return self._session_for(key)
-            raise NoSessionError("no session", "open the notebook")
+            from hailer.marimo_client import match_session  # the real rule: exact path, no filename fallback
+
+            session = match_session(self.sessions(), Path(notebook), None)
+            if session is None:
+                raise NoSessionError("no session", "open the notebook")
+            return session
         if not self.has_session:
             raise NoSessionError("no session", "open the notebook")
         return MarimoSession("s1", "analysis.py", "notebooks/analysis.py")
@@ -612,3 +614,107 @@ def test_default_client_uses_active_notebook_folder_and_workspace(ws, monkeypatc
     notebooks.save_active_notebook(cfg, other)
     HailerTools(cfg)._default_client()
     assert captured["notebook"] == other
+
+
+# --------------------------------------------------------------------------- #
+# marimo configured but down: the factory succeeds, the first request fails
+# --------------------------------------------------------------------------- #
+
+
+class DownClient:
+    """What the real client looks like with ``marimo_url`` configured and nothing listening:
+    ``find_server`` returns the server unchecked, so every request raises."""
+
+    def __init__(self):
+        self.closed: list[str] = []
+
+    def _down(self):
+        return MarimoUnavailableError(
+            "Marimo is not running at http://127.0.0.1:2718 (connection refused).",
+            hint="Start everything in one go:\n\n    uv run hailer notebook",
+        )
+
+    def health(self):
+        return False
+
+    def sessions(self):
+        raise self._down()
+
+    def resolve_session(self, notebook):
+        raise self._down()
+
+    def execute(self, code, **kw):
+        raise self._down()
+
+    def shutdown_session(self, session_id):
+        self.closed.append(session_id)
+
+
+def test_notebook_create_with_marimo_configured_but_down(ws):
+    config, analysis, other = ws
+    opener = Opener()
+    tools = HailerTools(config, factory_for(DownClient()), open_url=opener, session_wait_sec=0)
+    text = tools.notebook_create("q2 churn")
+    created = config.notebooks_root / "q2_churn.py"
+    assert created.is_file()
+    assert notebooks.load_active_notebook(config) == created.resolve()
+    assert text.startswith("Created notebooks/q2_churn.py from the starter template; it is now the active notebook.")
+    assert "marimo is not running" in text and "connection refused" in text and "uv run hailer notebook" in text
+    assert not text.startswith("ERROR"), "a create that succeeded must not read as a failure"
+    assert opener.urls == []
+
+
+def test_notebook_open_with_marimo_configured_but_down(ws):
+    config, analysis, other = ws
+    opener = Opener()
+    tools = HailerTools(config, factory_for(DownClient()), open_url=opener, session_wait_sec=0)
+    text = tools.notebook_open("other")
+    assert text.startswith("notebooks/other.py is now the active notebook.")
+    assert "marimo is not running" in text and "Cells" not in text
+    assert notebooks.load_active_notebook(config) == other
+    assert opener.urls == []
+
+
+def test_marimo_status_with_marimo_configured_but_down(ws):
+    config, analysis, other = ws
+    notebooks.save_active_notebook(config, other)
+    text = HailerTools(config, factory_for(DownClient())).marimo_status()
+    assert text.startswith("marimo: not running")
+    assert "active notebook: notebooks/other.py" in text
+    assert "connection refused" in text and "uv run hailer notebook" in text
+
+
+def test_notebook_close_and_list_with_marimo_configured_but_down(ws):
+    config, analysis, other = ws
+    client = DownClient()
+    tools = HailerTools(config, factory_for(client))
+    text = tools.notebook_close()
+    assert text.startswith("marimo is not running, so notebooks/analysis.py has no kernel session to close.")
+    assert "connection refused" in text and client.closed == []
+    text = tools.notebook_list()
+    entries = [ln for ln in text.splitlines() if ln.startswith("  - ")]
+    assert any("notebooks/analysis.py" in ln for ln in entries) and any("notebooks/other.py" in ln for ln in entries)
+    assert "marimo is not reachable" in text and not any("[open]" in ln for ln in entries)
+
+
+def test_session_wait_that_loses_marimo_is_reported_not_raised(ws):
+    config, analysis, other = ws
+
+    class FlakyClient(FakeClient):
+        def __init__(self):
+            super().__init__(open_paths={analysis})
+            self.calls = 0
+
+        def resolve_session(self, notebook):
+            self.calls += 1
+            if self.calls > 1:  # the first call finds no session; the wait then loses the server
+                raise MarimoUnavailableError("Marimo is not running at http://127.0.0.1:2718 (timed out).", hint="restart it")
+            return super().resolve_session(notebook)
+
+    client = FlakyClient()
+    opener = Opener(client, grant_session=False)
+    tools = HailerTools(config, factory_for(client), open_url=opener, session_wait_sec=0)
+    text = tools.notebook_open("other")
+    assert text.startswith("notebooks/other.py is now the active notebook.")
+    assert "timed out" in text and "restart it" in text
+    assert len(opener.urls) == 1

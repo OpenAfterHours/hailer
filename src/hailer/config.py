@@ -452,6 +452,16 @@ def validate(config: HailerConfig) -> list[str]:
             f"Warning: notebooks folder not found: {root}. "
             "Create it (or set [hailer].notebooks_dir) so notebooks can be listed, created and opened from the chat."
         )
+    try:
+        folder_is_workspace = root.resolve() == Path(config.workspace).resolve()
+    except OSError:
+        folder_is_workspace = False
+    if folder_is_workspace:
+        problems.append(
+            f"Warning: the notebooks folder is the workspace itself ({root}); marimo would scan the whole "
+            "workspace (including .venv) for notebooks. Keep notebooks in a subfolder such as notebooks/ and "
+            "point [hailer].notebook and [hailer].notebooks_dir there."
+        )
     if not config.data_dir.is_dir():
         problems.append(
             f"Warning: data directory not found: {config.data_dir}. "

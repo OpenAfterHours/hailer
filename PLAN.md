@@ -1,5 +1,35 @@
 # Hailer — implementation plan
 
+## 2026-09-16: notebooks from the chat
+
+Built and verified live. The user (or the agent) can create new notebooks and reopen old ones without leaving
+the conversation:
+
+- One marimo server, started on the notebooks **folder** (`marimo edit notebooks --no-token`), hosts every
+  notebook; a notebook is opened by URL with an absolute `?file=` key, no restart. Verified on marimo 0.24.2 with
+  a websocket probe against both folder and single-file servers before the design was fixed.
+- The **active notebook** lives in `.hailer/notebook.json`, shared by the CLI process and the MCP tool server
+  (which re-reads it on every call). `hailer.notebooks` owns the state file, notebook listing, slugified
+  creation from a starter/empty template and folder-confined path resolution.
+- Four MCP tools (`notebook_list`, `notebook_create`, `notebook_open`, `notebook_close`) and the matching
+  `/notebook list | new | open | close` slash commands; a `[Hailer] ...` notice rides with the next message after
+  a slash-command switch; the system prompt names the folder, not the notebook, so switches never change the
+  prompt fingerprint.
+- Live verification (throwaway workspace, real Codex turns): "Create a new notebook called e2e beta and add one
+  cell that prints hello" → the model called `notebook_create`, `notebook_cells`, `marimo_execute`, the file
+  `e2e_beta.py` gained a `hello` cell, a browser tab opened from the tool server, and the CLI printed
+  `Active notebook is now notebooks/e2e_beta.py.`; "Open the e2e alpha notebook and tell me how many cells it
+  has" → `notebook_open` only, reply "I'm now in notebooks/e2e_alpha.py. It has 5 cells." (correct for the
+  starter template). `/notebook new`, `/notebook list`, `/notebook close`, `hailer exec` on the active notebook
+  and the skew-token `shutdown_session` call were exercised the same way.
+- Review fixes folded in: exact-path session matching (no filename fallback), Windows reserved names and a
+  64-character cap in slugs, `os.startfile`-first browser opening (a `BROWSER=true` shell had silently opened
+  nothing), the switch notice queued before the browser wait, state re-read after interrupted/failed turns,
+  `HAILER_NOTEBOOK` persisted to the state file so the tool server follows it.
+
+The single-file launch command quoted below (`marimo edit notebooks/analysis.py`) is the 2026-09-15 state;
+since 2026-09-16 Hailer launches the folder.
+
 ## Status (2026-09-15): built and verified
 
 All milestones M0–M7 are implemented in this repository (`https://github.com/OpenAfterHours/hailer`) and the
@@ -165,7 +195,9 @@ agent.py ── openai-codex SDK ── codex.exe app-server ── model endpoi
                                      ▼
                               hailer-mcp  (mcp_server.py)
                               tools: marimo_execute, marimo_status,
-                                     notebook_cells, list_periods,
+                                     notebook_cells, notebook_list,
+                                     notebook_create, notebook_open,
+                                     notebook_close, list_periods,
                                      load_skill, read_skill_file,
                                      fetch_page (allowlisted domains only)
                                      │
@@ -173,7 +205,7 @@ agent.py ── openai-codex SDK ── codex.exe app-server ── model endpoi
                               marimo_client.py  (pure-Python HTTP + SSE)
                                      │
                                      ▼
-                  marimo edit notebooks/analysis.py --no-token   (live kernel)
+                  marimo edit notebooks --no-token   (live kernel; the folder since 2026-09-16)
                        scratchpad  +  marimo._code_mode  →  Polars / DuckDB / charts
                                      │
                                      ▼
