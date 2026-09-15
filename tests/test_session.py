@@ -9,8 +9,10 @@ from hailer.session import (
     COMMANDS,
     EXIT_COMMANDS,
     help_text,
+    load_prompt_hash,
     load_session,
     parse_command,
+    prompt_hash,
     save_session,
     session_path,
 )
@@ -79,3 +81,34 @@ def test_partial_or_wrong_typed_fields_are_ignored(tmp_path):
     assert state.turns == 0
     assert state.model == "m"
     assert state.output_tokens == 0
+
+
+def test_help_text_does_not_repeat_the_command_in_its_description():
+    for line in help_text().splitlines():
+        if line.strip().startswith("/"):
+            name, _, desc = line.strip().partition(" ")
+            assert not desc.strip().startswith(name), line
+    assert "/model <name>" in COMMANDS["model"]  # usage still shown, after the description
+
+
+def test_prompt_hash_is_stable_and_persisted(tmp_path):
+    h1 = prompt_hash("You are Hailer.")
+    assert h1 == prompt_hash("You are Hailer.") and h1 != prompt_hash("You are Hailer!")
+    assert load_prompt_hash(tmp_path) is None
+    save_session(tmp_path, SessionState(thread_id="t-1"), prompt_hash=h1)
+    assert load_prompt_hash(tmp_path) == h1
+    # saving without a hash keeps the stored one; state fields still round-trip
+    save_session(tmp_path, SessionState(thread_id="t-1", turns=2))
+    assert load_prompt_hash(tmp_path) == h1
+    assert load_session(tmp_path).turns == 2
+    # an explicit empty hash clears it
+    save_session(tmp_path, SessionState(thread_id="t-2"), prompt_hash="")
+    assert load_prompt_hash(tmp_path) is None
+
+
+def test_prompt_hash_tolerates_absence_and_garbage(tmp_path):
+    path = session_path(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"thread_id": "t", "prompt_hash": 42}), encoding="utf-8")
+    assert load_prompt_hash(tmp_path) is None
+    assert load_session(tmp_path).thread_id == "t"

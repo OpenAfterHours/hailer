@@ -50,6 +50,9 @@ class _Handler(BaseHTTPRequestHandler):
             if not self._authorised():
                 self._send(401, b'{"detail":"unauthorised"}')
                 return
+            if self.server.mode == "sessions_500":
+                self._send(500, b'{"detail":"kernel manager exploded"}')
+                return
             self._send(200, json.dumps(self.server.sessions).encode())
         else:
             self._send(404, b"")
@@ -347,6 +350,19 @@ def test_snippets_are_valid_python():
     # top-level `async with` is only valid in the scratchpad; wrap to check syntax
     ast.parse("async def _():\n" + "\n".join("    " + line for line in code.splitlines()))
     assert "hide_code=False" in code and "name='demo'" in code and "ctx.run_cell(cid)" in code
+
+
+def test_sessions_server_error_is_actionable(fake, tmp_path):
+    fake.mode = "sessions_500"
+    client = mc.MarimoClient(fake.url, notebook=tmp_path / "nb.py", workspace=tmp_path)
+    with pytest.raises(MarimoUnavailableError) as info:
+        client.sessions()
+    assert "HTTP 500" in str(info.value)
+    assert "kernel manager exploded" in str(info.value)
+    assert "--no-token" in info.value.hint
+    # resolve_session (used by preflight) must surface the same actionable error, never a raw HTTPError
+    with pytest.raises(MarimoUnavailableError):
+        client.resolve_session(tmp_path / "nb.py")
 
 
 def test_sse_parser_handles_comments_and_multiline_data():

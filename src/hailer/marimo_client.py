@@ -259,8 +259,19 @@ class MarimoClient:
         return _health_ok(self.base_url, timeout=min(self.timeout, 3.0))
 
     def sessions(self) -> list[MarimoSession]:
-        with self._open("GET", "/api/sessions") as resp:
-            payload = json.loads(resp.read().decode("utf-8", "replace") or "{}")
+        try:
+            with self._open("GET", "/api/sessions") as resp:
+                payload = json.loads(resp.read().decode("utf-8", "replace") or "{}")
+        except urllib.error.HTTPError as err:
+            # 401/403 are already mapped by _open; anything else (500, 404 on an old marimo) lands here.
+            detail = _error_detail(err.read())
+            raise MarimoUnavailableError(
+                f"Marimo at {self.base_url} answered HTTP {err.code} to /api/sessions" + (f": {detail}" if detail else "."),
+                hint=(
+                    "Check the marimo server log for errors (0.24.x is expected), or restart it with:\n\n"
+                    f"    {_format_command(launch_command(self.notebook, self.workspace))}"
+                ),
+            ) from err
         if not isinstance(payload, dict):
             return []
         out: list[MarimoSession] = []

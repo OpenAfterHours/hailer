@@ -5,6 +5,7 @@ The CLI owns all printing; this module is pure logic so it is easy to test.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import asdict
 from pathlib import Path
@@ -13,17 +14,18 @@ from hailer.models import Command, SessionState
 
 SESSION_DIRNAME = ".hailer"
 SESSION_FILENAME = "session.json"
+PROMPT_HASH_KEY = "prompt_hash"
 
-# name -> one-line help (order is the order shown by /help)
+# name -> one-line description (order is the order shown by /help)
 COMMANDS: dict[str, str] = {
     "help": "Show this help.",
-    "status": "Show model, provider, thread, token usage and marimo status.",
+    "status": "Show model, provider, credentials, thread, token usage and marimo status.",
     "new": "Start a new conversation thread (context files are re-read).",
-    "model": "/model <name> or /model <provider>:<name>  Switch model; starts a new thread.",
+    "model": "Switch model and start a new thread. Usage: /model <name>  or  /model <provider>:<name>",
     "notebook": "Show the notebook path, its URL and the marimo launch command.",
     "context": "List loaded context files, skills, prompts and the web allowlist.",
-    "skill": "/skill <name> [message]  Run a turn with a project skill attached.",
-    "prompt": "/prompt <name> [args]  Send a saved prompt from .config/hailer/prompts.",
+    "skill": "Run a turn with a project skill attached. Usage: /skill <name> [message]",
+    "prompt": "Send a saved prompt from .config/hailer/prompts. Usage: /prompt <name> [args]",
     "reload": "Re-read .config/hailer; applies to the next thread (/new).",
     "clear": "Clear the screen.",
     "exit": "Exit Hailer.",
@@ -63,15 +65,23 @@ def session_path(workspace: Path) -> Path:
     return Path(workspace) / SESSION_DIRNAME / SESSION_FILENAME
 
 
-def load_session(workspace: Path) -> SessionState:
-    """Load the saved session; a missing or corrupt file yields a fresh state."""
+def prompt_hash(text: str) -> str:
+    """Stable fingerprint of the system prompt a thread was started with."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _read_raw(workspace: Path) -> dict:
     path = session_path(workspace)
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return SessionState()
-    if not isinstance(raw, dict):
-        return SessionState()
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def load_session(workspace: Path) -> SessionState:
+    """Load the saved session; a missing or corrupt file yields a fresh state."""
+    raw = _read_raw(workspace)
     state = SessionState()
     for key in ("thread_id", "model", "provider"):
         value = raw.get(key)
@@ -84,9 +94,20 @@ def load_session(workspace: Path) -> SessionState:
     return state
 
 
-def save_session(workspace: Path, state: SessionState) -> None:
+def load_prompt_hash(workspace: Path) -> str | None:
+    """The prompt fingerprint stored with the session, if any (tolerant of absence)."""
+    value = _read_raw(workspace).get(PROMPT_HASH_KEY)
+    return value if isinstance(value, str) and value else None
+
+
+def save_session(workspace: Path, state: SessionState, *, prompt_hash: str | None = None) -> None:
+    """Persist ``state``. ``prompt_hash`` is stored when given, otherwise the existing one is kept."""
     path = session_path(workspace)
     path.parent.mkdir(parents=True, exist_ok=True)
+    payload = asdict(state)
+    stored = prompt_hash if prompt_hash is not None else load_prompt_hash(workspace)
+    if stored:
+        payload[PROMPT_HASH_KEY] = stored
     tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(asdict(state), indent=2), encoding="utf-8")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     tmp.replace(path)

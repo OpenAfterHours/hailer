@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import io
 import json
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -11,7 +13,7 @@ from rich.console import Console
 from typer.testing import CliRunner
 
 import hailer.cli as cli
-from hailer.errors import ConfigError, CredentialsError, NoSessionError
+from hailer.errors import ConfigError, CredentialsError, HailerError, NoSessionError
 from hailer.models import (
     AgentEvent,
     ContextBundle,
@@ -56,6 +58,9 @@ class FakeAgent:
     interrupted: bool = False
     closed: bool = False
     bundle: ContextBundle | None = None
+    set_model_restarts: bool = False  # True: set_model starts its own thread (provider change) and returns True
+    key_source: str | None = None
+    new_threads: int = 0
 
     def start(self, *, resume_thread_id=None):
         self.started.append(resume_thread_id)
@@ -64,13 +69,16 @@ class FakeAgent:
     def run_turn(self, text, *, on_event=None, skill=None):
         self.turns.append((text, skill.name if skill else None))
         if self.fail_with is not None:
+            if isinstance(self.fail_with, KeyboardInterrupt):
+                self.interrupted = True  # the real agent interrupts the turn before re-raising
             raise self.fail_with
         final = f"Answer to: {text}"
         if on_event:
             on_event(AgentEvent("command", "dir data"))
             on_event(AgentEvent("tool_call", "marimo_execute"))
             if self.stream:
-                for chunk in ("Answer ", "to: ", text):
+                # Codex streams interim commentary and the final answer as separate messages
+                for chunk in ("Checking the ", "notebook...", "Answer ", "to: ", text):
                     on_event(AgentEvent("message_delta", chunk))
         return TurnSummary(final_response=final, thread_id=self.thread_id, turn_id="turn-1", input_tokens=10, output_tokens=5)
 
@@ -78,11 +86,16 @@ class FakeAgent:
         self.interrupted = True
 
     def new_thread(self):
+        self.new_threads += 1
         self.thread_id = "thread-2"
         return self.thread_id
 
     def set_model(self, name, provider=None):
         self.model = (name, provider)
+        if self.set_model_restarts:
+            self.thread_id = "thread-restarted"
+            return True
+        return False
 
     def close(self):
         self.closed = True
@@ -104,6 +117,8 @@ class FakeClient:
         return self.session
 
     def execute(self, code, *, session_id=None, notebook=None, on_stdout=None, on_stderr=None, timeout=600.0):
+        if self.session is None and session_id is None:
+            self.resolve_session(notebook)  # raises NoSessionError like the real client
         self.codes.append(code)
         result = self.exec_result or ExecResult(True, stdout="out\n", output="42")
         if on_stdout and result.stdout:
@@ -153,6 +168,7 @@ class Harness:
     key_source: tuple = ("x", "env")
     server: MarimoServer | None = SERVER
     bundle: ContextBundle = field(default_factory=ContextBundle)
+    prompt_hash: str = "hash-1"
 
 
 @pytest.fixture
@@ -164,6 +180,8 @@ def harness(tmp_path, monkeypatch):
     def load_context(config):
         h.context_loads += 1
         return h.bundle
+
+    monkeypatch.setattr(cli, "_prompt_hash", lambda config, bundle: h.prompt_hash)
 
     monkeypatch.setattr(cli, "console_factory", lambda: Console(force_terminal=False, width=120, highlight=False, soft_wrap=True, color_system=None))
     monkeypatch.setattr(cli, "_load_config", lambda opts: h.config)
@@ -510,3 +528,175 @@ def test_version_flag():
     result = runner.invoke(cli.app, ["--version"], catch_exceptions=False)
     assert result.exit_code == 0
     assert "hailer 0.1.0" in result.output
+
+
+# --------------------------------------------------------------------------- #
+# Review fixes: markup, encoding, interrupts, status, model switch, staleness
+# --------------------------------------------------------------------------- #
+
+
+def test_validation_message_with_brackets_is_printed_verbatim(harness, monkeypatch):
+    monkeypatch.setattr(
+        cli,
+        "_validate_config",
+        lambda config: ["[web].allowed_domains entry '*' is invalid", '[model_providers.internal].wire_api must be "responses"'],
+    )
+    result = chat()
+    assert result.exit_code == 1
+    assert "[web].allowed_domains entry '*' is invalid" in result.output
+    assert '[model_providers.internal].wire_api must be "responses"' in result.output
+
+
+def test_error_hint_with_brackets_is_printed_verbatim(harness):
+    harness.agent.fail_with = HailerError("Bad [web] section", hint="Fix [web].allowed_domains in hailer.toml")
+    result = chat(input_text="hello\n/exit\n")
+    assert "Bad [web] section" in result.output
+    assert "Fix [web].allowed_domains in hailer.toml" in result.output
+
+
+def test_reconfigure_streams_makes_cp1252_pipe_safe(monkeypatch):
+    raw = io.BytesIO()
+    pipe = io.TextIOWrapper(raw, encoding="cp1252")  # strict, like a redirected stdout on Windows
+    monkeypatch.setattr(sys, "stdout", pipe)
+    monkeypatch.setattr(sys, "stderr", io.TextIOWrapper(io.BytesIO(), encoding="cp1252"))
+    assert pipe.errors == "strict"
+    cli._reconfigure_streams()
+    assert sys.stdout.errors == "replace" and sys.stderr.errors == "replace"
+    console = Console(file=sys.stdout, force_terminal=False, width=80, highlight=False, color_system=None)
+    console.print("┌─┐ → 🙂 shape: (6, 2)", markup=False)  # Polars frames and emoji must not crash
+    sys.stdout.flush()
+    assert b"shape: (6, 2)" in raw.getvalue()
+
+
+def test_ctrl_c_during_turn_interrupts_and_keeps_loop(harness):
+    harness.agent.fail_with = KeyboardInterrupt()
+    result = chat(input_text="long running\n/exit\n")
+    assert result.exit_code == 0, result.output
+    assert "Interrupted." in result.output
+    assert harness.agent.interrupted
+    assert "Bye." in result.output
+
+
+def test_ctrl_c_at_prompt_exits_cleanly(harness, monkeypatch):
+    def raise_interrupt(self, prompt="", **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(Console, "input", raise_interrupt)
+    result = chat(input_text="")
+    assert result.exit_code == 0
+    assert "Bye." in result.output
+    assert harness.agent.closed
+
+
+def test_verbose_prints_traceback_for_hailer_error(harness):
+    harness.agent.fail_with = CredentialsError("Endpoint rejected the API key (401).", hint="Run: uv run hailer login openai")
+    result = chat(args=["--verbose"], input_text="hello\n/exit\n")
+    assert "rejected the API key" in result.output
+    assert "Traceback" in result.output
+
+
+def test_unknown_prompt_reports_available(harness, monkeypatch):
+    def render(config, name, args):
+        raise HailerError(f"Unknown prompt {name!r}.", hint="Available prompts: monthly-pack")
+
+    monkeypatch.setattr(cli, "_render_prompt", render)
+    result = chat(input_text="/prompt nope\n/exit\n")
+    assert "Unknown prompt 'nope'" in result.output
+    assert "Available prompts: monthly-pack" in result.output
+    assert harness.agent.turns == []
+
+
+def test_exec_without_session_shows_url(harness):
+    harness.client = FakeClient(session=None)
+    result = runner.invoke(cli.app, ["exec", "-c", "1"], catch_exceptions=False)
+    assert result.exit_code == 1
+    assert "not open in a browser" in result.output
+    assert URL in result.output
+
+
+def test_login_openai_then_status_reports_keyring(harness, monkeypatch):
+    stored: dict[str, str] = {}
+    monkeypatch.setattr(cli, "_store_key", lambda provider, value: stored.__setitem__(provider.id, value))
+    monkeypatch.setattr(cli, "_resolve_key", lambda provider: ("v", "keyring") if provider.id in stored else (None, "missing"))
+    result = runner.invoke(cli.app, ["status"], catch_exceptions=False)
+    assert "Credentials: Codex login (no OPENAI_API_KEY set)" in result.output
+    result = runner.invoke(cli.app, ["login", "openai"], input="sk-test\n", catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    assert stored == {"openai": "sk-test"}
+    assert "sk-test" not in result.output
+    result = runner.invoke(cli.app, ["status"], catch_exceptions=False)
+    assert "Credentials: OPENAI_API_KEY from keyring" in result.output
+    result = runner.invoke(cli.app, ["doctor"], catch_exceptions=False)
+    assert "OPENAI_API_KEY from keyring" in result.output
+
+
+def test_status_command_shows_endpoint_and_credentials(harness):
+    harness.config = make_config(harness.config.workspace, provider="internal", providers={"internal": INTERNAL})
+    harness.agent.key_source = "keyring"
+    result = chat(input_text="/status\n/exit\n")
+    assert result.exit_code == 0, result.output
+    assert "internal (https://llm.example.internal/v1)" in result.output
+    assert "INTERNAL_MODEL_API_KEY from keyring" in result.output
+
+
+def test_model_switch_does_not_start_a_second_thread(harness):
+    harness.config = make_config(harness.config.workspace, providers={"internal": INTERNAL})
+    harness.agent.set_model_restarts = True
+    result = chat(input_text="/model internal:foo\n/exit\n")
+    assert result.exit_code == 0, result.output
+    assert harness.agent.new_threads == 0
+    assert result.output.count("started a new thread") == 1
+    saved = json.loads(session_path(harness.config.workspace).read_text())
+    assert saved["thread_id"] == "thread-restarted"
+
+
+def test_resume_warns_when_prompt_changed(harness):
+    save_session(harness.config.workspace, SessionState(thread_id="old-thread", turns=1), prompt_hash="hash-0")
+    result = chat()
+    assert "Resumed conversation" in result.output
+    assert "use /new to apply" in result.output
+    # a resume keeps the hash the thread was started with
+    assert json.loads(session_path(harness.config.workspace).read_text())["prompt_hash"] == "hash-0"
+
+
+def test_new_thread_records_current_prompt_hash(harness):
+    save_session(harness.config.workspace, SessionState(thread_id="old-thread", turns=1), prompt_hash="hash-0")
+    result = chat(input_text="/new\n/exit\n")
+    assert result.exit_code == 0
+    assert json.loads(session_path(harness.config.workspace).read_text())["prompt_hash"] == "hash-1"
+    harness.agent = FakeAgent()
+    result = chat()
+    assert "use /new to apply" not in result.output
+
+
+def test_commentary_deltas_are_not_printed_and_answer_appears_once(harness):
+    harness.agent.stream = True
+    result = chat(input_text="hi\n/exit\n")
+    assert result.output.count("Answer to: hi") == 1
+    assert "Checking the notebook" not in result.output
+
+
+@pytest.mark.parametrize(
+    "raw, shown",
+    [
+        (
+            '"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command \'Get-ChildItem data\'',
+            "Get-ChildItem data",
+        ),
+        ('powershell -NoProfile -Command "dir data"', "dir data"),
+        ("cmd.exe /d /s /c dir data", "dir data"),
+        ("cmd /c type hailer.toml", "type hailer.toml"),
+        ("bash -lc 'ls data'", "ls data"),
+        ('/bin/sh -c "ls"', "ls"),
+        ("uv run pytest -q", "uv run pytest -q"),
+    ],
+)
+def test_display_command_strips_shell_wrappers(raw, shown):
+    assert cli._display_command(raw) == shown
+
+
+def test_progress_line_shows_inner_command(harness):
+    console = Console(force_terminal=False, width=100, highlight=False, color_system=None)
+    display = cli._TurnDisplay(console)
+    display(cli.AgentEvent("command", '"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command \'dir data\''))
+    assert display.last_activity == "dir data"

@@ -24,7 +24,13 @@ does not cover it.
   reachable; anything else is refused.
 
 **First turn of a session:** call `marimo_status()`. If the notebook has no session, tell the user the URL
-to open in their browser and stop; nothing can run until it is open.
+to open in their browser and stop; nothing can run until it is open. If `marimo_execute` later reports
+that there is no session (browser tab closed or refreshed), call `marimo_status()` again and relay the URL
+it gives instead of retrying blindly.
+
+**Notebook-provided globals** (already defined by the starter cells; reuse them, never redefine them):
+`mo`, `pl`, `duckdb`, `Path`, `WORKSPACE`, `DATA_DIR`, `period_files` (the scanned `YY-MM` files), and
+the helpers `scan_period_files`, `load_periods`, `scan_periods`, `duckdb_periods_view`, `describe_periods`.
 
 ## The scratchpad and durable changes
 
