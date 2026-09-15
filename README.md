@@ -67,13 +67,25 @@ uv run python scripts/make_sample_data.py --help   # --out, --months, --rows, --
 
 ## Quick start
 
+One terminal is enough:
+
 ```bash
 uv run hailer init        # writes hailer.toml and .config/hailer/{context,skills,prompts} with examples
-uv run hailer notebook    # runs: uv run marimo edit notebooks/analysis.py --no-token (new console on Windows)
+uv run hailer notebook    # starts marimo, opens the notebook in your browser, and chats right here
 ```
 
-Open the URL marimo prints (for example `http://localhost:2718`) so the kernel session exists, then in
-another terminal:
+`hailer notebook` runs the startup checks, starts a token-less marimo server for the configured notebook in
+the background (log in `.hailer/marimo.log`), opens the notebook URL so the kernel gets a session, then
+runs the chat in the same terminal. When you leave the chat (`/exit`, Ctrl+Z Enter, or Ctrl+C at the
+prompt) it stops the marimo server it started. If a marimo server is already running with this notebook
+open, it is reused and left running.
+
+Flags: `--port N` (default 2718; a free port is chosen when it is busy), `--no-browser` (print the URL
+instead of opening it), `--keep-marimo` (leave the server running after the chat), `--foreground` (just run
+marimo attached to this terminal, no chat), `--new` (start a fresh conversation).
+
+Chat only, when marimo is already running (started by `hailer notebook --keep-marimo` or by
+`uv run marimo edit notebooks/analysis.py --no-token` with the notebook open in a browser):
 
 ```bash
 uv run hailer
@@ -268,7 +280,8 @@ credentials, customer names and row-level data out of it.
 
 Ctrl+C while the agent is working interrupts that turn and returns to the prompt.
 
-Other subcommands: `hailer notebook [--port N]`, `hailer exec -c "code"` (or `hailer exec script.py`,
+Other subcommands: `hailer notebook [--port N] [--no-browser] [--keep-marimo] [--foreground] [--new]` (the
+one-command session described in Quick start), `hailer exec -c "code"` (or `hailer exec script.py`,
 `hailer exec -` for stdin) to run Python in the live kernel yourself, `hailer status`, `hailer doctor`,
 `hailer login|logout <provider>`, `hailer init [--force]`. Global options: `--verbose`, `--config <path>`,
 `--workspace <path>`, `--new`, `--version`.
@@ -341,7 +354,8 @@ when a session exists, confirms that marimo's code-mode API is available in the 
 
 | Message | Meaning and fix |
 |---|---|
-| `Marimo is not running.` then `Start it with: uv run marimo edit notebooks/analysis.py --no-token` and `Then run Hailer again: uv run hailer` | No server answered at the configured or discovered URL. Start it (or `uv run hailer notebook`). Servers started with `--no-token` register themselves so Hailer finds them; otherwise set `marimo_url` in `hailer.toml`. |
+| `Marimo is not running.` then `Start everything in one go: uv run hailer notebook`, `Or start it yourself with: uv run marimo edit notebooks/analysis.py --no-token`, `Then run Hailer again: uv run hailer` | No server answered at the configured or discovered URL. `uv run hailer notebook` starts one and runs the chat in the same terminal. Servers started with `--no-token` register themselves so Hailer finds them; otherwise set `marimo_url` in `hailer.toml`. |
+| `Marimo exited early (code N)` or `Marimo did not answer on http://127.0.0.1:2718 within 60 s`, followed by `Log: .hailer\marimo.log` and its last lines | `hailer notebook` could not start marimo. The log tail usually names the cause (port in use by something else, a syntax error in the notebook, marimo not installed in the environment). |
 | `the notebook is not open in a browser` followed by `Open http://... in your browser.` | The server is up but has no kernel session. Open the URL; Hailer opens it for you once at startup. |
 | `not found: <path>` for the notebook | Fix `[hailer].notebook` or create the notebook with `uv run marimo edit <path>`. |
 | `INTERNAL_MODEL_API_KEY is not set (required by provider 'internal')` | Run `uv run hailer login internal` or set the variable in this terminal. |
@@ -358,7 +372,8 @@ when a session exists, confirms that marimo's code-mode API is available in the 
 
 - `marimo._code_mode` is a private API; Hailer pins marimo 0.24.2 and may need changes for other versions.
 - The notebook must be open in a browser; a headless server without a tab has nothing to execute against.
-- Hailer does not start marimo automatically; `uv run hailer notebook` launches it in a new console.
+- `uv run hailer notebook` starts and stops marimo for you; plain `uv run hailer` expects a running server
+  and tells you how to start one.
 - Windows sandbox quirks listed above apply to the agent's shell; the kernel path is unaffected.
 - Custom gateways see roughly 10 KB of instructions and tool schema per turn plus the conversation; strict
   request-size limits or schema validation may need relaxing (see PLAN.md §1a for the measured details).

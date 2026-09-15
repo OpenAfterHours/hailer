@@ -370,3 +370,95 @@ def test_sse_parser_handles_comments_and_multiline_data():
     events = list(mc._iter_sse(iter(lines)))
     assert events[0][0] == "stdout" and json.loads(events[0][1]) == {"data": "x"}
     assert events[1][0] == "done"
+
+
+# --------------------------------------------------------------------------- #
+# Helpers for `hailer notebook`: ports, readiness waits, registry cleanup, hint
+# --------------------------------------------------------------------------- #
+
+
+def test_find_free_port_prefers_the_requested_port():
+    port = _free_port()
+    assert mc.find_free_port(port) == port
+
+
+def test_find_free_port_falls_back_when_busy(fake):
+    busy = fake.server_address[1]
+    assert mc.port_in_use(busy)
+    chosen = mc.find_free_port(busy)
+    assert chosen != busy and not mc.port_in_use(chosen)
+
+
+def test_wait_for_health_true_for_live_server(fake):
+    assert mc.wait_for_health(fake.url, timeout=2.0, interval=0.05)
+
+
+def test_wait_for_health_false_when_nothing_listens():
+    url = f"http://127.0.0.1:{_free_port()}"
+    assert not mc.wait_for_health(url, timeout=0.3, interval=0.05)
+
+
+def test_wait_for_health_stops_early_when_process_died():
+    url = f"http://127.0.0.1:{_free_port()}"
+    calls = []
+
+    def died():
+        calls.append(1)
+        return True
+
+    assert not mc.wait_for_health(url, timeout=30.0, interval=0.05, should_stop=died)
+    assert len(calls) == 1, "returns as soon as should_stop() is True instead of waiting for the timeout"
+
+
+def test_wait_for_session_returns_when_notebook_opens(fake, tmp_path):
+    nb = tmp_path / "notebooks" / "analysis.py"
+    client = mc.MarimoClient(fake.url, notebook=nb, workspace=tmp_path)
+
+    def open_tab():
+        fake.sessions["s_new"] = {"filename": str(nb), "path": str(nb)}
+
+    threading.Timer(0.3, open_tab).start()
+    session = mc.wait_for_session(client, nb, timeout=5.0, interval=0.05)
+    assert session is not None and session.session_id == "s_new"
+
+
+def test_wait_for_session_none_on_timeout(fake, tmp_path):
+    nb = tmp_path / "notebooks" / "analysis.py"
+    client = mc.MarimoClient(fake.url, notebook=nb, workspace=tmp_path)
+    assert mc.wait_for_session(client, nb, timeout=0.3, interval=0.05) is None
+
+
+def test_registry_entry_path_and_removal(tmp_path):
+    registry = tmp_path / "servers"
+    registry.mkdir()
+    path = mc.registry_entry_path("http://127.0.0.1:2718", registry)
+    assert path == registry / "127.0.0.1_2718.json"
+    path.write_text("{}", encoding="utf-8")
+    assert mc.remove_registry_entry("http://127.0.0.1:2718", registry)
+    assert not path.exists()
+    assert not mc.remove_registry_entry("http://127.0.0.1:2718", registry), "already gone"
+
+
+def test_marimo_server_command_flags(tmp_path):
+    nb = tmp_path / "notebooks" / "analysis.py"
+    cmd = mc.marimo_server_command(nb, tmp_path, 2731)
+    assert cmd[0] == mc.sys.executable and cmd[1:4] == ["-m", "marimo", "edit"]
+    assert cmd[4] == "notebooks/analysis.py"
+    for flag in ("--no-token", "--headless", "--skip-update-check"):
+        assert flag in cmd
+    assert cmd[cmd.index("--port") + 1] == "2731"
+
+
+def test_launch_hint_offers_one_command_route_first(tmp_path):
+    hint = mc.launch_hint(tmp_path / "notebooks" / "analysis.py", tmp_path)
+    assert hint.index("uv run hailer notebook") < hint.index("uv run marimo edit notebooks/analysis.py --no-token")
+    assert hint.rstrip().endswith("uv run hailer")
+    assert "Or start it yourself with:" in hint and "Then run Hailer again:" in hint
+
+
+def test_unavailable_error_uses_one_command_hint(tmp_path):
+    client = mc.MarimoClient(f"http://127.0.0.1:{_free_port()}", timeout=0.5, notebook=tmp_path / "nb.py", workspace=tmp_path)
+    with pytest.raises(MarimoUnavailableError) as info:
+        client.sessions()
+    assert "uv run hailer notebook" in info.value.hint
+    assert "uv run marimo edit nb.py --no-token" in info.value.hint

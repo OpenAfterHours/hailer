@@ -18,6 +18,7 @@ import json
 import os
 import socket
 import sys
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterator, Sequence
@@ -61,6 +62,41 @@ def notebook_launch_command(config: HailerConfig, *, port: int | None = None) ->
     return launch_command(config.notebook, config.workspace, port=port)
 
 
+def marimo_server_command(notebook: Path, workspace: Path, port: int) -> list[str]:
+    """Argument list ``hailer notebook`` uses to start marimo as its own background child.
+
+    Runs marimo through the current interpreter (the uv-managed venv that also runs Hailer)
+    rather than through ``uv run``: on Windows terminating a ``uv`` wrapper would not stop the
+    marimo process it spawned, and Hailer must be able to stop what it started.
+    """
+    rel = _relative_to_workspace(notebook, workspace)
+    return [
+        sys.executable,
+        "-m",
+        "marimo",
+        "edit",
+        rel,
+        "--no-token",
+        "--headless",
+        "--port",
+        str(port),
+        "--skip-update-check",
+    ]
+
+
+def launch_hint(notebook: Path | None, workspace: Path | None = None) -> str:
+    """The fix printed under "Marimo is not running." — the one-command route first."""
+    cmd = _format_command(launch_command(notebook, workspace))
+    return (
+        "Start everything in one go:\n\n"
+        "    uv run hailer notebook\n\n"
+        "Or start it yourself with:\n\n"
+        f"    {cmd}\n\n"
+        "Then run Hailer again:\n\n"
+        "    uv run hailer"
+    )
+
+
 def open_notebook_url(server: MarimoServer, notebook: Path, workspace: Path) -> str:
     """URL the user should open so the kernel gets a session, e.g. ``http://127.0.0.1:2718/?file=notebooks/analysis.py``."""
     rel = _relative_to_workspace(notebook, workspace)
@@ -69,6 +105,89 @@ def open_notebook_url(server: MarimoServer, notebook: Path, workspace: Path) -> 
 
 def _format_command(cmd: Sequence[str]) -> str:
     return " ".join(cmd)
+
+
+# --------------------------------------------------------------------------- #
+# Starting a server: ports and readiness
+# --------------------------------------------------------------------------- #
+
+
+def port_in_use(port: int, host: str = "127.0.0.1") -> bool:
+    """True when something already listens on ``host:port`` (bind fails)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind((host, port))
+        except OSError:
+            return True
+    return False
+
+
+def find_free_port(preferred: int = 2718, host: str = "127.0.0.1") -> int:
+    """``preferred`` when it is free, otherwise a free ephemeral port chosen by the OS."""
+    if not port_in_use(preferred, host):
+        return preferred
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((host, 0))
+        return int(sock.getsockname()[1])
+
+
+def wait_for_health(
+    url: str,
+    timeout: float = 60.0,
+    *,
+    interval: float = 0.5,
+    should_stop: Callable[[], bool] | None = None,
+) -> bool:
+    """Poll ``/health`` until it answers, the timeout passes, or ``should_stop()`` returns True."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if _health_ok(url):
+            return True
+        if should_stop is not None and should_stop():
+            return False
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)
+
+
+def wait_for_session(
+    client: "MarimoClient",
+    notebook: Path | None,
+    timeout: float = 90.0,
+    *,
+    interval: float = 0.5,
+) -> MarimoSession | None:
+    """Poll ``/api/sessions`` until the notebook has a kernel session; ``None`` on timeout."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return client.resolve_session(notebook)
+        except NoSessionError:
+            pass
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(interval)
+
+
+def registry_entry_path(url: str, registry: Path | None = None) -> Path:
+    """The registry file marimo writes for a ``--no-token`` server at ``url`` (``<host>_<port>.json``)."""
+    parts = urlsplit(url if "://" in url else f"http://{url}")
+    host = parts.hostname or "127.0.0.1"
+    port = parts.port or 80
+    directory = registry if registry is not None else registry_dir()
+    return directory / f"{host}_{port}.json".replace(":", "_").replace("/", "_")
+
+
+def remove_registry_entry(url: str, registry: Path | None = None) -> bool:
+    """Delete the registry file for ``url``; marimo only removes it on a clean shutdown."""
+    path = registry_entry_path(url, registry)
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -220,10 +339,9 @@ class MarimoClient:
         return headers
 
     def _unavailable(self, reason: str) -> MarimoUnavailableError:
-        cmd = _format_command(launch_command(self.notebook, self.workspace))
         return MarimoUnavailableError(
             f"Marimo is not running at {self.base_url} ({reason}).",
-            hint=f"Start it with:\n\n    {cmd}\n\nThen run Hailer again:\n\n    uv run hailer",
+            hint=launch_hint(self.notebook, self.workspace),
         )
 
     def _auth_error(self, status: int) -> MarimoUnavailableError:
