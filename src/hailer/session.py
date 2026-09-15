@@ -22,7 +22,7 @@ COMMANDS: dict[str, str] = {
     "status": "Show model, provider, credentials, thread, token usage and marimo status.",
     "new": "Start a new conversation thread (context files are re-read).",
     "model": "Switch model and start a new thread. Usage: /model <name>  or  /model <provider>:<name>",
-    "notebook": "Show the notebook path, its URL and the marimo launch command.",
+    "notebook": "Show or switch the active notebook. Usage: /notebook [list | new <name> [--empty] | open <name> | close [name]]",
     "context": "List loaded context files, skills, prompts and the web allowlist.",
     "skill": "Run a turn with a project skill attached. Usage: /skill <name> [message]",
     "prompt": "Send a saved prompt from .config/hailer/prompts. Usage: /prompt <name> [args]",

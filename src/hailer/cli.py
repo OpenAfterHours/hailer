@@ -24,6 +24,7 @@ import sys
 import traceback
 import webbrowser
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -33,7 +34,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from hailer import __version__
+from hailer import __version__, notebooks
 from hailer.errors import (
     ConfigError,
     CredentialsError,
@@ -136,9 +137,16 @@ def _prompt_hash(config: HailerConfig, bundle: ContextBundle) -> str:
 
 
 def _load_config(opts: CliOptions) -> HailerConfig:
+    """The resolved configuration with ``notebook`` set to the *active* notebook.
+
+    Every subcommand goes through here, so from this point on ``config.notebook`` means the
+    notebook the chat is working in (the state file wins over ``[hailer].notebook``; see
+    :func:`hailer.notebooks.load_active_notebook`).
+    """
     from hailer.config import load_config
 
-    return load_config(workspace=opts.workspace, config_path=opts.config_path)
+    config = load_config(workspace=opts.workspace, config_path=opts.config_path)
+    return replace(config, notebook=notebooks.load_active_notebook(config))
 
 
 def _validate_config(config: HailerConfig) -> list[str]:
@@ -187,6 +195,12 @@ def _cm_help_code() -> str:
     from hailer.marimo_client import CM_HELP_CODE
 
     return CM_HELP_CODE
+
+
+def _list_cells_code() -> str:
+    from hailer.marimo_client import LIST_CELLS_CODE
+
+    return LIST_CELLS_CODE
 
 
 def _resolve_key(provider: ProviderConfig) -> tuple[str | None, str]:
@@ -391,12 +405,44 @@ def _relative(path: Path, workspace: Path) -> str:
         return str(path)
 
 
+def _same_file(a: Path, b: Path) -> bool:
+    """Path equality that tolerates case and separator differences (Windows)."""
+    try:
+        return os.path.normcase(str(Path(a).resolve())) == os.path.normcase(str(Path(b).resolve()))
+    except OSError:
+        return False
+
+
+def _inside(path: Path, root: Path) -> bool:
+    try:
+        Path(path).resolve().relative_to(Path(root).resolve())
+    except (ValueError, OSError):
+        return False
+    return True
+
+
+def _session_for(sessions: list[MarimoSession], path: Path) -> MarimoSession | None:
+    """The kernel session for ``path`` among ``sessions`` (by path, then by unique filename)."""
+    for session in sessions:
+        for candidate in (session.path, session.filename):
+            if candidate and _same_file(Path(candidate), path):
+                return session
+    name = os.path.normcase(Path(path).name)
+    by_name = [s for s in sessions if os.path.normcase(Path(s.filename or s.path or "").name) == name]
+    return by_name[0] if len(by_name) == 1 else None
+
+
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}" + ("" if count == 1 else "s")
+
+
 def _startup_panel(console: Console, config: HailerConfig) -> None:
     body = "\n".join(
         [
             f"Model:      {config.model.name}",
             f"Provider:   {_provider_line(config)}",
             f"Notebook:   {_relative(config.notebook, config.workspace)}",
+            f"Notebooks:  {_relative(config.notebooks_root, config.workspace)}",
             f"Workspace:  {config.workspace}",
             f"Web access: {_web_line(config)}",
         ]
@@ -476,14 +522,17 @@ def local_checks(config: HailerConfig) -> list[Check]:
         checks.append(Check("config", True, summary, fatal=False))
 
     if config.notebook.exists():
-        checks.append(Check("notebook", True, _relative(config.notebook, config.workspace)))
+        checks.append(Check("notebook", True, f"{_relative(config.notebook, config.workspace)} (active)"))
     else:
         checks.append(
             Check(
                 "notebook",
                 False,
                 f"not found: {config.notebook}",
-                hint="Create the notebook (uv run marimo edit <path>) or fix [hailer].notebook in hailer.toml.",
+                hint=(
+                    "Fix [hailer].notebook in hailer.toml or restore the file. Notebooks created from the chat "
+                    f"(/notebook new <name>) live in {_relative(config.notebooks_root, config.workspace)}."
+                ),
             )
         )
 
@@ -608,6 +657,9 @@ class ChatLoop:
         self.state: SessionState = load_session(config.workspace)
         self.bundle: ContextBundle = ContextBundle()
         self.agent: Any = None
+        # One-line notice sent with the next user message after a /notebook switch (the model
+        # learns about switches it made itself from its own tool results).
+        self._pending_preamble: str | None = None
 
     # -- lifecycle --------------------------------------------------------- #
 
@@ -691,9 +743,11 @@ class ChatLoop:
     def _turn(self, text: str, *, skill: SkillInfo | None = None) -> None:
         display = _TurnDisplay(self.console)
         display.start()
+        preamble = self._pending_preamble
         try:
-            summary: TurnSummary = self.agent.run_turn(text, on_event=display, skill=skill)
+            summary: TurnSummary = self.agent.run_turn(text, on_event=display, skill=skill, preamble=preamble)
         except KeyboardInterrupt:
+            self._pending_preamble = None  # the notice went out with the interrupted turn
             display.stop()
             try:
                 self.agent.interrupt()
@@ -704,6 +758,7 @@ class ChatLoop:
         except BaseException:
             display.stop()
             raise
+        self._pending_preamble = None
         display.finish(summary)
         self.state.turns += 1
         self.state.input_tokens += summary.input_tokens or 0
@@ -711,6 +766,24 @@ class ChatLoop:
         if summary.thread_id:
             self.state.thread_id = summary.thread_id
         save_session(self.config.workspace, self.state)
+        self._sync_active_notebook()
+
+    def _sync_active_notebook(self) -> None:
+        """Pick up a switch the model made during the turn (its tools write the same state file)."""
+        try:
+            active = notebooks.load_active_notebook(self.config)
+        except Exception:  # noqa: BLE001 - a bad state file must never spoil a finished turn
+            return
+        if _same_file(active, self.config.notebook):
+            return
+        self.config = replace(self.config, notebook=active)
+        name = notebooks.notebook_display_name(self.config, active)
+        self.console.print(Text(f"Active notebook is now {name}.", style="dim"))
+        server, session, _err = _marimo_state(self.config)
+        if server is not None and session is None:
+            url = _notebook_url(server, self.config)
+            self.console.print(f"Opening {url} in your browser...", markup=False)
+            _open_browser(url)
 
     # -- slash commands ---------------------------------------------------- #
 
@@ -725,7 +798,7 @@ class ChatLoop:
         elif name == "model":
             self._model(args)
         elif name == "notebook":
-            self._notebook()
+            self._notebook(args)
         elif name == "clear":
             self.console.clear()
         elif name == "context":
@@ -771,6 +844,7 @@ class ChatLoop:
             ("Tokens", f"{self.state.input_tokens} in / {self.state.output_tokens} out"),
             ("Marimo", marimo),
             ("Notebook", _relative(self.config.notebook, self.config.workspace)),
+            ("Notebooks", _relative(self.config.notebooks_root, self.config.workspace)),
             ("Web access", _web_line(self.config)),
         ]
         for label, value in rows:
@@ -837,16 +911,172 @@ class ChatLoop:
         already = getattr(self.agent, "thread_id", None) if restarted else None
         self._new_thread(reason=reason, thread_id=already if isinstance(already, str) and already else None)
 
-    def _notebook(self) -> None:
-        self.console.print(f"Notebook: {self.config.notebook}", markup=False)
-        server, _session, _err = _marimo_state(self.config)
-        if server is not None:
-            self.console.print(f"URL:      {_notebook_url(server, self.config)}", markup=False)
-            self.console.print("View:     app view (results only); Ctrl+. in the notebook toggles the code editor", markup=False)
+    # -- /notebook --------------------------------------------------------- #
+
+    def _notebook(self, args: str) -> None:
+        sub, _, rest = args.strip().partition(" ")
+        sub, rest = sub.lower(), rest.strip()
+        if not sub:
+            self._notebook_show()
+        elif sub == "list":
+            self._notebook_list()
+        elif sub == "new":
+            self._notebook_new(rest)
+        elif sub == "open":
+            self._notebook_open(rest)
+        elif sub == "close":
+            self._notebook_close(rest)
         else:
+            self.console.print(f"Unknown /notebook subcommand {sub!r}. {NOTEBOOK_USAGE}", markup=False)
+
+    def _display_name(self, path: Path) -> str:
+        return notebooks.notebook_display_name(self.config, path)
+
+    def _notebook_show(self) -> None:
+        cfg, out = self.config, self.console
+        out.print(f"Notebook:  {self._display_name(cfg.notebook)} (active)", markup=False)
+        count = len(notebooks.list_notebooks(cfg))
+        out.print(f"Notebooks: {self._display_name(cfg.notebooks_root)} ({_plural(count, 'notebook')}; /notebook list)", markup=False)
+        server, session, _err = _marimo_state(cfg)
+        if server is None:
+            out.print("Marimo:    not running", markup=False)
+        else:
+            state = f"session {session.session_id}" if session is not None else "not open in a browser"
+            out.print(f"Marimo:    {server.url} ({state})", markup=False)
+            out.print(f"URL:       {_notebook_url(server, cfg)}", markup=False)
+            out.print("View:      app view (results only); Ctrl+. in the notebook toggles the code editor", markup=False)
+        out.print("Start everything in one go:  uv run hailer notebook", markup=False)
+        out.print(f"Launch:    {' '.join(_launch_command(cfg))}", markup=False)
+        out.print(NOTEBOOK_USAGE, markup=False)
+
+    def _server_sessions(self) -> tuple[MarimoServer | None, Any, list[MarimoSession]]:
+        """(server, client, open sessions); server is None when marimo is not running."""
+        try:
+            server = _find_server(self.config)
+        except HailerError:
+            return None, None, []
+        if server is None:
+            return None, None, []
+        client = _make_client(server, self.config)
+        try:
+            if not client.health():
+                return None, None, []
+            return server, client, client.sessions()
+        except HailerError:
+            return server, client, []
+
+    def _notebook_list(self) -> None:
+        infos = notebooks.list_notebooks(self.config)
+        folder = self._display_name(self.config.notebooks_root)
+        if not infos:
+            self.console.print(f"No notebooks in {folder} yet. Create one with /notebook new <name>.", markup=False)
+            return
+        _server, _client, sessions = self._server_sessions()
+        table = Table.grid(padding=(0, 2))
+        for info in infos:
+            markers = []
+            if _same_file(info.path, self.config.notebook):
+                markers.append("active")
+            if _session_for(sessions, info.path) is not None:
+                markers.append("open")
+            modified = datetime.fromtimestamp(info.modified).strftime("%Y-%m-%d %H:%M")
+            table.add_row(
+                Text(self._display_name(info.path)),
+                Text(modified),
+                Text(f"{info.size / 1024:.1f} KB"),
+                Text(", ".join(markers)),
+            )
+        self.console.print(table)
+        self.console.print(f"{_plural(len(infos), 'notebook')} in {folder}. /notebook open <name> switches.", markup=False)
+
+    def _notebook_new(self, rest: str) -> None:
+        tokens = rest.split()
+        kind = "empty" if "--empty" in tokens else "starter"
+        name = " ".join(t for t in tokens if t != "--empty")
+        if not name:
+            self.console.print("Usage: /notebook new <name> [--empty]", markup=False)
+            return
+        path = notebooks.create_notebook(self.config, name, kind=kind)
+        self.console.print(f"Created {self._display_name(path)} from the {kind} template.", markup=False)
+        self._switch_notebook(path, how=f"created from the {kind} template")
+
+    def _notebook_open(self, rest: str) -> None:
+        if not rest:
+            self.console.print("Usage: /notebook open <name>", markup=False)
+            return
+        path = notebooks.resolve_notebook(self.config, rest)
+        if _same_file(path, self.config.notebook):
+            self.console.print(f"{self._display_name(path)} is already the active notebook.", markup=False)
+            self._ensure_session()
+            return
+        self._switch_notebook(path, how="reopened")
+
+    def _notebook_close(self, rest: str) -> None:
+        path = notebooks.resolve_notebook(self.config, rest) if rest else self.config.notebook
+        name = self._display_name(path)
+        server, client, _sessions = self._server_sessions()
+        if server is None:
             self.console.print("Marimo is not running.", markup=False)
-        self.console.print("Start everything in one go:  uv run hailer notebook", markup=False)
-        self.console.print(f"Launch:   {' '.join(_launch_command(self.config))}", markup=False)
+            return
+        try:
+            session = client.resolve_session(path)
+        except NoSessionError:
+            self.console.print(f"{name} is not open (no kernel session).", markup=False)
+            return
+        client.shutdown_session(session.session_id)
+        self.console.print(f"Closed {name} (session {session.session_id}); its browser tab is disconnected.", markup=False)
+        if _same_file(path, self.config.notebook):
+            self.console.print(f"It stays the active notebook; /notebook open {Path(path).stem} reopens it.", markup=False)
+
+    def _switch_notebook(self, path: Path, *, how: str) -> None:
+        """Make ``path`` the active notebook for this chat, the tool server and the next session."""
+        notebooks.save_active_notebook(self.config, path)
+        self.config = replace(self.config, notebook=path)
+        name = self._display_name(path)
+        session, client = self._ensure_session()
+        detail = how
+        if session is not None:
+            count = self._cell_count(client)
+            if count is not None:
+                detail += f", {_plural(count, 'cell')}"
+        else:
+            detail += ", not open in a browser yet"
+        self._pending_preamble = f"[Hailer] The active notebook is now {name} ({detail}). Call notebook_cells before editing."
+        self.console.print(f"Active notebook: {name}.", markup=False)
+
+    def _ensure_session(self) -> tuple[MarimoSession | None, Any]:
+        """Open the active notebook in the browser when it has no kernel session; (session, client)."""
+        cfg = self.config
+        server, session, _err = _marimo_state(cfg)
+        if server is None:
+            self.console.print("Marimo is not running; the notebook opens once it is (uv run hailer notebook).", markup=False)
+            return None, None
+        client = _make_client(server, cfg)
+        if session is not None:
+            self.console.print(f"Notebook is open (session {session.session_id}).", markup=False)
+            return session, client
+        url = _notebook_url(server, cfg)
+        self.console.print(f"Opening {url} in your browser...", markup=False)
+        _open_browser(url)
+        with self.console.status("Waiting for the notebook to open..."):
+            session = _wait_for_session(client, cfg.notebook, SWITCH_SESSION_TIMEOUT_SEC)
+        if session is None:
+            self.console.print(f"No kernel session yet. Open {url} in your browser.", style="yellow", markup=False)
+        else:
+            self.console.print(f"Notebook is open (session {session.session_id}).", markup=False)
+        return session, client
+
+    def _cell_count(self, client: Any) -> int | None:
+        """Number of cells in the active notebook, or None when it cannot be determined."""
+        if client is None:
+            return None
+        try:
+            result = client.execute(_list_cells_code(), notebook=self.config.notebook)
+        except Exception:  # noqa: BLE001 - informational only; never fail a switch over it
+            return None
+        if not result.success:
+            return None
+        return sum(1 for line in (result.stdout or "").splitlines() if line.strip())
 
     def _context(self) -> None:
         bundle = self.bundle
@@ -1000,15 +1230,27 @@ def _main(
 MARIMO_LOG_NAME = "marimo.log"
 HEALTH_TIMEOUT_SEC = 60.0
 SESSION_TIMEOUT_SEC = 90.0
+SWITCH_SESSION_TIMEOUT_SEC = 30.0  # how long /notebook new|open waits for the browser tab
+NOTEBOOK_USAGE = "Usage: /notebook [list | new <name> [--empty] | open <name> | close [name]]"
 APP_VIEW_HINT = (
     "The notebook opens in app view (results only). "
     "Press Ctrl+. in it, or use Toggle app view, to see and edit the code."
 )
 
 
+def _has_session_under(client: Any, root: Path) -> bool:
+    """True when the server hosts a kernel session for any notebook inside ``root``."""
+    try:
+        sessions = client.sessions()
+    except HailerError:
+        return False
+    return any(_inside(Path(s.path or s.filename or ""), root) for s in sessions if s.path or s.filename)
+
+
 def _reusable_server(config: HailerConfig) -> tuple[MarimoServer, MarimoSession | None] | None:
     """A running server Hailer may attach to: the configured URL, or a live server that already has
-    a kernel session for this notebook. Anything else gets a fresh server on its own port."""
+    a kernel session for the active notebook or for another notebook in the notebooks folder (one
+    server hosts them all). Anything else gets a fresh server on its own port."""
     try:
         server = _find_server(config)
     except HailerError:
@@ -1022,7 +1264,9 @@ def _reusable_server(config: HailerConfig) -> tuple[MarimoServer, MarimoSession 
         session = client.resolve_session(config.notebook)
         return server, session
     except NoSessionError:
-        return (server, None) if config.marimo_url else None
+        if config.marimo_url or _has_session_under(client, config.notebooks_root):
+            return server, None
+        return None
     except HailerError:
         return None
 
@@ -1101,8 +1345,16 @@ def notebook(
     config = _config_or_exit(console, opts)
 
     if foreground:
+        config.notebooks_root.mkdir(parents=True, exist_ok=True)  # marimo edit refuses a missing folder
         if not config.notebook.exists():
-            console.print(_labelled("Notebook not found:", "yellow", f" {config.notebook} (marimo will create it)."))
+            console.print(
+                _labelled(
+                    "Notebook not found:",
+                    "yellow",
+                    f" {config.notebook}. Marimo runs on the notebooks folder; create the notebook in the chat "
+                    "with /notebook new <name> or fix [hailer].notebook in hailer.toml.",
+                )
+            )
         cmd = _launch_command(config, port=port)
         console.print("Launching: " + " ".join(cmd), markup=False)
         raise typer.Exit(code=_run_foreground(cmd, config.workspace))
@@ -1111,6 +1363,7 @@ def notebook(
     _print_checks(console, checks, only_failures=True)
     if any(not c.ok and c.fatal for c in checks):
         raise typer.Exit(code=1)
+    config.notebooks_root.mkdir(parents=True, exist_ok=True)  # marimo edit refuses a missing folder
 
     proc: Any = None
     log_path: Path | None = None

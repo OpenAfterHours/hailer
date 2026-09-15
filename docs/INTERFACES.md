@@ -232,20 +232,36 @@ def looks_like_secret(text: str) -> bool                       # sk-..., "api_ke
 ## `mcp_server.py`  (owner: wave 1 / C)
 
 stdio MCP server (`mcp` package; inspect the installed version's API before writing). Reads
-`HAILER_CONFIG`/`HAILER_WORKSPACE` from env and calls `load_config`. Tools (all return plain text, truncated to
-`config.max_tool_output_chars` with head/tail and a `[... truncated N chars ...]` marker):
+`HAILER_CONFIG`/`HAILER_WORKSPACE` from env and calls `load_config`. The process outlives many turns, so the
+**active notebook is re-read from `.hailer/notebook.json` on every call** (`HailerTools._active_config()` returns
+the config with `notebook` replaced by `notebooks.load_active_notebook`); nothing about it is cached. Every kernel
+tool acts on the active notebook. Tools (all return plain text, truncated to `config.max_tool_output_chars` with
+head/tail and a `[... truncated N chars ...]` marker):
 
 | tool | args | behaviour |
 |---|---|---|
-| `marimo_execute` | `code: str` | run in the scratchpad against the configured notebook's session; returns stdout/output/stderr (rich mimetypes such as text/html or application/json are replaced by a short placeholder, so HTML never reaches the model); errors from `MarimoUnavailableError`/`NoSessionError` become the hint text, not exceptions |
-| `marimo_status` | – | server url, version, sessions, whether the configured notebook has a session, URL to open if not |
-| `notebook_cells` | `pattern: str = ""` | runs a `cm` snippet listing cells (id, name, first line, status, errors); optional substring filter |
+| `marimo_execute` | `code: str` | run in the scratchpad against the active notebook's session; returns stdout/output/stderr (rich mimetypes such as text/html or application/json are replaced by a short placeholder, so HTML never reaches the model); errors from `MarimoUnavailableError`/`NoSessionError` become the hint text, not exceptions |
+| `marimo_status` | – | server url, version; `active notebook: <workspace-relative> -> session <id> (ready)` or `... has NO session. Ask the user to open <url>`; every session with its notebook and a marker: `(active notebook)`, `(another notebook in the notebooks folder; notebook_open switches to it)`, `(outside the notebooks folder)`, `(unsaved)`; when marimo is down the text still names the active notebook |
+| `notebook_cells` | `pattern: str = ""` | runs a `cm` snippet listing the active notebook's cells (id, name, first line, status, errors); optional substring filter |
+| `notebook_list` | – | `notebooks.list_notebooks`: one line per notebook `  - <name>  modified YYYY-MM-DD HH:MM  <size>  [active] [open]` (`[open]` = has a session; when marimo is unreachable the files are still listed and a trailing line says sessions are unknown); empty folder → `No notebooks in <folder> yet. Create one with notebook_create(name).` |
+| `notebook_create` | `name: str, template: str = "starter"` | `notebooks.create_notebook` (+ `save_active_notebook`), then bring-up (below); text: `Created <name> from the <kind> template; it is now the active notebook.` + session line + a reminder of what the template defines; unknown template → `ERROR: unknown template ...`; existing name / unusable name → the `NotebookExistsError` / `NotebookPathError` text |
+| `notebook_open` | `notebook: str` | `notebooks.resolve_notebook` (+ `save_active_notebook`), bring-up, then when a session exists the cell listing (`Cells (id, name, status, errors, first line):`); text starts `<name> is now the active notebook.`; unknown / outside-folder references → the `NotebookNotFoundError` / `NotebookPathError` text and the active notebook is unchanged |
+| `notebook_close` | `notebook: str = ""` | resolve (empty = active), `client.resolve_session`, `client.shutdown_session(id)`; says the kernel is freed and, for the active notebook, that it stays active but must be reopened; no session → `<name> is not open (no kernel session), so there is nothing to close.` |
 | `list_periods` | `name: str = ""` | `describe_periods(scan_period_files(config.data_dir, name or None))` |
 | `load_skill` | `name: str` | `read_skill` |
 | `read_skill_file` | `name: str, path: str` | `read_skill_file` |
 | `fetch_page` | `url: str` | `web.fetch_page`; denial text lists allowed domains |
 
-`def main() -> None` runs the server; `def build_server(config: HailerConfig)` returns it (for tests).
+Bring-up (`HailerTools._bring_up(notebook)`): if the notebook already has a session it is reused and the browser is
+not opened; otherwise `open_notebook_url(server, notebook)` is opened through `HailerTools.open_url` (default:
+`webbrowser` on Windows, an explicitly stdout-silenced launcher elsewhere, because stdout is the MCP transport) and
+`wait_for_session` polls for up to `HailerTools.session_wait_sec` (default 30 s). Outcomes are reported as text
+(`kernel session ready (<id>)`, `no kernel session appeared within N s` + URL, `Could not open a browser` + URL,
+`marimo is not running` + launch hint); the browser never raises. Both hooks are constructor keywords of
+`HailerTools` and `build_server` so tests never launch a browser.
+
+`def main() -> None` runs the server; `def build_server(config, *, client_factory=None, open_url=None,
+session_wait_sec=30.0)` returns it (for tests; `server.hailer_tools` is the `HailerTools` instance).
 
 ## `secrets.py`  (owner: wave 2 / D)
 
