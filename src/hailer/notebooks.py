@@ -382,6 +382,13 @@ def resolve_notebook(config: HailerConfig, ref: str) -> Path:
     root = Path(config.notebooks_root).resolve()
     root_shown = notebook_display_name(config, root)
     given = Path(text).expanduser()
+    if not given.is_absolute() and ".." in given.parts:
+        # An explicit escape ("../x.py") is refused even when a notebook of that name exists inside
+        # the folder; silently mapping it to the inside twin would hide the user's intent.
+        raise NotebookPathError(
+            f"{text} points outside the notebooks folder.",
+            hint=f"Hailer only opens notebooks under {root_shown}; give the name or the path inside it.",
+        )
     with_py = text if text.lower().endswith(".py") else f"{text}.py"
     try:
         slug: str | None = slugify(text)

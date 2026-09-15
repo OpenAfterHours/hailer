@@ -695,6 +695,8 @@ def test_notebook_close_and_list_with_marimo_configured_but_down(ws):
     entries = [ln for ln in text.splitlines() if ln.startswith("  - ")]
     assert any("notebooks/analysis.py" in ln for ln in entries) and any("notebooks/other.py" in ln for ln in entries)
     assert "marimo is not reachable" in text and not any("[open]" in ln for ln in entries)
+    # The list also carries the error and the launch hint, like the other tools when marimo is down.
+    assert "connection refused" in text and "uv run hailer notebook" in text
 
 
 def test_session_wait_that_loses_marimo_is_reported_not_raised(ws):

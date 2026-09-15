@@ -271,6 +271,16 @@ def test_resolve_notebook_prefers_the_folder_over_the_workspace(tmp_path):
     assert nbs.resolve_notebook(cfg, "notebooks/main.py") == inside
 
 
+def test_resolve_notebook_refuses_an_explicit_escape_even_with_an_inside_twin(tmp_path):
+    cfg = make_config(tmp_path)
+    _write(cfg.notebooks_root / "main.py")
+    _write(cfg.workspace / "main.py")
+    with pytest.raises(NotebookPathError) as info:
+        nbs.resolve_notebook(cfg, "../main.py")
+    assert "points outside the notebooks folder" in str(info.value)
+    assert nbs.resolve_notebook(cfg, "main.py").resolve() == (cfg.notebooks_root / "main.py").resolve()
+
+
 def test_resolve_notebook_folder_relative_without_extension(tmp_path):
     cfg = make_config(tmp_path)
     report = _write(cfg.notebooks_root / "sub" / "report.py").resolve()

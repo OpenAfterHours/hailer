@@ -254,17 +254,21 @@ class HailerTools:
 
     def _open_paths(self) -> set[str] | None:
         """Normalised paths of the notebooks that have a session; ``None`` when marimo is unreachable."""
+        return self._open_paths_or_error()[0]
+
+    def _open_paths_or_error(self) -> tuple[set[str] | None, HailerError | None]:
+        """Like ``_open_paths`` but also returns the error that made marimo unreachable."""
         try:
             client, _ = self._client_factory()
             sessions = client.sessions()
-        except HailerError:
-            return None
+        except HailerError as err:
+            return None, err
         out: set[str] = set()
         for session in sessions:
             raw = session.path or session.filename
             if raw:
                 out.add(os.path.normcase(str(_absolute(self.config, raw))))
-        return out
+        return out, None
 
     def _bring_up(self, notebook: Path) -> _SessionOutcome:
         """Make sure ``notebook`` has a kernel session: reuse one, else open the browser and wait."""
@@ -406,7 +410,7 @@ class HailerTools:
             infos = notebooks.list_notebooks(config)
             if not infos:
                 return f"No notebooks in {folder} yet. Create one with notebook_create(name)."
-            open_paths = self._open_paths()
+            open_paths, marimo_error = self._open_paths_or_error()
             lines = [f"Notebooks in {folder} ([active] = the one tools act on, [open] = has a kernel session):"]
             for info in infos:
                 markers: list[str] = []
@@ -420,6 +424,10 @@ class HailerTools:
                 lines.append(line)
             if open_paths is None:
                 lines.append("(marimo is not reachable, so which notebooks are open is unknown.)")
+                if marimo_error is not None:
+                    lines.append(str(marimo_error))
+                    if marimo_error.hint:
+                        lines.append(marimo_error.hint)
             return "\n".join(lines)
 
         return self._run(go)
