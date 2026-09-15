@@ -1,5 +1,21 @@
 # Hailer — implementation plan
 
+## Status (2026-09-15): built and verified
+
+All milestones M0–M7 are implemented in this repository (`https://github.com/OpenAfterHours/hailer`) and the
+offline test suite passes (`uv run pytest`, 283 tests, no API key, no marimo, no network). Verified live on
+Windows 11 against a running `marimo edit notebooks/analysis.py --no-token` server with the notebook open in a
+browser and Codex using the existing ChatGPT login:
+
+- Definition-of-done sequence: "create a dataframe with monthly RWA values and show it in the notebook" →
+  "turn that into a chart" → "summarise the biggest movement". Cells were created, then edited in place for
+  the chart, and the summary quoted the real figures from the sample data.
+- Realistic sequence: inspect parquet files → identify periods → compare latest two → biggest month-on-month
+  movements → break down by exposure class → plot. Eight cells were added, all ran without errors, and the
+  agent applied the example project skill's reconciliation checks on its own.
+- Custom endpoints, keyring storage, the domain allowlist and the Windows sandbox behaviour were verified
+  as described in §1a–1c below; the one correction found during the build is recorded in §2 (approval mode).
+
 Investigated 2026-09-15 against the real installed APIs: `openai-codex` 0.154.0, `marimo` 0.24.2,
 `polars` 1.44.2, `duckdb` 1.5.5, `typer` 0.27.2, `rich` 15.0.0, `pytest` 9.1.1, `uv` 0.12.1, Python 3.12/3.13 on Windows 11.
 
