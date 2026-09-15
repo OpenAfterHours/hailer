@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from .errors import HailerError, MarimoUnavailableError, NoSessionError
-from .models import HailerConfig, MarimoServer
+from .models import ExecResult, HailerConfig, MarimoServer
 from .web import truncate_text
 
 log = logging.getLogger("hailer.mcp")
@@ -41,6 +41,30 @@ for _c in _ctx.cells:
 '''.strip()
 
 ClientFactory = Callable[[], tuple[Any, MarimoServer]]
+
+# Mimetypes whose rendered value is useful to a language model as-is.
+_TEXT_MIMETYPES = frozenset({"", "text/plain", "text/markdown", "text/csv"})
+
+
+def _result_text(result: Any) -> str:
+    """Model-friendly text for an ExecResult.
+
+    Rich rendered values (``text/html`` tables, ``application/json`` widgets ...) are replaced
+    by a short placeholder: they can be tens of kilobytes and carry nothing the model can
+    read. stdout/stderr are kept intact, so ``print()`` remains the way to inspect values.
+    """
+    mimetype = (getattr(result, "mimetype", "") or "").split(";")[0].strip().lower()
+    output = getattr(result, "output", "") or ""
+    if output.strip() and mimetype not in _TEXT_MIMETYPES:
+        placeholder = f"[{mimetype} output omitted - print() the values you need]"
+        return ExecResult(
+            success=result.success,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            output=placeholder,
+            mimetype="text/plain",
+        ).as_text()
+    return result.as_text()
 
 
 def _error_text(err: HailerError) -> str:
@@ -80,7 +104,13 @@ class HailerTools:
                 "marimo is not running (no server configured or discovered)",
                 f"Start it with:\n    {cmd}\nThen open the notebook in your browser.",
             )
-        return mc.MarimoClient(server.url, token=self.config.marimo_token), server
+        client = mc.MarimoClient(
+            server.url,
+            token=self.config.marimo_token,
+            notebook=self.config.notebook,
+            workspace=self.config.workspace,
+        )
+        return client, server
 
     def _truncate(self, text: str) -> str:
         return truncate_text(text, self.config.max_tool_output_chars)
@@ -108,7 +138,7 @@ class HailerTools:
         def go() -> str:
             client, _ = self._client_factory()
             result = client.execute(code, notebook=self.config.notebook)
-            text = result.as_text()
+            text = _result_text(result)
             return text if result.success else f"Execution failed.\n{text}"
 
         return self._run(go)
@@ -147,7 +177,7 @@ class HailerTools:
                 code = _FALLBACK_LIST_CELLS_CODE
             client, _ = self._client_factory()
             result = client.execute(code, notebook=self.config.notebook)
-            text = result.as_text()
+            text = _result_text(result)
             if not result.success:
                 return f"Could not list cells.\n{text}"
             if pattern.strip():

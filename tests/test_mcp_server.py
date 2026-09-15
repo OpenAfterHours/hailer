@@ -245,3 +245,43 @@ def test_stdio_server_roundtrip(tmp_path):
             assert "No period files found" in r.content[0].text
 
     asyncio.run(go())
+
+
+# --------------------------------------------------------------------------- #
+# Fix-wave additions: rich outputs, configured notebook/workspace on the client
+# --------------------------------------------------------------------------- #
+
+
+def test_rich_output_is_replaced_by_placeholder(tmp_path):
+    html = "<table><tr><td>1</td></tr></table>" * 50
+    client = FakeClient(result=ExecResult(success=True, stdout="shape: (5, 3)\n", output=html, mimetype="text/html"))
+    tools = HailerTools(make_config(tmp_path), factory_for(client))
+    text = tools.marimo_execute("df.head()")
+    assert "shape: (5, 3)" in text
+    assert "<table>" not in text
+    assert "text/html output omitted" in text and "print()" in text
+    # stderr survives alongside the placeholder
+    client = FakeClient(result=ExecResult(success=True, stderr="warn\n", output="{}", mimetype="application/json"))
+    text = HailerTools(make_config(tmp_path), factory_for(client)).marimo_execute("x")
+    assert "application/json output omitted" in text and "[stderr]" in text
+    # plain text output still passes through unchanged
+    client = FakeClient(result=ExecResult(success=True, output="42", mimetype="text/plain"))
+    assert HailerTools(make_config(tmp_path), factory_for(client)).marimo_execute("42") == "42"
+
+
+def test_default_client_uses_configured_notebook_and_workspace(tmp_path, monkeypatch):
+    from hailer import marimo_client as mc
+
+    captured: dict = {}
+
+    class CapturingClient:
+        def __init__(self, base_url, token=None, **kw):
+            captured.update(base_url=base_url, token=token, **kw)
+
+    monkeypatch.setattr(mc, "find_server", lambda config: MarimoServer(url="http://127.0.0.1:2718", source="config"))
+    monkeypatch.setattr(mc, "MarimoClient", CapturingClient)
+    cfg = make_config(tmp_path, marimo_token="tok")
+    client, server = HailerTools(cfg)._default_client()
+    assert isinstance(client, CapturingClient) and server.url == "http://127.0.0.1:2718"
+    assert captured["notebook"] == cfg.notebook and captured["workspace"] == cfg.workspace
+    assert captured["token"] == "tok"

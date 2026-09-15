@@ -17,6 +17,7 @@ import logging
 import os
 from collections.abc import Mapping
 
+from hailer.errors import CredentialsError
 from hailer.models import ProviderConfig
 
 try:  # log.py is written by another owner; fall back to plain logging if absent.
@@ -65,25 +66,39 @@ def resolve_provider_key(
     return None, "missing"
 
 
+def _env_fallback_hint(provider: ProviderConfig) -> str:
+    return f"Set the {provider.env_key} environment variable in your terminal instead."
+
+
 def store_provider_key(provider: ProviderConfig, value: str) -> None:
-    """Save a key in the OS credential store. Raises ``RuntimeError`` with a hint on failure."""
+    """Save a key in the OS credential store.
+
+    Raises ``CredentialsError`` (with the environment-variable fallback as the hint) when the
+    provider has no ``env_key``, the value is empty, or the keyring backend is unusable.
+    """
     if not provider.env_key:
-        raise RuntimeError(f"Provider '{provider.id}' has no env_key; nothing to store.")
+        raise CredentialsError(
+            f"Provider '{provider.id}' has no env_key; nothing to store.",
+            hint=f"Add env_key = \"<VAR_NAME>\" to [model_providers.{provider.id}] in hailer.toml.",
+        )
     if not value or not value.strip():
-        raise RuntimeError("Refusing to store an empty key.")
+        raise CredentialsError("Refusing to store an empty key.", hint="Run the login command again and paste the key.")
     try:
         import keyring
 
         keyring.set_password(KEYRING_SERVICE, keyring_username(provider.id, provider.env_key), value.strip())
     except Exception as exc:
-        raise RuntimeError(
-            f"Could not store the key in the OS credential store ({type(exc).__name__}). "
-            f"Set the {provider.env_key} environment variable instead."
+        raise CredentialsError(
+            f"Could not store the key in the OS credential store ({type(exc).__name__}).",
+            hint=_env_fallback_hint(provider),
         ) from exc
 
 
 def delete_provider_key(provider: ProviderConfig) -> bool:
-    """Remove a stored key. Returns ``True`` if something was deleted."""
+    """Remove a stored key. Returns ``True`` if something was deleted, ``False`` if nothing was stored.
+
+    Raises ``CredentialsError`` when the keyring backend is unusable.
+    """
     if not provider.env_key:
         return False
     username = keyring_username(provider.id, provider.env_key)
@@ -96,4 +111,7 @@ def delete_provider_key(provider: ProviderConfig) -> bool:
         return True
     except Exception as exc:
         log.debug("keyring delete failed for %s: %s", username, type(exc).__name__)
-        return False
+        raise CredentialsError(
+            f"Could not access the OS credential store ({type(exc).__name__}).",
+            hint=_env_fallback_hint(provider),
+        ) from exc

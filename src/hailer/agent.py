@@ -12,7 +12,9 @@ from __future__ import annotations
 import importlib.resources
 import logging
 import os
+import queue
 import sys
+import threading
 import time
 import tomllib
 from collections.abc import Callable, Mapping
@@ -200,6 +202,7 @@ def build_config_overrides(config: HailerConfig, user_codex_config: dict) -> tup
     if config.config_path is not None:
         mcp_env["HAILER_CONFIG"] = str(config.config_path)
     mcp_env["HAILER_WORKSPACE"] = str(config.workspace)
+    mcp_env["HAILER_LOG_LEVEL"] = config.log_level  # not secret; secrets never go in -c overrides
     out.extend(
         [
             _override(f"mcp_servers.{MCP_SERVER_NAME}.command", sys.executable),
@@ -207,6 +210,7 @@ def build_config_overrides(config: HailerConfig, user_codex_config: dict) -> tup
             _override(f"mcp_servers.{MCP_SERVER_NAME}.env", mcp_env),
             _override(f"mcp_servers.{MCP_SERVER_NAME}.tool_timeout_sec", MCP_TOOL_TIMEOUT_SEC),
             _override(f"mcp_servers.{MCP_SERVER_NAME}.startup_timeout_sec", MCP_STARTUP_TIMEOUT_SEC),
+            _override(f"mcp_servers.{MCP_SERVER_NAME}.default_tools_approval_mode", "auto"),
         ]
     )
 
@@ -247,6 +251,11 @@ def build_child_env(
     if config.config_path is not None:
         env["HAILER_CONFIG"] = str(config.config_path)
     env["HAILER_WORKSPACE"] = str(config.workspace)
+    # HAILER_MARIMO_TOKEN is a secret: it goes into the process environment only, never into
+    # the -c mcp_servers.hailer.env map (a command-line argument). MCP servers spawned by
+    # Codex inherit the app-server's environment, so the Hailer MCP server sees it too.
+    if config.marimo_token:
+        env["HAILER_MARIMO_TOKEN"] = config.marimo_token
     if config.codex_home is not None:
         env["CODEX_HOME"] = str(config.codex_home)
     return env
@@ -322,12 +331,41 @@ def _login_hint(provider: ProviderConfig) -> str:
     return f"Check the credentials for provider '{provider.id}'."
 
 
-def map_exception(exc: BaseException, config: HailerConfig) -> Exception:
-    """Translate SDK/runtime failures into actionable Hailer errors."""
+_MODEL_NOT_FOUND_SIGNALS = (
+    "not found",
+    "does not exist",
+    "not exist",
+    "unknown model",
+    "invalid model",
+    "unsupported model",
+    "no such model",
+)
+_CONNECTION_SIGNALS = (
+    "connection refused",
+    "failed to connect",
+    "error sending request",
+    "dns error",
+    "name resolution",
+    "connect error",
+    "connection reset",
+    "no such host",
+    "timed out",
+)
+# Signals that the endpoint rejected the *shape* of the request (not the model, not auth).
+_RESPONSES_API_SIGNALS = ("404", "unsupported", "unknown endpoint", "responses", "unknown parameter", "schema")
+
+
+def map_exception(exc: BaseException, config: HailerConfig, *, model: str | None = None) -> Exception:
+    """Translate SDK/runtime failures into actionable Hailer errors.
+
+    ``model`` is the model name in use (defaults to the configured one) so an unknown-model
+    error names the right thing.
+    """
     text = str(exc)
     low = text.lower()
     provider = _active_provider(config)
     base_url = provider.base_url or "https://api.openai.com/v1"
+    model_name = model or config.model.name
 
     from openai_codex.errors import TransportClosedError  # local import: keep module import cheap
 
@@ -343,24 +381,30 @@ def map_exception(exc: BaseException, config: HailerConfig) -> Exception:
             )
         return AgentError("The Codex runtime stopped unexpectedly.", hint=text[:600])
 
+    # An unknown model must not be mistaken for an incompatible endpoint.
+    if "model" in low and any(s in low for s in _MODEL_NOT_FOUND_SIGNALS):
+        return ProviderError(
+            f"Unknown model '{model_name}' for provider '{provider.id}'.",
+            hint=(
+                "Check [model].name in hailer.toml (or the name given to /model). "
+                "Run `hailer status` to see the active provider and endpoint."
+            ),
+        )
     if "401" in low or "unauthorized" in low or "invalid api key" in low or "incorrect api key" in low:
         return CredentialsError(
             f"The model endpoint rejected the API key for provider '{provider.id}'.",
             hint=_login_hint(provider),
         )
-    if any(
-        s in low
-        for s in (
-            "connection refused",
-            "failed to connect",
-            "error sending request",
-            "dns error",
-            "name resolution",
-            "connect error",
-            "timed out",
-            "no such host",
+    # Tool timeouts come from Hailer's MCP server (notebook computation), not the endpoint.
+    if "timed out" in low and ("tool" in low or "mcp" in low):
+        return AgentError(
+            "A tool call timed out before the notebook finished.",
+            hint=(
+                "Reduce the data touched per call (filter, aggregate, sample) or run the heavy "
+                "step as a notebook cell and inspect its result in a later call."
+            ),
         )
-    ):
+    if any(s in low for s in _CONNECTION_SIGNALS):
         return ProviderError(
             f"Could not reach the model endpoint at {base_url}.",
             hint=(
@@ -368,11 +412,11 @@ def map_exception(exc: BaseException, config: HailerConfig) -> Exception:
                 "endpoint is running. Run `hailer doctor` to test reachability."
             ),
         )
-    if any(s in low for s in ("404", "not found", "responses", "schema", "unknown parameter", "invalid_request")):
+    if any(s in low for s in _RESPONSES_API_SIGNALS):
         return ProviderError(
             f"The endpoint at {base_url} did not accept the request.",
             hint=(
-                "Codex requires the OpenAI Responses API (POST {base_url}/responses, streaming). "
+                f"Codex requires the OpenAI Responses API (POST {base_url}/responses, streaming). "
                 "If the gateway only offers Chat Completions, run a translating proxy locally "
                 "and point base_url at it."
             ),
@@ -422,6 +466,40 @@ def _final_response(items: list[Any]) -> str | None:
     return unknown_phase
 
 
+_STREAM_END = object()
+
+
+class _StreamError:
+    """Carries an exception raised by ``handle.stream()`` from the pump thread."""
+
+    __slots__ = ("exc",)
+
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
+
+
+def _pump_events(handle: Any, out: "queue.Queue[Any]") -> None:
+    """Consume a turn's notification stream on a worker thread.
+
+    The SDK's stream blocks in an untimed ``Condition.wait()``, which Windows cannot
+    interrupt with Ctrl+C; the main thread instead waits on the queue with a timeout.
+    """
+    try:
+        for event in handle.stream():
+            out.put(event)
+    except BaseException as exc:  # noqa: BLE001 - forwarded to the main thread
+        out.put(_StreamError(exc))
+    finally:
+        out.put(_STREAM_END)
+
+
+def _safe_interrupt(handle: Any) -> None:
+    try:
+        handle.interrupt()
+    except Exception as exc:  # already finished, transport gone ...
+        log.debug("interrupt failed: %s", type(exc).__name__)
+
+
 def _default_codex_factory(cfg: Any) -> Any:
     from openai_codex import Codex
 
@@ -451,6 +529,7 @@ class HailerAgent:
         self._codex: Any = None
         self._thread: Any = None
         self._handle: Any = None
+        self._interrupt_requested = False
         self.thread_id: str | None = None
         self._model = config.model.name
         self._provider_id = config.model.provider
@@ -504,7 +583,12 @@ class HailerAgent:
 
         return {
             "sandbox": Sandbox.workspace_write,
-            "approval_mode": ApprovalMode.deny_all,
+            # auto_review, not deny_all: with approval_policy "never" Codex rejects every MCP
+            # tool call ("MCP tool call requires approval, but approval policy is never")
+            # regardless of per-server/per-tool approval settings (verified live). With
+            # auto_review, Hailer's tools (default_tools_approval_mode="auto") run without
+            # prompting and the SDK auto-accepts command/file-change approvals.
+            "approval_mode": ApprovalMode.auto_review,
             "base_instructions": system_prompt(self.config, self.bundle),
             "cwd": str(self.config.workspace),
             "model": self._model,
@@ -525,7 +609,7 @@ class HailerAgent:
         try:
             self._codex = self._codex_factory(cfg)
         except Exception as exc:
-            raise map_exception(exc, self.config) from exc
+            raise map_exception(exc, self.config, model=self._model) from exc
 
     def start(self, *, resume_thread_id: str | None = None) -> str:
         """Start the runtime and a thread; returns the thread id."""
@@ -549,17 +633,18 @@ class HailerAgent:
         try:
             self._thread = self._codex.thread_start(**self._thread_kwargs())
         except Exception as exc:
-            raise map_exception(exc, self.config) from exc
+            raise map_exception(exc, self.config, model=self._model) from exc
         self.thread_id = self._thread.id
         self._thread_provider_id = self._provider_id
         log.debug("started thread %s", self.thread_id)
         return self.thread_id
 
-    def set_model(self, name: str, provider: str | None = None) -> None:
+    def set_model(self, name: str, provider: str | None = None) -> bool:
         """Change the model (and optionally provider) for subsequent turns.
 
         A provider change needs a new thread; one is started automatically when the
-        runtime is already running.
+        runtime is already running. Returns ``True`` when that happened, so the caller
+        must not start another thread itself.
         """
         if provider is not None and provider != "openai" and provider not in self.config.providers:
             raise ConfigError(
@@ -571,15 +656,20 @@ class HailerAgent:
             self._provider_id = provider
             if self._codex is not None:
                 self.new_thread()
+                return True
+        return False
 
     def interrupt(self) -> None:
+        """Stop the active turn, if any. Idempotent; a no-op when no turn is running.
+
+        After an interrupt the turn's remaining notifications are still collected (so the
+        turn ends cleanly) but no longer surfaced through ``on_event``.
+        """
+        self._interrupt_requested = True
         handle = self._handle
         if handle is None:
             return
-        try:
-            handle.interrupt()
-        except Exception as exc:  # already finished, transport gone ...
-            log.debug("interrupt failed: %s", type(exc).__name__)
+        _safe_interrupt(handle)
 
     def close(self) -> None:
         codex, self._codex = self._codex, None
@@ -615,8 +705,9 @@ class HailerAgent:
         try:
             handle = self._thread.turn(turn_input, model=self._model)
         except Exception as exc:
-            raise map_exception(exc, self.config) from exc
+            raise map_exception(exc, self.config, model=self._model) from exc
         self._handle = handle
+        self._interrupt_requested = False
 
         items: list[Any] = []
         commands: list[str] = []
@@ -625,40 +716,86 @@ class HailerAgent:
         completed_turn: Any = None
         partial: list[str] = []
 
-        try:
-            for event in handle.stream():
-                method = getattr(event, "method", "")
-                payload = getattr(event, "payload", None)
-                if method == "item/agentMessage/delta":
-                    delta = getattr(payload, "delta", "") or ""
-                    partial.append(delta)
+        def handle_event(event: Any) -> None:
+            nonlocal usage, completed_turn
+            method = getattr(event, "method", "")
+            payload = getattr(event, "payload", None)
+            quiet = self._interrupt_requested  # after an interrupt: collect, do not display
+            if method == "item/agentMessage/delta":
+                delta = getattr(payload, "delta", "") or ""
+                partial.append(delta)
+                if not quiet:
                     emit(AgentEvent("message_delta", delta))
-                elif method == "item/started":
-                    item = _unwrap(getattr(payload, "item", None))
-                    kind = _item_type(item)
-                    if kind in ("commandExecution", "CommandExecutionThreadItem"):
-                        command = getattr(item, "command", "") or ""
-                        commands.append(command)
+            elif method == "item/started":
+                item = _unwrap(getattr(payload, "item", None))
+                kind = _item_type(item)
+                if kind in ("commandExecution", "CommandExecutionThreadItem"):
+                    command = getattr(item, "command", "") or ""
+                    commands.append(command)
+                    if not quiet:
                         emit(AgentEvent("command", command, {"cwd": getattr(item, "cwd", None)}))
-                    elif kind in ("mcpToolCall", "McpToolCallThreadItem"):
-                        name = f"{getattr(item, 'server', '')}.{getattr(item, 'tool', '')}".strip(".")
-                        tool_calls.append(name)
+                elif kind in ("mcpToolCall", "McpToolCallThreadItem"):
+                    name = f"{getattr(item, 'server', '')}.{getattr(item, 'tool', '')}".strip(".")
+                    tool_calls.append(name)
+                    if not quiet:
                         preview = _preview(getattr(item, "arguments", None))
                         emit(AgentEvent("tool_call", name, {"arguments": preview}))
-                elif method == "item/commandExecution/outputDelta":
+            elif method == "item/commandExecution/outputDelta":
+                if not quiet:
                     emit(AgentEvent("command_output", getattr(payload, "delta", "") or ""))
-                elif method in ("item/reasoning/textDelta", "item/reasoning/summaryTextDelta"):
+            elif method in ("item/reasoning/textDelta", "item/reasoning/summaryTextDelta"):
+                if not quiet:
                     emit(AgentEvent("reasoning", getattr(payload, "delta", "") or ""))
-                elif method == "item/completed":
-                    items.append(getattr(payload, "item", None))
-                elif method == "thread/tokenUsage/updated":
-                    usage = getattr(payload, "token_usage", None)
-                elif method == "error":
+            elif method == "item/completed":
+                items.append(getattr(payload, "item", None))
+            elif method == "thread/tokenUsage/updated":
+                usage = getattr(payload, "token_usage", None)
+            elif method == "error":
+                if not quiet:
                     emit(AgentEvent("status", _preview(getattr(payload, "message", payload), 200)))
-                elif method == "turn/completed":
-                    completed_turn = getattr(payload, "turn", None)
+            elif method == "turn/completed":
+                completed_turn = getattr(payload, "turn", None)
+
+        events: queue.Queue[Any] = queue.Queue()
+        pump = threading.Thread(
+            target=_pump_events, args=(handle, events), name="hailer-turn-stream", daemon=True
+        )
+        pump.start()
+
+        try:
+            try:
+                while True:
+                    try:
+                        msg = events.get(timeout=0.2)  # timed wait: interruptible on Windows
+                    except queue.Empty:
+                        if not pump.is_alive() and events.empty():
+                            break
+                        continue
+                    if msg is _STREAM_END:
+                        break
+                    if isinstance(msg, _StreamError):
+                        raise msg.exc
+                    handle_event(msg)
+            except KeyboardInterrupt:
+                # Ctrl+C: stop the turn on the LOCAL handle (the finally below clears
+                # self._handle), let the runtime acknowledge so the next message does not
+                # join this turn, then hand the interrupt back to the CLI.
+                self._interrupt_requested = True
+                _safe_interrupt(handle)
+                deadline = time.monotonic() + 10.0
+                while completed_turn is None and time.monotonic() < deadline:
+                    try:
+                        msg = events.get(timeout=0.2)
+                    except queue.Empty:
+                        if not pump.is_alive():
+                            break
+                        continue
+                    if msg is _STREAM_END or isinstance(msg, _StreamError):
+                        break
+                    handle_event(msg)
+                raise
         except Exception as exc:
-            raise map_exception(exc, self.config) from exc
+            raise map_exception(exc, self.config, model=self._model) from exc
         finally:
             self._handle = None
 
@@ -669,7 +806,7 @@ class HailerAgent:
         error = getattr(completed_turn, "error", None)
         if status == "failed":
             message = getattr(error, "message", None) or str(error) or "unknown error"
-            raise map_exception(RuntimeError(message), self.config)
+            raise map_exception(RuntimeError(message), self.config, model=self._model)
 
         final = _final_response(items)
         if final is None:

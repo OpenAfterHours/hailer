@@ -227,9 +227,12 @@ def test_overrides_for_custom_provider(tmp_path):
     assert 'mcp_servers.hailer.args=["-m", "hailer.mcp_server"]' in ov
     env_override = next(o for o in ov if o.startswith("mcp_servers.hailer.env="))
     assert "HAILER_WORKSPACE = " in env_override and "HAILER_CONFIG = " in env_override
+    assert "HAILER_LOG_LEVEL = " in env_override
+    assert "HAILER_MARIMO_TOKEN" not in env_override  # secrets never go on the command line
     assert toml_value(str(cfg.workspace)) in env_override
     assert "mcp_servers.hailer.tool_timeout_sec=600" in ov
     assert "mcp_servers.hailer.startup_timeout_sec=60" in ov
+    assert 'mcp_servers.hailer.default_tools_approval_mode="auto"' in ov
     # no network overrides by default, no sandbox/approval overrides ever
     assert not any(o.startswith(("network.", "features.network_proxy", "sandbox_")) for o in ov)
     assert not any(o.startswith(("sandbox_mode", "approval_policy")) for o in ov)
@@ -367,7 +370,8 @@ def test_start_uses_thread_start_with_expected_kwargs(tmp_path):
     kwargs = codex.start_calls[0]
     assert kwargs["model"] == "internal-analyst" and kwargs["model_provider"] == "internal"
     assert kwargs["sandbox"].value == "workspace-write"
-    assert kwargs["approval_mode"].value == "deny_all"
+    # auto_review: under deny_all Codex rejects every MCP tool call (verified live)
+    assert kwargs["approval_mode"].value == "auto_review"
     assert kwargs["cwd"] == str(ag.config.workspace)
     assert "Hailer" in kwargs["base_instructions"]
     assert ag.key_source == "env"
@@ -477,11 +481,11 @@ def test_new_thread_and_set_model(tmp_path):
     ag, created = make_agent(tmp_path)
     ag.start()
     assert ag.new_thread() == "thread-2"
-    ag.set_model("internal-fast")
+    assert ag.set_model("internal-fast") is False  # same provider: no new thread
     ag.run_turn("x")
     assert ag._thread.turn_calls[0][1]["model"] == "internal-fast"
     # provider switch starts a fresh thread automatically
-    ag.set_model("gpt-5.5", provider="openai")
+    assert ag.set_model("gpt-5.5", provider="openai") is True  # it started the thread itself
     assert ag.thread_id == "thread-3"
     assert created[0].start_calls[-1]["model_provider"] == "openai"
     with pytest.raises(ConfigError):
@@ -529,6 +533,8 @@ def test_map_connection_refused_is_provider_error(tmp_path):
 def test_map_404_mentions_responses_api(tmp_path):
     mapped = map_exception(RuntimeError("404 Not Found"), make_config(tmp_path))
     assert isinstance(mapped, ProviderError) and "Responses API" in mapped.hint
+    assert "https://llm.example.internal/v1/responses" in mapped.hint
+    assert "{base_url}" not in mapped.hint
 
 
 def test_failed_turn_is_mapped(tmp_path):
@@ -556,3 +562,89 @@ def test_factory_failure_is_mapped(tmp_path):
     ag = HailerAgent(cfg, ContextBundle(), codex_factory=factory, user_codex_config={}, env={"INTERNAL_MODEL_API_KEY": "k"})
     with pytest.raises(ConfigError):
         ag.start()
+
+
+# --------------------------------------------------------------------------- #
+# Fix-wave additions: secrets in env only, Ctrl+C, set_model, error classification
+# --------------------------------------------------------------------------- #
+
+
+def test_child_env_carries_marimo_token_but_overrides_never_do(tmp_path):
+    cfg = make_config(tmp_path, marimo_token="marimo-secret-token")
+    env = build_child_env(cfg, "sekrit")
+    assert env["HAILER_MARIMO_TOKEN"] == "marimo-secret-token"
+    ov = build_config_overrides(cfg, USER_CODEX_CONFIG)
+    assert not any("marimo-secret-token" in o or "HAILER_MARIMO_TOKEN" in o for o in ov)
+    assert not any("sekrit" in o for o in ov)
+
+
+def test_keyboard_interrupt_during_turn_interrupts_and_reraises(tmp_path):
+    full = scripted_events()
+    events = full[:3] + [turn_completed(status="interrupted")]
+    ag, _ = make_agent(tmp_path, events=events)
+    ag.start()
+    seen: list[str] = []
+
+    def on_event(ev: AgentEvent) -> None:
+        seen.append(ev.kind)
+        if ev.kind == "command":
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        ag.run_turn("go", on_event=on_event)
+    assert ag._thread.last_handle.interrupted is True  # interrupted on the LOCAL handle
+    assert ag._handle is None
+    assert "command_output" not in seen  # nothing surfaced after the interrupt
+    ag.interrupt()  # idempotent when nothing is running
+
+    # the agent is usable again afterwards
+    ag._thread.events = scripted_events()
+    summary = ag.run_turn("again")
+    assert summary.status == "completed" and summary.final_response == "RWA rose 5.6%."
+
+
+def test_stream_errors_from_the_pump_thread_are_mapped(tmp_path):
+    class BoomHandle:
+        def stream(self):
+            raise RuntimeError("error sending request: connection refused")
+            yield  # pragma: no cover
+
+        def interrupt(self) -> None:
+            pass
+
+    ag, _ = make_agent(tmp_path)
+    ag.start()
+    ag._thread.turn = lambda *a, **k: BoomHandle()  # type: ignore[assignment]
+    with pytest.raises(ProviderError):
+        ag.run_turn("hi")
+    assert ag._handle is None
+
+
+def test_map_unknown_model_is_not_the_proxy_hint(tmp_path):
+    exc = RuntimeError("The model `gpt-9` does not exist or you do not have access to it.")
+    mapped = map_exception(exc, make_config(tmp_path), model="gpt-9")
+    assert isinstance(mapped, ProviderError)
+    assert "Unknown model 'gpt-9'" in str(mapped) and "internal" in str(mapped)
+    assert "Responses API" not in mapped.hint
+
+
+def test_map_generic_not_found_is_agent_error(tmp_path):
+    mapped = map_exception(RuntimeError("thread not found"), make_config(tmp_path))
+    assert isinstance(mapped, AgentError)
+
+
+def test_map_tool_timeout_is_not_an_endpoint_failure(tmp_path):
+    mapped = map_exception(RuntimeError("MCP tool call marimo_execute timed out after 600s"), make_config(tmp_path))
+    assert isinstance(mapped, AgentError) and "tool call timed out" in str(mapped).lower()
+    mapped = map_exception(RuntimeError("request timed out while connecting"), make_config(tmp_path))
+    assert isinstance(mapped, ProviderError) and "Could not reach" in str(mapped)
+
+
+def test_failed_turn_with_unknown_model_uses_live_model_name(tmp_path):
+    events = [turn_completed(status="failed", error_message="model `internal-fast` not found")]
+    ag, _ = make_agent(tmp_path, events=events)
+    ag.start()
+    ag.set_model("internal-fast")
+    with pytest.raises(ProviderError) as err:
+        ag.run_turn("hi")
+    assert "internal-fast" in str(err.value)

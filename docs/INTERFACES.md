@@ -42,7 +42,7 @@ module exposes so work can proceed in parallel. Shared types live in `src/hailer
 - Codex SDK: `Codex(CodexConfig(config_overrides=tuple[str,...], cwd=str, env=dict))` launches the bundled
   app-server; overrides are `codex -c key=value` (value parsed as TOML). `codex.thread_start(model=,
   model_provider=, base_instructions=, developer_instructions=, sandbox=Sandbox.workspace_write,
-  approval_mode=ApprovalMode.deny_all, cwd=, ephemeral=)`, `codex.thread_resume(thread_id, ...)`,
+  approval_mode=ApprovalMode.auto_review, cwd=, ephemeral=)` (auto_review, not deny_all: under deny_all/approval_policy "never" Codex rejects every MCP tool call with "MCP tool call requires approval, but approval policy is never", whatever the per-server/per-tool approval settings say; verified live on 2026-09-15), `codex.thread_resume(thread_id, ...)`,
   `thread.turn(text) -> TurnHandle` with `.stream()` (notifications: `item/agentMessage/delta`,
   `item/started`, `item/completed`, `item/commandExecution/outputDelta`, `item/mcpToolCall/progress`,
   `turn/completed`), `.interrupt()`, `.run() -> TurnResult(final_response, items, usage, status, error)`.
@@ -62,7 +62,7 @@ module exposes so work can proceed in parallel. Shared types live in `src/hailer
   `localhost` in the domain map. Otherwise pass nothing (default sandbox blocks outbound, allows loopback).
 - Hailer's MCP server is registered as `mcp_servers.hailer.command=<sys.executable>`,
   `mcp_servers.hailer.args=["-m","hailer.mcp_server"]`, `mcp_servers.hailer.env={HAILER_CONFIG=...,
-  HAILER_WORKSPACE=...}`, `mcp_servers.hailer.tool_timeout_sec=600`, `mcp_servers.hailer.startup_timeout_sec=60`.
+  HAILER_WORKSPACE=...}`, `mcp_servers.hailer.tool_timeout_sec=600`, `mcp_servers.hailer.startup_timeout_sec=60`, `mcp_servers.hailer.default_tools_approval_mode="auto"` (without it, MCP tools default to "prompt" approval, which the `never` approval policy auto-rejects and the model reports "tools require approval").
 - Windows sandbox facts: shell commands cannot reach the internet by default; loopback works; the sandbox
   could not execute a Python interpreter outside the workspace. All Python execution goes through the MCP
   server → marimo kernel.
@@ -161,7 +161,7 @@ stdio MCP server (`mcp` package; inspect the installed version's API before writ
 
 | tool | args | behaviour |
 |---|---|---|
-| `marimo_execute` | `code: str` | run in the scratchpad against the configured notebook's session; returns stdout/output/stderr; errors from `MarimoUnavailableError`/`NoSessionError` become the hint text, not exceptions |
+| `marimo_execute` | `code: str` | run in the scratchpad against the configured notebook's session; returns stdout/output/stderr (rich mimetypes such as text/html or application/json are replaced by a short placeholder, so HTML never reaches the model); errors from `MarimoUnavailableError`/`NoSessionError` become the hint text, not exceptions |
 | `marimo_status` | – | server url, version, sessions, whether the configured notebook has a session, URL to open if not |
 | `notebook_cells` | `pattern: str = ""` | runs a `cm` snippet listing cells (id, name, first line, status, errors); optional substring filter |
 | `list_periods` | `name: str = ""` | `describe_periods(scan_period_files(config.data_dir, name or None))` |
@@ -177,8 +177,8 @@ stdio MCP server (`mcp` package; inspect the installed version's API before writ
 KEYRING_SERVICE = "hailer"
 def keyring_username(provider_id: str, env_key: str) -> str        # f"{provider_id}:{env_key}"
 def resolve_provider_key(provider: ProviderConfig, env: Mapping[str, str] = os.environ) -> tuple[str | None, str]  # (value, "env"|"keyring"|"missing"); keyring failures → "missing" (log at debug)
-def store_provider_key(provider: ProviderConfig, value: str) -> None
-def delete_provider_key(provider: ProviderConfig) -> bool
+def store_provider_key(provider: ProviderConfig, value: str) -> None   # CredentialsError (hint: set the env var) on empty value, missing env_key, or unusable keyring backend
+def delete_provider_key(provider: ProviderConfig) -> bool          # False when nothing was stored; CredentialsError when the keyring backend is unusable
 ```
 
 ## `agent.py`  (owner: wave 2 / D)
@@ -186,22 +186,22 @@ def delete_provider_key(provider: ProviderConfig) -> bool
 ```python
 def read_user_codex_config(codex_home: Path | None = None) -> dict     # tomllib of ~/.codex/config.toml or {}
 def build_config_overrides(config: HailerConfig, user_codex_config: dict) -> tuple[str, ...]   # pure; provider + trimming + mcp server + network overrides; values TOML-quoted
-def build_child_env(config: HailerConfig, key: str | None) -> dict[str, str]   # env for the codex process: provider env_key → key (if any), HAILER_CONFIG/HAILER_WORKSPACE, CODEX_HOME if config.codex_home
+def build_child_env(config: HailerConfig, key: str | None, extra_keys: Mapping[str, str] | None = None) -> dict[str, str]   # env for the codex process: provider env_key → key (if any), other declared providers' keys, HAILER_CONFIG/HAILER_WORKSPACE, CODEX_HOME if config.codex_home, HAILER_MARIMO_TOKEN if set (process environment only, never in the -c mcp_servers.hailer.env map; Codex-spawned MCP servers inherit it)
 def system_prompt(config: HailerConfig, bundle: ContextBundle) -> str  # prompts/system.md (importlib.resources) + project context + skills index + web allowlist statement
 class HailerAgent:
     def __init__(self, config: HailerConfig, bundle: ContextBundle, *, codex_factory: Callable[..., Any] | None = None) -> None
     def start(self, *, resume_thread_id: str | None = None) -> str     # returns thread id; resume failure → new thread (log)
-    def run_turn(self, text: str, *, on_event: Callable[[AgentEvent], None] | None = None, skill: SkillInfo | None = None) -> TurnSummary
-    def interrupt(self) -> None
+    def run_turn(self, text: str, *, on_event: Callable[[AgentEvent], None] | None = None, skill: SkillInfo | None = None) -> TurnSummary   # stream consumed on a worker thread with a timed queue wait (Ctrl+C works on Windows); on KeyboardInterrupt it interrupts the turn itself, waits up to 10 s for turn/completed, then re-raises KeyboardInterrupt
+    def interrupt(self) -> None      # idempotent; no-op without an active turn; afterwards remaining notifications are collected but not surfaced via on_event
     def new_thread(self) -> str
-    def set_model(self, name: str, provider: str | None = None) -> None   # applies to next thread_start/turn
+    def set_model(self, name: str, provider: str | None = None) -> bool   # applies to the next turn; a provider change while running starts a new thread and returns True (the CLI must not start another)
     def close(self) -> None
     thread_id: str | None
 ```
 `codex_factory` defaults to `openai_codex.Codex`; tests inject a fake exposing `thread_start`, `thread_resume`,
 `close`, and threads with `turn()` returning a handle with `stream()`/`interrupt()`. Map SDK exceptions to
 `AgentError`/`ProviderError`/`CredentialsError` with hints (401 → key rejected; connection refused → base_url;
-404 on `/responses` or schema error → "endpoint must implement the Responses API; run a translating proxy").
+404 on `/responses` or schema error → "endpoint must implement the Responses API; run a translating proxy"; "model ... not found/does not exist" → ProviderError naming the unknown model, checked before the endpoint heuristics; "tool ... timed out" → AgentError, never an endpoint failure). `map_exception(exc, config, *, model=None)`.
 
 ## `session.py`  (owner: wave 2 / E)
 

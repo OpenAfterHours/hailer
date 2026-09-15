@@ -8,6 +8,7 @@ from keyring.backend import KeyringBackend
 from keyring.errors import PasswordDeleteError
 
 from hailer import secrets
+from hailer.errors import CredentialsError
 from hailer.models import ProviderConfig
 
 
@@ -107,10 +108,13 @@ def test_openai_missing_is_reported_not_raised(memory_keyring):
 
 def test_keyring_failure_treated_as_missing(broken_keyring):
     assert secrets.resolve_provider_key(INTERNAL, {}) == (None, "missing")
-    assert secrets.delete_provider_key(INTERNAL) is False
-    with pytest.raises(RuntimeError) as err:
+    with pytest.raises(CredentialsError) as err:
+        secrets.delete_provider_key(INTERNAL)
+    assert "INTERNAL_MODEL_API_KEY" in err.value.hint
+    with pytest.raises(CredentialsError) as err:
         secrets.store_provider_key(INTERNAL, "abc")
-    assert "INTERNAL_MODEL_API_KEY" in str(err.value)
+    assert "INTERNAL_MODEL_API_KEY" in err.value.hint
+    assert "credential store" in str(err.value)
 
 
 def test_store_and_delete_round_trip(memory_keyring):
@@ -123,7 +127,7 @@ def test_store_and_delete_round_trip(memory_keyring):
 
 
 def test_store_rejects_empty(memory_keyring):
-    with pytest.raises(RuntimeError):
+    with pytest.raises(CredentialsError):
         secrets.store_provider_key(INTERNAL, "   ")
-    with pytest.raises(RuntimeError):
+    with pytest.raises(CredentialsError):
         secrets.store_provider_key(ProviderConfig(id="nokey"), "abc")
