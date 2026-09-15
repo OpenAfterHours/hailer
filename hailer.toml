@@ -1,0 +1,42 @@
+# Hailer project configuration.
+# Relative paths are resolved against the workspace (the folder containing this file).
+# Secrets never go in this file: API keys come from the OS credential store
+# (`uv run hailer login <provider>`) or an environment variable named by `env_key`.
+
+[hailer]
+notebook = "notebooks/analysis.py"   # live marimo notebook Hailer works in
+data_dir = "data"                    # where the monthly parquet files live
+# marimo_url = "http://127.0.0.1:2718"  # optional; auto-discovered from the marimo registry when omitted
+# context_dir = ".config/hailer/context"  # always-on context (*.md) sent with every session
+# skills_dir  = ".config/hailer/skills"   # on-demand skills (<name>/SKILL.md)
+# prompts_dir = ".config/hailer/prompts"  # reusable prompts (/prompt <name>)
+# max_tool_output_chars = 12000        # cap on any single tool result sent to the model
+# max_context_bytes = 24000            # cap on the concatenated context files
+# log_level = "WARNING"                # or set HAILER_LOG_LEVEL / --verbose
+
+[model]
+name = "gpt-5.5"
+provider = "openai"                  # "openai" uses your existing Codex login or OPENAI_API_KEY
+# reasoning_effort = "medium"        # minimal | low | medium | high | xhigh
+
+# A bespoke / internal endpoint. It must implement the OpenAI Responses API
+# (streaming). If it only offers Chat Completions, run a translating proxy and
+# point base_url at that.
+#
+# [model_providers.internal]
+# base_url             = "https://llm.example.internal/v1"
+# wire_api             = "responses"
+# env_key              = "INTERNAL_MODEL_API_KEY"   # env var name; value from `hailer login internal` or the shell
+# requires_openai_auth = false
+# name                 = "Internal"
+# http_headers         = { "X-Team" = "risk-analytics" }
+# env_http_headers     = { "X-Client-Id" = "INTERNAL_CLIENT_ID" }
+# query_params         = { "api-version" = "2025-04-01-preview" }
+
+# Websites the agent may read for context. Without this section the agent has
+# no internet access at all. "*.d" = subdomains only, "**.d" = apex + subdomains.
+#
+# [web]
+# allowed_domains = ["docs.pola.rs", "duckdb.org", "**.bankofengland.co.uk"]
+# max_page_bytes = 200000
+# allow_shell_network = false        # also let shell commands reach the same domains
