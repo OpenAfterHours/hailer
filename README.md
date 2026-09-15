@@ -358,6 +358,12 @@ with the files attached.
 `--no-push` stops after the local commit and tag, `--version X.Y.Z` releases an exact version (pre-releases
 such as `1.2.0rc1` are accepted), and arguments after `--` are passed to pytest.
 
+Repository rulesets restrict this: `main` cannot be force-pushed or deleted and changes to it must come
+through a pull request with the test checks green, and `v*` tags can only be created by repository admins,
+who also bypass the pull-request rule so the release script can push directly. The `pypi` environment only
+deploys from `v*` tags, and `.github/workflows/members-only.yml` closes pull requests opened by people
+outside the OpenAfterHours organization.
+
 ## Security
 
 **Sent to the configured model endpoint:** your messages; Hailer's system prompt plus everything in
