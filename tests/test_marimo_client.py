@@ -8,6 +8,7 @@ import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 
@@ -46,6 +47,13 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             self._send(200, b'{"status":"healthy"}')
+        elif self.path == "/":
+            self.server.page_hits += 1
+            if self.server.mode == "no_token_tag":
+                self._send(200, b"<html><body>not marimo</body></html>", "text/html")
+                return
+            html = f'<html><head><marimo-server-token data-token="{self.server.server_token}"></marimo-server-token></head></html>'
+            self._send(200, html.encode(), "text/html")
         elif self.path == "/api/sessions":
             if not self._authorised():
                 self._send(401, b'{"detail":"unauthorised"}')
@@ -63,6 +71,18 @@ class _Handler(BaseHTTPRequestHandler):
         self.server.requests.append({"path": self.path, "headers": dict(self.headers.items()), "body": json.loads(body or b"{}")})
         if not self._authorised():
             self._send(401, b'{"detail":"unauthorised"}')
+            return
+        if self.path == "/api/home/shutdown_session":
+            # every POST except /api/kernel/execute needs the skew-protection token
+            if self.headers.get("Marimo-Server-Token") != self.server.server_token or self.server.mode == "stale_token":
+                self._send(401, b'{"error":"Invalid server token"}')
+                return
+            sid = self.server.requests[-1]["body"].get("sessionId")
+            if sid not in self.server.sessions:
+                self._send(500, b'{"detail":"Session not found"}')
+                return
+            del self.server.sessions[sid]
+            self._send(200, b'{"files":[]}')
             return
         if self.path != "/api/kernel/execute":
             self._send(404, b"")
@@ -95,6 +115,8 @@ class FakeMarimo(ThreadingHTTPServer):
         self.sessions: dict[str, dict] = {}
         self.mode = "success"
         self.token: str | None = None
+        self.server_token = "skew-token-123"
+        self.page_hits = 0
         self.requests: list[dict] = []
 
     @property
@@ -235,8 +257,55 @@ def test_connection_refused_hint_has_launch_command(tmp_path):
     client = mc.MarimoClient(f"http://127.0.0.1:{_free_port()}", notebook=nb, workspace=tmp_path)
     with pytest.raises(MarimoUnavailableError) as exc:
         client.sessions()
-    assert "uv run marimo edit notebooks/analysis.py --no-token" in exc.value.hint
+    assert "uv run marimo edit notebooks --no-token" in exc.value.hint, "the folder, not the file"
     assert "uv run hailer" in exc.value.hint
+
+
+# --------------------------------------------------------------------------- #
+# server token / shutdown_session
+# --------------------------------------------------------------------------- #
+
+
+def test_server_token_is_read_from_the_page_and_cached(fake):
+    client = mc.MarimoClient(fake.url)
+    assert client.server_token() == "skew-token-123"
+    assert client.server_token() == "skew-token-123"
+    assert fake.page_hits == 1, "cached on the instance"
+
+
+def test_server_token_missing_is_actionable(fake):
+    fake.mode = "no_token_tag"
+    with pytest.raises(MarimoUnavailableError) as exc:
+        mc.MarimoClient(fake.url).server_token()
+    assert "server token" in str(exc.value) and "marimo-server-token" in exc.value.hint
+
+
+def test_shutdown_session_sends_token_and_closes(fake):
+    fake.sessions = {"s1": {"filename": "a.py", "path": "a.py"}, "s2": {"filename": "b.py", "path": "b.py"}}
+    client = mc.MarimoClient(fake.url)
+    client.shutdown_session("s1")
+    req = fake.requests[-1]
+    assert req["path"] == "/api/home/shutdown_session"
+    assert req["headers"]["Marimo-Server-Token"] == "skew-token-123"
+    assert req["body"] == {"sessionId": "s1"}
+    assert [s.session_id for s in client.sessions()] == ["s2"]
+    with pytest.raises(MarimoUnavailableError) as exc:
+        client.shutdown_session("nope")
+    assert "HTTP 500" in str(exc.value) and "Session not found" in str(exc.value)
+
+
+def test_shutdown_session_stale_token_is_actionable_and_refetched(fake):
+    fake.sessions = {"s1": {"filename": "a.py", "path": "a.py"}}
+    client = mc.MarimoClient(fake.url)
+    assert client.server_token() == "skew-token-123"
+    fake.mode = "stale_token"
+    with pytest.raises(MarimoUnavailableError) as exc:
+        client.shutdown_session("s1")
+    assert "HTTP 401" in str(exc.value) and "restarted" in exc.value.hint
+    fake.mode = "success"
+    client.shutdown_session("s1")  # the token was dropped and fetched again
+    assert fake.page_hits == 2
+    assert client.sessions() == []
 
 
 # --------------------------------------------------------------------------- #
@@ -249,7 +318,7 @@ def test_resolve_no_sessions(fake, tmp_path):
     with pytest.raises(NoSessionError) as exc:
         mc.MarimoClient(fake.url, notebook=nb, workspace=tmp_path).resolve_session(nb)
     assert "not open in a browser" in str(exc.value)
-    assert exc.value.hint.startswith("Open ") and "?file=notebooks/analysis.py" in exc.value.hint
+    assert exc.value.hint.startswith("Open ") and f"?file={mc.notebook_file_key(nb)}" in exc.value.hint
 
 
 def test_resolve_by_absolute_path_and_case(fake, tmp_path):
@@ -329,16 +398,30 @@ def test_find_server_single_registry_entry(fake, tmp_path):
 # --------------------------------------------------------------------------- #
 
 
+def test_notebook_file_key_is_absolute_posix(tmp_path):
+    nb = tmp_path / "notebooks" / ".." / "notebooks" / "my analysis.py"
+    key = mc.notebook_file_key(nb)
+    assert key == (tmp_path / "notebooks" / "my analysis.py").resolve().as_posix()
+    assert "\\" not in key and ".." not in key
+    assert Path(key).is_absolute()
+
+
 def test_open_notebook_url_defaults_to_app_view(tmp_path):
     nb = tmp_path / "notebooks" / "my analysis.py"
     url = mc.open_notebook_url(MarimoServer(url="http://127.0.0.1:2718"), nb, tmp_path)
-    assert url == "http://127.0.0.1:2718/?file=notebooks/my%20analysis.py&view-as=present"
+    key = nb.resolve().as_posix()
+    assert url == f"http://127.0.0.1:2718/?file={quote(key, safe='/:')}&view-as=present"
+    assert "my%20analysis.py" in url and "%5C" not in url, "absolute posix key, no backslashes"
+    # the workspace no longer influences the key (absolute keys work on folder and single-file servers)
+    assert mc.open_notebook_url(MarimoServer(url="http://127.0.0.1:2718"), nb, tmp_path / "elsewhere") == url
+    assert mc.open_notebook_url(MarimoServer(url="http://127.0.0.1:2718"), nb) == url
 
 
 def test_open_notebook_url_edit_view(tmp_path):
     nb = tmp_path / "notebooks" / "analysis.py"
     server = MarimoServer(url="http://127.0.0.1:2718/")
-    assert mc.open_notebook_url(server, nb, tmp_path, view="edit") == "http://127.0.0.1:2718/?file=notebooks/analysis.py"
+    expected = f"http://127.0.0.1:2718/?file={quote(nb.resolve().as_posix(), safe='/:')}"
+    assert mc.open_notebook_url(server, nb, tmp_path, view="edit") == expected
     with pytest.raises(ValueError):
         mc.open_notebook_url(server, nb, tmp_path, view="kiosk")
 
@@ -346,13 +429,17 @@ def test_open_notebook_url_edit_view(tmp_path):
 def test_client_notebook_url_uses_app_view(fake, tmp_path):
     nb = tmp_path / "notebooks" / "analysis.py"
     client = mc.MarimoClient(fake.url, notebook=nb, workspace=tmp_path)
-    assert client.notebook_url().endswith("?file=notebooks/analysis.py&view-as=present")
+    assert client.notebook_url().endswith(f"?file={quote(mc.notebook_file_key(nb), safe='/:')}&view-as=present")
 
 
-def test_notebook_launch_command(tmp_path):
+def test_notebook_launch_command_uses_the_folder(tmp_path):
     cfg = _config(tmp_path)
-    assert mc.notebook_launch_command(cfg) == ["uv", "run", "marimo", "edit", "notebooks/analysis.py", "--no-token"]
+    assert cfg.notebooks_root == tmp_path / "notebooks"
+    assert mc.notebook_launch_command(cfg) == ["uv", "run", "marimo", "edit", "notebooks", "--no-token"]
     assert mc.notebook_launch_command(cfg, port=2718)[-2:] == ["--port", "2718"]
+    custom = _config(tmp_path, notebooks_dir=tmp_path / "nbs" / "deep")
+    assert mc.notebook_launch_command(custom)[4] == "nbs/deep"
+    assert mc.launch_command(None) == ["uv", "run", "marimo", "edit", "notebooks", "--no-token"]
 
 
 def test_snippets_are_valid_python():
@@ -454,25 +541,28 @@ def test_registry_entry_path_and_removal(tmp_path):
 
 
 def test_marimo_server_command_flags(tmp_path):
-    nb = tmp_path / "notebooks" / "analysis.py"
-    cmd = mc.marimo_server_command(nb, tmp_path, 2731)
+    cmd = mc.marimo_server_command(tmp_path / "notebooks", tmp_path, 2731)
     assert cmd[0] == mc.sys.executable and cmd[1:4] == ["-m", "marimo", "edit"]
-    assert cmd[4] == "notebooks/analysis.py"
+    assert cmd[4] == "notebooks", "marimo is started on the folder"
     for flag in ("--no-token", "--headless", "--skip-update-check"):
         assert flag in cmd
     assert cmd[cmd.index("--port") + 1] == "2731"
 
 
 def test_launch_hint_offers_one_command_route_first(tmp_path):
-    hint = mc.launch_hint(tmp_path / "notebooks" / "analysis.py", tmp_path)
-    assert hint.index("uv run hailer notebook") < hint.index("uv run marimo edit notebooks/analysis.py --no-token")
+    hint = mc.launch_hint(tmp_path / "notebooks", tmp_path)
+    assert hint.index("uv run hailer notebook") < hint.index("uv run marimo edit notebooks --no-token")
     assert hint.rstrip().endswith("uv run hailer")
     assert "Or start it yourself with:" in hint and "Then run Hailer again:" in hint
 
 
 def test_unavailable_error_uses_one_command_hint(tmp_path):
-    client = mc.MarimoClient(f"http://127.0.0.1:{_free_port()}", timeout=0.5, notebook=tmp_path / "nb.py", workspace=tmp_path)
+    client = mc.MarimoClient(f"http://127.0.0.1:{_free_port()}", timeout=0.5, notebook=tmp_path / "nbs" / "nb.py", workspace=tmp_path)
     with pytest.raises(MarimoUnavailableError) as info:
         client.sessions()
     assert "uv run hailer notebook" in info.value.hint
-    assert "uv run marimo edit nb.py --no-token" in info.value.hint
+    assert "uv run marimo edit nbs --no-token" in info.value.hint, "derived from the notebook's folder"
+    explicit = mc.MarimoClient(f"http://127.0.0.1:{_free_port()}", timeout=0.5, notebook=tmp_path / "nbs" / "nb.py", workspace=tmp_path, notebooks_dir=tmp_path / "all")
+    with pytest.raises(MarimoUnavailableError) as info:
+        explicit.sessions()
+    assert "uv run marimo edit all --no-token" in info.value.hint

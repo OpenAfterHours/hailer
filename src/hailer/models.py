@@ -157,6 +157,12 @@ class HailerConfig:
     config_path: Path | None = None
     max_tool_output_chars: int = 12_000
     max_context_bytes: int = 24_000
+    notebooks_dir: Path | None = None  # load_config always fills it; None only in hand-built test configs
+
+    @property
+    def notebooks_root(self) -> Path:
+        """The folder notebooks live in (``notebooks_dir``, else the configured notebook's folder)."""
+        return self.notebooks_dir if self.notebooks_dir is not None else self.notebook.parent
 
     @property
     def provider(self) -> ProviderConfig:

@@ -55,6 +55,8 @@ def test_defaults_without_config_file(tmp_path: Path) -> None:
     assert cfg.config_path is None
     assert cfg.workspace == ws.resolve()
     assert cfg.notebook == (ws / "notebooks" / "analysis.py").resolve()
+    assert cfg.notebooks_dir == (ws / "notebooks").resolve(), "defaults to the notebook's folder"
+    assert cfg.notebooks_root == cfg.notebooks_dir
     assert cfg.data_dir == (ws / "data").resolve()
     assert cfg.context_dir == (ws / ".config" / "hailer" / "context").resolve()
     assert cfg.skills_dir == (ws / ".config" / "hailer" / "skills").resolve()
@@ -131,6 +133,7 @@ def test_workspace_from_env(tmp_path: Path) -> None:
 FULL_CONFIG = """
 [hailer]
 notebook = "nb/main.py"
+notebooks_dir = "nb"
 data_dir = "parquet"
 marimo_url = "http://127.0.0.1:2718/"
 context_dir = "ctx"
@@ -172,6 +175,7 @@ def test_full_file_is_mapped(tmp_path: Path) -> None:
     cfg = load_config(workspace=ws, env={})
     assert cfg.config_path == (ws / "hailer.toml").resolve()
     assert cfg.notebook == (ws / "nb" / "main.py").resolve()
+    assert cfg.notebooks_dir == (ws / "nb").resolve()
     assert cfg.data_dir == (ws / "parquet").resolve()
     assert cfg.marimo_url == "http://127.0.0.1:2718"  # trailing slash stripped
     assert cfg.context_dir == (ws / "ctx").resolve()
@@ -255,6 +259,7 @@ def test_every_env_override(tmp_path: Path) -> None:
     other_nb = _write(tmp_path / "other.py", "import marimo\n")
     env = {
         "HAILER_NOTEBOOK": str(other_nb),
+        "HAILER_NOTEBOOKS_DIR": "envnbs",
         "HAILER_DATA_DIR": "envdata",
         "HAILER_MARIMO_URL": "http://localhost:9999/",
         "HAILER_MARIMO_TOKEN": "supersecrettoken",
@@ -265,6 +270,7 @@ def test_every_env_override(tmp_path: Path) -> None:
     }
     cfg = load_config(workspace=ws, env=env)
     assert cfg.notebook == other_nb.resolve()
+    assert cfg.notebooks_dir == (ws / "envnbs").resolve()
     assert cfg.data_dir == (ws / "envdata").resolve()
     assert cfg.marimo_url == "http://localhost:9999"
     assert cfg.marimo_token == "supersecrettoken"
@@ -307,6 +313,28 @@ def test_validate_notebook_missing_is_fatal(tmp_path: Path) -> None:
     assert len(errors) == 1
     assert "Notebook not found" in errors[0]
     assert "analysis.py" in errors[0]
+
+
+def test_validate_notebook_outside_notebooks_dir_is_fatal(tmp_path: Path) -> None:
+    ws = _make_workspace(tmp_path, '[hailer]\nnotebooks_dir = "other"\n')
+    (ws / "other").mkdir()
+    problems = validate(load_config(workspace=ws, env={}))
+    errors = _errors(problems)
+    assert len(errors) == 1
+    assert "[hailer].notebook" in errors[0] and "[hailer].notebooks_dir" in errors[0]
+    assert "analysis.py" in errors[0]
+
+
+def test_validate_notebooks_dir_missing_is_warning(tmp_path: Path) -> None:
+    ws = _make_workspace(tmp_path, notebook=False)
+    problems = validate(load_config(workspace=ws, env={}))
+    assert any(p.startswith("Warning:") and "notebooks folder not found" in p for p in problems)
+    # an env override may point at a folder that does not exist yet: warning, not fatal
+    (tmp_path / "second").mkdir()
+    ws2 = _make_workspace(tmp_path / "second")
+    problems = validate(load_config(workspace=ws2, env={"HAILER_NOTEBOOKS_DIR": "nbs"}))
+    assert any("notebooks folder not found" in p for p in problems)
+    assert any("not inside [hailer].notebooks_dir" in p for p in _errors(problems))
 
 
 def test_validate_data_dir_missing_is_warning(tmp_path: Path) -> None:

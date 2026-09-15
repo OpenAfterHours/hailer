@@ -23,6 +23,14 @@ class NotebookNotFoundError(HailerError):
     """The configured marimo notebook file does not exist."""
 
 
+class NotebookExistsError(HailerError):
+    """A notebook with that name already exists in the notebooks folder."""
+
+
+class NotebookPathError(HailerError):
+    """The path is outside the notebooks folder or is not a marimo notebook."""
+
+
 class MarimoUnavailableError(HailerError):
     """No marimo server answers at the configured/discovered URL."""
 

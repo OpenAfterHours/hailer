@@ -23,8 +23,26 @@ module exposes so work can proceed in parallel. Shared types live in `src/hailer
 - **Ownership.** Each module has one owner during a wave. Only edit files you own; if you need something from
   another module that is not in this contract, write against the contract and note the gap in your report.
 - **Dependencies** are already declared in `pyproject.toml`; do not add any. Report if something is missing.
+- **The active notebook is shared state, not config.** `<workspace>/.hailer/notebook.json` (next to
+  `session.json`) records which notebook the chat is working in. Exactly one process writes it at a time: the
+  CLI between turns (slash commands) and the MCP server during a turn (tool calls). Every reader re-reads it
+  before use through `hailer.notebooks.load_active_notebook` and never caches it. `HAILER_NOTEBOOK` (an
+  explicit one-off override) wins over the file.
 
 ## Runtime facts (verified; see PLAN.md §1, §1a–1c)
+
+- Multi-notebook (verified live on marimo 0.24.2, both `marimo edit <file>` and `marimo edit <dir>`): one
+  server opens any *existing* notebook at runtime via `?file=<key>`, no restart needed (in single-file mode the
+  session manager registers the path in the workspace allow-list before loading it). Keys resolve against the
+  server cwd in single-file mode and against the folder in directory mode; **absolute posix paths work in
+  both**, so Hailer always sends `?file=<absolute path>`. `?file=__new__` gives an untitled session
+  (`path: null`). A missing file closes the websocket. A second connection to a file that already has a
+  session joins it (no duplicate kernel). Sessions outlive the browser tab. Hailer starts marimo on the
+  notebooks *folder* so marimo's own home page lists every notebook too.
+- Skew protection: every POST except `/api/kernel/execute`, `/ws` and login needs the header
+  `Marimo-Server-Token`, whose value is the `data-token` attribute of `<marimo-server-token>` in `GET /`;
+  without it marimo answers 401. Needed for `/api/home/{workspace_files,running_notebooks,shutdown_session}`
+  and `/api/kernel/{save,rename}`. GETs are exempt.
 
 - marimo protocol: `GET {url}/health`, `GET {url}/api/sessions` → `{sid: {filename, path}}`,
   `POST {url}/api/kernel/execute` with header `Marimo-Session-Id: <sid>`, body `{"code": "..."}`, response
@@ -82,13 +100,20 @@ Rules: missing file → defaults (not an error); unparsable → `ConfigError` na
 keys are warnings returned by `validate`, not errors. Relative paths resolve against the workspace. Env
 overrides: `HAILER_CONFIG`, `HAILER_WORKSPACE`, `HAILER_NOTEBOOK`, `HAILER_DATA_DIR`, `HAILER_MARIMO_URL`,
 `HAILER_MARIMO_TOKEN` (value kept in memory only), `HAILER_MODEL`, `HAILER_MODEL_PROVIDER`,
-`HAILER_LOG_LEVEL`, `HAILER_CODEX_HOME`. Provider tables `[model_providers.<id>]` map 1:1 to
-`ProviderConfig`. `[web]` maps to `WebConfig` (`allowed_domains` list, `max_page_bytes`,
-`allow_shell_network`). `[hailer]` keys: `notebook`, `data_dir`, `marimo_url`, `context_dir`,
-`skills_dir`, `prompts_dir`, `max_tool_output_chars`, `max_context_bytes`; `[model]` keys: `name`,
-`provider`, `reasoning_effort`. `validate` checks: notebook exists, data_dir exists (warning only), active
-provider declared (or `openai`), custom provider has `base_url` and `env_key`, `wire_api == "responses"`,
-domains are well-formed.
+`HAILER_LOG_LEVEL`, `HAILER_CODEX_HOME`, `HAILER_NOTEBOOKS_DIR`. Provider tables `[model_providers.<id>]` map
+1:1 to `ProviderConfig`. `[web]` maps to `WebConfig` (`allowed_domains` list, `max_page_bytes`,
+`allow_shell_network`). `[hailer]` keys: `notebook`, `notebooks_dir`, `data_dir`, `marimo_url`,
+`context_dir`, `skills_dir`, `prompts_dir`, `max_tool_output_chars`, `max_context_bytes`; `[model]` keys:
+`name`, `provider`, `reasoning_effort`. `notebooks_dir` (relative to the workspace) is the folder notebooks
+are listed from, created in and opened from; it defaults to the configured notebook's folder and is always
+filled in by `load_config` (`HailerConfig.notebooks_dir`; use `HailerConfig.notebooks_root`, which falls back
+to `notebook.parent` for hand-built configs). `validate` checks: notebook exists, notebook is inside
+`notebooks_dir` (fatal, names both keys), `notebooks_dir` exists (warning only), data_dir exists (warning
+only), active provider declared (or `openai`), custom provider has `base_url` and `env_key`,
+`wire_api == "responses"`, domains are well-formed.
+
+Errors added for the notebook feature (`errors.py`): `NotebookExistsError` (create: name taken) and
+`NotebookPathError` (outside the notebooks folder, or not a marimo notebook).
 
 ## `log.py`  (owner: wave 1 / A)
 
@@ -103,21 +128,72 @@ Normal level WARNING to stderr via Rich-free plain handler; `--verbose` → DEBU
 
 ```python
 CM_HELP_CODE = "import marimo._code_mode as cm; help(cm)"
+DEFAULT_LAUNCH_DIR = "notebooks"
+SERVER_TOKEN_HEADER = "Marimo-Server-Token"
 def discover_servers() -> list[MarimoServer]         # registry files; drop entries whose /health does not answer
 def find_server(config: HailerConfig) -> MarimoServer | None   # config.marimo_url first, then registry (single live server, else None)
 class MarimoClient:
-    def __init__(self, base_url: str, token: str | None = None, *, timeout: float = 10.0) -> None
+    def __init__(self, base_url: str, token: str | None = None, *, timeout: float = 10.0,
+                 notebook: Path | None = None, workspace: Path | None = None, notebooks_dir: Path | None = None) -> None
+                 # notebook: the one resolve_session()/execute() default to; notebooks_dir: named in launch hints (else notebook.parent)
     def health(self) -> bool
     def sessions(self) -> list[MarimoSession]
     def resolve_session(self, notebook: Path | None) -> MarimoSession   # match by path/filename (normalised, case-insensitive on Windows); 0 → NoSessionError with hint to open the notebook URL; >1 without match → NoSessionError listing them
     def execute(self, code: str, *, session_id: str | None = None, notebook: Path | None = None,
                 on_stdout: Callable[[str], None] | None = None, on_stderr: Callable[[str], None] | None = None,
                 timeout: float = 600.0) -> ExecResult   # SSE parse; missing `done` → MarimoExecutionError
-def open_notebook_url(server: MarimoServer, notebook: Path, workspace: Path, *, view: str = "app") -> str   # URL the user should open; view="app" (default) adds &view-as=present so marimo opens in app view (results only; Ctrl+. toggles the editor): http://127.0.0.1:2718/?file=notebooks/analysis.py&view-as=present; view="edit" omits it
-def notebook_launch_command(config: HailerConfig, *, port: int | None = None) -> list[str]  # ["uv","run","marimo","edit",<notebook>,"--no-token", ...]
+    def notebook_url(self, notebook: Path | None = None) -> str
+    def server_token(self) -> str                       # data-token of <marimo-server-token> in GET /; cached per instance; MarimoUnavailableError if absent
+    def shutdown_session(self, session_id: str) -> None # POST /api/home/shutdown_session {"sessionId": id} + Marimo-Server-Token; 401 → MarimoUnavailableError ("server restarted; retry"), token dropped so the next call refetches it
+def notebook_file_key(notebook: Path) -> str          # the ?file= key: Path(notebook).resolve().as_posix() (absolute, forward slashes; works on folder and single-file servers)
+def open_notebook_url(server: MarimoServer, notebook: Path, workspace: Path | None = None, *, view: str = "app") -> str   # http://127.0.0.1:2718/?file=<quoted absolute posix path>&view-as=present (view="app", default: results only, Ctrl+. toggles the editor); view="edit" omits the parameter; workspace is accepted but unused
+def launch_command(notebooks_dir: Path | None, workspace: Path | None = None, *, port: int | None = None) -> list[str]   # ["uv","run","marimo","edit",<folder relative to workspace>,"--no-token", ...]; None → "notebooks"
+def notebook_launch_command(config: HailerConfig, *, port: int | None = None) -> list[str]  # launch_command(config.notebooks_root, config.workspace, port=port)
+def marimo_server_command(notebooks_dir: Path, workspace: Path, port: int) -> list[str]   # [sys.executable,"-m","marimo","edit",<folder>,"--no-token","--headless","--port",N,"--skip-update-check"]
+def launch_hint(notebooks_dir: Path | None, workspace: Path | None = None) -> str   # "Start everything in one go: uv run hailer notebook" first, then the launch_command
+def wait_for_health(url: str, timeout: float = 60.0, *, interval: float = 0.5, should_stop=None) -> bool
+def wait_for_session(client: MarimoClient, notebook: Path | None, timeout: float = 90.0, *, interval: float = 0.5) -> MarimoSession | None
 ```
-Connection refused/timeout → `MarimoUnavailableError` with the exact `uv run marimo edit ... --no-token`
-command in the hint. HTTP 401/403 → `MarimoUnavailableError` mentioning `HAILER_MARIMO_TOKEN`.
+marimo is always started on the notebooks **folder** (never on a single file) so that every notebook,
+existing or created later, opens on the same server. Connection refused/timeout → `MarimoUnavailableError`
+with the exact `uv run marimo edit <folder> --no-token` command in the hint. HTTP 401/403 →
+`MarimoUnavailableError` mentioning `HAILER_MARIMO_TOKEN`.
+
+## `notebooks.py`  (owner: notebook feature / foundation)
+
+Notebook lifecycle shared by the CLI and the MCP server. Standard library only; never imports marimo, typer
+or rich. Nothing here talks to the marimo server (that is `marimo_client`); this module owns files and state.
+
+```python
+STATE_FILENAME = "notebook.json"           # <workspace>/.hailer/notebook.json: {"active": "<workspace-relative posix path>", "recent": [...]}
+RECENT_LIMIT = 10
+STARTER_TEMPLATE: str; EMPTY_TEMPLATE: str  # __HAILER_VERSION__ / __HAILER_TITLE__ placeholders, filled by render_template
+TEMPLATE_KINDS = ("starter", "empty")
+@dataclass(frozen=True) class NotebookInfo: path: Path (absolute); name: str (stem); modified: float; size: int
+def state_path(workspace: Path) -> Path
+def load_active_notebook(config: HailerConfig, env: Mapping[str, str] = os.environ) -> Path
+    # HAILER_NOTEBOOK set → config.notebook. Else the state file's "active" when it resolves inside
+    # notebooks_root and exists; otherwise (missing/corrupt file, deleted or foreign path) config.notebook.
+def save_active_notebook(config: HailerConfig, notebook: Path) -> None
+    # atomic (tmp + replace); stores the workspace-relative posix path; "recent" most-recent-first, unique, max 10; creates .hailer/
+def load_recent(config: HailerConfig) -> list[Path]         # existing notebooks only, absolute, most recent first
+def notebook_display_name(config: HailerConfig, path: Path) -> str   # workspace-relative posix ("notebooks/q2_churn.py"), absolute posix when outside
+def is_marimo_notebook(path: Path) -> bool                 # marimo's rule: .py whose first 1 MB contains "import marimo" and "marimo.App"; errors → False
+def list_notebooks(config: HailerConfig) -> list[NotebookInfo]   # recursive under notebooks_root, skips folders starting with "." or "__", sorted by relative path (case-insensitive)
+def slugify(name: str) -> str                              # "Q2 Churn (draft).py" → "q2_churn_draft"; must start with a letter (else "nb_" prefix); ValueError when empty
+def resolve_notebook(config: HailerConfig, ref: str) -> Path
+    # bare name ("q2 churn"), filename, workspace-relative, notebooks_root-relative or absolute; tried as given
+    # (workspace then notebooks_root), then "<slug>.py" under notebooks_root, then a case-insensitive unique
+    # NotebookInfo.name match. Outside notebooks_root or not a notebook → NotebookPathError; nothing → NotebookNotFoundError
+    # (hint lists up to 10 names); several name matches → NotebookNotFoundError listing them.
+def marimo_version() -> str                                # importlib.metadata.version("marimo"), fallback "0.24.2"
+def render_template(kind: Literal["starter", "empty"], *, title: str, version: str | None = None) -> str
+    # starter = the cells of notebooks/analysis.py with the title as heading and WORKSPACE found by walking up to
+    # pyproject.toml / hailer.toml; empty = marimo's own empty notebook. Title is made safe for the f-string markdown.
+def create_notebook(config: HailerConfig, name: str, *, kind: Literal["starter", "empty"] = "starter") -> Path
+    # <notebooks_root>/<slug>.py (folder created); NotebookExistsError when it exists; NotebookPathError when the
+    # name has no letters/digits; returns the absolute path. Never touches the state file.
+```
 
 ## `periods.py`  (owner: wave 1 / B)
 

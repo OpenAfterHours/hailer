@@ -32,7 +32,7 @@ from hailer.session import save_session, session_path
 
 runner = CliRunner()
 SERVER = MarimoServer(url="http://127.0.0.1:2718", server_id="127.0.0.1:2718", version="0.24.2", source="config")
-LAUNCH = ["uv", "run", "marimo", "edit", "notebooks/analysis.py", "--no-token"]
+LAUNCH = ["uv", "run", "marimo", "edit", "notebooks", "--no-token"]
 URL = "http://127.0.0.1:2718/?file=notebooks/analysis.py&view-as=present"
 INTERNAL = ProviderConfig(
     id="internal",
@@ -405,7 +405,7 @@ def test_marimo_down_is_fatal_with_launch_hint(harness):
     result = chat()
     assert result.exit_code == 1
     assert "Marimo is not running." in result.output
-    assert "uv run marimo edit notebooks/analysis.py --no-token" in result.output
+    assert "uv run marimo edit notebooks --no-token" in result.output, "the folder, so every notebook opens on one server"
     assert "Then run Hailer again" in result.output
     assert "uv run hailer" in result.output
 
@@ -566,7 +566,7 @@ def nb(harness, monkeypatch):
     monkeypatch.setattr(cli, "_spawn_marimo", spawn)
     monkeypatch.setattr(cli, "_run_foreground", lambda cmd, cwd: (h.foreground.append((cmd, cwd)) or 0))
     monkeypatch.setattr(cli, "_find_free_port", lambda preferred: h.free_port if h.free_port is not None else preferred)
-    monkeypatch.setattr(cli, "_marimo_server_command", lambda config, port: [sys.executable, "-m", "marimo", "edit", "notebooks/analysis.py", "--no-token", "--headless", "--port", str(port), "--skip-update-check"])
+    monkeypatch.setattr(cli, "_marimo_server_command", lambda config, port: [sys.executable, "-m", "marimo", "edit", "notebooks", "--no-token", "--headless", "--port", str(port), "--skip-update-check"])
     monkeypatch.setattr(cli, "_wait_for_health", wait_health)
     monkeypatch.setattr(cli, "_wait_for_session", wait_session)
     monkeypatch.setattr(cli, "_registry_remove", lambda url: (h.removed.append(url) or True))

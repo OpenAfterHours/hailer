@@ -43,6 +43,7 @@ VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 _KNOWN_TOP = {"hailer", "model", "model_providers", "web"}
 _KNOWN_HAILER = {
     "notebook",
+    "notebooks_dir",
     "data_dir",
     "marimo_url",
     "context_dir",
@@ -82,7 +83,8 @@ DEFAULT_CONFIG_TEMPLATE = """\
 # (`uv run hailer login <provider>`) or an environment variable named by `env_key`.
 
 [hailer]
-notebook = "notebooks/analysis.py"   # live marimo notebook Hailer works in
+notebook = "notebooks/analysis.py"   # default notebook; the chat can create and open others
+# notebooks_dir = "notebooks"        # folder for notebooks created or opened from the chat (default: the notebook's folder)
 data_dir = "data"                    # where the monthly parquet files live
 # marimo_url = "http://127.0.0.1:2718"  # optional; auto-discovered from the marimo registry when omitted
 # context_dir = ".config/hailer/context"  # always-on context (*.md) sent with every session
@@ -305,6 +307,7 @@ def load_config(
     web_tbl = _section(data, "web", path)
 
     notebook = env.get("HAILER_NOTEBOOK") or _str(hailer_tbl, "notebook", "hailer", path, DEFAULT_NOTEBOOK)
+    notebooks_dir = env.get("HAILER_NOTEBOOKS_DIR") or _str(hailer_tbl, "notebooks_dir", "hailer", path)
     data_dir = env.get("HAILER_DATA_DIR") or _str(hailer_tbl, "data_dir", "hailer", path, DEFAULT_DATA_DIR)
     context_dir = _str(hailer_tbl, "context_dir", "hailer", path, DEFAULT_CONTEXT_DIR)
     skills_dir = _str(hailer_tbl, "skills_dir", "hailer", path, DEFAULT_SKILLS_DIR)
@@ -347,9 +350,11 @@ def load_config(
         allow_shell_network=_bool(web_tbl, "allow_shell_network", "web", path, False),
     )
 
+    resolved_notebook = _resolve(ws, notebook or DEFAULT_NOTEBOOK)
     return HailerConfig(
         workspace=ws,
-        notebook=_resolve(ws, notebook or DEFAULT_NOTEBOOK),
+        notebook=resolved_notebook,
+        notebooks_dir=_resolve(ws, notebooks_dir) if notebooks_dir else resolved_notebook.parent,
         data_dir=_resolve(ws, data_dir or DEFAULT_DATA_DIR),
         context_dir=_resolve(ws, context_dir or DEFAULT_CONTEXT_DIR),
         skills_dir=_resolve(ws, skills_dir or DEFAULT_SKILLS_DIR),
@@ -433,6 +438,19 @@ def validate(config: HailerConfig) -> list[str]:
             f"Notebook not found: {config.notebook}. "
             "Set [hailer].notebook (or HAILER_NOTEBOOK) to an existing marimo notebook, "
             "or run `uv run hailer init` to create the default one."
+        )
+    root = config.notebooks_root
+    try:
+        config.notebook.resolve().relative_to(root.resolve())
+    except ValueError:
+        problems.append(
+            f"[hailer].notebook ({config.notebook}) is not inside [hailer].notebooks_dir ({root}). "
+            "Point notebooks_dir at the folder that holds the notebook, or move the notebook into it."
+        )
+    if not root.is_dir():
+        problems.append(
+            f"Warning: notebooks folder not found: {root}. "
+            "Create it (or set [hailer].notebooks_dir) so notebooks can be listed, created and opened from the chat."
         )
     if not config.data_dir.is_dir():
         problems.append(

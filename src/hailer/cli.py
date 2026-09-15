@@ -162,7 +162,13 @@ def _find_server(config: HailerConfig) -> MarimoServer | None:
 def _make_client(server: MarimoServer, config: HailerConfig) -> Any:
     from hailer.marimo_client import MarimoClient
 
-    return MarimoClient(server.url, config.marimo_token, notebook=config.notebook, workspace=config.workspace)
+    return MarimoClient(
+        server.url,
+        config.marimo_token,
+        notebook=config.notebook,
+        workspace=config.workspace,
+        notebooks_dir=config.notebooks_root,
+    )
 
 
 def _notebook_url(server: MarimoServer, config: HailerConfig) -> str:
@@ -229,7 +235,7 @@ def _open_browser(url: str) -> None:
 def _marimo_server_command(config: HailerConfig, port: int) -> list[str]:
     from hailer.marimo_client import marimo_server_command
 
-    return marimo_server_command(config.notebook, config.workspace, port)
+    return marimo_server_command(config.notebooks_root, config.workspace, port)
 
 
 def _find_free_port(preferred: int) -> int:
@@ -427,7 +433,7 @@ def _marimo_state(config: HailerConfig) -> tuple[MarimoServer | None, MarimoSess
 def _launch_hint(config: HailerConfig) -> str:
     from hailer.marimo_client import launch_hint
 
-    return launch_hint(config.notebook, config.workspace)
+    return launch_hint(config.notebooks_root, config.workspace)
 
 
 def preflight(config: HailerConfig) -> list[Check]:
