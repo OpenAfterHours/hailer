@@ -254,16 +254,36 @@ def build_config_overrides(
     return tuple(out)
 
 
+#: Hosts the Codex child must reach directly (never through HTTP(S)_PROXY): the chat bridge.
+BRIDGE_NO_PROXY_HOSTS = ("127.0.0.1", "localhost")
+
+
+def _with_no_proxy(existing: str | None) -> str:
+    """Append the bridge hosts to a NO_PROXY value, keeping whatever the user already listed."""
+    entries = [e.strip() for e in (existing or "").split(",") if e.strip()]
+    for host in BRIDGE_NO_PROXY_HOSTS:
+        if host not in entries:
+            entries.append(host)
+    return ",".join(entries)
+
+
 def build_child_env(
-    config: HailerConfig, key: str | None, extra_keys: Mapping[str, str] | None = None
+    config: HailerConfig,
+    key: str | None,
+    extra_keys: Mapping[str, str] | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Variables to *add* to the Codex child environment (the SDK copies ``os.environ`` itself).
 
     ``key`` is the active provider's API key (or ``None``); ``extra_keys`` maps other
     providers' ``env_key`` names to their values so ``/model <provider>:<name>`` works
-    mid-session. Values are never logged.
+    mid-session. ``environ`` is the parent environment (``os.environ`` by default); it is
+    consulted so the loopback bridge for ``wire_api = "chat"`` providers is exempted from
+    the user's HTTP(S)_PROXY without dropping their own NO_PROXY entries. Values are never
+    logged.
     """
     env: dict[str, str] = {}
+    parent = environ if environ is not None else os.environ
     provider = _active_provider(config)
     if key and provider.env_key:
         env[provider.env_key] = key
@@ -280,6 +300,11 @@ def build_child_env(
         env["HAILER_MARIMO_TOKEN"] = config.marimo_token
     if config.codex_home is not None:
         env["CODEX_HOME"] = str(config.codex_home)
+    if chat_completion_upstreams(config):
+        # Codex (reqwest) honours HTTP(S)_PROXY with no implicit loopback bypass; without this a
+        # corporate proxy would be asked to reach the bridge on the user's own machine.
+        for name in ("NO_PROXY", "no_proxy"):
+            env[name] = _with_no_proxy(parent.get("NO_PROXY") or parent.get("no_proxy"))
     return env
 
 
@@ -368,6 +393,7 @@ _MODEL_NOT_FOUND_SIGNALS = (
 _CONNECTION_SIGNALS = (
     "connection refused",
     "failed to connect",
+    "could not reach",  # the chat bridge's own wording for an unreachable upstream
     "error sending request",
     "dns error",
     "name resolution",
@@ -380,15 +406,29 @@ _CONNECTION_SIGNALS = (
 _RESPONSES_API_SIGNALS = ("404", "unsupported", "unknown endpoint", "responses", "unknown parameter", "schema")
 
 
-def map_exception(exc: BaseException, config: HailerConfig, *, model: str | None = None) -> Exception:
+def _provider_by_id(config: HailerConfig, provider_id: str | None) -> ProviderConfig:
+    """The provider the agent is currently using (``/model`` may have switched it)."""
+    if provider_id is None or provider_id == config.model.provider:
+        return _active_provider(config)
+    if provider_id in config.providers:
+        return config.providers[provider_id]
+    if provider_id == "openai":
+        return ProviderConfig(id="openai", env_key="OPENAI_API_KEY", requires_openai_auth=True)
+    return _active_provider(config)
+
+
+def map_exception(
+    exc: BaseException, config: HailerConfig, *, model: str | None = None, provider: str | None = None
+) -> Exception:
     """Translate SDK/runtime failures into actionable Hailer errors.
 
-    ``model`` is the model name in use (defaults to the configured one) so an unknown-model
-    error names the right thing.
+    ``model`` and ``provider`` are the model name and provider id in use (they default to
+    the configured ones) so unknown-model and endpoint errors name the right thing after a
+    ``/model`` switch.
     """
     text = str(exc)
     low = text.lower()
-    provider = _active_provider(config)
+    provider = _provider_by_id(config, provider)
     base_url = provider.base_url or "https://api.openai.com/v1"
     model_name = model or config.model.name
 
@@ -435,6 +475,15 @@ def map_exception(exc: BaseException, config: HailerConfig, *, model: str | None
             hint=(
                 "Check [model_providers].base_url in hailer.toml, your VPN/proxy, and that the "
                 "endpoint is running. Run `hailer doctor` to test reachability."
+            ),
+        )
+    if "chat completions bridge" in low:
+        return ProviderError(
+            f"Codex asked for a Responses API endpoint the Chat Completions bridge for provider '{provider.id}' does not offer.",
+            hint=(
+                "Only POST /responses is translated to /chat/completions (Codex features such as server-side "
+                'compaction are not). Run `hailer --verbose` to see the endpoint, or set wire_api = "responses" '
+                "if the gateway implements the Responses API."
             ),
         )
     if any(s in low for s in _RESPONSES_API_SIGNALS):
@@ -579,11 +628,11 @@ class HailerAgent:
             self.key_sources[prov.id] = src
             if value:
                 extra[prov.env_key] = value
-        self._child_env = build_child_env(config, key, extra)
+        self._child_env = build_child_env(config, key, extra, environ)
         del key, extra  # do not keep secrets on the instance
 
         self._user_codex_config = user_codex_config if user_codex_config is not None else read_user_codex_config(config.codex_home)
-        self.overrides: tuple[str, ...] = build_config_overrides(config, self._user_codex_config)
+        build_config_overrides(config, self._user_codex_config)  # fail early on an undeclared provider
 
     # ---- lifecycle ---------------------------------------------------------
 
@@ -604,17 +653,36 @@ class HailerAgent:
         """The Chat Completions bridge, once started (only when a provider has ``wire_api = "chat"``)."""
         return self._bridge
 
+    @property
+    def overrides(self) -> tuple[str, ...]:
+        """The ``-c`` overrides Codex is (or will be) started with.
+
+        Derived on demand so that, once the chat bridge is up, ``wire_api = "chat"`` providers
+        are rendered at the bridge URL; there is no stale pre-bridge copy to read by mistake.
+        """
+        bridge_urls = self._bridge.urls if self._bridge is not None else None
+        return build_config_overrides(self.config, self._user_codex_config, bridge_urls)
+
     def _ensure_bridge(self) -> None:
-        """Start the loopback bridge for ``wire_api = "chat"`` providers and re-point Codex at it."""
+        """Start the loopback bridge for ``wire_api = "chat"`` providers (Codex is pointed at it)."""
         if self._bridge is not None:
             return
         upstreams = chat_completion_upstreams(self.config)
         if not upstreams:
             return
         bridge = ChatBridge(upstreams)
-        bridge.start()
+        try:
+            bridge.start()
+        except OSError as exc:
+            raise ProviderError(
+                "Could not start the local Chat Completions bridge on 127.0.0.1.",
+                hint=(
+                    f"Providers with wire_api = \"chat\" ({', '.join(sorted(upstreams))}) need a loopback "
+                    f"port. The OS refused one: {exc}. Check local firewall or sandbox rules, or set "
+                    'wire_api = "responses" if the endpoint implements the Responses API.'
+                ),
+            ) from exc
         self._bridge = bridge
-        self.overrides = build_config_overrides(self.config, self._user_codex_config, bridge.urls)
 
     def _require_key(self) -> None:
         provider = self.config.providers.get(self._provider_id)
@@ -658,7 +726,7 @@ class HailerAgent:
         try:
             self._codex = self._codex_factory(cfg)
         except Exception as exc:
-            raise map_exception(exc, self.config, model=self._model) from exc
+            raise map_exception(exc, self.config, model=self._model, provider=self._provider_id) from exc
 
     def start(self, *, resume_thread_id: str | None = None) -> str:
         """Start the runtime and a thread; returns the thread id."""
@@ -682,7 +750,7 @@ class HailerAgent:
         try:
             self._thread = self._codex.thread_start(**self._thread_kwargs())
         except Exception as exc:
-            raise map_exception(exc, self.config, model=self._model) from exc
+            raise map_exception(exc, self.config, model=self._model, provider=self._provider_id) from exc
         self.thread_id = self._thread.id
         self._thread_provider_id = self._provider_id
         log.debug("started thread %s", self.thread_id)
@@ -772,7 +840,7 @@ class HailerAgent:
         try:
             handle = self._thread.turn(turn_input, model=self._model)
         except Exception as exc:
-            raise map_exception(exc, self.config, model=self._model) from exc
+            raise map_exception(exc, self.config, model=self._model, provider=self._provider_id) from exc
         self._handle = handle
         self._interrupt_requested = False
 
@@ -862,7 +930,7 @@ class HailerAgent:
                     handle_event(msg)
                 raise
         except Exception as exc:
-            raise map_exception(exc, self.config, model=self._model) from exc
+            raise map_exception(exc, self.config, model=self._model, provider=self._provider_id) from exc
         finally:
             self._handle = None
 
@@ -873,7 +941,7 @@ class HailerAgent:
         error = getattr(completed_turn, "error", None)
         if status == "failed":
             message = getattr(error, "message", None) or str(error) or "unknown error"
-            raise map_exception(RuntimeError(message), self.config, model=self._model)
+            raise map_exception(RuntimeError(message), self.config, model=self._model, provider=self._provider_id)
 
         final = _final_response(items)
         if final is None:

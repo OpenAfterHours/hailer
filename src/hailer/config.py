@@ -25,7 +25,15 @@ from pathlib import Path
 from typing import Any
 
 from hailer.errors import ConfigError
-from hailer.models import HailerConfig, ModelConfig, ProviderConfig, WebConfig
+from hailer.models import (
+    VALID_WIRE_APIS,
+    WIRE_API_CHAT,
+    WIRE_API_RESPONSES,
+    HailerConfig,
+    ModelConfig,
+    ProviderConfig,
+    WebConfig,
+)
 
 CONFIG_FILENAMES: tuple[str, ...] = ("hailer.toml", ".config/hailer/hailer.toml")
 
@@ -38,7 +46,6 @@ DEFAULT_LOG_LEVEL = "WARNING"
 
 VALID_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
-VALID_WIRE_APIS = ("responses", "chat")
 
 # Known keys per section; anything else is reported by validate() as a warning.
 _KNOWN_TOP = {"hailer", "model", "model_providers", "web"}
@@ -337,7 +344,7 @@ def load_config(
         providers[provider_id] = ProviderConfig(
             id=provider_id,
             base_url=_clean_url(_str(raw, "base_url", section, path)),
-            wire_api=_str(raw, "wire_api", section, path, "responses") or "responses",
+            wire_api=_str(raw, "wire_api", section, path, WIRE_API_RESPONSES) or WIRE_API_RESPONSES,
             env_key=_str(raw, "env_key", section, path),
             requires_openai_auth=_bool(raw, "requires_openai_auth", section, path, False),
             name=_str(raw, "name", section, path),
@@ -497,7 +504,7 @@ def validate(config: HailerConfig) -> list[str]:
                 '"chat" when it implements Chat Completions (POST <base_url>/chat/completions).'
             )
         if provider.is_builtin_openai:
-            if provider.wire_api == "chat":
+            if provider.wire_api == WIRE_API_CHAT:
                 problems.append(
                     f'{section}.wire_api = "chat" needs a base_url; the built-in OpenAI provider always uses the Responses API.'
                 )

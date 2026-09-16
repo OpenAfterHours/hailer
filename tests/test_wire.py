@@ -11,9 +11,11 @@ from typing import Any
 
 import pytest
 
+from hailer import wire as wire_mod
 from hailer.wire import (
     ChatBridge,
     ChatStreamTranslator,
+    _reason,
     chat_request_from_responses,
     iter_sse_data,
     sse_frame,
@@ -201,7 +203,66 @@ def test_stream_tool_call_without_id_gets_one():
     t.start()
     t.feed(_chunk(tool_calls=[{"index": 0, "function": {"name": "f", "arguments": "{}"}}]))
     done = t.finish()
-    assert done[1]["item"]["call_id"].startswith("call_")
+    call_id = done[1]["item"]["call_id"]
+    assert call_id.startswith("call_")
+    assert done[0]["item"]["call_id"] == call_id  # the `added` event carries the same id, never null
+
+
+def test_stream_tool_call_deltas_without_index_continue_the_open_call():
+    t = ChatStreamTranslator()
+    t.start()
+    t.feed(_chunk(tool_calls=[{"id": "c1", "type": "function", "function": {"name": "shell", "arguments": ""}}]))
+    t.feed(_chunk(tool_calls=[{"function": {"arguments": '{"cmd":'}}]))
+    t.feed(_chunk(tool_calls=[{"function": {"arguments": ' "ls"}'}}]))
+    t.feed(_chunk(tool_calls=[{"id": "c1", "function": {"arguments": ""}}]))  # repeated id: same call
+    t.feed(_chunk(tool_calls=[{"id": "c2", "function": {"name": "read", "arguments": "{}"}}]))  # new id: new call
+    t.feed(_chunk(tool_calls=[{"function": {"name": "write", "arguments": "{}"}}]))  # name while one is open: new call
+    output = t.finish()[-1]["response"]["output"]
+    assert [(o["name"], o["arguments"], o["call_id"]) for o in output] == [
+        ("shell", '{"cmd": "ls"}', "c1"),
+        ("read", "{}", "c2"),
+        ("write", "{}", output[2]["call_id"]),
+    ]
+
+
+def test_stream_reasoning_after_text_closes_the_message_first():
+    t = ChatStreamTranslator()
+    t.start()
+    added = t.feed(_chunk(content="Let me"))
+    ev = t.feed(_chunk(reasoning_content="hmm"))
+    assert _types(ev)[:2] == ["response.output_text.done", "response.output_item.done"]
+    assert ev[1]["output_index"] == added[0]["output_index"] == 0
+    assert ev[2]["type"] == "response.output_item.added" and ev[2]["output_index"] == 1
+    t.feed(_chunk(content=" check"))
+    output = t.finish()[-1]["response"]["output"]
+    assert [o["type"] for o in output] == ["message", "reasoning", "message"]
+
+
+def test_stream_string_error_fails_the_response():
+    t = ChatStreamTranslator()
+    t.start()
+    ev = t.feed({"error": "Rate limit exceeded"})
+    assert _types(ev) == ["response.failed"] and ev[0]["response"]["error"] == {"message": "Rate limit exceeded"}
+    t = ChatStreamTranslator()
+    t.start()
+    assert t.feed({"error": {}}) == [] and not t.failed  # an empty error object is not an error
+
+
+def test_stream_content_part_with_null_text_is_ignored():
+    t = ChatStreamTranslator()
+    t.start()
+    assert t.feed({"choices": [{"index": 0, "delta": {"content": [{"type": "text", "text": None}, {"type": "text", "text": "ok"}]}}]})
+    assert t.finish()[-1]["response"]["output"][0]["content"][0]["text"] == "ok"
+
+
+def test_reason_wording_matches_the_connection_signals():
+    import socket
+    import urllib.error
+
+    assert _reason(urllib.error.URLError(socket.gaierror(-2, "Name or service not known"))).startswith("dns error (")
+    assert _reason(urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))) == "[Errno 111] Connection refused"
+    assert _reason(TimeoutError("The read operation timed out")) == "The read operation timed out"
+    assert _reason(TimeoutError()) == "timed out (TimeoutError)"
 
 
 def test_stream_reasoning_content_becomes_a_reasoning_item():
@@ -250,11 +311,20 @@ def test_sse_helpers():
 class FakeUpstream:
     """A Chat Completions server that records requests and streams scripted chunks."""
 
-    def __init__(self, chunks: list[dict[str, Any]], *, status: int = 200, body: bytes | None = None, done: bool = True) -> None:
+    def __init__(
+        self,
+        chunks: list[dict[str, Any]],
+        *,
+        status: int = 200,
+        body: bytes | None = None,
+        done: bool = True,
+        content_type: str = "text/event-stream",
+    ) -> None:
         self.chunks = chunks
         self.status = status
         self.body = body
         self.done = done
+        self.content_type = content_type
         self.requests: list[dict[str, Any]] = []
         server = self
 
@@ -286,9 +356,14 @@ class FakeUpstream:
                     self.wfile.write(payload)
                     return
                 self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Type", server.content_type)
                 self.send_header("Connection", "close")
                 self.end_headers()
+                if server.body is not None:
+                    self.wfile.write(server.body)
+                    self.wfile.flush()
+                    self.close_connection = True
+                    return
                 for chunk in server.chunks:
                     self.wfile.write(b"data: " + json.dumps(chunk).encode() + b"\n\n")
                     self.wfile.flush()
@@ -299,7 +374,7 @@ class FakeUpstream:
 
         self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self._httpd.daemon_threads = True
-        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        self._thread = threading.Thread(target=self._httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
 
     @property
     def base_url(self) -> str:
@@ -396,6 +471,40 @@ def test_bridge_passes_models_probe_through_and_rejects_unknown_paths(no_proxy):
         assert status == 404
         status, _, _ = _post(bridge.urls["p"] + "/responses", {"model": "m", "input": "hi"}, {})
         assert status == 200
+
+
+def test_bridge_detects_sse_with_a_wrong_content_type(no_proxy):
+    chunks = [_chunk(content="streamed"), {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}]
+    with FakeUpstream(chunks, content_type="text/plain") as up, ChatBridge({"p": up.base_url}) as bridge:
+        status, _, body = _post(bridge.urls["p"] + "/responses", {"model": "m", "input": "hi"})
+    assert status == 200
+    events = _events(body)
+    assert "response.output_text.delta" in [e["type"] for e in events]
+    assert events[-1]["response"]["output"][0]["content"][0]["text"] == "streamed"
+
+
+def test_bridge_accepts_a_non_streamed_json_reply(no_proxy):
+    reply = {"choices": [{"index": 0, "message": {"role": "assistant", "content": "whole"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+    with FakeUpstream([], content_type="application/json", body=json.dumps(reply).encode()) as up, ChatBridge({"p": up.base_url}) as bridge:
+        status, _, body = _post(bridge.urls["p"] + "/responses", {"model": "m", "input": "hi"})
+    assert status == 200
+    completed = _events(body)[-1]
+    assert completed["type"] == "response.completed"
+    assert completed["response"]["output"][0]["content"][0]["text"] == "whole"
+    assert completed["response"]["usage"]["total_tokens"] == 2
+
+
+def test_bridge_ends_the_stream_cleanly_when_translation_raises(no_proxy, monkeypatch):
+    def boom(self, chunk):
+        raise TypeError("sequence item 0: expected str instance, NoneType found")
+
+    monkeypatch.setattr(wire_mod.ChatStreamTranslator, "feed", boom)
+    with FakeUpstream([_chunk(content="x")]) as up, ChatBridge({"p": up.base_url}) as bridge:
+        status, _, body = _post(bridge.urls["p"] + "/responses", {"model": "m", "input": "hi"})
+    assert status == 200  # headers were already out; the failure travels inside the stream
+    events = _events(body)
+    assert events[-1]["type"] == "response.failed"
+    assert "NoneType" in events[-1]["response"]["error"]["message"]
 
 
 def test_bridge_stream_without_done_still_completes(no_proxy):

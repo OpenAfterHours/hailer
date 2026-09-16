@@ -254,8 +254,8 @@ uv run hailer
 ```
 
 Or set `INTERNAL_MODEL_API_KEY` in the terminal instead of logging in; an environment variable always wins
-over the credential store. `doctor` and `status` show the provider with its base URL and where the key came
-from (`from keyring` or `from env`), never the value.
+over the credential store. The startup panel and `status` show the provider with its base URL; `doctor` and
+`status` show where the key came from (`from keyring` or `from env`), never the value.
 
 **`wire_api` chooses the protocol the endpoint speaks**, and both must be streaming:
 
@@ -264,8 +264,8 @@ from (`from keyring` or `from env`), never the value.
 | `"responses"` (default) | `POST {base_url}/responses` straight from Codex | The gateway implements the OpenAI Responses API. |
 | `"chat"` | `POST {base_url}/chat/completions`, translated by Hailer | The gateway implements Chat Completions only (vLLM, Ollama, LiteLLM, most internal gateways). |
 
-With `"responses"` the gateway must also tolerate a `GET {base_url}/models` probe at startup (a 404 is fine)
-and accept the `reasoning`, `include` and `client_metadata` request fields.
+In both modes the gateway must tolerate a `GET {base_url}/models` probe at startup (a 404 is fine). With
+`"responses"` it must also accept the `reasoning`, `include` and `client_metadata` request fields.
 
 With `"chat"` Hailer starts a loopback bridge (`127.0.0.1`, random port) for the session, points Codex at it
 and translates each request: the system prompt becomes the `system` message, the conversation becomes
@@ -274,9 +274,10 @@ streamed `delta.content`, `delta.tool_calls`, `reasoning_content` and final `usa
 Responses events. The bridge forwards the `Authorization` header (from `env_key`), `http_headers`,
 `env_http_headers` and `query_params` unchanged and keeps no key of its own; `GET /models` is passed
 through. Reasoning effort is sent as `reasoning_effort` when set. The gateway must support streaming
-(`stream: true`) and function calling; `stream_options.include_usage` is requested for token counts. Nothing
-else changes: `hailer status` and `doctor` show the provider as `internal (https://..., chat completions)`,
-and endpoint errors name `/chat/completions`.
+(`stream: true`) and function calling; `stream_options.include_usage` is requested for token counts. The
+bridge listens on `127.0.0.1` only and is exempted from `HTTP(S)_PROXY` via `NO_PROXY` in the Codex child
+environment. Nothing else changes: the startup panel and `/status` show the provider as
+`internal (https://..., chat completions)`, and endpoint errors name `/chat/completions`.
 
 Hailer keeps the request small and predictable for gateways: its own system prompt replaces Codex's
 built-in coding-agent prompt, and web search, multi-agent, plugin and app features are switched off for

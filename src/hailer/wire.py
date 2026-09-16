@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import json
 import logging
+import socket
+import ssl
 import threading
 import urllib.error
 import urllib.parse
@@ -28,6 +30,8 @@ import uuid
 from collections.abc import Iterable, Iterator, Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+
+from hailer.models import VALID_WIRE_APIS, WIRE_API_CHAT, WIRE_API_RESPONSES  # noqa: F401 - re-exported
 
 try:  # keep importable when hailer.log is absent (see agent.py)
     from hailer.log import get_logger
@@ -39,12 +43,12 @@ except Exception:  # pragma: no cover
 
 log = get_logger("hailer.wire")
 
-WIRE_API_RESPONSES = "responses"
-WIRE_API_CHAT = "chat"
-VALID_WIRE_APIS = (WIRE_API_RESPONSES, WIRE_API_CHAT)
-
 #: Seconds without a byte from the upstream stream before the bridge gives up.
 UPSTREAM_READ_TIMEOUT_SEC = 300
+#: How often the server loop checks for shutdown; keeps ``close()`` (and process exit) prompt.
+_SERVE_POLL_INTERVAL_SEC = 0.05
+#: Byte prefixes that identify an SSE body whatever Content-Type the gateway declared.
+_SSE_PREFIXES = (b"data:", b"event:", b"id:", b"retry:", b":")
 
 # Hop-by-hop or request-specific headers that must not be copied upstream.
 _DROP_REQUEST_HEADERS = {
@@ -347,6 +351,8 @@ class ChatStreamTranslator:
         for _, call in sorted(self._calls.items()):
             name = call["name"]
             arguments = "".join(call["arguments"])
+            if not call["call_id"]:
+                call["call_id"] = "call_" + uuid.uuid4().hex[:12]
             index = self._output_index
             self._output_index += 1
             if name in self._custom:
@@ -392,8 +398,11 @@ class ChatStreamTranslator:
         if self._finished:
             return []
         error = chunk.get("error")
-        if isinstance(error, Mapping) and error:
-            return self.fail(str(error.get("message") or error), code=error.get("code") or error.get("type"))
+        if isinstance(error, Mapping):
+            if error:
+                return self.fail(str(error.get("message") or error), code=error.get("code") or error.get("type"))
+        elif error:
+            return self.fail(str(error))
 
         events: list[dict[str, Any]] = []
         usage = chunk.get("usage")
@@ -412,6 +421,7 @@ class ChatStreamTranslator:
                 reasoning = delta.get("reasoning")
             if isinstance(reasoning, str) and reasoning:
                 if self._reasoning_id is None:
+                    events.extend(self._close_message())
                     self._reasoning_id = "rs_" + uuid.uuid4().hex
                     events.append(
                         {
@@ -442,7 +452,7 @@ class ChatStreamTranslator:
 
             content = delta.get("content")
             if isinstance(content, list):  # some gateways stream content parts
-                content = "".join(p.get("text", "") for p in content if isinstance(p, Mapping))
+                content = "".join(p["text"] for p in content if isinstance(p, Mapping) and isinstance(p.get("text"), str))
             if isinstance(content, str) and content:
                 events.extend(self._close_reasoning())
                 if self._message_id is None:
@@ -479,9 +489,12 @@ class ChatStreamTranslator:
                     continue
                 events.extend(self._close_reasoning())
                 events.extend(self._close_message())
+                fn = call.get("function") or {}
+                if not isinstance(fn, Mapping):
+                    fn = {}
                 index = call.get("index")
                 if not isinstance(index, int):
-                    index = len(self._calls)
+                    index = self._slot_for(call.get("id"), fn.get("name"))
                 slot = self._calls.get(index)
                 if slot is None:
                     slot = {
@@ -493,13 +506,27 @@ class ChatStreamTranslator:
                     self._calls[index] = slot
                 if call.get("id") and not slot["call_id"]:
                     slot["call_id"] = str(call["id"])
-                fn = call.get("function") or {}
-                if isinstance(fn, Mapping):
-                    if fn.get("name") and not slot["name"]:
-                        slot["name"] = str(fn["name"])
-                    if isinstance(fn.get("arguments"), str):
-                        slot["arguments"].append(fn["arguments"])
+                if fn.get("name") and not slot["name"]:
+                    slot["name"] = str(fn["name"])
+                if isinstance(fn.get("arguments"), str):
+                    slot["arguments"].append(fn["arguments"])
         return events
+
+    def _slot_for(self, call_id: Any, name: Any) -> int:
+        """Pick the slot for a tool-call delta that carries no ``index``.
+
+        A delta with a new id, or a name while the open call already has one, starts a new
+        call; anything else (argument fragments, a repeated id) continues the latest call.
+        """
+        if not self._calls:
+            return 0
+        last = max(self._calls)
+        open_call = self._calls[last]
+        if call_id:
+            return last if str(call_id) == open_call["call_id"] else last + 1
+        if name and open_call["name"]:
+            return last + 1
+        return last
 
     def fail(self, message: str, *, code: Any = None) -> list[dict[str, Any]]:
         if self._finished:
@@ -516,9 +543,6 @@ class ChatStreamTranslator:
             return []
         self._finished = True
         events = self._close_reasoning() + self._close_message() + self._close_calls()
-        for call in self._items:
-            if call.get("type") in ("function_call", "custom_tool_call") and not call.get("call_id"):
-                call["call_id"] = "call_" + uuid.uuid4().hex[:12]
         completed = self._response("completed")
         if self._usage is not None:
             completed["usage"] = self._usage
@@ -601,6 +625,14 @@ class _BridgeHandler(BaseHTTPRequestHandler):
     def _send_error_json(self, status: int, message: str, kind: str = "hailer_bridge_error") -> None:
         self._send_json(status, {"error": {"message": message, "type": kind}})
 
+    def _relay(self, status: int, content_type: str | None, payload: bytes) -> None:
+        """Send an upstream response (typically an error) back to Codex unchanged."""
+        self.send_response(status)
+        self.send_header("Content-Type", content_type or "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
     def _read_body(self) -> bytes:
         length = int(self.headers.get("Content-Length") or 0)
         return self.rfile.read(length) if length > 0 else b""
@@ -630,7 +662,7 @@ class _BridgeHandler(BaseHTTPRequestHandler):
 
     def _open_upstream(self, method: str, url: str, data: bytes | None, headers: Mapping[str, str]) -> Any:
         req = urllib.request.Request(url, data=data, headers=dict(headers), method=method)
-        return urllib.request.urlopen(req, timeout=UPSTREAM_READ_TIMEOUT_SEC)  # noqa: S310 - user-configured endpoint
+        return self.server.opener.open(req, timeout=UPSTREAM_READ_TIMEOUT_SEC)  # noqa: S310 - user-configured endpoint
 
     def _passthrough(self, method: str, upstream: str, rest: str, query: str, body: bytes | None) -> None:
         url = upstream + rest + (f"?{query}" if query else "")
@@ -639,21 +671,11 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             headers["Content-Type"] = self.headers.get("Content-Type") or "application/json"
         try:
             with self._open_upstream(method, url, body, headers) as resp:
-                payload = resp.read()
-                status = resp.status
-                content_type = resp.headers.get("Content-Type") or "application/json"
+                self._relay(resp.status, resp.headers.get("Content-Type"), resp.read())
         except urllib.error.HTTPError as exc:
-            payload = exc.read()
-            status = exc.code
-            content_type = exc.headers.get("Content-Type") or "application/json"
+            self._relay(exc.code, exc.headers.get("Content-Type"), exc.read())
         except (urllib.error.URLError, OSError) as exc:
             self._send_error_json(502, f"could not reach {url}: {_reason(exc)}")
-            return
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
 
     def _responses(self, upstream: str, query: str, body: bytes) -> None:
         try:
@@ -676,12 +698,7 @@ class _BridgeHandler(BaseHTTPRequestHandler):
         try:
             resp = self._open_upstream("POST", url, data, headers)
         except urllib.error.HTTPError as exc:
-            payload = exc.read()
-            self.send_response(exc.code)
-            self.send_header("Content-Type", exc.headers.get("Content-Type") or "application/json")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
+            self._relay(exc.code, exc.headers.get("Content-Type"), exc.read())
             return
         except (urllib.error.URLError, OSError) as exc:
             self._send_error_json(502, f"could not reach {url}: {_reason(exc)}")
@@ -695,20 +712,16 @@ class _BridgeHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
         def emit(events: list[dict[str, Any]]) -> None:
-            for event in events:
-                frame = sse_frame(event)
-                self.wfile.write(f"{len(frame):x}\r\n".encode("ascii") + frame + b"\r\n")
+            if not events:
+                return
+            frames = [sse_frame(event) for event in events]
+            self.wfile.write(b"".join(f"{len(f):x}\r\n".encode("ascii") + f + b"\r\n" for f in frames))
             self.wfile.flush()
 
         try:
             with resp:
                 emit(translator.start())
-                content_type = (resp.headers.get("Content-Type") or "").lower()
-                if "text/event-stream" not in content_type:
-                    # The gateway ignored stream=true; treat the whole body as one chunk.
-                    whole = json.loads(resp.read().decode("utf-8"))
-                    emit(translator.feed(whole))
-                else:
+                if _looks_like_sse(resp):
                     for payload in iter_sse_data(resp):
                         if payload.strip() == "[DONE]":
                             break
@@ -721,8 +734,18 @@ class _BridgeHandler(BaseHTTPRequestHandler):
                             emit(translator.feed(chunk))
                         if translator.failed:
                             break
+                else:
+                    # The gateway ignored stream=true; treat the whole body as one chunk.
+                    whole = json.loads(resp.read().decode("utf-8"))
+                    if not isinstance(whole, Mapping):
+                        raise ValueError("upstream returned a non-object JSON body")
+                    emit(translator.feed(whole))
                 emit(translator.finish())
-        except (urllib.error.URLError, OSError, ValueError) as exc:
+        except OSError as exc:
+            # The Codex side or the upstream socket went away; nothing sensible left to send.
+            log.debug("bridge: stream aborted: %s", _reason(exc))
+            return
+        except Exception as exc:  # noqa: BLE001 - any translation failure must end the stream cleanly
             log.debug("bridge: upstream stream failed: %s", _reason(exc))
             try:
                 emit(translator.fail(f"upstream stream from {url} failed: {_reason(exc)}"))
@@ -735,10 +758,36 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             pass
 
 
+def _looks_like_sse(resp: Any) -> bool:
+    """True when the upstream body is an event stream, by Content-Type or by its first bytes."""
+    if "text/event-stream" in (resp.headers.get("Content-Type") or "").lower():
+        return True
+    peek = getattr(resp, "peek", None)
+    if peek is None:
+        return False
+    try:
+        head = peek(16).lstrip()
+    except (OSError, ValueError):
+        return False
+    return head.startswith(_SSE_PREFIXES)
+
+
 def _reason(exc: BaseException) -> str:
+    """A short cause for an upstream failure, worded so Hailer's error mapping recognises it."""
     reason = getattr(exc, "reason", None)
-    text = str(reason) if reason is not None else str(exc)
-    return text or type(exc).__name__
+    cause = reason if reason is not None else exc
+    text = str(cause) or type(cause).__name__
+    if isinstance(cause, socket.gaierror):
+        return f"dns error ({text})"
+    if isinstance(cause, TimeoutError) and "timed out" not in text.lower():
+        return f"timed out ({text})"
+    return text
+
+
+def _build_opener() -> urllib.request.OpenerDirector:
+    """One opener (and one TLS context) for the bridge's lifetime, honouring the usual proxy variables."""
+    context = ssl.create_default_context()
+    return urllib.request.build_opener(urllib.request.HTTPSHandler(context=context))
 
 
 class ChatBridge:
@@ -752,6 +801,7 @@ class ChatBridge:
         daemon_threads = True
         allow_reuse_address = True
         upstreams: dict[str, str]
+        opener: urllib.request.OpenerDirector
 
     def __init__(self, upstreams: Mapping[str, str], *, host: str = "127.0.0.1") -> None:
         self._upstreams = {pid: url.rstrip("/") for pid, url in upstreams.items()}
@@ -779,8 +829,11 @@ class ChatBridge:
             return self
         server = ChatBridge._Server((self._host, 0), _BridgeHandler)
         server.upstreams = dict(self._upstreams)
+        server.opener = _build_opener()
         self._server = server
-        self._thread = threading.Thread(target=server.serve_forever, name="hailer-chat-bridge", daemon=True)
+        self._thread = threading.Thread(
+            target=server.serve_forever, kwargs={"poll_interval": _SERVE_POLL_INTERVAL_SEC}, name="hailer-chat-bridge", daemon=True
+        )
         self._thread.start()
         log.debug("chat bridge listening on port %s for %s", self.port, ", ".join(sorted(self._upstreams)))
         return self

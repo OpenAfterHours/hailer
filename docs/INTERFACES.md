@@ -81,7 +81,13 @@ module exposes so work can proceed in parallel. Shared types live in `src/hailer
   `response.output_text.delta`, `response.reasoning_summary_text.delta`, `response.output_item.done` for
   `message` / `function_call` / `custom_tool_call` / `reasoning`, `response.completed` with `usage`,
   `response.failed`). It forwards Codex's request headers and query string upstream, so credentials stay on
-  the provider config; `GET /<id>/models` is passed through; `/responses/compact` answers 404.
+  the provider config; `GET /<id>/models` is passed through; `/responses/compact` answers 404 with a body
+  naming the bridge, which `map_exception` turns into a dedicated hint. Trust model: the bridge binds
+  `127.0.0.1` only, stores no credential, forwards whatever headers its caller supplies, and any local process
+  can use it to reach `base_url` (through Hailer's own proxy/CA environment) for the session's lifetime.
+  `build_child_env` adds `127.0.0.1,localhost` to `NO_PROXY`/`no_proxy` whenever a chat provider is declared so
+  Codex never sends bridge traffic to an `HTTP(S)_PROXY`. `HailerAgent.overrides` is a property derived from
+  the current bridge state (no stale pre-bridge copy); a loopback bind failure raises `ProviderError`.
   Secrets reach Codex via the child-process env (`CodexConfig.env`).
 - Trimming overrides Hailer always passes: `web_search="disabled"`, `features.web_search_request=false`,
   `features.multi_agent=false`, `features.multi_agent_v2=false`, `features.plugins=false`,

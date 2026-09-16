@@ -102,15 +102,20 @@ class ExecResult:
 # --------------------------------------------------------------------------- #
 
 
+#: Protocols a provider endpoint can speak. Codex talks the Responses API natively; for
+#: ``"chat"`` Hailer bridges Codex's Responses calls to Chat Completions (see hailer.wire).
+WIRE_API_RESPONSES = "responses"
+WIRE_API_CHAT = "chat"
+VALID_WIRE_APIS = (WIRE_API_RESPONSES, WIRE_API_CHAT)
+
+
 @dataclass(frozen=True)
 class ProviderConfig:
     """A model provider, passed through to Codex as ``model_providers.<id>.*``."""
 
     id: str
     base_url: str | None = None
-    #: "responses" (the endpoint implements the OpenAI Responses API, which Codex speaks natively)
-    #: or "chat" (the endpoint implements Chat Completions; Hailer bridges the two, see hailer.wire).
-    wire_api: str = "responses"
+    wire_api: str = WIRE_API_RESPONSES  # one of VALID_WIRE_APIS
     env_key: str | None = None
     requires_openai_auth: bool = False
     name: str | None = None
@@ -125,7 +130,7 @@ class ProviderConfig:
     @property
     def uses_chat_completions(self) -> bool:
         """True when Hailer must translate Codex's Responses calls into Chat Completions."""
-        return self.wire_api == "chat" and not self.is_builtin_openai
+        return self.wire_api == WIRE_API_CHAT and not self.is_builtin_openai
 
 
 @dataclass(frozen=True)
