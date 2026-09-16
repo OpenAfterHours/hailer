@@ -1286,3 +1286,48 @@ def test_chat_upstreams_carry_the_bridge_options_but_codex_never_sees_them(tmp_p
     assert (hard.merge_messages, hard.stream_options, hard.parallel_tool_calls) == (False, False, False)
     ov = build_config_overrides(cfg, USER_CODEX_CONFIG, {"internal": "http://127.0.0.1:1/internal", "strict": "http://127.0.0.1:1/strict"})
     assert not any(key in o for o in ov for key in (".merge_messages=", ".stream_options=", ".parallel_tool_calls="))
+
+
+# ---- integration follow-ups: stream = false example, connection branch quoting ---------------
+
+
+def test_map_rejected_hint_does_not_suggest_stream_false_when_already_off(tmp_path):
+    unstreamed = ProviderConfig(
+        id="internal",
+        name="Internal",
+        base_url="https://llm.example.internal/v1",
+        wire_api="chat",
+        stream=False,
+        env_key="INTERNAL_MODEL_API_KEY",
+    )
+    mapped = map_exception(RuntimeError(_GATEWAY_422), make_config(tmp_path, providers={"internal": unstreamed}))
+    assert "rejected the request" in str(mapped)
+    assert ", stream = false)" in mapped.hint  # the sent-description still says streaming is off
+    assert "for example stream = false" not in mapped.hint and "other chat switches" in mapped.hint
+    streaming = map_exception(RuntimeError(_GATEWAY_422), make_config(tmp_path, providers={"internal": CHAT_PROVIDER}))
+    assert "for example stream = false" in streaming.hint
+
+
+def test_map_connection_branch_quotes_gateway_text_but_not_plain_reasons(tmp_path):
+    cfg = make_config(tmp_path, providers={"internal": CHAT_PROVIDER})
+    mid_stream = map_exception(
+        RuntimeError("upstream stream from https://llm.example.internal/v1/chat/completions failed: timed out"), cfg
+    )
+    assert "Could not reach" in str(mid_stream)
+    assert (
+        "The endpoint said: upstream stream from https://llm.example.internal/v1/chat/completions failed: timed out"
+        in mid_stream.hint
+    )
+    gateway_504 = map_exception(
+        RuntimeError(
+            'unexpected status 504 Gateway Timeout: {"error": {"message": "upstream timed out after 60s"}}'
+            ", url: http://127.0.0.1:7/internal/responses"
+        ),
+        cfg,
+    )
+    assert "Could not reach" in str(gateway_504)
+    assert "upstream timed out after 60s" in gateway_504.hint and "127.0.0.1" not in gateway_504.hint
+    plain = map_exception(RuntimeError("error sending request: connection refused"), cfg)
+    assert "Could not reach" in str(plain) and "The endpoint said" not in plain.hint
+    dns = map_exception(RuntimeError("could not reach https://llm.example.internal/v1/chat/completions: dns error (x)"), cfg)
+    assert "The endpoint said" not in dns.hint
