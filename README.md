@@ -236,7 +236,7 @@ provider = "internal"
 
 [model_providers.internal]
 base_url             = "https://llm.example.internal/v1"
-wire_api             = "responses"
+wire_api             = "responses"                # or "chat" for a Chat Completions endpoint
 env_key              = "INTERNAL_MODEL_API_KEY"   # env var name; value from `hailer login internal` or the shell
 requires_openai_auth = false
 # name             = "Internal"
@@ -257,11 +257,26 @@ Or set `INTERNAL_MODEL_API_KEY` in the terminal instead of logging in; an enviro
 over the credential store. `doctor` and `status` show the provider with its base URL and where the key came
 from (`from keyring` or `from env`), never the value.
 
-**The endpoint must implement the OpenAI Responses API, streaming** (`POST {base_url}/responses`). Codex
-speaks nothing else; `wire_api` accepts only `"responses"`. If your gateway only offers Chat Completions,
-run a translating proxy such as LiteLLM locally and point `base_url` at it. The gateway must also tolerate a
-`GET {base_url}/models` probe at startup (a 404 is fine) and accept the `reasoning`, `include` and
-`client_metadata` request fields.
+**`wire_api` chooses the protocol the endpoint speaks**, and both must be streaming:
+
+| `wire_api` | What Hailer sends | Use it when |
+|---|---|---|
+| `"responses"` (default) | `POST {base_url}/responses` straight from Codex | The gateway implements the OpenAI Responses API. |
+| `"chat"` | `POST {base_url}/chat/completions`, translated by Hailer | The gateway implements Chat Completions only (vLLM, Ollama, LiteLLM, most internal gateways). |
+
+With `"responses"` the gateway must also tolerate a `GET {base_url}/models` probe at startup (a 404 is fine)
+and accept the `reasoning`, `include` and `client_metadata` request fields.
+
+With `"chat"` Hailer starts a loopback bridge (`127.0.0.1`, random port) for the session, points Codex at it
+and translates each request: the system prompt becomes the `system` message, the conversation becomes
+`messages` with `tool_calls` / `tool` entries, Codex's function tools become Chat Completions `tools`, and the
+streamed `delta.content`, `delta.tool_calls`, `reasoning_content` and final `usage` chunks come back as
+Responses events. The bridge forwards the `Authorization` header (from `env_key`), `http_headers`,
+`env_http_headers` and `query_params` unchanged and keeps no key of its own; `GET /models` is passed
+through. Reasoning effort is sent as `reasoning_effort` when set. The gateway must support streaming
+(`stream: true`) and function calling; `stream_options.include_usage` is requested for token counts. Nothing
+else changes: `hailer status` and `doctor` show the provider as `internal (https://..., chat completions)`,
+and endpoint errors name `/chat/completions`.
 
 Hailer keeps the request small and predictable for gateways: its own system prompt replaces Codex's
 built-in coding-agent prompt, and web search, multi-agent, plugin and app features are switched off for
@@ -466,7 +481,8 @@ when a session exists, confirms that marimo's code-mode API is available in the 
 | `The model endpoint rejected the API key for provider '...'` | The gateway returned 401. Re-run `hailer login <provider>`. |
 | `Unknown model '...' for provider '...'` | Fix `[model].name`. |
 | `Could not reach the model endpoint at <base_url>` | Check `base_url`, VPN or proxy, and that the endpoint is running. |
-| `The endpoint at <base_url> did not accept the request.` with the Responses-API hint | The gateway does not implement `POST /responses`. Put a translating proxy in front of it. |
+| `The endpoint at <base_url> did not accept the request.` with the Responses-API hint | The gateway does not implement `POST /responses`. If it offers Chat Completions, set `wire_api = "chat"` for the provider. |
+| `The endpoint at <base_url> did not accept the request.` with the `/chat/completions` hint | `wire_api = "chat"` is set but the gateway rejected `POST /chat/completions` (wrong `base_url`, no streaming, or no function calling). |
 | `The Codex runtime refused to start because of a configuration error.` | Usually an interaction with `~/.codex/config.toml`. Run with `--verbose` for the runtime's message, or set `HAILER_CODEX_HOME`. |
 | A tool result starting with `ERROR:` inside the conversation | The agent hit a marimo or allowlist problem; the text contains the fix (for example the URL to open). |
 | marimo answers 401 or 403 and the hint mentions `HAILER_MARIMO_TOKEN` | The server was started with a token. Export it as `HAILER_MARIMO_TOKEN` (kept in memory only), or restart marimo with `--no-token`. |

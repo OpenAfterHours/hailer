@@ -62,6 +62,15 @@ def make_config(tmp_path: Path, **overrides: Any) -> HailerConfig:
     return HailerConfig(**base)
 
 
+CHAT_PROVIDER = ProviderConfig(
+    id="internal",
+    name="Internal",
+    base_url="https://llm.example.internal/v1",
+    wire_api="chat",
+    env_key="INTERNAL_MODEL_API_KEY",
+    http_headers={"X-Team": "risk"},
+)
+
 USER_CODEX_CONFIG = {
     "model": "gpt-6-astra",
     "plugins": {"browser@openai-bundled": {"enabled": True}, "sites@openai-bundled": {"enabled": True}},
@@ -239,6 +248,48 @@ def test_overrides_for_custom_provider(tmp_path):
     # never disable our own server, never emit plugin-provided mcp servers we did not see
     assert "mcp_servers.hailer.enabled=false" not in ov
     assert not any("cua_repl" in o for o in ov)
+
+
+def test_overrides_for_chat_provider_without_bridge_keep_the_declared_wire_api(tmp_path):
+    cfg = make_config(tmp_path, providers={"internal": CHAT_PROVIDER})
+    ov = build_config_overrides(cfg, USER_CODEX_CONFIG)
+    assert 'model_providers.internal.wire_api="chat"' in ov
+    assert 'model_providers.internal.base_url="https://llm.example.internal/v1"' in ov
+
+
+def test_overrides_for_chat_provider_point_codex_at_the_bridge(tmp_path):
+    cfg = make_config(tmp_path, providers={"internal": CHAT_PROVIDER})
+    ov = build_config_overrides(cfg, USER_CODEX_CONFIG, {"internal": "http://127.0.0.1:4242/internal"})
+    assert 'model_providers.internal.wire_api="responses"' in ov
+    assert 'model_providers.internal.base_url="http://127.0.0.1:4242/internal"' in ov
+    # credentials and headers stay on the provider so Codex attaches them and the bridge forwards them
+    assert 'model_providers.internal.env_key="INTERNAL_MODEL_API_KEY"' in ov
+    assert 'model_providers.internal.http_headers={X-Team = "risk"}' in ov
+    assert "llm.example.internal" not in " ".join(ov)
+
+
+def test_agent_starts_and_stops_the_bridge_for_chat_providers(tmp_path, monkeypatch):
+    monkeypatch.setenv("INTERNAL_MODEL_API_KEY", "k")
+    ag, created = make_agent(tmp_path, providers={"internal": CHAT_PROVIDER})
+    assert ag.bridge is None
+    assert 'model_providers.internal.wire_api="chat"' in ag.overrides
+    ag.start()
+    assert ag.bridge is not None and ag.bridge.port
+    bridge_url = ag.bridge.urls["internal"]
+    (fake,) = created
+    assert f'model_providers.internal.base_url="{bridge_url}"' in fake.cfg.config_overrides
+    assert 'model_providers.internal.wire_api="responses"' in fake.cfg.config_overrides
+    assert ag.overrides == fake.cfg.config_overrides
+    ag.close()
+    assert ag.bridge is None
+
+
+def test_agent_has_no_bridge_for_responses_providers(tmp_path, monkeypatch):
+    monkeypatch.setenv("INTERNAL_MODEL_API_KEY", "k")
+    ag, _ = make_agent(tmp_path)
+    ag.start()
+    assert ag.bridge is None
+    ag.close()
 
 
 def test_overrides_openai_default_has_no_provider_table(tmp_path):
@@ -601,7 +652,16 @@ def test_map_404_mentions_responses_api(tmp_path):
     mapped = map_exception(RuntimeError("404 Not Found"), make_config(tmp_path))
     assert isinstance(mapped, ProviderError) and "Responses API" in mapped.hint
     assert "https://llm.example.internal/v1/responses" in mapped.hint
+    assert 'wire_api = "chat"' in mapped.hint
     assert "{base_url}" not in mapped.hint
+
+
+def test_map_404_for_chat_provider_names_chat_completions(tmp_path):
+    cfg = make_config(tmp_path, providers={"internal": CHAT_PROVIDER})
+    mapped = map_exception(RuntimeError("404 Not Found"), cfg)
+    assert isinstance(mapped, ProviderError)
+    assert "https://llm.example.internal/v1/chat/completions" in mapped.hint
+    assert "/responses," not in mapped.hint
 
 
 def test_failed_turn_is_mapped(tmp_path):

@@ -31,6 +31,7 @@ from hailer.models import (
     SkillInfo,
     TurnSummary,
 )
+from hailer.wire import ChatBridge
 
 try:  # log.py is written by another owner; fall back to plain logging if absent.
     from hailer.log import get_logger
@@ -162,8 +163,21 @@ def _custom_providers(config: HailerConfig) -> list[ProviderConfig]:
     return [p for pid, p in sorted(config.providers.items()) if not p.is_builtin_openai]
 
 
-def build_config_overrides(config: HailerConfig, user_codex_config: dict) -> tuple[str, ...]:
+def chat_completion_upstreams(config: HailerConfig) -> dict[str, str]:
+    """Provider id -> ``base_url`` for every declared provider with ``wire_api = "chat"``."""
+    return {p.id: p.base_url for p in _custom_providers(config) if p.uses_chat_completions and p.base_url}
+
+
+def build_config_overrides(
+    config: HailerConfig, user_codex_config: dict, bridge_urls: Mapping[str, str] | None = None
+) -> tuple[str, ...]:
     """Return the ``key=value`` overrides passed to ``codex app-server``.
+
+    ``bridge_urls`` maps the id of each ``wire_api = "chat"`` provider to the loopback URL of
+    the running :class:`~hailer.wire.ChatBridge`; those providers are handed to Codex as
+    Responses-API providers at that URL (Codex refuses ``wire_api = "chat"`` itself). The
+    credentials and custom headers stay on the provider, so Codex still attaches them and the
+    bridge forwards them upstream.
 
     Pure: depends only on the arguments (plus ``sys.executable`` for the MCP server command).
     """
@@ -175,9 +189,15 @@ def build_config_overrides(config: HailerConfig, user_codex_config: dict) -> tup
 
     # Every declared custom provider is passed through, so /model can switch providers
     # without restarting the app-server.
+    bridged = bridge_urls or {}
     for prov in _custom_providers(config):
         for field in _PROVIDER_FIELDS:
             value = getattr(prov, field)
+            if prov.uses_chat_completions and prov.id in bridged:
+                if field == "base_url":
+                    value = bridged[prov.id]
+                elif field == "wire_api":
+                    value = "responses"
             if value is None or value == {} or value == "":
                 continue
             out.append(_override(f"model_providers.{toml_key(prov.id)}.{field}", value))
@@ -418,14 +438,19 @@ def map_exception(exc: BaseException, config: HailerConfig, *, model: str | None
             ),
         )
     if any(s in low for s in _RESPONSES_API_SIGNALS):
-        return ProviderError(
-            f"The endpoint at {base_url} did not accept the request.",
-            hint=(
-                f"Codex requires the OpenAI Responses API (POST {base_url}/responses, streaming). "
-                "If the gateway only offers Chat Completions, run a translating proxy locally "
-                "and point base_url at it."
-            ),
-        )
+        if provider.uses_chat_completions:
+            hint = (
+                f"This provider uses wire_api = \"chat\": Hailer sends POST {base_url}/chat/completions "
+                "(streaming, with function tools). Check that the gateway implements Chat Completions with "
+                'streaming at that path, or set wire_api = "responses" if it implements the Responses API.'
+            )
+        else:
+            hint = (
+                f"This provider uses the OpenAI Responses API (POST {base_url}/responses, streaming). "
+                'If the gateway only offers Chat Completions, set wire_api = "chat" in its '
+                "[model_providers] table instead."
+            )
+        return ProviderError(f"The endpoint at {base_url} did not accept the request.", hint=hint)
     return AgentError("The agent run failed.", hint=text[:600])
 
 
@@ -532,6 +557,7 @@ class HailerAgent:
         self.bundle = bundle
         self._codex_factory = codex_factory or _default_codex_factory
         self._codex: Any = None
+        self._bridge: ChatBridge | None = None
         self._thread: Any = None
         self._handle: Any = None
         self._interrupt_requested = False
@@ -556,8 +582,8 @@ class HailerAgent:
         self._child_env = build_child_env(config, key, extra)
         del key, extra  # do not keep secrets on the instance
 
-        user_cfg = user_codex_config if user_codex_config is not None else read_user_codex_config(config.codex_home)
-        self.overrides: tuple[str, ...] = build_config_overrides(config, user_cfg)
+        self._user_codex_config = user_codex_config if user_codex_config is not None else read_user_codex_config(config.codex_home)
+        self.overrides: tuple[str, ...] = build_config_overrides(config, self._user_codex_config)
 
     # ---- lifecycle ---------------------------------------------------------
 
@@ -572,6 +598,23 @@ class HailerAgent:
     @property
     def started(self) -> bool:
         return self._codex is not None
+
+    @property
+    def bridge(self) -> ChatBridge | None:
+        """The Chat Completions bridge, once started (only when a provider has ``wire_api = "chat"``)."""
+        return self._bridge
+
+    def _ensure_bridge(self) -> None:
+        """Start the loopback bridge for ``wire_api = "chat"`` providers and re-point Codex at it."""
+        if self._bridge is not None:
+            return
+        upstreams = chat_completion_upstreams(self.config)
+        if not upstreams:
+            return
+        bridge = ChatBridge(upstreams)
+        bridge.start()
+        self._bridge = bridge
+        self.overrides = build_config_overrides(self.config, self._user_codex_config, bridge.urls)
 
     def _require_key(self) -> None:
         provider = self.config.providers.get(self._provider_id)
@@ -603,6 +646,7 @@ class HailerAgent:
     def _ensure_codex(self) -> None:
         if self._codex is not None:
             return
+        self._ensure_bridge()
         from openai_codex import CodexConfig
 
         cfg = CodexConfig(
@@ -685,6 +729,9 @@ class HailerAgent:
                 codex.close()
             except Exception as exc:
                 log.debug("close failed: %s", type(exc).__name__)
+        bridge, self._bridge = self._bridge, None
+        if bridge is not None:
+            bridge.close()
 
     # ---- turns -------------------------------------------------------------
 

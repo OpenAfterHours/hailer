@@ -388,9 +388,16 @@ def _provider_line(config: HailerConfig) -> str:
         provider = config.provider
     except KeyError:
         return f"{config.model.provider} (not declared in hailer.toml)"
-    if provider.base_url:
-        return f"{provider.id} ({provider.base_url})"
-    return provider.id
+    return _describe_provider(provider)
+
+
+def _describe_provider(provider: ProviderConfig) -> str:
+    """``id (base_url, chat completions)`` for a chat provider; ``id (base_url)`` or ``id`` otherwise."""
+    if not provider.base_url:
+        return provider.id
+    if provider.uses_chat_completions:
+        return f"{provider.id} ({provider.base_url}, chat completions)"
+    return f"{provider.id} ({provider.base_url})"
 
 
 def _web_line(config: HailerConfig) -> str:
@@ -880,7 +887,7 @@ class ChatLoop:
         provider = self._active_provider()
         if provider is None:
             return f"{provider_id} (not declared in hailer.toml)"
-        return f"{provider.id} ({provider.base_url})" if provider.base_url else provider.id
+        return _describe_provider(provider)
 
     def _credentials_line(self) -> str:
         provider = self._active_provider()

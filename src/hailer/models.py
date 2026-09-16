@@ -108,6 +108,8 @@ class ProviderConfig:
 
     id: str
     base_url: str | None = None
+    #: "responses" (the endpoint implements the OpenAI Responses API, which Codex speaks natively)
+    #: or "chat" (the endpoint implements Chat Completions; Hailer bridges the two, see hailer.wire).
     wire_api: str = "responses"
     env_key: str | None = None
     requires_openai_auth: bool = False
@@ -119,6 +121,11 @@ class ProviderConfig:
     @property
     def is_builtin_openai(self) -> bool:
         return self.id == "openai" and self.base_url is None
+
+    @property
+    def uses_chat_completions(self) -> bool:
+        """True when Hailer must translate Codex's Responses calls into Chat Completions."""
+        return self.wire_api == "chat" and not self.is_builtin_openai
 
 
 @dataclass(frozen=True)

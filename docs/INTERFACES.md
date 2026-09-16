@@ -71,7 +71,18 @@ module exposes so work can proceed in parallel. Shared types live in `src/hailer
   `SkillInput(name, path)` may be included in turn input. Errors: `openai_codex.errors.*`.
 - Provider config is native Codex config: `model`, `model_provider`, `model_providers.<id>.{base_url,
   wire_api="responses", env_key, requires_openai_auth, name, http_headers, env_http_headers, query_params}`.
-  Codex only speaks the Responses API. Secrets reach Codex via the child-process env (`CodexConfig.env`).
+  Codex 0.154 only speaks the Responses API and refuses `wire_api = "chat"`. Hailer accepts `wire_api = "chat"`
+  in `hailer.toml` anyway: `agent.HailerAgent._ensure_bridge` starts `wire.ChatBridge` (loopback HTTP server,
+  one route per chat provider at `http://127.0.0.1:<port>/<id>`) before the app-server, and
+  `build_config_overrides(config, user_cfg, bridge_urls)` hands such providers to Codex as
+  `wire_api="responses"` at the bridge URL. The bridge translates `POST /<id>/responses` (Responses request →
+  `chat_request_from_responses`) into `POST {base_url}/chat/completions` (streaming) and the chunks back into
+  Responses SSE events (`ChatStreamTranslator`: `response.created`, `response.output_item.added`,
+  `response.output_text.delta`, `response.reasoning_summary_text.delta`, `response.output_item.done` for
+  `message` / `function_call` / `custom_tool_call` / `reasoning`, `response.completed` with `usage`,
+  `response.failed`). It forwards Codex's request headers and query string upstream, so credentials stay on
+  the provider config; `GET /<id>/models` is passed through; `/responses/compact` answers 404.
+  Secrets reach Codex via the child-process env (`CodexConfig.env`).
 - Trimming overrides Hailer always passes: `web_search="disabled"`, `features.web_search_request=false`,
   `features.multi_agent=false`, `features.multi_agent_v2=false`, `features.plugins=false`,
   `features.apps=false`, `features.codex_apps=false`, `features.connectors=false`,
@@ -114,7 +125,7 @@ filled in by `load_config` (`HailerConfig.notebooks_dir`; use `HailerConfig.note
 to `notebook.parent` for hand-built configs). `validate` checks: notebook exists, notebook is inside
 `notebooks_dir` (fatal, names both keys), `notebooks_dir` exists (warning only), data_dir exists (warning
 only), active provider declared (or `openai`), custom provider has `base_url` and `env_key`,
-`wire_api == "responses"`, domains are well-formed.
+`wire_api in ("responses", "chat")` (`"chat"` requires a `base_url`), domains are well-formed.
 
 Errors added for the notebook feature (`errors.py`): `NotebookExistsError` (create: name taken) and
 `NotebookPathError` (outside the notebooks folder, or not a marimo notebook).
@@ -318,7 +329,7 @@ class HailerAgent:
 `codex_factory` defaults to `openai_codex.Codex`; tests inject a fake exposing `thread_start`, `thread_resume`,
 `close`, and threads with `turn()` returning a handle with `stream()`/`interrupt()`. Map SDK exceptions to
 `AgentError`/`ProviderError`/`CredentialsError` with hints (401 → key rejected; connection refused → base_url;
-404 on `/responses` or schema error → "endpoint must implement the Responses API; run a translating proxy"; "model ... not found/does not exist" → ProviderError naming the unknown model, checked before the endpoint heuristics; "tool ... timed out" → AgentError, never an endpoint failure). `map_exception(exc, config, *, model=None)`.
+404 on `/responses` or schema error → ProviderError whose hint names the protocol the provider uses (`POST .../responses` for `wire_api = "responses"`, `POST .../chat/completions` for `"chat"`) and suggests switching `wire_api`; "model ... not found/does not exist" → ProviderError naming the unknown model, checked before the endpoint heuristics; "tool ... timed out" → AgentError, never an endpoint failure). `map_exception(exc, config, *, model=None)`.
 
 ## `session.py`  (owner: wave 2 / E)
 

@@ -953,6 +953,17 @@ def test_status_command_shows_endpoint_and_credentials(harness):
     assert "INTERNAL_MODEL_API_KEY from keyring" in result.output
 
 
+def test_status_command_marks_chat_completions_providers(harness):
+    chat_provider = ProviderConfig(
+        id="internal", base_url="https://llm.example.internal/v1", wire_api="chat", env_key="INTERNAL_MODEL_API_KEY"
+    )
+    harness.config = make_config(harness.config.workspace, provider="internal", providers={"internal": chat_provider})
+    harness.agent.key_source = "env"
+    result = chat(input_text="/status\n/exit\n")
+    assert result.exit_code == 0, result.output
+    assert "internal (https://llm.example.internal/v1, chat completions)" in result.output
+
+
 def test_model_switch_does_not_start_a_second_thread(harness):
     harness.config = make_config(harness.config.workspace, providers={"internal": INTERNAL})
     harness.agent.set_model_restarts = True

@@ -20,13 +20,14 @@ name = "gpt-5.5"
 provider = "openai"                  # "openai" uses your existing Codex login or OPENAI_API_KEY
 # reasoning_effort = "medium"        # minimal | low | medium | high | xhigh
 
-# A bespoke / internal endpoint. It must implement the OpenAI Responses API
-# (streaming). If it only offers Chat Completions, run a translating proxy and
-# point base_url at that.
+# A bespoke / internal endpoint. wire_api picks the protocol the endpoint speaks:
+#   "responses" - the OpenAI Responses API, streaming (POST {base_url}/responses)
+#   "chat"      - Chat Completions, streaming (POST {base_url}/chat/completions);
+#                 Hailer translates between the two on a loopback bridge.
 #
 # [model_providers.internal]
 # base_url             = "https://llm.example.internal/v1"
-# wire_api             = "responses"
+# wire_api             = "responses"                      # or "chat"
 # env_key              = "INTERNAL_MODEL_API_KEY"   # env var name; value from `hailer login internal` or the shell
 # requires_openai_auth = false
 # name                 = "Internal"
