@@ -62,6 +62,9 @@ TRIMMING_OVERRIDES: tuple[tuple[str, Any], ...] = (
 )
 
 MCP_SERVER_NAME = "hailer"
+#: Server request Codex sends to have the client approve an MCP tool call (see approval_handler).
+MCP_ELICITATION_METHOD = "mcpServer/elicitation/request"
+MCP_TOOL_CALL_APPROVAL_KIND = "mcp_tool_call"
 MCP_TOOL_TIMEOUT_SEC = 600
 MCP_STARTUP_TIMEOUT_SEC = 60
 LOCAL_HOSTS = ("127.0.0.1", "localhost")
@@ -651,7 +654,10 @@ def reviewer_free_thread_params(kwargs: Mapping[str, Any], resume_thread_id: str
     ignored because the explicit parameter wins (verified live). Hailer therefore builds the
     app-server params itself from the same ``kwargs`` it would give the wrapper. With
     ``"user"`` as reviewer the SDK's default handler still accepts command and file-change
-    approval requests, and Hailer's MCP tools run under their ``default_tools_approval_mode``.
+    approval requests; MCP tool-call approvals are answered by :func:`approval_handler`.
+    ``sandbox`` is translated with the SDK's ``_sandbox_mode`` because the public ``Sandbox``
+    presets and the wire ``SandboxMode`` values differ (``full_access`` is
+    ``danger-full-access`` on the wire).
     """
     from openai_codex._sandbox import _sandbox_mode
     from openai_codex.generated.v2_all import (
@@ -681,6 +687,61 @@ def _sdk_thread(client: Any, thread_id: str) -> Any:
     from openai_codex.api import Thread
 
     return Thread(client, thread_id)
+
+
+def _is_hailer_tool_call(params: Mapping[str, Any] | None) -> bool:
+    if not isinstance(params, Mapping) or params.get("serverName") != MCP_SERVER_NAME:
+        return False
+    meta = params.get("_meta")
+    return isinstance(meta, Mapping) and meta.get("codex_approval_kind") == MCP_TOOL_CALL_APPROVAL_KIND
+
+
+def approval_handler(default: Callable[[str, Any], Any]) -> Callable[[str, Any], Any]:
+    """Answer Codex's approval requests: accept Hailer's own MCP tool calls, delegate the rest.
+
+    On a thread without Codex's reviewer (see :func:`uses_codex_reviewer`) Codex 0.154 asks
+    the client to approve every MCP tool call with an ``mcpServer/elicitation/request`` server
+    request (``serverName``, ``_meta.codex_approval_kind == "mcp_tool_call"``, a message such
+    as 'Allow the hailer MCP server to run tool "marimo_status"?'). The SDK's default handler
+    knows only ``item/commandExecution/requestApproval`` and ``item/fileChange/requestApproval``
+    and answers ``{}`` to anything else, which Codex records as "user rejected MCP tool call";
+    neither ``mcp_servers.<id>.default_tools_approval_mode = "auto"`` nor a granular permission
+    policy stops the request (verified live). With the reviewer on, the reviewer answers these
+    itself. Only calls to Hailer's own server are accepted; every other request goes to
+    ``default`` (the SDK's handler), so commands and file changes keep its behaviour. The
+    request lists the persistence Codex offers in ``_meta.persist`` (``"session"``,
+    ``"always"``); the answer asks for ``"session"`` when offered and never ``"always"``.
+    """
+
+    def handle(method: str, params: Any) -> Any:
+        if method == MCP_ELICITATION_METHOD and _is_hailer_tool_call(params):
+            answer: dict[str, Any] = {"action": "accept", "content": {}}
+            offered = params["_meta"].get("persist")
+            if isinstance(offered, (list, tuple)) and "session" in offered:
+                # Remember the answer for the thread: Codex then asks once per tool instead of
+                # once per call (two calls of one tool produced one request; verified live).
+                answer["_meta"] = {"persist": "session"}
+            return answer
+        return default(method, params)
+
+    return handle
+
+
+def install_approval_handler(codex: Any) -> None:
+    """Wrap the raw client's approval handler with :func:`approval_handler`.
+
+    ``Codex()`` builds its ``CodexClient`` without a handler and ``CodexClient`` keeps it in
+    ``_approval_handler`` (a constructor argument, but not reachable through ``Codex``), so it
+    is replaced in place right after construction.
+    """
+    client = getattr(codex, "_client", None)
+    default = getattr(client, "_approval_handler", None)
+    if client is None or not callable(default):
+        raise AgentError(
+            "The Codex SDK does not expose the approval handler Hailer needs to approve its own MCP tool calls.",
+            hint="Hailer pins openai-codex==0.154.0; run `uv sync` to restore that version, or report the version installed.",
+        )
+    client._approval_handler = approval_handler(default)
 
 
 # --------------------------------------------------------------------------- #
@@ -832,9 +893,11 @@ class HailerAgent:
         )
         log.debug("starting codex app-server with %d overrides", len(self.overrides))
         try:
-            self._codex = self._codex_factory(cfg)
+            codex = self._codex_factory(cfg)
         except Exception as exc:
             raise map_exception(exc, self.config, model=self._model, provider=self._provider_id) from exc
+        install_approval_handler(codex)
+        self._codex = codex
 
     def _reviewer_choice(self) -> bool:
         """Whether the next thread may use Codex's reviewer; asks the runtime which account is signed in."""

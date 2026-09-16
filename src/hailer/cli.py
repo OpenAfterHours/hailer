@@ -862,6 +862,7 @@ class ChatLoop:
             ("Model", f"{self.state.model or self.config.model.name}"),
             ("Provider", self._active_provider_line()),
             ("Credentials", self._credentials_line()),
+            ("Reviewer", {True: "Codex (ChatGPT account)", False: "none (Hailer approves its own tools)"}.get(getattr(self.agent, "codex_reviewer", None), "-")),
             ("Thread", self.state.thread_id or "-"),
             ("Turns", str(self.state.turns)),
             ("Tokens", f"{self.state.input_tokens} in / {self.state.output_tokens} out"),
