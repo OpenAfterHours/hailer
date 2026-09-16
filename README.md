@@ -227,19 +227,33 @@ provider = "openai"
 Codex reuses the ChatGPT login already on the machine. Alternatively store an API key with
 `uv run hailer login openai`, or set `OPENAI_API_KEY` in the terminal.
 
+When Codex is signed in with a ChatGPT account, its automatic action reviewer (the `codex-auto-review`
+model) judges shell commands and tool calls before they run. That model exists only on the ChatGPT
+backend, so Hailer asks the runtime which account is signed in and keeps the reviewer only for a ChatGPT
+account on the built-in provider. With an API key (whether set for Hailer, stored with `codex login
+--api-key`, or used by the desktop app), and on every custom endpoint, the thread starts without it
+(approval policy `on-request`, reviewer `user`) and Hailer answers Codex's approval requests itself: the
+Codex SDK accepts command and file-change approvals, and Hailer accepts the approval request Codex sends
+for each call to its own MCP server's tools. Without this, the first command or notebook tool call would
+fail with `model_not_found` from OpenAI or a `422`/`400` from a gateway that validates model names.
+
 ### A custom or internal endpoint
 
 ```toml
 [model]
 name     = "risk-analyst-v3"          # whatever model id the gateway expects
 provider = "internal"
+# reasoning_effort = "medium"         # minimal | low | medium | high | xhigh; "" sends no reasoning effort
 
 [model_providers.internal]
-base_url             = "https://llm.example.internal/v1"
-wire_api             = "responses"                # or "chat" for a Chat Completions endpoint
-# stream             = true                       # "chat" only: false if the gateway rejects stream = true
-env_key              = "INTERNAL_MODEL_API_KEY"   # env var name; value from `hailer login internal` or the shell
-requires_openai_auth = false
+base_url              = "https://llm.example.internal/v1"
+wire_api              = "responses"               # or "chat" for a Chat Completions endpoint
+# stream              = true                      # "chat" only: false if the gateway rejects stream = true
+# merge_messages      = true                      # "chat" only: false keeps consecutive system/user messages separate
+# stream_options      = true                      # "chat" only: false omits stream_options (token counts may be lost)
+# parallel_tool_calls = true                      # "chat" only: false omits the parallel_tool_calls field
+env_key               = "INTERNAL_MODEL_API_KEY"  # env var name; value from `hailer login internal` or the shell
+requires_openai_auth  = false
 # name             = "Internal"
 # http_headers     = { "X-Team" = "risk-analytics" }
 # env_http_headers = { "X-Client-Id" = "INTERNAL_CLIENT_ID" }
@@ -271,11 +285,13 @@ In both modes the gateway must tolerate a `GET {base_url}/models` probe at start
 
 With `"chat"` Hailer starts a loopback bridge (`127.0.0.1`, random port) for the session, points Codex at it
 and translates each request: the system prompt becomes the `system` message, the conversation becomes
-`messages` with `tool_calls` / `tool` entries, Codex's function tools become Chat Completions `tools`, and the
-streamed `delta.content`, `delta.tool_calls`, `reasoning_content` and final `usage` chunks come back as
-Responses events. The bridge forwards the `Authorization` header (from `env_key`), `http_headers`,
-`env_http_headers` and `query_params` unchanged and keeps no key of its own; `GET /models` is passed
-through. Reasoning effort is sent as `reasoning_effort` when set. The gateway must support function calling.
+`messages` with `tool_calls` / `tool` entries, Codex's function tools become Chat Completions `tools` (Hailer's
+own notebook tools, which Codex sends as one `mcp__hailer` namespace tool, are flattened into ordinary
+functions and their calls routed back to the notebook server), and the streamed `delta.content`,
+`delta.tool_calls`, `reasoning_content` and final `usage` chunks come back as Responses events. The bridge
+forwards the `Authorization` header (from `env_key`), `http_headers`, `env_http_headers` and `query_params`
+unchanged and keeps no key of its own; `GET /models` is passed through. Reasoning effort is sent as
+`reasoning_effort` when set. The gateway must support function calling.
 By default it must also support streaming (`stream: true`; `stream_options.include_usage` is requested for
 token counts). If it rejects streamed requests or cannot deliver server-sent events (some internal gateways
 and proxies buffer or refuse them), set `stream = false` on the provider: the bridge then sends
@@ -286,9 +302,20 @@ always streams the Responses API. The bridge listens on `127.0.0.1` only and is 
 `/status` show the provider as `internal (https://..., chat completions)` (`chat completions, no streaming`
 with `stream = false`), and endpoint errors name `/chat/completions`.
 
+Three more per-provider switches shape the request for strict gateways; all apply to `"chat"` only and
+all default to `true`. `merge_messages` collapses the two system messages Codex sends (Hailer's
+instructions and Codex's own developer message) into one, and the two user messages (the environment
+context and the user's text) into one, because many chat templates insist on alternating roles; set it
+to `false` to keep them separate. `stream_options = false` omits the `stream_options` field from streamed
+requests (some Azure API versions and proxies reject it; token counts are then whatever the final chunk
+carries). `parallel_tool_calls = false` omits the `parallel_tool_calls` field entirely. Independently of
+the provider, `reasoning_effort = ""` under `[model]` stops the `reasoning_effort` field being sent at all,
+for gateways or models that reject it.
+
 Hailer keeps the request small and predictable for gateways: its own system prompt replaces Codex's
 built-in coding-agent prompt, and web search, multi-agent, plugin and app features are switched off for
-the session, so the endpoint sees a handful of function tools plus Hailer's `mcp__hailer` tools.
+the session, so the endpoint sees a handful of Codex function tools plus Hailer's own notebook tools
+(`marimo_execute`, `notebook_cells`, ... from the `mcp__hailer` namespace).
 
 Several providers can be declared; switch inside a session with `/model <name>` or
 `/model <provider>:<name>` (this starts a new thread). One-off overrides: `HAILER_MODEL`,
@@ -463,8 +490,11 @@ secrets (they travel only as an environment variable of the Codex child process 
 **Sandboxing:** the agent's shell runs in Codex's workspace-write sandbox. It cannot reach the internet
 unless `allow_shell_network` is on, can reach loopback (the marimo server), and on Windows cannot execute a
 Python interpreter outside the workspace. All Python the agent needs runs in the marimo kernel through the
-MCP server, which is the only tool namespace Hailer exposes. Approvals use Codex's `auto_review` mode;
-calls to Hailer's own MCP tools are auto-approved on that server.
+MCP server, which is the only tool namespace Hailer exposes. Approvals use Codex's `on-request` policy:
+with a ChatGPT account on the built-in provider Codex's automatic reviewer judges escalations; elsewhere
+the SDK accepts command and file-change approvals and Hailer itself answers the approval request Codex
+sends for every call to its own MCP server's tools (see [OpenAI](#openai)). Tools of any other MCP server
+are not approved by Hailer.
 
 **Your own Codex configuration:** Codex reads `~/.codex/config.toml`, which for desktop-app users enables
 extra MCP servers and plugins (browser, computer use, spreadsheets, ...). Hailer disables those for its
@@ -488,9 +518,14 @@ when a session exists, confirms that marimo's code-mode API is available in the 
 | `no OPENAI_API_KEY found; Codex will use its existing ChatGPT login if you have one` | Informational. If the agent then fails to authenticate, `uv run hailer login openai`. |
 | `The model endpoint rejected the API key for provider '...'` | The gateway returned 401. Re-run `hailer login <provider>`. |
 | `Unknown model '...' for provider '...'` | Fix `[model].name`. |
+| The first command or notebook tool call fails and the message names `codex-auto-review` | Codex's reviewer model was sent to an endpoint that does not serve it (an API key on OpenAI, or a custom endpoint). Hailer now starts such threads without the reviewer; releases up to 0.2.1 did not, so upgrade. |
 | `Could not reach the model endpoint at <base_url>` | Check `base_url`, VPN or proxy, and that the endpoint is running. |
-| `The endpoint at <base_url> did not accept the request.` with the Responses-API hint | The gateway does not implement `POST /responses`. If it offers Chat Completions, set `wire_api = "chat"` for the provider. |
-| `The endpoint at <base_url> did not accept the request.` with the `/chat/completions` hint | `wire_api = "chat"` is set but the gateway rejected `POST /chat/completions` (wrong `base_url`, no function calling, or no streaming: try `stream = false` on the provider). |
+| `The endpoint at <base_url> did not accept the request.` with the Responses-API hint | The gateway answered 404/405 to `POST /responses`, so it does not implement that API there. If it offers Chat Completions, set `wire_api = "chat"` for the provider. The gateway's own reply is quoted on the last line, after `The endpoint said:`. |
+| `The endpoint at <base_url> did not accept the request.` with the `/chat/completions` hint | `wire_api = "chat"` is set but the gateway answered 404/405 to `POST /chat/completions` (wrong `base_url`, or no such route). Check the path the gateway expects; its reply is quoted after `The endpoint said:`. |
+| `The endpoint at <base_url> rejected the request.` | The gateway understood the request but refused a field, a value or the model name (HTTP 400/422 or a validation error). The line `The endpoint said:` quotes its reply: fix what it names (`stream = false` on the provider, `reasoning_effort = ""` under `[model]` to stop sending reasoning effort, or `[model].name`). `hailer --verbose` logs every upstream reply in full. |
+| `The endpoint at <base_url> refused access (HTTP 403).` | The key was accepted but is not allowed for this model, route or organisation. Check the gateway's access policy and the provider's `http_headers` / `env_http_headers`. |
+| `Unknown model '<name>' for provider '...'` where `<name>` is not your `[model].name` | The gateway rejected a model name Codex sent on its own (for example the approval reviewer `codex-auto-review`, which only exists behind a ChatGPT login). The hint names both models. |
+| An error mentioning `url: http://127.0.0.1:<port>/<provider>/responses` | That loopback address is Hailer's Chat Completions bridge, not your gateway. The status and body are the gateway's reply to `POST <base_url>/chat/completions`; Hailer strips the loopback address from its own error messages, but Codex's raw text (shown with `--verbose`) still carries it. |
 | `The Codex runtime refused to start because of a configuration error.` | Usually an interaction with `~/.codex/config.toml`. Run with `--verbose` for the runtime's message, or set `HAILER_CODEX_HOME`. |
 | A tool result starting with `ERROR:` inside the conversation | The agent hit a marimo or allowlist problem; the text contains the fix (for example the URL to open). |
 | marimo answers 401 or 403 and the hint mentions `HAILER_MARIMO_TOKEN` | The server was started with a token. Export it as `HAILER_MARIMO_TOKEN` (kept in memory only), or restart marimo with `--no-token`. |

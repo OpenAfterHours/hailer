@@ -13,6 +13,7 @@ import importlib.resources
 import logging
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -22,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from hailer import secrets as _secrets
-from hailer.errors import AgentError, ConfigError, CredentialsError, ProviderError
+from hailer.errors import AgentError, ConfigError, CredentialsError, HailerError, ProviderError
 from hailer.models import (
     AgentEvent,
     ContextBundle,
@@ -34,11 +35,14 @@ from hailer.models import (
 from hailer.wire import ChatBridge, ChatUpstream
 
 try:  # log.py is written by another owner; fall back to plain logging if absent.
-    from hailer.log import get_logger
+    from hailer.log import get_logger, redact
 except Exception:  # pragma: no cover - only when hailer.log is missing
 
     def get_logger(name: str = "hailer") -> logging.Logger:
         return logging.getLogger(name)
+
+    def redact(text: str, env: Mapping[str, str] | None = None) -> str:
+        return text
 
 
 log = get_logger("hailer.agent")
@@ -62,6 +66,9 @@ TRIMMING_OVERRIDES: tuple[tuple[str, Any], ...] = (
 )
 
 MCP_SERVER_NAME = "hailer"
+#: Server request Codex sends to have the client approve an MCP tool call (see approval_handler).
+MCP_ELICITATION_METHOD = "mcpServer/elicitation/request"
+MCP_TOOL_CALL_APPROVAL_KIND = "mcp_tool_call"
 MCP_TOOL_TIMEOUT_SEC = 600
 MCP_STARTUP_TIMEOUT_SEC = 60
 LOCAL_HOSTS = ("127.0.0.1", "localhost")
@@ -164,12 +171,23 @@ def _custom_providers(config: HailerConfig) -> list[ProviderConfig]:
 
 
 def chat_completion_upstreams(config: HailerConfig) -> dict[str, ChatUpstream]:
-    """Provider id -> bridge upstream (``base_url`` and ``stream``) for every ``wire_api = "chat"`` provider.
+    """Provider id -> bridge upstream for every ``wire_api = "chat"`` provider.
 
-    ``stream`` is a bridge setting, not a Codex one: it is never passed through as a
-    ``model_providers.<id>.*`` override (see ``_PROVIDER_FIELDS``).
+    ``stream``, ``merge_messages``, ``stream_options`` and ``parallel_tool_calls`` are bridge
+    settings, not Codex ones: they are never passed through as ``model_providers.<id>.*``
+    overrides (see ``_PROVIDER_FIELDS``).
     """
-    return {p.id: ChatUpstream(p.base_url, stream=p.stream) for p in _custom_providers(config) if p.uses_chat_completions and p.base_url}
+    return {
+        p.id: ChatUpstream(
+            p.base_url,
+            stream=p.stream,
+            merge_messages=p.merge_messages,
+            stream_options=p.stream_options,
+            parallel_tool_calls=p.parallel_tool_calls,
+        )
+        for p in _custom_providers(config)
+        if p.uses_chat_completions and p.base_url
+    }
 
 
 def build_config_overrides(
@@ -406,8 +424,86 @@ _CONNECTION_SIGNALS = (
     "no such host",
     "timed out",
 )
-# Signals that the endpoint rejected the *shape* of the request (not the model, not auth).
-_RESPONSES_API_SIGNALS = ("404", "unsupported", "unknown endpoint", "responses", "unknown parameter", "schema")
+# Signals that the endpoint does not implement the API Hailer speaks to it (the path is wrong or
+# the protocol is), as opposed to refusing one field of an otherwise understood request.
+_ENDPOINT_MISSING_SIGNALS = ("404", "405", "unknown endpoint", "method not allowed", "no route", "cannot post")
+# Signals that the endpoint understood the request but refused its shape: a field, a value, the
+# model name. Its own words are the useful part, so they are quoted rather than reinterpreted.
+_REJECTED_REQUEST_SIGNALS = (
+    "bad request",
+    "unprocessable",
+    "invalid_request_error",
+    "invalid request",
+    "unsupported parameter",
+    "unrecognized request argument",
+    "unknown parameter",
+    "extra inputs",
+    "validation error",
+    "should match pattern",
+    "schema",
+    "unsupported",
+)
+#: Codex appends ``, url: <url>`` to "unexpected status" errors; for ``wire_api = "chat"`` that is the
+#: loopback bridge, which says nothing about the gateway.
+_URL_SUFFIX_RE = re.compile(r",\s*url:\s*(\S+)\s*$")
+_LOOPBACK_URL_RE = re.compile(r"^https?://(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(/|$)", re.IGNORECASE)
+#: "unexpected status 422 ..." (one failed call) or "exceeded retry limit, last status: 502 ..." (retries).
+_UNEXPECTED_STATUS_RE = re.compile(r"(?:unexpected status|last status:?)\s*(\d{3})", re.IGNORECASE)
+#: Text that came from a gateway rather than from Codex or the SDK: an HTTP status, or a JSON error body.
+_GATEWAY_BODY_RE = re.compile(r'\{\s*"(?:error|detail)"|invalid_request_error|unexpected status')
+#: The model name a gateway quotes ("The model 'x' does not exist", "model `x` ...").
+_QUOTED_MODEL_RE = re.compile(r"model[^'\"`\n]{0,24}['\"`]([^'\"`\s]+)['\"`]", re.IGNORECASE)
+_MODEL_PARAM_RE = re.compile(r'"param"\s*:\s*"model"|model_not_found')
+_ENDPOINT_SAID_LIMIT = 500
+
+
+def _endpoint_text(text: str) -> tuple[str, int | None]:
+    """The gateway's own words in a Codex turn error, and the HTTP status when one is named.
+
+    A trailing ``, url: http://127.0.0.1:<port>/<provider>/responses`` is the chat bridge's
+    address, not the gateway's, and is dropped; a real endpoint URL is kept.
+    """
+    match = _URL_SUFFIX_RE.search(text)
+    if match and _LOOPBACK_URL_RE.match(match.group(1)):
+        text = text[: match.start()]
+    status_match = _UNEXPECTED_STATUS_RE.search(text)
+    status = int(status_match.group(1)) if status_match else None
+    return text.strip(), status
+
+
+def _endpoint_said(text: str) -> str:
+    """One line quoting the gateway for the end of a hint: secrets masked, whitespace collapsed, trimmed."""
+    flat = " ".join(redact(text).split())
+    if len(flat) > _ENDPOINT_SAID_LIMIT:
+        flat = flat[: _ENDPOINT_SAID_LIMIT - 3] + "..."
+    return f"The endpoint said: {flat}"
+
+
+def _turn_error_text(error: Any) -> str:
+    """Codex's wording for a failed turn: ``message`` plus ``additional_details`` when it adds something."""
+    message = getattr(error, "message", None)
+    text = message.strip() if isinstance(message, str) else ""
+    details = getattr(error, "additional_details", None)
+    if isinstance(details, str) and details.strip() and details.strip() not in text:
+        text = f"{text}: {details.strip()}" if text else details.strip()
+    return text
+
+
+#: The bridge's per-provider request switches, in the order the rejected-request hint lists them.
+_CHAT_SWITCHES = ("stream", "stream_options", "parallel_tool_calls", "merge_messages")
+
+
+def _chat_switches_still_on(provider: ProviderConfig) -> tuple[str, ...]:
+    """The chat bridge switches a user could still turn off for this provider."""
+    return tuple(name for name in _CHAT_SWITCHES if getattr(provider, name))
+
+
+def _switch_list(names: tuple[str, ...]) -> str:
+    """``a = false, b = false or c = false`` for the hint."""
+    items = [f"{name} = false" for name in names]
+    if len(items) == 1:
+        return items[0]
+    return ", ".join(items[:-1]) + " or " + items[-1]
 
 
 def _provider_by_id(config: HailerConfig, provider_id: str | None) -> ProviderConfig:
@@ -431,7 +527,8 @@ def map_exception(
     ``/model`` switch.
     """
     text = str(exc)
-    low = text.lower()
+    endpoint_text, status = _endpoint_text(text)
+    low = endpoint_text.lower()
     provider = _provider_by_id(config, provider)
     base_url = provider.base_url or "https://api.openai.com/v1"
     model_name = model or config.model.name
@@ -450,15 +547,30 @@ def map_exception(
             )
         return AgentError("The Codex runtime stopped unexpectedly.", hint=text[:600])
 
-    # An unknown model must not be mistaken for an incompatible endpoint.
+    gateway_like = status is not None or _GATEWAY_BODY_RE.search(low) is not None
+
+    # An unknown model must not be mistaken for an incompatible endpoint; "model" plus "not found"
+    # alone is not enough (Codex: "Tool x not found in model tool registry"), the text has to name
+    # the configured model, quote a model name, or carry the model_not_found / param markers.
     if "model" in low and any(s in low for s in _MODEL_NOT_FOUND_SIGNALS):
-        return ProviderError(
-            f"Unknown model '{model_name}' for provider '{provider.id}'.",
-            hint=(
+        quoted = _QUOTED_MODEL_RE.search(endpoint_text)
+        named = quoted.group(1) if quoted else None
+        configured_named = bool(model_name) and model_name.lower() in low
+        if named or configured_named or _MODEL_PARAM_RE.search(low):
+            named = named or model_name
+            hint = (
                 "Check [model].name in hailer.toml (or the name given to /model). "
                 "Run `hailer status` to see the active provider and endpoint."
-            ),
-        )
+            )
+            if named != model_name:
+                hint = (
+                    f"The rejected request named model '{named}', not the configured '{model_name}': Codex sends "
+                    "its own model names for side requests such as the approval reviewer ('codex-auto-review'), "
+                    "which only exist behind a ChatGPT login. " + hint
+                )
+            return ProviderError(
+                f"Unknown model '{named}' for provider '{provider.id}'.", hint=hint + "\n" + _endpoint_said(endpoint_text)
+            )
     if "401" in low or "unauthorized" in low or "invalid api key" in low or "incorrect api key" in low:
         return CredentialsError(
             f"The model endpoint rejected the API key for provider '{provider.id}'.",
@@ -474,13 +586,15 @@ def map_exception(
             ),
         )
     if any(s in low for s in _CONNECTION_SIGNALS):
-        return ProviderError(
-            f"Could not reach the model endpoint at {base_url}.",
-            hint=(
-                "Check [model_providers].base_url in hailer.toml, your VPN/proxy, and that the "
-                "endpoint is running. Run `hailer doctor` to test reachability."
-            ),
+        hint = (
+            "Check [model_providers].base_url in hailer.toml, your VPN/proxy, and that the "
+            "endpoint is running. Run `hailer doctor` to test reachability."
         )
+        # A gateway reply (504 body, mid-stream failure naming the upstream) is worth quoting; a
+        # bare "connection refused" / "dns error" adds nothing beyond the reason.
+        if gateway_like or "upstream stream from" in low:
+            hint += "\n" + _endpoint_said(endpoint_text)
+        return ProviderError(f"Could not reach the model endpoint at {base_url}.", hint=hint)
     if "chat completions bridge" in low:
         return ProviderError(
             f"Codex asked for a Responses API endpoint the Chat Completions bridge for provider '{provider.id}' does not offer.",
@@ -490,7 +604,7 @@ def map_exception(
                 "if the gateway implements the Responses API."
             ),
         )
-    if any(s in low for s in _RESPONSES_API_SIGNALS):
+    if status in (404, 405) or any(s in low for s in _ENDPOINT_MISSING_SIGNALS):
         if provider.uses_chat_completions and provider.stream:
             hint = (
                 f"This provider uses wire_api = \"chat\": Hailer sends POST {base_url}/chat/completions "
@@ -510,7 +624,51 @@ def map_exception(
                 'If the gateway only offers Chat Completions, set wire_api = "chat" in its '
                 "[model_providers] table instead."
             )
-        return ProviderError(f"The endpoint at {base_url} did not accept the request.", hint=hint)
+        return ProviderError(f"The endpoint at {base_url} did not accept the request.", hint=hint + "\n" + _endpoint_said(endpoint_text))
+    if status == 403 or (gateway_like and "forbidden" in low):
+        return ProviderError(
+            f"The endpoint at {base_url} refused access (HTTP 403).",
+            hint=(
+                "The key was accepted but is not allowed for this model, route or organisation: check the "
+                "gateway's access policy and any http_headers / env_http_headers the provider needs.\n"
+                + _endpoint_said(endpoint_text)
+            ),
+        )
+    # Wording alone ("unsupported", "validation error") is only evidence when the text came from a
+    # gateway; the SDK and Codex use the same words for local failures.
+    if (status is not None and 400 <= status < 500 and status != 429) or (
+        gateway_like and any(s in low for s in _REJECTED_REQUEST_SIGNALS)
+    ):
+        effort = '[model].reasoning_effort (reasoning_effort = "" stops sending it)'
+        if provider.uses_chat_completions:
+            sent = (
+                f"Hailer sent POST {base_url}/chat/completions (wire_api = \"chat\", translated from Codex's "
+                f"Responses call{'' if provider.stream else ', stream = false'})."
+            )
+            switches = _chat_switches_still_on(provider)
+            if len(switches) == len(_CHAT_SWITCHES):
+                where = f"the provider's chat switches in its [model_providers] table in hailer.toml ({_switch_list(switches)}) and {effort}"
+            elif switches:
+                where = f"the provider's other chat switches in its [model_providers] table in hailer.toml ({_switch_list(switches)}) and {effort}"
+            else:
+                where = f"the provider's [model_providers] table in hailer.toml (every chat switch is already off) and {effort}"
+        elif provider.is_builtin_openai:
+            sent = f"Hailer sent POST {base_url}/responses straight from Codex."
+            where = effort + " in hailer.toml"
+        else:
+            sent = f"Hailer sent POST {base_url}/responses (wire_api = \"responses\", straight from Codex)."
+            where = f"the provider's [model_providers] table in hailer.toml and {effort}"
+        hint = (
+            f"{sent} If the message names a request field the gateway does not support, check {where}; "
+            "if it names the model, check [model].name. Run `hailer --verbose` to see every upstream reply.\n"
+            + _endpoint_said(endpoint_text)
+        )
+        return ProviderError(f"The endpoint at {base_url} rejected the request.", hint=hint)
+    if status is not None and (status >= 500 or status == 429):
+        return ProviderError(
+            f"The endpoint at {base_url} is unavailable (HTTP {status}).",
+            hint="Retry in a moment; if it persists, check the gateway's status or rate limits.\n" + _endpoint_said(endpoint_text),
+        )
     return AgentError("The agent run failed.", hint=text[:600])
 
 
@@ -597,6 +755,151 @@ def _default_codex_factory(cfg: Any) -> Any:
 
 
 # --------------------------------------------------------------------------- #
+# Thread approvals
+# --------------------------------------------------------------------------- #
+
+
+def uses_codex_reviewer(provider: ProviderConfig, key_source: str, account_type: str | None) -> bool:
+    """Whether a thread on ``provider`` may use Codex's automatic reviewer.
+
+    Under ``ApprovalMode.auto_review`` Codex sends every escalation (shell commands and MCP
+    tool calls alike) to its reviewer model, slug ``codex-auto-review``, and those requests
+    go to the provider in use. The slug exists only on the ChatGPT backend: api.openai.com
+    answers ``model_not_found`` for an API key and a custom gateway rejects it (a strict one
+    with ``422 ... model: String should match pattern``), which fails the whole turn. So the
+    reviewer is kept only for the built-in provider when Codex is signed in with a ChatGPT
+    account. ``account_type`` is what :func:`codex_account_type` reports; when the lookup
+    failed (``None``) the key source decides instead: a missing key means Codex will use
+    whatever login it has. Verified live with openai-codex 0.154.0.
+    """
+    if not provider.is_builtin_openai:
+        return False
+    if account_type is None:
+        return key_source == "missing"
+    return account_type == "chatgpt"
+
+
+def codex_account_type(codex: Any) -> str | None:
+    """The login Codex will use, from ``codex.account()``.
+
+    ``"chatgpt"``, ``"apiKey"`` (``codex login --api-key`` or the desktop app in API-key mode),
+    ``"amazonBedrock"``, ``"none"`` when nobody is signed in (an ``OPENAI_API_KEY`` in the
+    environment alone reports no account), or ``None`` when the lookup itself failed.
+    """
+    try:
+        response = codex.account()
+    except Exception as exc:  # best effort: the caller falls back to the key source
+        log.debug("codex account lookup failed: %s", type(exc).__name__)
+        return None
+    account = getattr(response, "account", None)
+    if account is None:
+        return "none"
+    inner = getattr(account, "root", account)  # the SDK wraps the account variants in a RootModel
+    kind = getattr(inner, "type", None)
+    return str(kind) if kind else "none"
+
+
+def reviewer_free_thread_params(kwargs: Mapping[str, Any], resume_thread_id: str | None = None) -> Any:
+    """Wire params for a thread with ``approval_policy = "on-request"`` and ``approvals_reviewer = "user"``.
+
+    The SDK's ``thread_start`` / ``thread_resume`` accept only ``ApprovalMode.deny_all``
+    (approval policy ``never``, under which Codex rejects every MCP tool call) and
+    ``ApprovalMode.auto_review`` (policy ``on-request`` plus the reviewer model that only the
+    ChatGPT backend serves); a thread-level ``config`` override of ``approvals_reviewer`` is
+    ignored because the explicit parameter wins (verified live). Hailer therefore builds the
+    app-server params itself from the same ``kwargs`` it would give the wrapper. With
+    ``"user"`` as reviewer the SDK's default handler still accepts command and file-change
+    approval requests; MCP tool-call approvals are answered by :func:`approval_handler`.
+    ``sandbox`` is translated with the SDK's ``_sandbox_mode`` because the public ``Sandbox``
+    presets and the wire ``SandboxMode`` values differ (``full_access`` is
+    ``danger-full-access`` on the wire).
+    """
+    from openai_codex._sandbox import _sandbox_mode
+    from openai_codex.generated.v2_all import (
+        ApprovalsReviewer,
+        AskForApproval,
+        AskForApprovalValue,
+        ThreadResumeParams,
+        ThreadStartParams,
+    )
+
+    fields: dict[str, Any] = {key: value for key, value in kwargs.items() if key != "approval_mode"}
+    if "sandbox" in fields:
+        fields["sandbox"] = _sandbox_mode(fields["sandbox"])
+    fields["approval_policy"] = AskForApproval(root=AskForApprovalValue.on_request)
+    fields["approvals_reviewer"] = ApprovalsReviewer.user
+    model_cls = ThreadResumeParams if resume_thread_id else ThreadStartParams
+    unknown = sorted(set(fields) - set(model_cls.model_fields))
+    if unknown:  # pydantic would ignore them silently; a kwarg that never reaches Codex is a bug
+        raise TypeError(f"thread kwargs unknown to {model_cls.__name__}: {', '.join(unknown)}")
+    if resume_thread_id:
+        return ThreadResumeParams(thread_id=resume_thread_id, **fields)
+    return ThreadStartParams(**fields)
+
+
+def _sdk_thread(client: Any, thread_id: str) -> Any:
+    """The SDK's thread facade for a thread started through the raw client."""
+    from openai_codex.api import Thread
+
+    return Thread(client, thread_id)
+
+
+def _is_hailer_tool_call(params: Mapping[str, Any] | None) -> bool:
+    if not isinstance(params, Mapping) or params.get("serverName") != MCP_SERVER_NAME:
+        return False
+    meta = params.get("_meta")
+    return isinstance(meta, Mapping) and meta.get("codex_approval_kind") == MCP_TOOL_CALL_APPROVAL_KIND
+
+
+def approval_handler(default: Callable[[str, Any], Any]) -> Callable[[str, Any], Any]:
+    """Answer Codex's approval requests: accept Hailer's own MCP tool calls, delegate the rest.
+
+    On a thread without Codex's reviewer (see :func:`uses_codex_reviewer`) Codex 0.154 asks
+    the client to approve every MCP tool call with an ``mcpServer/elicitation/request`` server
+    request (``serverName``, ``_meta.codex_approval_kind == "mcp_tool_call"``, a message such
+    as 'Allow the hailer MCP server to run tool "marimo_status"?'). The SDK's default handler
+    knows only ``item/commandExecution/requestApproval`` and ``item/fileChange/requestApproval``
+    and answers ``{}`` to anything else, which Codex records as "user rejected MCP tool call";
+    neither ``mcp_servers.<id>.default_tools_approval_mode = "auto"`` nor a granular permission
+    policy stops the request (verified live). With the reviewer on, the reviewer answers these
+    itself. Only calls to Hailer's own server are accepted; every other request goes to
+    ``default`` (the SDK's handler), so commands and file changes keep its behaviour. The
+    request lists the persistence Codex offers in ``_meta.persist`` (``"session"``,
+    ``"always"``); the answer asks for ``"session"`` when offered and never ``"always"``.
+    """
+
+    def handle(method: str, params: Any) -> Any:
+        if method == MCP_ELICITATION_METHOD and _is_hailer_tool_call(params):
+            answer: dict[str, Any] = {"action": "accept", "content": {}}
+            offered = params["_meta"].get("persist")
+            if isinstance(offered, (list, tuple)) and "session" in offered:
+                # Remember the answer for the thread: Codex then asks once per tool instead of
+                # once per call (two calls of one tool produced one request; verified live).
+                answer["_meta"] = {"persist": "session"}
+            return answer
+        return default(method, params)
+
+    return handle
+
+
+def install_approval_handler(codex: Any) -> None:
+    """Wrap the raw client's approval handler with :func:`approval_handler`.
+
+    ``Codex()`` builds its ``CodexClient`` without a handler and ``CodexClient`` keeps it in
+    ``_approval_handler`` (a constructor argument, but not reachable through ``Codex``), so it
+    is replaced in place right after construction.
+    """
+    client = getattr(codex, "_client", None)
+    default = getattr(client, "_approval_handler", None)
+    if client is None or not callable(default):
+        raise AgentError(
+            "The Codex SDK does not expose the approval handler Hailer needs to approve its own MCP tool calls.",
+            hint="Hailer pins openai-codex==0.154.0; run `uv sync` to restore that version, or report the version installed.",
+        )
+    client._approval_handler = approval_handler(default)
+
+
+# --------------------------------------------------------------------------- #
 # Agent
 # --------------------------------------------------------------------------- #
 
@@ -622,6 +925,7 @@ class HailerAgent:
         self._handle: Any = None
         self._interrupt_requested = False
         self.thread_id: str | None = None
+        self.codex_reviewer: bool | None = None  # whether the current thread uses Codex's reviewer
         self._model = config.model.name
         self._provider_id = config.model.provider
         self._thread_provider_id: str | None = None
@@ -641,6 +945,14 @@ class HailerAgent:
                 extra[prov.env_key] = value
         self._child_env = build_child_env(config, key, extra, environ)
         del key, extra  # do not keep secrets on the instance
+        # Thread approvals depend on whether the built-in provider would run on an API key
+        # or on the ChatGPT login (see uses_codex_reviewer), so its key source is recorded
+        # even when another provider is active and /model may switch to it later.
+        if "openai" not in self.key_sources:
+            builtin = _provider_by_id(config, "openai")
+            if builtin.is_builtin_openai:
+                _, builtin_source = _secrets.resolve_provider_key(builtin, environ)
+                self.key_sources[builtin.id] = builtin_source
 
         self._user_codex_config = user_codex_config if user_codex_config is not None else read_user_codex_config(config.codex_home)
         build_config_overrides(config, self._user_codex_config)  # fail early on an undeclared provider
@@ -710,11 +1022,12 @@ class HailerAgent:
 
         return {
             "sandbox": Sandbox.workspace_write,
-            # auto_review, not deny_all: with approval_policy "never" Codex rejects every MCP
-            # tool call ("MCP tool call requires approval, but approval policy is never")
-            # regardless of per-server/per-tool approval settings (verified live). With
-            # auto_review, Hailer's tools (default_tools_approval_mode="auto") run without
-            # prompting and the SDK auto-accepts command/file-change approvals.
+            # Only used when the thread may use Codex's reviewer (see uses_codex_reviewer:
+            # built-in provider, ChatGPT account). auto_review, not deny_all: with approval_policy "never" Codex rejects
+            # every MCP tool call ("MCP tool call requires approval, but approval policy is
+            # never") regardless of per-server/per-tool approval settings (verified live).
+            # Every other provider gets the same on-request policy without the reviewer
+            # model, built by reviewer_free_thread_params.
             "approval_mode": ApprovalMode.auto_review,
             "base_instructions": system_prompt(self.config, self.bundle),
             "cwd": str(self.config.workspace),
@@ -735,35 +1048,83 @@ class HailerAgent:
         )
         log.debug("starting codex app-server with %d overrides", len(self.overrides))
         try:
-            self._codex = self._codex_factory(cfg)
+            codex = self._codex_factory(cfg)
         except Exception as exc:
             raise map_exception(exc, self.config, model=self._model, provider=self._provider_id) from exc
+        install_approval_handler(codex)
+        self._codex = codex
+
+    def _reviewer_choice(self) -> bool:
+        """Whether the next thread may use Codex's reviewer; asks the runtime which account is signed in."""
+        provider = _provider_by_id(self.config, self._provider_id)
+        account_type = codex_account_type(self._codex) if provider.is_builtin_openai else None
+        return uses_codex_reviewer(provider, self.key_sources.get(provider.id, "missing"), account_type)
+
+    def _thread_settings(self) -> tuple[dict[str, Any], bool]:
+        """The wrapper kwargs for the next thread and whether it may use Codex's reviewer."""
+        try:
+            return self._thread_kwargs(), self._reviewer_choice()
+        except HailerError:
+            raise
+        except Exception as exc:
+            raise map_exception(exc, self.config, model=self._model, provider=self._provider_id) from exc
+
+    def _open_thread(self, kwargs: Mapping[str, Any], use_reviewer: bool, resume_thread_id: str | None = None) -> Any:
+        """Start (or resume) a thread: the SDK wrapper with Codex's reviewer, else the raw client without it."""
+        if use_reviewer:
+            log.debug("thread approvals: on-request with Codex's reviewer (ChatGPT account)")
+            if resume_thread_id:
+                return self._codex.thread_resume(resume_thread_id, **kwargs)
+            return self._codex.thread_start(**kwargs)
+        log.debug("thread approvals: on-request, reviewer=user (provider %s)", self._provider_id)
+        client = getattr(self._codex, "_client", None)  # the SDK wrapper cannot express these settings
+        if client is None:
+            raise AgentError(
+                "The Codex SDK does not expose the raw client Hailer needs to start a thread without Codex's reviewer.",
+                hint="Hailer pins openai-codex==0.154.0; run `uv sync` to restore that version, or report the version installed.",
+            )
+        params = reviewer_free_thread_params(kwargs, resume_thread_id)
+        if resume_thread_id:
+            response = client.thread_resume(resume_thread_id, params)
+        else:
+            response = client.thread_start(params)
+        return _sdk_thread(client, response.thread.id)
+
+    def _adopt_thread(self, thread: Any, use_reviewer: bool) -> None:
+        self._thread = thread
+        self.thread_id = thread.id
+        self._thread_provider_id = self._provider_id
+        self.codex_reviewer = use_reviewer
 
     def start(self, *, resume_thread_id: str | None = None) -> str:
         """Start the runtime and a thread; returns the thread id."""
         self._require_key()
         self._ensure_codex()
-        kwargs = self._thread_kwargs()
         if resume_thread_id:
+            kwargs, use_reviewer = self._thread_settings()
             try:
-                self._thread = self._codex.thread_resume(resume_thread_id, **kwargs)
-                self.thread_id = self._thread.id
-                self._thread_provider_id = self._provider_id
-                log.debug("resumed thread %s", self.thread_id)
-                return self.thread_id
+                thread = self._open_thread(kwargs, use_reviewer, resume_thread_id)
+            except HailerError:
+                raise
             except Exception as exc:
                 log.warning("could not resume thread %s (%s); starting a new one", resume_thread_id, type(exc).__name__)
+            else:
+                self._adopt_thread(thread, use_reviewer)
+                log.debug("resumed thread %s", self.thread_id)
+                return self.thread_id
         return self.new_thread()
 
     def new_thread(self) -> str:
         self._require_key()
         self._ensure_codex()
+        kwargs, use_reviewer = self._thread_settings()
         try:
-            self._thread = self._codex.thread_start(**self._thread_kwargs())
+            thread = self._open_thread(kwargs, use_reviewer)
+        except HailerError:
+            raise
         except Exception as exc:
             raise map_exception(exc, self.config, model=self._model, provider=self._provider_id) from exc
-        self.thread_id = self._thread.id
-        self._thread_provider_id = self._provider_id
+        self._adopt_thread(thread, use_reviewer)
         log.debug("started thread %s", self.thread_id)
         return self.thread_id
 
@@ -897,8 +1258,13 @@ class HailerAgent:
             elif method == "thread/tokenUsage/updated":
                 usage = getattr(payload, "token_usage", None)
             elif method == "error":
+                # ErrorNotification carries the text under .error (a TurnError), not .message.
+                text = _turn_error_text(getattr(payload, "error", None)) or _turn_error_text(payload) or payload
+                if getattr(payload, "will_retry", False) is True:
+                    text = f"retrying: {text}"
+                log.debug("codex error notification: %s", text)
                 if not quiet:
-                    emit(AgentEvent("status", _preview(getattr(payload, "message", payload), 200)))
+                    emit(AgentEvent("status", _preview(text, 200)))
             elif method == "turn/completed":
                 completed_turn = getattr(payload, "turn", None)
 
@@ -951,7 +1317,8 @@ class HailerAgent:
         status = _enum_value(getattr(completed_turn, "status", "completed")) or "completed"
         error = getattr(completed_turn, "error", None)
         if status == "failed":
-            message = getattr(error, "message", None) or str(error) or "unknown error"
+            message = _turn_error_text(error) or (str(error) if error is not None else "") or "unknown error"
+            log.debug("turn %s failed: %s", getattr(completed_turn, "id", "") or "?", message)
             raise map_exception(RuntimeError(message), self.config, model=self._model, provider=self._provider_id)
 
         final = _final_response(items)

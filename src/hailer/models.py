@@ -119,6 +119,14 @@ class ProviderConfig:
     #: Chat Completions only: False sends ``stream: false`` and reads one JSON reply, for
     #: gateways that reject or cannot deliver server-sent events. Codex always streams the Responses API.
     stream: bool = True
+    #: Chat Completions only: collapse Codex's consecutive ``system`` messages into one and its
+    #: consecutive ``user`` messages into one, for chat templates that insist on alternating roles.
+    merge_messages: bool = True
+    #: Chat Completions only: False omits ``stream_options`` from streamed requests, for gateways
+    #: that reject the field (token counts are then whatever the final chunk carries).
+    stream_options: bool = True
+    #: Chat Completions only: False omits the ``parallel_tool_calls`` field, for gateways that reject it.
+    parallel_tool_calls: bool = True
     env_key: str | None = None
     requires_openai_auth: bool = False
     name: str | None = None

@@ -528,3 +528,47 @@ def test_repo_example_matches_template() -> None:
     example = REPO_ROOT / "hailer.toml"
     assert example.is_file()
     assert example.read_text(encoding="utf-8").replace("\r\n", "\n") == DEFAULT_CONFIG_TEMPLATE
+
+
+def test_chat_provider_bridge_options_default_to_true(tmp_path: Path) -> None:
+    ws = _make_workspace(
+        tmp_path,
+        '[model]\nprovider = "internal"\n[model_providers.internal]\n'
+        'base_url = "https://llm.example.internal/v1"\nwire_api = "chat"\nenv_key = "K"\n',
+    )
+    p = load_config(workspace=ws, env={}).providers["internal"]
+    assert (p.merge_messages, p.stream_options, p.parallel_tool_calls) == (True, True, True)
+
+
+def test_chat_provider_bridge_options_can_be_turned_off(tmp_path: Path) -> None:
+    ws = _make_workspace(
+        tmp_path,
+        '[model]\nprovider = "internal"\n[model_providers.internal]\n'
+        'base_url = "https://llm.example.internal/v1"\nwire_api = "chat"\nenv_key = "K"\n'
+        "merge_messages = false\nstream_options = false\nparallel_tool_calls = false\n",
+    )
+    cfg = load_config(workspace=ws, env={})
+    p = cfg.providers["internal"]
+    assert (p.merge_messages, p.stream_options, p.parallel_tool_calls) == (False, False, False)
+    assert not any(key in problem for problem in validate(cfg) for key in ("merge_messages", "stream_options", "parallel_tool_calls"))
+
+
+@pytest.mark.parametrize("key", ["merge_messages", "stream_options", "parallel_tool_calls"])
+def test_validate_rejects_bridge_options_for_responses_providers(tmp_path: Path, key: str) -> None:
+    ws = _make_workspace(
+        tmp_path,
+        '[model]\nprovider = "internal"\n[model_providers.internal]\n'
+        f'base_url = "https://llm.example.internal/v1"\n{key} = false\nenv_key = "K"\n',
+    )
+    problems = _errors(validate(load_config(workspace=ws, env={})))
+    assert any(f'{key} = false only applies to wire_api = "chat"' in p for p in problems)
+
+
+def test_validate_bridge_option_typo_is_an_unknown_key_warning(tmp_path: Path) -> None:
+    ws = _make_workspace(
+        tmp_path,
+        '[model]\nprovider = "internal"\n[model_providers.internal]\n'
+        'base_url = "https://llm.example.internal/v1"\nwire_api = "chat"\nenv_key = "K"\nmerge_message = false\n',
+    )
+    problems = validate(load_config(workspace=ws, env={}))
+    assert any("merge_message" in p and "unknown" in p.lower() for p in problems)

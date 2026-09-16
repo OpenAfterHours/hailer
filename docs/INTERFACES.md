@@ -64,22 +64,39 @@ module exposes so work can proceed in parallel. Shared types live in `src/hailer
 - Codex SDK: `Codex(CodexConfig(config_overrides=tuple[str,...], cwd=str, env=dict))` launches the bundled
   app-server; overrides are `codex -c key=value` (value parsed as TOML). `codex.thread_start(model=,
   model_provider=, base_instructions=, developer_instructions=, sandbox=Sandbox.workspace_write,
-  approval_mode=ApprovalMode.auto_review, cwd=, ephemeral=)` (auto_review, not deny_all: under deny_all/approval_policy "never" Codex rejects every MCP tool call with "MCP tool call requires approval, but approval policy is never", whatever the per-server/per-tool approval settings say; verified live on 2026-09-15), `codex.thread_resume(thread_id, ...)`,
+  approval_mode=ApprovalMode.auto_review, cwd=, ephemeral=)` only when `uses_codex_reviewer(provider, key_source, account_type)` is true: the built-in `openai` provider with a ChatGPT account, where `account_type` comes from `codex_account_type(codex)` → `codex.account()` (`GetAccountResponse.account.root.type`: "chatgpt" | "apiKey" | "amazonBedrock"; "none" when signed out, which is also what an `OPENAI_API_KEY` in the environment alone reports; `None` when the lookup failed, then the key source decides and "missing" keeps the reviewer). auto_review, not deny_all, because under deny_all/approval_policy "never" Codex rejects every MCP tool call with "MCP tool call requires approval, but approval policy is never", whatever the per-server/per-tool approval settings say (verified live on 2026-09-15). Every other case goes through the raw client, `codex._client.thread_start(reviewer_free_thread_params(kwargs))` / `thread_resume(id, ...)` with `ThreadStartParams(approval_policy="on-request", approvals_reviewer="user", <every other wrapper kwarg, sandbox mapped>)` (unknown kwarg names raise TypeError), wrapped in `openai_codex.api.Thread(client, id)`; a missing `_client` attribute is an AgentError naming the SDK pin. Reason: under auto_review Codex sends every escalation (commands and MCP tool calls) to its reviewer model `codex-auto-review`, which only the ChatGPT backend serves (api.openai.com answers model_not_found for an API key; a strict gateway answers 422), the SDK wrapper offers only deny_all/auto_review, and a thread-level `config={"approvals_reviewer": "user"}` is ignored because the explicit parameter wins (all verified live on 2026-09-16 with openai-codex 0.154.0). `HailerAgent.codex_reviewer` records the choice for the current thread. On such threads Codex asks the client to approve every MCP tool call with the server request `mcpServer/elicitation/request` (`serverName`, `_meta.codex_approval_kind == "mcp_tool_call"`); the SDK's default handler answers `{}` (= "user rejected MCP tool call") and neither `default_tools_approval_mode = "auto"` nor a granular policy stops the request, so `install_approval_handler(codex)` (called in `_ensure_codex`) wraps `codex._client._approval_handler` with `approval_handler(default)`, which answers `{"action": "accept", "content": {}}` for Hailer's own server only (plus `"_meta": {"persist": "session"}` when the request's `_meta.persist` offers it, so Codex asks once per tool per thread; two calls produced one request live, while `content.persist` or a top-level `persist` changed nothing) and delegates everything else to the SDK default (verified live 2026-09-16). `codex.thread_resume(thread_id, ...)`,
   `thread.turn(text) -> TurnHandle` with `.stream()` (notifications: `item/agentMessage/delta`,
   `item/started`, `item/completed`, `item/commandExecution/outputDelta`, `item/mcpToolCall/progress`,
   `turn/completed`), `.interrupt()`, `.run() -> TurnResult(final_response, items, usage, status, error)`.
   `SkillInput(name, path)` may be included in turn input. Errors: `openai_codex.errors.*`.
 - Provider config is native Codex config: `model`, `model_provider`, `model_providers.<id>.{base_url,
   wire_api="responses", env_key, requires_openai_auth, name, http_headers, env_http_headers, query_params}`,
-  plus Hailer's own `stream=true` (`ProviderConfig.stream`), which is never passed to Codex.
+  plus Hailer's own bridge settings `stream`, `merge_messages`, `stream_options` and `parallel_tool_calls`
+  (`ProviderConfig`, all default `true`, `"chat"` only), which are never passed to Codex.
   Codex 0.154 only speaks the Responses API and refuses `wire_api = "chat"`. Hailer accepts `wire_api = "chat"`
   in `hailer.toml` anyway: `agent.HailerAgent._ensure_bridge` starts `wire.ChatBridge` (loopback HTTP server,
   one route per chat provider at `http://127.0.0.1:<port>/<id>`) before the app-server, and
   `build_config_overrides(config, user_cfg, bridge_urls)` hands such providers to Codex as
   `wire_api="responses"` at the bridge URL. The bridge translates `POST /<id>/responses` (Responses request →
-  `chat_request_from_responses(body, stream=...)`) into `POST {base_url}/chat/completions` and the reply back
-  into Responses SSE events. `chat_completion_upstreams(config)` gives the bridge one `wire.ChatUpstream(base_url,
-  stream)` per provider: with `stream=True` (default) the request carries `stream: true` plus
+  `chat_request_from_responses(body, stream=..., merge_messages=..., stream_options=..., parallel_tool_calls=...)`) into `POST {base_url}/chat/completions` and the reply back
+  into Responses SSE events. `chat_request_from_responses` returns `(chat_body, wire.ChatToolMap)`: Codex 0.154
+  sends an MCP server's tools as ONE Responses tool `{type: "namespace", name: "mcp__hailer", description,
+  tools: [{type: "function", name, description, parameters, strict}, ...]}` (verified live 2026-09-16), which the
+  bridge flattens into ordinary function tools under their bare names (`<namespace>__<name>` when a name is
+  already taken by a top-level tool, an earlier namespace or an earlier tool of the same namespace; the
+  namespace description is not sent, a debug log says so). The map is handed to
+  `ChatStreamTranslator(tools=...)`, which emits such calls as `function_call` items carrying `namespace` plus
+  the bare `name` (Codex routes MCP calls by that pair; a prefixed name alone is not routed); a reply that names
+  `<namespace>__<name>` for a tool advertised under its bare name is mapped the same way. Replayed
+  `function_call` input items that carry `namespace` are renamed to the advertised name, as is a namespaced
+  `tool_choice`; a `tool_choice` naming a clashing bare name without `namespace` resolves to the top-level tool.
+  With `merge_messages` (default) each run of consecutive `system` messages and of consecutive `user`
+  messages is collapsed into one message (strings joined by a blank line; when either side is a parts list
+  the result is a parts list with text and image parts in order); assistant and tool messages are never
+  merged. `stream_options=False` omits `stream_options` from a streamed request and `parallel_tool_calls=False`
+  omits that field entirely, for gateways that reject them.
+  `chat_completion_upstreams(config)` gives the bridge one `wire.ChatUpstream(base_url, stream,
+  merge_messages, stream_options, parallel_tool_calls)` per provider: with `stream=True` (default) the request carries `stream: true` plus
   `stream_options.include_usage` and the chunks are relayed as they arrive; with `stream=False`
   (`stream = false` in `hailer.toml`, for gateways that reject or cannot deliver SSE) it carries `stream: false`,
   `Accept: application/json`, and the single `chat.completion` body is fed to the translator as one chunk, so
@@ -137,7 +154,8 @@ filled in by `load_config` (`HailerConfig.notebooks_dir`; use `HailerConfig.note
 to `notebook.parent` for hand-built configs). `validate` checks: notebook exists, notebook is inside
 `notebooks_dir` (fatal, names both keys), `notebooks_dir` exists (warning only), data_dir exists (warning
 only), active provider declared (or `openai`), custom provider has `base_url` and `env_key`,
-`wire_api in ("responses", "chat")` (`"chat"` requires a `base_url`), `stream = false` only with `wire_api = "chat"`,
+`wire_api in ("responses", "chat")` (`"chat"` requires a `base_url`), `stream = false` (likewise `merge_messages`, `stream_options` and `parallel_tool_calls = false`) only with
+`wire_api = "chat"`,
 domains are well-formed.
 
 Errors added for the notebook feature (`errors.py`): `NotebookExistsError` (create: name taken) and
@@ -342,7 +360,7 @@ class HailerAgent:
 `codex_factory` defaults to `openai_codex.Codex`; tests inject a fake exposing `thread_start`, `thread_resume`,
 `close`, and threads with `turn()` returning a handle with `stream()`/`interrupt()`. Map SDK exceptions to
 `AgentError`/`ProviderError`/`CredentialsError` with hints (401 → key rejected; connection refused → base_url;
-404 on `/responses` or schema error → ProviderError whose hint names the protocol the provider uses (`POST .../responses` for `wire_api = "responses"`, `POST .../chat/completions` for `"chat"`) and suggests switching `wire_api`; "model ... not found/does not exist" → ProviderError naming the unknown model, checked before the endpoint heuristics; "tool ... timed out" → AgentError, never an endpoint failure). `map_exception(exc, config, *, model=None)`.
+404/405 or "unknown endpoint" → ProviderError "did not accept the request" whose hint names the protocol the provider uses (`POST .../responses` for `wire_api = "responses"`, `POST .../chat/completions` for `"chat"`) and suggests switching `wire_api`; 403 → ProviderError "refused access (HTTP 403)"; any other 4xx (`unexpected status 4xx ...`) or a validation-style body ("unsupported parameter", "unrecognized request argument", "should match pattern", "schema", ...) → ProviderError "rejected the request" whose hint says what Hailer sent and where to change it (the `stream = false` example only for `wire_api = "chat"`, no `[model_providers]` advice for the built-in openai provider); the wording signals only count when the text looks like a gateway reply (a parsed status, `{"error"`/`{"detail"`, `invalid_request_error`), so the SDK's own "validation error" or Codex's "unsupported operation" fall through to AgentError; 429/5xx, including Codex's `exceeded retry limit, last status: NNN`, → ProviderError "unavailable (HTTP n)"; "model ... not found/does not exist" → ProviderError naming the unknown model only when the text names the configured model, quotes one (`The model 'x' does not exist` → "Unknown model 'x'", with a note when x differs from `[model].name`) or carries `model_not_found`/`"param": "model"`, checked before the endpoint heuristics; "tool ... timed out" → AgentError, never an endpoint failure). Every endpoint-related ProviderError ends its hint with `The endpoint said: <the gateway's own text>` (whitespace collapsed, trimmed to 500 chars, passed through `hailer.log.redact`). Codex's `, url: http://127.0.0.1:<port>/<provider>/responses` suffix is the chat bridge's address and is stripped before matching and quoting (a real endpoint URL is kept); the bridge itself logs every upstream non-2xx reply (URL, status, first 500 bytes) at debug. The raw turn error (`TurnError.message` plus `additional_details` when it adds something) is logged at debug before mapping, and the `error` notification's status line previews `payload.error.message` rather than the object repr. `map_exception(exc, config, *, model=None, provider=None)`.
 
 ## `session.py`  (owner: wave 2 / E)
 
