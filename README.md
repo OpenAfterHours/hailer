@@ -361,8 +361,9 @@ such as `1.2.0rc1` are accepted), and arguments after `--` are passed to pytest.
 Repository rulesets restrict this: `main` cannot be force-pushed or deleted and changes to it must come
 through a pull request with the test checks green, and `v*` tags can only be created by repository admins,
 who also bypass the pull-request rule so the release script can push directly. The `pypi` environment only
-deploys from `v*` tags, and `.github/workflows/members-only.yml` closes pull requests opened by people
-outside the OpenAfterHours organization.
+deploys from `v*` tags, and `.github/workflows/members-only.yml` closes pull requests opened from forks by
+people outside the OpenAfterHours organization. Open your own pull requests from a branch in this repository;
+those are always kept.
 
 ## Security
 

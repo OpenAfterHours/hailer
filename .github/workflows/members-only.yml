@@ -1,9 +1,14 @@
 # Close pull requests from outside the organization.
 #
 # GitHub has no setting that stops people opening pull requests on a public
-# repository, so this closes any pull request whose author is not an organization
-# member or a repository collaborator, leaving a short comment. Members' pull
-# requests are untouched (the job is skipped).
+# repository, so this closes pull requests from outsiders, leaving a short comment.
+#
+# A pull request is kept when its head branch lives in this repository (only people
+# with write access can push one, so forks are the only route for outsiders) or when
+# GitHub reports the author as OWNER, MEMBER or COLLABORATOR. The branch check comes
+# first because the event payload only reports MEMBER for *public* org memberships;
+# a member whose membership is private shows up as CONTRIBUTOR or NONE, which is
+# how this workflow once closed a member's own pull request.
 #
 # pull_request_target runs on the base branch with a write token. It never checks
 # out or runs code from the pull request, so that token is not exposed to it.
@@ -20,7 +25,7 @@ permissions:
 jobs:
   guard:
     name: Close pull requests from non-members
-    if: ${{ !contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association) }}
+    if: ${{ github.event.pull_request.head.repo.full_name != github.repository && !contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association) }}
     runs-on: ubuntu-latest
     steps:
       - name: Comment and close
