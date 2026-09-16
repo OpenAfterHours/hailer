@@ -486,6 +486,23 @@ def _turn_error_text(error: Any) -> str:
     return text
 
 
+#: The bridge's per-provider request switches, in the order the rejected-request hint lists them.
+_CHAT_SWITCHES = ("stream", "stream_options", "parallel_tool_calls", "merge_messages")
+
+
+def _chat_switches_still_on(provider: ProviderConfig) -> tuple[str, ...]:
+    """The chat bridge switches a user could still turn off for this provider."""
+    return tuple(name for name in _CHAT_SWITCHES if getattr(provider, name))
+
+
+def _switch_list(names: tuple[str, ...]) -> str:
+    """``a = false, b = false or c = false`` for the hint."""
+    items = [f"{name} = false" for name in names]
+    if len(items) == 1:
+        return items[0]
+    return ", ".join(items[:-1]) + " or " + items[-1]
+
+
 def _provider_by_id(config: HailerConfig, provider_id: str | None) -> ProviderConfig:
     """The provider the agent is currently using (``/model`` may have switched it)."""
     if provider_id is None or provider_id == config.model.provider:
@@ -625,10 +642,13 @@ def map_exception(
                 f"Hailer sent POST {base_url}/chat/completions (wire_api = \"chat\", translated from Codex's "
                 f"Responses call{'' if provider.stream else ', stream = false'})."
             )
-            if provider.stream:
-                where = f"the provider's chat switches in its [model_providers] table in hailer.toml (for example stream = false) and {effort}"
+            switches = _chat_switches_still_on(provider)
+            if len(switches) == len(_CHAT_SWITCHES):
+                where = f"the provider's chat switches in its [model_providers] table in hailer.toml ({_switch_list(switches)}) and {effort}"
+            elif switches:
+                where = f"the provider's other chat switches in its [model_providers] table in hailer.toml ({_switch_list(switches)}) and {effort}"
             else:
-                where = f"the provider's other chat switches in its [model_providers] table in hailer.toml and {effort}"
+                where = f"the provider's [model_providers] table in hailer.toml (every chat switch is already off) and {effort}"
         elif provider.is_builtin_openai:
             sent = f"Hailer sent POST {base_url}/responses straight from Codex."
             where = effort + " in hailer.toml"

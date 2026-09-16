@@ -296,16 +296,18 @@ def _merge_consecutive_messages(messages: list[dict[str, Any]]) -> list[dict[str
 
     Codex sends its instructions and its developer message as two system items, and the
     environment context ahead of the user's text as two user items; strict chat templates
-    reject both ("roles must alternate"). Assistant and tool messages are never merged.
+    reject both ("roles must alternate"). Assistant and tool messages are never merged. Any
+    other key on the first message of a run is kept; a run whose merged content is empty is dropped.
     """
     out: list[dict[str, Any]] = []
     for message in messages:
         role = message.get("role")
         if out and role in _MERGEABLE_ROLES and out[-1].get("role") == role:
-            out[-1] = {"role": role, "content": _join_content(out[-1].get("content"), message.get("content"))}
+            out[-1] = {**out[-1], "content": _join_content(out[-1].get("content"), message.get("content"))}
             continue
         out.append(message)
-    return out
+    # A run that carried no text at all (e.g. only empty parts) has nothing to say.
+    return [m for m in out if not (m.get("role") in _MERGEABLE_ROLES and m.get("content") in ("", []))]
 
 
 def _append_tool_call(messages: list[dict[str, Any]], call: dict[str, Any]) -> None:

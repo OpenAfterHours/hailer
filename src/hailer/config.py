@@ -110,7 +110,7 @@ data_dir = "data"                    # where the monthly parquet files live
 name = "gpt-5.5"
 provider = "openai"                  # "openai" uses your existing Codex login or OPENAI_API_KEY
 # reasoning_effort = "medium"        # minimal | low | medium | high | xhigh; "" sends no reasoning
-#                                    # effort at all (for gateways that reject the field)
+#                                      effort at all (for gateways that reject the field)
 
 # A bespoke / internal endpoint. wire_api picks the protocol the endpoint speaks:
 #   "responses" - the OpenAI Responses API, streaming (POST {base_url}/responses)

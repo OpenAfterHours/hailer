@@ -1303,9 +1303,10 @@ def test_map_rejected_hint_does_not_suggest_stream_false_when_already_off(tmp_pa
     mapped = map_exception(RuntimeError(_GATEWAY_422), make_config(tmp_path, providers={"internal": unstreamed}))
     assert "rejected the request" in str(mapped)
     assert ", stream = false)" in mapped.hint  # the sent-description still says streaming is off
-    assert "for example stream = false" not in mapped.hint and "other chat switches" in mapped.hint
+    assert "(stream = false" not in mapped.hint  # already off: not offered again
+    assert "other chat switches in its [model_providers] table in hailer.toml (stream_options = false, parallel_tool_calls = false or merge_messages = false)" in mapped.hint
     streaming = map_exception(RuntimeError(_GATEWAY_422), make_config(tmp_path, providers={"internal": CHAT_PROVIDER}))
-    assert "for example stream = false" in streaming.hint
+    assert "chat switches in its [model_providers] table in hailer.toml (stream = false, stream_options = false, parallel_tool_calls = false or merge_messages = false)" in streaming.hint
 
 
 def test_map_connection_branch_quotes_gateway_text_but_not_plain_reasons(tmp_path):
@@ -1331,3 +1332,35 @@ def test_map_connection_branch_quotes_gateway_text_but_not_plain_reasons(tmp_pat
     assert "Could not reach" in str(plain) and "The endpoint said" not in plain.hint
     dns = map_exception(RuntimeError("could not reach https://llm.example.internal/v1/chat/completions: dns error (x)"), cfg)
     assert "The endpoint said" not in dns.hint
+
+
+def test_map_rejected_hint_names_the_chat_switches_still_on(tmp_path):
+    partly = ProviderConfig(
+        id="internal",
+        name="Internal",
+        base_url="https://llm.example.internal/v1",
+        wire_api="chat",
+        env_key="INTERNAL_MODEL_API_KEY",
+        stream_options=False,
+        merge_messages=False,
+    )
+    mapped = map_exception(RuntimeError(_GATEWAY_422), make_config(tmp_path, providers={"internal": partly}))
+    assert "other chat switches in its [model_providers] table in hailer.toml (stream = false or parallel_tool_calls = false)" in mapped.hint
+    assert "stream_options = false" not in mapped.hint and "merge_messages = false" not in mapped.hint
+    all_off = ProviderConfig(
+        id="internal",
+        name="Internal",
+        base_url="https://llm.example.internal/v1",
+        wire_api="chat",
+        env_key="INTERNAL_MODEL_API_KEY",
+        stream=False,
+        stream_options=False,
+        parallel_tool_calls=False,
+        merge_messages=False,
+    )
+    mapped = map_exception(RuntimeError(_GATEWAY_422), make_config(tmp_path, providers={"internal": all_off}))
+    assert "(every chat switch is already off)" in mapped.hint
+    assert not any(f"{name} = false" in mapped.hint for name in ("stream_options", "parallel_tool_calls", "merge_messages"))
+    responses = map_exception(RuntimeError(_GATEWAY_422), make_config(tmp_path))  # the default provider speaks the Responses API
+    assert "rejected the request" in str(responses)
+    assert not any(name in responses.hint for name in ("stream_options", "parallel_tool_calls", "merge_messages", "chat switches"))

@@ -907,3 +907,33 @@ def test_bridge_merges_messages_and_keeps_the_optional_fields_by_default(no_prox
     sent = up.requests[-1]["json"]
     assert [m["role"] for m in sent["messages"]] == ["system", "user"]
     assert sent["stream_options"] == {"include_usage": True} and sent["parallel_tool_calls"] is True
+
+
+def test_merge_keeps_other_keys_of_the_first_message_and_drops_empty_runs():
+    from hailer.wire import _merge_consecutive_messages
+
+    merged = _merge_consecutive_messages(
+        [
+            {"role": "user", "content": "a", "name": "phil"},
+            {"role": "user", "content": "b"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": ""},
+            {"role": "user", "content": []},
+        ]
+    )
+    assert merged == [{"role": "user", "content": "a\n\nb", "name": "phil"}, {"role": "assistant", "content": "ok"}]
+
+
+def test_request_translation_drops_an_all_empty_user_run():
+    body = {
+        "model": "m",
+        "input": [
+            {"type": "message", "role": "user", "content": ""},
+            {"type": "message", "role": "user", "content": []},
+            {"type": "message", "role": "assistant", "content": "hello"},
+            {"type": "message", "role": "user", "content": ""},
+            {"type": "message", "role": "user", "content": "now say hi"},
+        ],
+    }
+    chat, _ = chat_request_from_responses(body)
+    assert chat["messages"] == [{"role": "assistant", "content": "hello"}, {"role": "user", "content": "now say hi"}]

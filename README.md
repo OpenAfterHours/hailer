@@ -245,14 +245,14 @@ provider = "internal"
 # reasoning_effort = "medium"         # minimal | low | medium | high | xhigh; "" sends no reasoning effort
 
 [model_providers.internal]
-base_url             = "https://llm.example.internal/v1"
-wire_api             = "responses"                # or "chat" for a Chat Completions endpoint
-# stream             = true                       # "chat" only: false if the gateway rejects stream = true
-# merge_messages     = true                       # "chat" only: false keeps consecutive system/user messages separate
-# stream_options     = true                       # "chat" only: false omits stream_options (token counts may be lost)
+base_url              = "https://llm.example.internal/v1"
+wire_api              = "responses"               # or "chat" for a Chat Completions endpoint
+# stream              = true                      # "chat" only: false if the gateway rejects stream = true
+# merge_messages      = true                      # "chat" only: false keeps consecutive system/user messages separate
+# stream_options      = true                      # "chat" only: false omits stream_options (token counts may be lost)
 # parallel_tool_calls = true                      # "chat" only: false omits the parallel_tool_calls field
-env_key              = "INTERNAL_MODEL_API_KEY"   # env var name; value from `hailer login internal` or the shell
-requires_openai_auth = false
+env_key               = "INTERNAL_MODEL_API_KEY"  # env var name; value from `hailer login internal` or the shell
+requires_openai_auth  = false
 # name             = "Internal"
 # http_headers     = { "X-Team" = "risk-analytics" }
 # env_http_headers = { "X-Client-Id" = "INTERNAL_CLIENT_ID" }
