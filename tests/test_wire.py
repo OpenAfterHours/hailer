@@ -15,6 +15,7 @@ from hailer import wire as wire_mod
 from hailer.wire import (
     ChatBridge,
     ChatStreamTranslator,
+    ChatToolMap,
     ChatUpstream,
     _reason,
     chat_request_from_responses,
@@ -60,8 +61,8 @@ RESPONSES_REQUEST: dict[str, Any] = {
 
 
 def test_request_translation_builds_chat_messages():
-    chat, custom = chat_request_from_responses(RESPONSES_REQUEST)
-    assert custom == {"apply_patch"}
+    chat, tools = chat_request_from_responses(RESPONSES_REQUEST)
+    assert tools.custom == {"apply_patch"} and tools.namespaced == {}
     assert chat["model"] == "risk-analyst-v3"
     assert chat["stream"] is True and chat["stream_options"] == {"include_usage": True}
     assert chat["reasoning_effort"] == "high"
@@ -101,9 +102,9 @@ def test_request_translation_tools():
 
 
 def test_request_translation_minimal_and_string_input():
-    chat, custom = chat_request_from_responses({"model": "m", "input": "hi"})
+    chat, tools = chat_request_from_responses({"model": "m", "input": "hi"})
     assert chat == {"model": "m", "messages": [{"role": "user", "content": "hi"}], "stream": True, "stream_options": {"include_usage": True}}
-    assert custom == set()
+    assert tools == ChatToolMap()
 
 
 def test_request_translation_without_streaming_sends_stream_false():
@@ -128,6 +129,73 @@ def test_request_translation_named_tool_choice_and_json_schema():
     assert chat["tools"][0]["function"]["strict"] is True
     assert chat["response_format"] == {"type": "json_schema", "json_schema": {"name": "out", "schema": {"type": "object"}, "strict": True}}
     assert chat["verbosity"] == "low" and chat["max_tokens"] == 50
+
+
+# Codex 0.154 sends an MCP server's tools as one "namespace" tool; the bridge flattens it.
+NAMESPACE_TOOLS: list[dict[str, Any]] = [
+    {"type": "function", "name": "shell", "parameters": {"type": "object"}},
+    {
+        "type": "namespace",
+        "name": "mcp__hailer",
+        "description": "Hailer tools. A long explanation of the notebook workflow that must not be sent.",
+        "tools": [
+            {"type": "function", "name": "marimo_status", "description": "Is marimo running?", "parameters": {"type": "object", "properties": {}}, "strict": False},
+            {"type": "function", "name": "shell", "description": "Clashes with the top-level tool", "parameters": {"type": "object"}},
+            {"type": "function", "name": "notebook_cells", "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}}}, "strict": True},
+            {"type": "hosted_thing", "name": "ignored"},
+            {"type": "function", "name": ""},
+            "not a tool",
+        ],
+    },
+    {"type": "namespace", "name": "mcp__other", "tools": [{"type": "function", "name": "marimo_status", "parameters": {"type": "object"}}]},
+    {"type": "namespace", "tools": [{"type": "function", "name": "nameless_namespace"}]},
+]
+
+
+def test_request_translation_flattens_namespace_tools():
+    chat, tools = chat_request_from_responses({"model": "m", "input": [], "tools": NAMESPACE_TOOLS})
+    names = [t["function"]["name"] for t in chat["tools"]]
+    assert names == ["shell", "marimo_status", "mcp__hailer__shell", "notebook_cells", "mcp__other__marimo_status"]
+    assert tools.custom == frozenset()
+    assert tools.namespaced == {
+        "marimo_status": ("mcp__hailer", "marimo_status"),
+        "mcp__hailer__shell": ("mcp__hailer", "shell"),
+        "notebook_cells": ("mcp__hailer", "notebook_cells"),
+        "mcp__other__marimo_status": ("mcp__other", "marimo_status"),
+    }
+    assert chat["tools"][1]["function"] == {"name": "marimo_status", "description": "Is marimo running?", "parameters": {"type": "object", "properties": {}}}
+    assert chat["tools"][2]["function"]["description"] == "Clashes with the top-level tool"
+    assert chat["tools"][3]["function"]["strict"] is True
+    assert "Hailer tools" not in json.dumps(chat)  # the namespace description is not sent
+    assert tools.chat_name("shell", "mcp__hailer") == "mcp__hailer__shell"
+    assert tools.chat_name("shell") == "shell"
+    assert tools.chat_name("gone", "mcp__hailer") == "gone"  # unknown tool: bare name, never an error
+
+
+def test_request_translation_top_level_tools_win_even_when_listed_after_a_namespace():
+    chat, tools = chat_request_from_responses({"model": "m", "input": [], "tools": [NAMESPACE_TOOLS[1], NAMESPACE_TOOLS[0]]})
+    assert [t["function"]["name"] for t in chat["tools"]] == ["marimo_status", "mcp__hailer__shell", "notebook_cells", "shell"]
+    assert tools.namespaced["mcp__hailer__shell"] == ("mcp__hailer", "shell")
+
+
+def test_request_translation_replays_namespaced_calls_with_the_advertised_names():
+    chat, _ = chat_request_from_responses(
+        {
+            "model": "m",
+            "input": [
+                {"type": "function_call", "call_id": "c1", "name": "marimo_status", "namespace": "mcp__hailer", "arguments": "{}"},
+                {"type": "function_call", "call_id": "c2", "name": "shell", "namespace": "mcp__hailer", "arguments": "{}"},
+                {"type": "function_call", "call_id": "c3", "name": "shell", "arguments": '{"cmd": "ls"}'},
+                {"type": "function_call_output", "call_id": "c1", "output": "ok"},
+            ],
+            "tools": NAMESPACE_TOOLS,
+            "tool_choice": {"type": "function", "name": "shell", "namespace": "mcp__hailer"},
+        }
+    )
+    calls = chat["messages"][0]["tool_calls"]
+    assert [c["function"]["name"] for c in calls] == ["marimo_status", "mcp__hailer__shell", "shell"]
+    assert chat["messages"][1] == {"role": "tool", "tool_call_id": "c1", "content": "ok"}
+    assert chat["tool_choice"] == {"type": "function", "function": {"name": "mcp__hailer__shell"}}
 
 
 # --------------------------------------------------------------------------- #
@@ -179,8 +247,33 @@ def test_stream_text_reply():
     assert t.finish() == []  # idempotent
 
 
+def test_stream_namespaced_tool_calls_come_back_with_namespace_and_bare_name():
+    _, tools = chat_request_from_responses({"model": "m", "input": [], "tools": NAMESPACE_TOOLS})
+    t = ChatStreamTranslator(tools=tools)
+    t.start()
+    t.feed(_chunk(tool_calls=[{"index": 0, "id": "call_1", "type": "function", "function": {"name": "marimo_status", "arguments": "{}"}}]))
+    t.feed(_chunk(tool_calls=[{"index": 1, "id": "call_2", "type": "function", "function": {"name": "mcp__hailer__shell", "arguments": '{"cmd": "ls"}'}}]))
+    t.feed(_chunk(tool_calls=[{"index": 2, "id": "call_3", "type": "function", "function": {"name": "shell", "arguments": "{}"}}]))
+    done = t.finish()
+    items = [e["item"] for e in done if e["type"] == "response.output_item.done"]
+    assert items[0] == {
+        "type": "function_call",
+        "id": items[0]["id"],
+        "call_id": "call_1",
+        "name": "marimo_status",
+        "namespace": "mcp__hailer",
+        "arguments": "{}",
+        "status": "completed",
+    }
+    assert items[1]["name"] == "shell" and items[1]["namespace"] == "mcp__hailer" and items[1]["arguments"] == '{"cmd": "ls"}'
+    assert items[2]["name"] == "shell" and "namespace" not in items[2]  # a plain function stays plain
+    added = [e["item"] for e in done if e["type"] == "response.output_item.added"]
+    assert added[1]["namespace"] == "mcp__hailer" and added[1]["name"] == "shell" and added[1]["status"] == "in_progress"
+    assert [o.get("namespace") for o in done[-1]["response"]["output"]] == ["mcp__hailer", "mcp__hailer", None]
+
+
 def test_stream_tool_calls_including_custom_and_parallel():
-    t = ChatStreamTranslator(custom_tools={"apply_patch"})
+    t = ChatStreamTranslator(tools=ChatToolMap(custom=frozenset({"apply_patch"})))
     t.start()
     t.feed(_chunk(content="Running."))
     ev = t.feed(_chunk(tool_calls=[{"index": 0, "id": "call_1", "type": "function", "function": {"name": "shell", "arguments": ""}}]))
@@ -423,14 +516,19 @@ def test_bridge_translates_a_streamed_turn(no_proxy):
         _chunk(role="assistant", content="Hi "),
         _chunk(content="there"),
         _chunk(tool_calls=[{"index": 0, "id": "call_9", "type": "function", "function": {"name": "shell", "arguments": "{}"}}]),
+        _chunk(tool_calls=[{"index": 1, "id": "call_10", "type": "function", "function": {"name": "marimo_status", "arguments": "{}"}}]),
         {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
         {"choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}},
+    ]
+    tools = [
+        {"type": "function", "name": "shell", "parameters": {}},
+        {"type": "namespace", "name": "mcp__hailer", "description": "Hailer tools.", "tools": [{"type": "function", "name": "marimo_status", "parameters": {"type": "object"}}]},
     ]
     with FakeUpstream(chunks) as up, ChatBridge({"internal": up.base_url}) as bridge:
         assert bridge.urls == {"internal": f"http://127.0.0.1:{bridge.port}/internal"}
         status, headers, body = _post(
             bridge.urls["internal"] + "/responses?api-version=2025-04-01",
-            {"model": "m", "instructions": "sys", "input": "hi", "tools": [{"type": "function", "name": "shell", "parameters": {}}], "stream": True},
+            {"model": "m", "instructions": "sys", "input": "hi", "tools": tools, "stream": True},
             {"Authorization": "Bearer sk-secret", "X-Team": "risk", "OpenAI-Beta": "responses=experimental", "Accept": "text/event-stream"},
         )
     assert status == 200 and headers["Content-Type"].startswith("text/event-stream")
@@ -440,9 +538,12 @@ def test_bridge_translates_a_streamed_turn(no_proxy):
     assert kinds[-1] == "response.completed"
     assert "response.output_text.delta" in kinds and "response.output_item.done" in kinds
     completed = events[-1]["response"]
-    assert [o["type"] for o in completed["output"]] == ["message", "function_call"]
+    assert [o["type"] for o in completed["output"]] == ["message", "function_call", "function_call"]
     assert completed["output"][0]["content"][0]["text"] == "Hi there"
-    assert completed["output"][1]["call_id"] == "call_9"
+    assert completed["output"][1]["call_id"] == "call_9" and "namespace" not in completed["output"][1]
+    # the MCP tool call goes back to Codex as (namespace, bare name), which is how it routes to the server
+    assert completed["output"][2]["call_id"] == "call_10"
+    assert completed["output"][2]["name"] == "marimo_status" and completed["output"][2]["namespace"] == "mcp__hailer"
     assert completed["usage"]["input_tokens"] == 5 and completed["usage"]["output_tokens"] == 3
 
     (req,) = up.requests
@@ -451,7 +552,8 @@ def test_bridge_translates_a_streamed_turn(no_proxy):
     assert req["headers"]["X-Team"] == "risk"
     assert req["headers"]["Accept"] == "text/event-stream"
     assert req["json"]["messages"] == [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
-    assert req["json"]["stream"] is True and req["json"]["tools"][0]["function"]["name"] == "shell"
+    assert req["json"]["stream"] is True
+    assert [t["function"]["name"] for t in req["json"]["tools"]] == ["shell", "marimo_status"]  # the namespace is flattened
 
 
 def test_bridge_relays_upstream_http_errors(no_proxy):

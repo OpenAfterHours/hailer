@@ -78,7 +78,15 @@ module exposes so work can proceed in parallel. Shared types live in `src/hailer
   `build_config_overrides(config, user_cfg, bridge_urls)` hands such providers to Codex as
   `wire_api="responses"` at the bridge URL. The bridge translates `POST /<id>/responses` (Responses request →
   `chat_request_from_responses(body, stream=...)`) into `POST {base_url}/chat/completions` and the reply back
-  into Responses SSE events. `chat_completion_upstreams(config)` gives the bridge one `wire.ChatUpstream(base_url,
+  into Responses SSE events. `chat_request_from_responses` returns `(chat_body, wire.ChatToolMap)`: Codex 0.154
+  sends an MCP server's tools as ONE Responses tool `{type: "namespace", name: "mcp__hailer", description,
+  tools: [{type: "function", name, description, parameters, strict}, ...]}` (verified live 2026-09-16), which the
+  bridge flattens into ordinary function tools under their bare names (`<namespace>__<name>` when a name is
+  already taken by a top-level tool or an earlier namespace; the namespace description is not sent). The map is
+  handed to `ChatStreamTranslator(tools=...)`, which emits such calls as `function_call` items carrying
+  `namespace` plus the bare `name` (Codex routes MCP calls by that pair; a prefixed name alone is not routed),
+  and replayed `function_call` input items that carry `namespace` are renamed the same way, as is a namespaced
+  `tool_choice`. `chat_completion_upstreams(config)` gives the bridge one `wire.ChatUpstream(base_url,
   stream)` per provider: with `stream=True` (default) the request carries `stream: true` plus
   `stream_options.include_usage` and the chunks are relayed as they arrive; with `stream=False`
   (`stream = false` in `hailer.toml`, for gateways that reject or cannot deliver SSE) it carries `stream: false`,

@@ -33,7 +33,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections.abc import Iterable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -136,30 +136,68 @@ def _message_content(role: str, content: Any) -> Any:
     return parts
 
 
-def _chat_tools(tools: Any) -> tuple[list[dict[str, Any]], set[str]]:
-    """Translate Responses tools to Chat Completions tools; returns them plus the names of custom tools.
+@dataclass(frozen=True)
+class ChatToolMap:
+    """How one request's Responses tools were advertised to Chat Completions.
+
+    ``custom`` names the custom (free-form) tools; their calls come back as ``custom_tool_call``
+    items. ``namespaced`` maps each chat-side function name that stands for a tool inside a
+    Responses ``namespace`` tool (Codex sends every MCP server's tools as one such tool) to
+    ``(namespace, tool name)``; their calls come back as ``function_call`` items carrying
+    ``namespace`` and the bare tool name, which is how Codex routes them to the MCP server.
+    """
+
+    custom: frozenset[str] = frozenset()
+    namespaced: Mapping[str, tuple[str, str]] = field(default_factory=dict)
+
+    def chat_name(self, name: str, namespace: str | None = None) -> str:
+        """The chat-side function name for a Responses tool call, as advertised in ``tools``.
+
+        Falls back to ``name`` when the call is not namespaced or the namespace is unknown (for
+        example a call recorded before the tool set changed).
+        """
+        if namespace:
+            for chat, (ns, bare) in self.namespaced.items():
+                if ns == namespace and bare == name:
+                    return chat
+        return name
+
+
+def _function_tool(name: str, tool: Mapping[str, Any]) -> dict[str, Any]:
+    fn: dict[str, Any] = {"name": name}
+    if tool.get("description"):
+        fn["description"] = tool["description"]
+    fn["parameters"] = tool.get("parameters") or {"type": "object", "properties": {}}
+    if tool.get("strict") is True:
+        fn["strict"] = True
+    return {"type": "function", "function": fn}
+
+
+def _chat_tools(tools: Any) -> tuple[list[dict[str, Any]], ChatToolMap]:
+    """Translate Responses tools to Chat Completions tools; returns them plus their :class:`ChatToolMap`.
 
     Custom (free-form) tools have no Chat Completions equivalent, so each becomes a function
     with a single required string parameter ``input``; the bridge maps such calls back to a
-    ``custom_tool_call`` item. Hosted tools (web search, local shell, ...) are dropped.
+    ``custom_tool_call`` item. A ``namespace`` tool (the shape Codex uses for an MCP server's
+    tools) is flattened: every function inside it becomes an ordinary function tool under its
+    bare name, or under ``<namespace>__<name>`` when that name is already taken by a top-level
+    tool or by an earlier namespace, so the order of the tools decides deterministically. The
+    namespace's own description is not sent; each tool keeps its own. Hosted tools (web search,
+    local shell, ...) are dropped.
     """
+    entries = [t for t in tools or [] if isinstance(t, Mapping)]
     out: list[dict[str, Any]] = []
     custom: set[str] = set()
-    for tool in tools or []:
-        if not isinstance(tool, Mapping):
-            continue
+    namespaced: dict[str, tuple[str, str]] = {}
+    # Top-level names win over namespaced ones wherever they appear in the list.
+    used: set[str] = {t["name"] for t in entries if t.get("type") in ("function", "custom") and isinstance(t.get("name"), str)}
+    for tool in entries:
         kind = tool.get("type")
         name = tool.get("name")
         if not isinstance(name, str) or not name:
             continue
         if kind == "function":
-            fn: dict[str, Any] = {"name": name}
-            if tool.get("description"):
-                fn["description"] = tool["description"]
-            fn["parameters"] = tool.get("parameters") or {"type": "object", "properties": {}}
-            if tool.get("strict") is True:
-                fn["strict"] = True
-            out.append({"type": "function", "function": fn})
+            out.append(_function_tool(name, tool))
         elif kind == "custom":
             custom.add(name)
             fn = {
@@ -173,17 +211,33 @@ def _chat_tools(tools: Any) -> tuple[list[dict[str, Any]], set[str]]:
             if tool.get("description"):
                 fn["description"] = tool["description"]
             out.append({"type": "function", "function": fn})
+        elif kind == "namespace":
+            for inner in tool.get("tools") or []:
+                if not isinstance(inner, Mapping):
+                    continue
+                bare = inner.get("name")
+                if not isinstance(bare, str) or not bare:
+                    continue
+                if inner.get("type", "function") != "function":
+                    log.debug("dropping unsupported tool type %r inside namespace %r for chat completions", inner.get("type"), name)
+                    continue
+                chat_name = bare if bare not in used else f"{name}__{bare}"
+                while chat_name in used:  # a literal "<namespace>__<name>" tool is unlikely but must not collide
+                    chat_name += "_"
+                used.add(chat_name)
+                namespaced[chat_name] = (name, bare)
+                out.append(_function_tool(chat_name, inner))
         else:
             log.debug("dropping unsupported tool type %r for chat completions", kind)
-    return out, custom
+    return out, ChatToolMap(custom=frozenset(custom), namespaced=namespaced)
 
 
-def _tool_choice(choice: Any) -> Any:
+def _tool_choice(choice: Any, tool_map: ChatToolMap) -> Any:
     if isinstance(choice, str):
         return choice
     if isinstance(choice, Mapping):
         if choice.get("type") == "function" and choice.get("name"):
-            return {"type": "function", "function": {"name": choice["name"]}}
+            return {"type": "function", "function": {"name": tool_map.chat_name(choice["name"], choice.get("namespace"))}}
         return None
     return None
 
@@ -199,12 +253,15 @@ def _append_tool_call(messages: list[dict[str, Any]], call: dict[str, Any]) -> N
     messages.append({"role": "assistant", "content": None, "tool_calls": [call]})
 
 
-def chat_request_from_responses(body: Mapping[str, Any], *, stream: bool = True) -> tuple[dict[str, Any], set[str]]:
+def chat_request_from_responses(body: Mapping[str, Any], *, stream: bool = True) -> tuple[dict[str, Any], ChatToolMap]:
     """Build the Chat Completions request body for a Responses API request.
 
-    Returns the body and the set of tool names that were custom tools (their calls are
-    translated back into ``custom_tool_call`` items).
+    Returns the body and the :class:`ChatToolMap` describing how the tools were advertised;
+    hand the map to :class:`ChatStreamTranslator` so the reply's tool calls are translated
+    back consistently. Earlier calls replayed in ``input`` use the same chat-side names.
     """
+    tools, tool_map = _chat_tools(body.get("tools"))
+
     messages: list[dict[str, Any]] = []
     instructions = body.get("instructions")
     if isinstance(instructions, str) and instructions.strip():
@@ -226,12 +283,13 @@ def chat_request_from_responses(body: Mapping[str, Any], *, stream: bool = True)
             messages.append({"role": role, "content": _message_content(role, item.get("content"))})
         elif kind == "function_call":
             args = item.get("arguments")
+            name = tool_map.chat_name(item.get("name") or "", item.get("namespace"))
             _append_tool_call(
                 messages,
                 {
                     "id": item.get("call_id") or item.get("id") or f"call_{len(messages)}",
                     "type": "function",
-                    "function": {"name": item.get("name") or "", "arguments": args if isinstance(args, str) else json.dumps(args or {})},
+                    "function": {"name": name, "arguments": args if isinstance(args, str) else json.dumps(args or {})},
                 },
             )
         elif kind == "custom_tool_call":
@@ -253,10 +311,9 @@ def chat_request_from_responses(body: Mapping[str, Any], *, stream: bool = True)
     if stream:
         chat["stream_options"] = {"include_usage": True}
 
-    tools, custom = _chat_tools(body.get("tools"))
     if tools:
         chat["tools"] = tools
-        choice = _tool_choice(body.get("tool_choice"))
+        choice = _tool_choice(body.get("tool_choice"), tool_map)
         if choice is not None:
             chat["tool_choice"] = choice
         if isinstance(body.get("parallel_tool_calls"), bool):
@@ -279,7 +336,7 @@ def chat_request_from_responses(body: Mapping[str, Any], *, stream: bool = True)
 
     if isinstance(body.get("max_output_tokens"), int):
         chat["max_tokens"] = body["max_output_tokens"]
-    return chat, custom
+    return chat, tool_map
 
 
 # --------------------------------------------------------------------------- #
@@ -306,13 +363,14 @@ class ChatStreamTranslator:
 
     Usage: ``events = t.start()``; then ``events = t.feed(chunk)`` per parsed chunk; finally
     ``events = t.finish()``. Each returned event is a dict with a ``type`` key, ready to be
-    serialised as the ``data:`` of an SSE frame.
+    serialised as the ``data:`` of an SSE frame. ``tools`` is the :class:`ChatToolMap` of the
+    request being answered, so custom and namespaced tool calls are translated back correctly.
     """
 
-    def __init__(self, *, model: str | None = None, custom_tools: Iterable[str] = ()) -> None:
+    def __init__(self, *, model: str | None = None, tools: ChatToolMap | None = None) -> None:
         self.response_id = "resp_" + uuid.uuid4().hex
         self.model = model
-        self._custom = set(custom_tools)
+        self._tools = tools or ChatToolMap()
         self._output_index = 0
         self._items: list[dict[str, Any]] = []  # completed output items, in order
         # in-flight pieces
@@ -379,7 +437,7 @@ class ChatStreamTranslator:
                 call["call_id"] = "call_" + uuid.uuid4().hex[:12]
             index = self._output_index
             self._output_index += 1
-            if name in self._custom:
+            if name in self._tools.custom:
                 try:
                     parsed = json.loads(arguments) if arguments else {}
                     raw_input = parsed.get("input", arguments) if isinstance(parsed, Mapping) else arguments
@@ -402,6 +460,10 @@ class ChatStreamTranslator:
                     "arguments": arguments or "{}",
                     "status": "completed",
                 }
+                mapped = self._tools.namespaced.get(name)
+                if mapped is not None:
+                    # Codex routes a namespaced call by (namespace, bare name); a prefixed name alone is unknown to it.
+                    item["namespace"], item["name"] = mapped
             self._items.append(item)
             events.append({"type": "response.output_item.added", "output_index": index, "item": dict(item, status="in_progress")})
             events.append({"type": "response.output_item.done", "output_index": index, "item": item})
@@ -711,7 +773,7 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             self._send_error_json(400, "request body must be a JSON object", "invalid_request_error")
             return
 
-        chat_body, custom = chat_request_from_responses(request, stream=upstream.stream)
+        chat_body, tool_map = chat_request_from_responses(request, stream=upstream.stream)
         url = upstream.base_url + "/chat/completions" + (f"?{query}" if query else "")
         headers = self._forward_headers()
         headers["Content-Type"] = "application/json"
@@ -734,7 +796,7 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             self._send_error_json(502, f"could not reach {url}: {_reason(exc)}")
             return
 
-        translator = ChatStreamTranslator(model=chat_body.get("model"), custom_tools=custom)
+        translator = ChatStreamTranslator(model=chat_body.get("model"), tools=tool_map)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")

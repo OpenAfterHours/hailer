@@ -271,9 +271,10 @@ In both modes the gateway must tolerate a `GET {base_url}/models` probe at start
 
 With `"chat"` Hailer starts a loopback bridge (`127.0.0.1`, random port) for the session, points Codex at it
 and translates each request: the system prompt becomes the `system` message, the conversation becomes
-`messages` with `tool_calls` / `tool` entries, Codex's function tools become Chat Completions `tools`, and the
-streamed `delta.content`, `delta.tool_calls`, `reasoning_content` and final `usage` chunks come back as
-Responses events. The bridge forwards the `Authorization` header (from `env_key`), `http_headers`,
+`messages` with `tool_calls` / `tool` entries, Codex's function tools become Chat Completions `tools` (Hailer's
+own notebook tools, which Codex sends as one `mcp__hailer` namespace tool, are flattened into ordinary functions
+and their calls routed back to the notebook server), and the streamed `delta.content`, `delta.tool_calls`,
+`reasoning_content` and final `usage` chunks come back as Responses events. The bridge forwards the `Authorization` header (from `env_key`), `http_headers`,
 `env_http_headers` and `query_params` unchanged and keeps no key of its own; `GET /models` is passed
 through. Reasoning effort is sent as `reasoning_effort` when set. The gateway must support function calling.
 By default it must also support streaming (`stream: true`; `stream_options.include_usage` is requested for
@@ -288,7 +289,8 @@ with `stream = false`), and endpoint errors name `/chat/completions`.
 
 Hailer keeps the request small and predictable for gateways: its own system prompt replaces Codex's
 built-in coding-agent prompt, and web search, multi-agent, plugin and app features are switched off for
-the session, so the endpoint sees a handful of function tools plus Hailer's `mcp__hailer` tools.
+the session, so the endpoint sees a handful of Codex function tools plus Hailer's own notebook tools
+(`marimo_execute`, `notebook_cells`, ... from the `mcp__hailer` namespace).
 
 Several providers can be declared; switch inside a session with `/model <name>` or
 `/model <provider>:<name>` (this starts a new thread). One-off overrides: `HAILER_MODEL`,
