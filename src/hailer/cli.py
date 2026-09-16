@@ -392,11 +392,13 @@ def _provider_line(config: HailerConfig) -> str:
 
 
 def _describe_provider(provider: ProviderConfig) -> str:
-    """``id (base_url, chat completions)`` for a chat provider; ``id (base_url)`` or ``id`` otherwise."""
+    """``id (base_url, chat completions)`` for a chat provider (``, no streaming`` when ``stream = false``);
+    ``id (base_url)`` or ``id`` otherwise."""
     if not provider.base_url:
         return provider.id
     if provider.uses_chat_completions:
-        return f"{provider.id} ({provider.base_url}, chat completions)"
+        mode = "chat completions" if provider.stream else "chat completions, no streaming"
+        return f"{provider.id} ({provider.base_url}, {mode})"
     return f"{provider.id} ({provider.base_url})"
 
 

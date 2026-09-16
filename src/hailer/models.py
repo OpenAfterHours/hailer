@@ -116,6 +116,9 @@ class ProviderConfig:
     id: str
     base_url: str | None = None
     wire_api: str = WIRE_API_RESPONSES  # one of VALID_WIRE_APIS
+    #: Chat Completions only: False sends ``stream: false`` and reads one JSON reply, for
+    #: gateways that reject or cannot deliver server-sent events. Codex always streams the Responses API.
+    stream: bool = True
     env_key: str | None = None
     requires_openai_auth: bool = False
     name: str | None = None

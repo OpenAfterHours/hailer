@@ -4,8 +4,13 @@ The bundled Codex runtime speaks only the OpenAI Responses API (it refuses
 ``wire_api = "chat"`` outright). To let a gateway that offers Chat Completions
 only be used without an external proxy, Hailer runs a small loopback HTTP server
 (:class:`ChatBridge`), points Codex at it, and translates every streamed
-``POST /responses`` into ``POST {base_url}/chat/completions`` (streaming) and the
-Chat Completions stream back into Responses SSE events.
+``POST /responses`` into ``POST {base_url}/chat/completions`` and the Chat
+Completions reply back into Responses SSE events. Upstream streaming is per
+provider (:class:`ChatUpstream`): normally the bridge asks for ``stream: true`` and
+relays the chunks as they arrive; with ``stream=False`` (``stream = false`` in
+``hailer.toml``) it sends ``stream: false``, reads the single JSON reply and emits
+the same Responses events for it in one go, for gateways that reject or cannot
+deliver server-sent events.
 
 Codex still attaches the provider's credentials and custom headers itself
 (``env_key`` → ``Authorization``, ``http_headers``, ``env_http_headers``,
@@ -28,6 +33,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections.abc import Iterable, Iterator, Mapping
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -49,6 +55,22 @@ UPSTREAM_READ_TIMEOUT_SEC = 300
 _SERVE_POLL_INTERVAL_SEC = 0.05
 #: Byte prefixes that identify an SSE body whatever Content-Type the gateway declared.
 _SSE_PREFIXES = (b"data:", b"event:", b"id:", b"retry:", b":")
+
+
+@dataclass(frozen=True)
+class ChatUpstream:
+    """One Chat Completions endpoint behind the bridge.
+
+    ``stream`` is whether to ask the gateway for server-sent events (``stream: true``); when
+    False the bridge sends ``stream: false`` and expects one JSON ``chat.completion`` body.
+    """
+
+    base_url: str
+    stream: bool = True
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "base_url", self.base_url.rstrip("/"))
+
 
 # Hop-by-hop or request-specific headers that must not be copied upstream.
 _DROP_REQUEST_HEADERS = {
@@ -177,7 +199,7 @@ def _append_tool_call(messages: list[dict[str, Any]], call: dict[str, Any]) -> N
     messages.append({"role": "assistant", "content": None, "tool_calls": [call]})
 
 
-def chat_request_from_responses(body: Mapping[str, Any]) -> tuple[dict[str, Any], set[str]]:
+def chat_request_from_responses(body: Mapping[str, Any], *, stream: bool = True) -> tuple[dict[str, Any], set[str]]:
     """Build the Chat Completions request body for a Responses API request.
 
     Returns the body and the set of tool names that were custom tools (their calls are
@@ -227,7 +249,9 @@ def chat_request_from_responses(body: Mapping[str, Any]) -> tuple[dict[str, Any]
             # reasoning items, hosted tool calls, compaction markers: nothing to send.
             log.debug("dropping input item of type %r for chat completions", kind)
 
-    chat: dict[str, Any] = {"model": body.get("model"), "messages": messages, "stream": True, "stream_options": {"include_usage": True}}
+    chat: dict[str, Any] = {"model": body.get("model"), "messages": messages, "stream": stream}
+    if stream:
+        chat["stream_options"] = {"include_usage": True}
 
     tools, custom = _chat_tools(body.get("tools"))
     if tools:
@@ -597,8 +621,8 @@ class _BridgeHandler(BaseHTTPRequestHandler):
 
     # ---- routing -----------------------------------------------------------
 
-    def _route(self) -> tuple[str | None, str, str]:
-        """Split ``/<provider>/<rest>?<query>`` into (upstream base, rest, query)."""
+    def _route(self) -> tuple[ChatUpstream | None, str, str]:
+        """Split ``/<provider>/<rest>?<query>`` into (upstream, rest, query)."""
         parsed = urllib.parse.urlsplit(self.path)
         parts = parsed.path.lstrip("/").split("/", 1)
         pid = urllib.parse.unquote(parts[0]) if parts and parts[0] else ""
@@ -644,7 +668,7 @@ class _BridgeHandler(BaseHTTPRequestHandler):
         if upstream is None:
             self._send_error_json(404, f"unknown provider path {self.path!r}")
             return
-        self._passthrough("GET", upstream, rest, query, None)
+        self._passthrough("GET", upstream.base_url, rest, query, None)
 
     def do_POST(self) -> None:  # noqa: N802
         upstream, rest, query = self._route()
@@ -677,7 +701,7 @@ class _BridgeHandler(BaseHTTPRequestHandler):
         except (urllib.error.URLError, OSError) as exc:
             self._send_error_json(502, f"could not reach {url}: {_reason(exc)}")
 
-    def _responses(self, upstream: str, query: str, body: bytes) -> None:
+    def _responses(self, upstream: ChatUpstream, query: str, body: bytes) -> None:
         try:
             request = json.loads(body.decode("utf-8")) if body else {}
         except ValueError as exc:
@@ -687,13 +711,19 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             self._send_error_json(400, "request body must be a JSON object", "invalid_request_error")
             return
 
-        chat_body, custom = chat_request_from_responses(request)
-        url = upstream + "/chat/completions" + (f"?{query}" if query else "")
+        chat_body, custom = chat_request_from_responses(request, stream=upstream.stream)
+        url = upstream.base_url + "/chat/completions" + (f"?{query}" if query else "")
         headers = self._forward_headers()
         headers["Content-Type"] = "application/json"
-        headers["Accept"] = "text/event-stream"
+        headers["Accept"] = "text/event-stream" if upstream.stream else "application/json"
         data = json.dumps(chat_body).encode("utf-8")
-        log.debug("bridge: POST %s (%d messages, %d tools)", url, len(chat_body["messages"]), len(chat_body.get("tools") or []))
+        log.debug(
+            "bridge: POST %s (%d messages, %d tools, %s)",
+            url,
+            len(chat_body["messages"]),
+            len(chat_body.get("tools") or []),
+            "streamed" if upstream.stream else "stream=false",
+        )
 
         try:
             resp = self._open_upstream("POST", url, data, headers)
@@ -735,7 +765,7 @@ class _BridgeHandler(BaseHTTPRequestHandler):
                         if translator.failed:
                             break
                 else:
-                    # The gateway ignored stream=true; treat the whole body as one chunk.
+                    # stream=false was requested, or the gateway ignored stream=true: one JSON body, one chunk.
                     whole = json.loads(resp.read().decode("utf-8"))
                     if not isinstance(whole, Mapping):
                         raise ValueError("upstream returned a non-object JSON body")
@@ -793,25 +823,32 @@ def _build_opener() -> urllib.request.OpenerDirector:
 class ChatBridge:
     """A loopback server translating Codex's Responses calls for Chat Completions providers.
 
-    ``upstreams`` maps a provider id to its real ``base_url``. After :meth:`start`,
+    ``upstreams`` maps a provider id to its real ``base_url`` (a string, streamed) or to a
+    :class:`ChatUpstream` that also says whether to stream. After :meth:`start`,
     :attr:`urls` maps the same ids to the loopback base URL Codex should use instead.
     """
 
     class _Server(ThreadingHTTPServer):
         daemon_threads = True
         allow_reuse_address = True
-        upstreams: dict[str, str]
+        upstreams: dict[str, ChatUpstream]
         opener: urllib.request.OpenerDirector
 
-    def __init__(self, upstreams: Mapping[str, str], *, host: str = "127.0.0.1") -> None:
-        self._upstreams = {pid: url.rstrip("/") for pid, url in upstreams.items()}
+    def __init__(self, upstreams: Mapping[str, str | ChatUpstream], *, host: str = "127.0.0.1") -> None:
+        self._upstreams = {pid: up if isinstance(up, ChatUpstream) else ChatUpstream(up) for pid, up in upstreams.items()}
         self._host = host
         self._server: ChatBridge._Server | None = None
         self._thread: threading.Thread | None = None
 
     @property
     def upstreams(self) -> dict[str, str]:
-        return dict(self._upstreams)
+        """Provider id -> upstream ``base_url``."""
+        return {pid: up.base_url for pid, up in self._upstreams.items()}
+
+    @property
+    def streaming(self) -> dict[str, bool]:
+        """Provider id -> whether the bridge asks that upstream for server-sent events."""
+        return {pid: up.stream for pid, up in self._upstreams.items()}
 
     @property
     def port(self) -> int | None:

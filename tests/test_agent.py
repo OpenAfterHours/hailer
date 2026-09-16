@@ -15,6 +15,7 @@ from hailer.agent import (
     HailerAgent,
     build_child_env,
     build_config_overrides,
+    chat_completion_upstreams,
     map_exception,
     system_prompt,
     toml_value,
@@ -259,6 +260,16 @@ def test_overrides_for_chat_provider_point_codex_at_the_bridge(tmp_path):
     assert 'model_providers.internal.env_key="INTERNAL_MODEL_API_KEY"' in ov
     assert 'model_providers.internal.http_headers={X-Team = "risk"}' in ov
     assert "llm.example.internal" not in " ".join(ov)
+
+
+def test_chat_upstreams_carry_the_stream_flag_but_codex_never_sees_it(tmp_path):
+    quiet = ProviderConfig(id="quiet", base_url="https://quiet.example/v1/", wire_api="chat", env_key="Q", stream=False)
+    cfg = make_config(tmp_path, providers={"internal": CHAT_PROVIDER, "quiet": quiet})
+    upstreams = chat_completion_upstreams(cfg)
+    assert upstreams["internal"].base_url == "https://llm.example.internal/v1" and upstreams["internal"].stream is True
+    assert upstreams["quiet"].base_url == "https://quiet.example/v1" and upstreams["quiet"].stream is False
+    ov = build_config_overrides(cfg, USER_CODEX_CONFIG, {"internal": "http://127.0.0.1:1/internal", "quiet": "http://127.0.0.1:1/quiet"})
+    assert not any(".stream=" in o for o in ov)  # a bridge setting, not a Codex model_providers key
 
 
 def test_agent_starts_and_stops_the_bridge_for_chat_providers(tmp_path, monkeypatch):
@@ -705,6 +716,17 @@ def test_map_404_for_chat_provider_names_chat_completions(tmp_path):
     assert isinstance(mapped, ProviderError)
     assert "https://llm.example.internal/v1/chat/completions" in mapped.hint
     assert "/responses," not in mapped.hint
+    assert "set stream = false" in mapped.hint  # the usual reason a gateway rejects the bridge's request
+
+
+def test_map_404_for_non_streaming_chat_provider_does_not_suggest_stream_false(tmp_path):
+    from dataclasses import replace
+
+    cfg = make_config(tmp_path, providers={"internal": replace(CHAT_PROVIDER, stream=False)})
+    mapped = map_exception(RuntimeError("404 Not Found"), cfg)
+    assert isinstance(mapped, ProviderError)
+    assert "stream = false" in mapped.hint and "set stream = false" not in mapped.hint
+    assert "one JSON reply" in mapped.hint
 
 
 def test_failed_turn_is_mapped(tmp_path):

@@ -964,6 +964,17 @@ def test_status_command_marks_chat_completions_providers(harness):
     assert "internal (https://llm.example.internal/v1, chat completions)" in result.output
 
 
+def test_status_command_marks_non_streaming_chat_providers(harness):
+    chat_provider = ProviderConfig(
+        id="internal", base_url="https://llm.example.internal/v1", wire_api="chat", stream=False, env_key="INTERNAL_MODEL_API_KEY"
+    )
+    harness.config = make_config(harness.config.workspace, provider="internal", providers={"internal": chat_provider})
+    harness.agent.key_source = "env"
+    result = chat(input_text="/status\n/exit\n")
+    assert result.exit_code == 0, result.output
+    assert "internal (https://llm.example.internal/v1, chat completions, no streaming)" in result.output
+
+
 def test_model_switch_does_not_start_a_second_thread(harness):
     harness.config = make_config(harness.config.workspace, providers={"internal": INTERNAL})
     harness.agent.set_model_restarts = True

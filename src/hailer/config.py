@@ -66,6 +66,7 @@ _KNOWN_MODEL = {"name", "provider", "reasoning_effort"}
 _KNOWN_PROVIDER = {
     "base_url",
     "wire_api",
+    "stream",
     "env_key",
     "requires_openai_auth",
     "name",
@@ -109,12 +110,13 @@ provider = "openai"                  # "openai" uses your existing Codex login o
 
 # A bespoke / internal endpoint. wire_api picks the protocol the endpoint speaks:
 #   "responses" - the OpenAI Responses API, streaming (POST {base_url}/responses)
-#   "chat"      - Chat Completions, streaming (POST {base_url}/chat/completions);
-#                 Hailer translates between the two on a loopback bridge.
+#   "chat"      - Chat Completions (POST {base_url}/chat/completions), streamed unless
+#                 stream = false; Hailer translates between the two on a loopback bridge.
 #
 # [model_providers.internal]
 # base_url             = "https://llm.example.internal/v1"
 # wire_api             = "responses"                      # or "chat"
+# stream               = true                             # "chat" only: false if the gateway rejects stream = true
 # env_key              = "INTERNAL_MODEL_API_KEY"   # env var name; value from `hailer login internal` or the shell
 # requires_openai_auth = false
 # name                 = "Internal"
@@ -345,6 +347,7 @@ def load_config(
             id=provider_id,
             base_url=_clean_url(_str(raw, "base_url", section, path)),
             wire_api=_str(raw, "wire_api", section, path, WIRE_API_RESPONSES) or WIRE_API_RESPONSES,
+            stream=_bool(raw, "stream", section, path, True),
             env_key=_str(raw, "env_key", section, path),
             requires_openai_auth=_bool(raw, "requires_openai_auth", section, path, False),
             name=_str(raw, "name", section, path),
@@ -502,6 +505,11 @@ def validate(config: HailerConfig) -> list[str]:
                 f'{section}.wire_api must be "responses" or "chat" (got {provider.wire_api!r}): '
                 '"responses" when the endpoint implements the OpenAI Responses API, '
                 '"chat" when it implements Chat Completions (POST <base_url>/chat/completions).'
+            )
+        if not provider.stream and provider.wire_api != WIRE_API_CHAT:
+            problems.append(
+                f'{section}.stream = false only applies to wire_api = "chat"; Codex always streams the Responses API. '
+                'Remove the key, or set wire_api = "chat" if the endpoint implements Chat Completions.'
             )
         if provider.is_builtin_openai:
             if provider.wire_api == WIRE_API_CHAT:
