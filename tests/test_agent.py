@@ -840,3 +840,108 @@ def test_failed_turn_with_unknown_model_uses_live_model_name(tmp_path):
     with pytest.raises(ProviderError) as err:
         ag.run_turn("hi")
     assert "internal-fast" in str(err.value)
+
+
+# --------------------------------------------------------------------------- #
+# Endpoint errors quote the gateway (chat bridge URL is not evidence)
+# --------------------------------------------------------------------------- #
+
+
+_GATEWAY_422 = (
+    'unexpected status 422 Unprocessable Entity: {"detail": [{"type": "string_pattern_mismatch", '
+    '"loc": ["body", "model"], "msg": "String should match pattern \'^(my-model)$\'", "input": "codex-auto-review"}]}'
+    ", url: http://127.0.0.1:54321/internal/responses"
+)
+
+
+def test_map_422_quotes_the_gateway_and_skips_the_protocol_hint(tmp_path):
+    cfg = make_config(tmp_path, providers={"internal": CHAT_PROVIDER})
+    mapped = map_exception(RuntimeError(_GATEWAY_422), cfg)
+    assert isinstance(mapped, ProviderError) and "rejected the request" in str(mapped)
+    assert "The endpoint said:" in mapped.hint and "String should match pattern" in mapped.hint
+    assert "Responses API" not in mapped.hint and 'wire_api = "responses"' not in mapped.hint
+    assert "127.0.0.1" not in mapped.hint  # the bridge's loopback URL says nothing about the gateway
+    assert "https://llm.example.internal/v1/chat/completions" in mapped.hint
+    assert "\n" in mapped.hint and mapped.hint.splitlines()[-1].startswith("The endpoint said:")
+
+
+def test_map_unsupported_parameter_body_is_quoted_not_reinterpreted(tmp_path):
+    body = (
+        '{"error": {"message": "Unsupported parameter: \'reasoning_effort\' is not supported with this model.", '
+        '"type": "invalid_request_error", "param": null, "code": null}}'
+    )
+    cfg = make_config(tmp_path, providers={"internal": CHAT_PROVIDER})
+    mapped = map_exception(RuntimeError(body), cfg)
+    assert isinstance(mapped, ProviderError) and "rejected the request" in str(mapped)
+    assert "Unsupported parameter: 'reasoning_effort'" in mapped.hint
+    assert 'reasoning_effort = ""' in mapped.hint
+    assert "Responses API" not in mapped.hint and "set stream = false in its" not in mapped.hint
+
+
+def test_map_404_keeps_the_protocol_hint_and_quotes_a_real_url(tmp_path):
+    text = "unexpected status 404 Not Found: 404 page not found, url: https://llm.example.internal/v1/responses"
+    mapped = map_exception(RuntimeError(text), make_config(tmp_path))
+    assert isinstance(mapped, ProviderError) and "did not accept the request" in str(mapped)
+    assert "Responses API" in mapped.hint and 'wire_api = "chat"' in mapped.hint
+    # a real endpoint URL (not the loopback bridge) stays in the quoted reply
+    assert "The endpoint said: unexpected status 404 Not Found: 404 page not found, url: https://llm.example.internal/v1/responses" in mapped.hint
+
+
+def test_map_404_through_the_bridge_drops_the_loopback_url(tmp_path):
+    cfg = make_config(tmp_path, providers={"internal": CHAT_PROVIDER})
+    text = "unexpected status 404 Not Found: no route, url: http://127.0.0.1:5/internal/responses"
+    mapped = map_exception(RuntimeError(text), cfg)
+    assert "did not accept the request" in str(mapped)
+    assert "/chat/completions" in mapped.hint and "127.0.0.1" not in mapped.hint
+    assert mapped.hint.endswith("The endpoint said: unexpected status 404 Not Found: no route")
+
+
+def test_map_endpoint_reply_is_redacted_and_trimmed(tmp_path):
+    text = "unexpected status 400 Bad Request: Authorization: Bearer sk-live-abcdefgh1234 rejected\n" + "x " * 600
+    mapped = map_exception(RuntimeError(text), make_config(tmp_path))
+    said = mapped.hint.splitlines()[-1]
+    assert said.startswith("The endpoint said: ") and "sk-live-abcdefgh1234" not in said and "<redacted>" in said
+    assert "\n" not in said and len(said) <= len("The endpoint said: ") + 500
+
+
+def test_map_5xx_and_429_are_unavailable_not_rejected(tmp_path):
+    for status in (503, 429):
+        mapped = map_exception(RuntimeError(f"unexpected status {status} Whatever: try later"), make_config(tmp_path))
+        assert isinstance(mapped, ProviderError) and f"unavailable (HTTP {status})" in str(mapped)
+        assert "The endpoint said:" in mapped.hint
+
+
+def test_map_generic_text_mentioning_responses_is_not_a_protocol_error(tmp_path):
+    # "responses" used to be a signal on its own; the bridge URL always contains it.
+    mapped = map_exception(RuntimeError("stream ended before any responses arrived"), make_config(tmp_path))
+    assert isinstance(mapped, AgentError)
+
+
+def test_turn_failure_folds_in_additional_details(tmp_path):
+    error = SimpleNamespace(message="Turn failed", additional_details=_GATEWAY_422)
+    events = [
+        N("turn/started", turn=SimpleNamespace(id="turn-1")),
+        N("turn/completed", turn=SimpleNamespace(id="turn-1", status="failed", error=error, duration_ms=1)),
+    ]
+    ag, _ = make_agent(tmp_path, events=events, providers={"internal": CHAT_PROVIDER})
+    ag.start()
+    with pytest.raises(ProviderError) as info:
+        ag.run_turn("hi")
+    assert "String should match pattern" in info.value.hint
+
+
+def test_error_notification_previews_the_turn_error_message(tmp_path):
+    error = SimpleNamespace(message=_GATEWAY_422, additional_details=None, codex_error_info=None)
+    events = [
+        N("turn/started", turn=SimpleNamespace(id="turn-1")),
+        N("error", error=error, thread_id="t", turn_id="turn-1", will_retry=False),
+        turn_completed("failed", error_message=_GATEWAY_422),
+    ]
+    ag, _ = make_agent(tmp_path, events=events, providers={"internal": CHAT_PROVIDER})
+    ag.start()
+    seen: list[AgentEvent] = []
+    with pytest.raises(ProviderError):
+        ag.run_turn("hi", on_event=seen.append)
+    statuses = [e.text for e in seen if e.kind == "status"]
+    assert statuses and statuses[0].startswith("unexpected status 422 Unprocessable Entity")
+    assert "TurnError(" not in statuses[0] and "namespace(" not in statuses[0]

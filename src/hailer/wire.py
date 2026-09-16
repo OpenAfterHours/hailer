@@ -697,8 +697,11 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             with self._open_upstream(method, url, body, headers) as resp:
                 self._relay(resp.status, resp.headers.get("Content-Type"), resp.read())
         except urllib.error.HTTPError as exc:
-            self._relay(exc.code, exc.headers.get("Content-Type"), exc.read())
+            payload = exc.read()
+            log.debug("bridge: upstream %s %s answered %d: %s", method, url, exc.code, _body_snippet(payload))
+            self._relay(exc.code, exc.headers.get("Content-Type"), payload)
         except (urllib.error.URLError, OSError) as exc:
+            log.debug("bridge: could not reach %s: %s", url, _reason(exc))
             self._send_error_json(502, f"could not reach {url}: {_reason(exc)}")
 
     def _responses(self, upstream: ChatUpstream, query: str, body: bytes) -> None:
@@ -728,9 +731,13 @@ class _BridgeHandler(BaseHTTPRequestHandler):
         try:
             resp = self._open_upstream("POST", url, data, headers)
         except urllib.error.HTTPError as exc:
-            self._relay(exc.code, exc.headers.get("Content-Type"), exc.read())
+            # Relayed unchanged; logged here because Codex's error text names the bridge URL, not this one.
+            payload = exc.read()
+            log.debug("bridge: upstream POST %s answered %d: %s", url, exc.code, _body_snippet(payload))
+            self._relay(exc.code, exc.headers.get("Content-Type"), payload)
             return
         except (urllib.error.URLError, OSError) as exc:
+            log.debug("bridge: could not reach %s: %s", url, _reason(exc))
             self._send_error_json(502, f"could not reach {url}: {_reason(exc)}")
             return
 
@@ -776,7 +783,7 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             log.debug("bridge: stream aborted: %s", _reason(exc))
             return
         except Exception as exc:  # noqa: BLE001 - any translation failure must end the stream cleanly
-            log.debug("bridge: upstream stream failed: %s", _reason(exc))
+            log.debug("bridge: upstream stream from %s failed: %s", url, _reason(exc))
             try:
                 emit(translator.fail(f"upstream stream from {url} failed: {_reason(exc)}"))
             except OSError:
@@ -786,6 +793,12 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             self.wfile.flush()
         except OSError:
             pass
+
+
+def _body_snippet(payload: bytes, limit: int = 500) -> str:
+    """The start of an upstream error body on one line, for debug logs (the log filter masks secrets)."""
+    text = " ".join(payload.decode("utf-8", errors="replace").split())
+    return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
 def _looks_like_sse(resp: Any) -> bool:

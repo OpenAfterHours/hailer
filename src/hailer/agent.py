@@ -13,6 +13,7 @@ import importlib.resources
 import logging
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -34,11 +35,14 @@ from hailer.models import (
 from hailer.wire import ChatBridge, ChatUpstream
 
 try:  # log.py is written by another owner; fall back to plain logging if absent.
-    from hailer.log import get_logger
+    from hailer.log import get_logger, redact
 except Exception:  # pragma: no cover - only when hailer.log is missing
 
     def get_logger(name: str = "hailer") -> logging.Logger:
         return logging.getLogger(name)
+
+    def redact(text: str, env: Mapping[str, str] | None = None) -> str:
+        return text
 
 
 log = get_logger("hailer.agent")
@@ -406,8 +410,63 @@ _CONNECTION_SIGNALS = (
     "no such host",
     "timed out",
 )
-# Signals that the endpoint rejected the *shape* of the request (not the model, not auth).
-_RESPONSES_API_SIGNALS = ("404", "unsupported", "unknown endpoint", "responses", "unknown parameter", "schema")
+# Signals that the endpoint does not implement the API Hailer speaks to it (the path is wrong or
+# the protocol is), as opposed to refusing one field of an otherwise understood request.
+_ENDPOINT_MISSING_SIGNALS = ("404", "405", "unknown endpoint", "method not allowed", "no route", "cannot post")
+# Signals that the endpoint understood the request but refused its shape: a field, a value, the
+# model name. Its own words are the useful part, so they are quoted rather than reinterpreted.
+_REJECTED_REQUEST_SIGNALS = (
+    "bad request",
+    "unprocessable",
+    "invalid_request_error",
+    "invalid request",
+    "unsupported parameter",
+    "unrecognized request argument",
+    "unknown parameter",
+    "extra inputs",
+    "validation error",
+    "should match pattern",
+    "schema",
+    "unsupported",
+)
+#: Codex appends ``, url: <url>`` to "unexpected status" errors; for ``wire_api = "chat"`` that is the
+#: loopback bridge, which says nothing about the gateway.
+_URL_SUFFIX_RE = re.compile(r",\s*url:\s*(\S+)\s*$")
+_LOOPBACK_URL_RE = re.compile(r"^https?://(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(/|$)", re.IGNORECASE)
+_UNEXPECTED_STATUS_RE = re.compile(r"unexpected status (\d{3})")
+_ENDPOINT_SAID_LIMIT = 500
+
+
+def _endpoint_text(text: str) -> tuple[str, int | None]:
+    """The gateway's own words in a Codex turn error, and the HTTP status when one is named.
+
+    A trailing ``, url: http://127.0.0.1:<port>/<provider>/responses`` is the chat bridge's
+    address, not the gateway's, and is dropped; a real endpoint URL is kept.
+    """
+    match = _URL_SUFFIX_RE.search(text)
+    if match and _LOOPBACK_URL_RE.match(match.group(1)):
+        text = text[: match.start()]
+    status_match = _UNEXPECTED_STATUS_RE.search(text)
+    status = int(status_match.group(1)) if status_match else None
+    return text.strip(), status
+
+
+def _endpoint_said(text: str) -> str:
+    """One line quoting the gateway for the end of a hint: secrets masked, whitespace collapsed, trimmed."""
+    flat = " ".join(redact(text).split())
+    if len(flat) > _ENDPOINT_SAID_LIMIT:
+        flat = flat[: _ENDPOINT_SAID_LIMIT - 3] + "..."
+    return f"The endpoint said: {flat}"
+
+
+def _turn_error_text(error: Any) -> str:
+    """Codex's wording for a failed turn: ``message`` plus ``additional_details`` when it adds something."""
+    message = getattr(error, "message", None)
+    text = message.strip() if isinstance(message, str) else ""
+    details = getattr(error, "additional_details", None)
+    if isinstance(details, str) and details.strip() and details.strip() not in text:
+        text = f"{text}: {details.strip()}" if text else details.strip()
+    return text
 
 
 def _provider_by_id(config: HailerConfig, provider_id: str | None) -> ProviderConfig:
@@ -431,7 +490,8 @@ def map_exception(
     ``/model`` switch.
     """
     text = str(exc)
-    low = text.lower()
+    endpoint_text, status = _endpoint_text(text)
+    low = endpoint_text.lower()
     provider = _provider_by_id(config, provider)
     base_url = provider.base_url or "https://api.openai.com/v1"
     model_name = model or config.model.name
@@ -490,7 +550,7 @@ def map_exception(
                 "if the gateway implements the Responses API."
             ),
         )
-    if any(s in low for s in _RESPONSES_API_SIGNALS):
+    if status in (404, 405) or any(s in low for s in _ENDPOINT_MISSING_SIGNALS):
         if provider.uses_chat_completions and provider.stream:
             hint = (
                 f"This provider uses wire_api = \"chat\": Hailer sends POST {base_url}/chat/completions "
@@ -510,7 +570,27 @@ def map_exception(
                 'If the gateway only offers Chat Completions, set wire_api = "chat" in its '
                 "[model_providers] table instead."
             )
-        return ProviderError(f"The endpoint at {base_url} did not accept the request.", hint=hint)
+        return ProviderError(f"The endpoint at {base_url} did not accept the request.", hint=hint + "\n" + _endpoint_said(endpoint_text))
+    if (status is not None and 400 <= status < 500 and status != 429) or any(s in low for s in _REJECTED_REQUEST_SIGNALS):
+        if provider.uses_chat_completions:
+            sent = (
+                f"Hailer sent POST {base_url}/chat/completions (wire_api = \"chat\", translated from Codex's "
+                f"Responses call{'' if provider.stream else ', stream = false'})."
+            )
+        else:
+            sent = f"Hailer sent POST {base_url}/responses (wire_api = \"responses\", straight from Codex)."
+        hint = (
+            f"{sent} If the message names a request field the gateway does not support, check the provider's "
+            "[model_providers] table in hailer.toml (for example stream = false) and [model].reasoning_effort "
+            '(reasoning_effort = "" stops sending it); if it names the model, check [model].name. '
+            "Run `hailer --verbose` to see every upstream reply.\n" + _endpoint_said(endpoint_text)
+        )
+        return ProviderError(f"The endpoint at {base_url} rejected the request.", hint=hint)
+    if status is not None and (status >= 500 or status == 429):
+        return ProviderError(
+            f"The endpoint at {base_url} is unavailable (HTTP {status}).",
+            hint="Retry in a moment; if it persists, check the gateway's status or rate limits.\n" + _endpoint_said(endpoint_text),
+        )
     return AgentError("The agent run failed.", hint=text[:600])
 
 
@@ -897,8 +977,11 @@ class HailerAgent:
             elif method == "thread/tokenUsage/updated":
                 usage = getattr(payload, "token_usage", None)
             elif method == "error":
+                # ErrorNotification carries the text under .error (a TurnError), not .message.
+                text = _turn_error_text(getattr(payload, "error", None)) or _turn_error_text(payload) or payload
+                log.debug("codex error notification: %s", text)
                 if not quiet:
-                    emit(AgentEvent("status", _preview(getattr(payload, "message", payload), 200)))
+                    emit(AgentEvent("status", _preview(text, 200)))
             elif method == "turn/completed":
                 completed_turn = getattr(payload, "turn", None)
 
@@ -951,7 +1034,8 @@ class HailerAgent:
         status = _enum_value(getattr(completed_turn, "status", "completed")) or "completed"
         error = getattr(completed_turn, "error", None)
         if status == "failed":
-            message = getattr(error, "message", None) or str(error) or "unknown error"
+            message = _turn_error_text(error) or (str(error) if error is not None else "") or "unknown error"
+            log.debug("turn %s failed: %s", getattr(completed_turn, "id", "") or "?", message)
             raise map_exception(RuntimeError(message), self.config, model=self._model, provider=self._provider_id)
 
         final = _final_response(items)
