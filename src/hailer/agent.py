@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from hailer import secrets as _secrets
-from hailer.errors import AgentError, ConfigError, CredentialsError, ProviderError
+from hailer.errors import AgentError, ConfigError, CredentialsError, HailerError, ProviderError
 from hailer.models import (
     AgentEvent,
     ContextBundle,
@@ -601,7 +601,7 @@ def _default_codex_factory(cfg: Any) -> Any:
 # --------------------------------------------------------------------------- #
 
 
-def uses_codex_reviewer(provider: ProviderConfig, key_source: str) -> bool:
+def uses_codex_reviewer(provider: ProviderConfig, key_source: str, account_type: str | None) -> bool:
     """Whether a thread on ``provider`` may use Codex's automatic reviewer.
 
     Under ``ApprovalMode.auto_review`` Codex sends every escalation (shell commands and MCP
@@ -609,10 +609,36 @@ def uses_codex_reviewer(provider: ProviderConfig, key_source: str) -> bool:
     go to the provider in use. The slug exists only on the ChatGPT backend: api.openai.com
     answers ``model_not_found`` for an API key and a custom gateway rejects it (a strict one
     with ``422 ... model: String should match pattern``), which fails the whole turn. So the
-    reviewer is kept only for the built-in provider when no API key is available, i.e. when
-    Codex will use its ChatGPT login. Verified live with openai-codex 0.154.0.
+    reviewer is kept only for the built-in provider when Codex is signed in with a ChatGPT
+    account. ``account_type`` is what :func:`codex_account_type` reports; when the lookup
+    failed (``None``) the key source decides instead: a missing key means Codex will use
+    whatever login it has. Verified live with openai-codex 0.154.0.
     """
-    return provider.is_builtin_openai and key_source == "missing"
+    if not provider.is_builtin_openai:
+        return False
+    if account_type is None:
+        return key_source == "missing"
+    return account_type == "chatgpt"
+
+
+def codex_account_type(codex: Any) -> str | None:
+    """The login Codex will use, from ``codex.account()``.
+
+    ``"chatgpt"``, ``"apiKey"`` (``codex login --api-key`` or the desktop app in API-key mode),
+    ``"amazonBedrock"``, ``"none"`` when nobody is signed in (an ``OPENAI_API_KEY`` in the
+    environment alone reports no account), or ``None`` when the lookup itself failed.
+    """
+    try:
+        response = codex.account()
+    except Exception as exc:  # best effort: the caller falls back to the key source
+        log.debug("codex account lookup failed: %s", type(exc).__name__)
+        return None
+    account = getattr(response, "account", None)
+    if account is None:
+        return "none"
+    inner = getattr(account, "root", account)  # the SDK wraps the account variants in a RootModel
+    kind = getattr(inner, "type", None)
+    return str(kind) if kind else "none"
 
 
 def reviewer_free_thread_params(kwargs: Mapping[str, Any], resume_thread_id: str | None = None) -> Any:
@@ -636,15 +662,15 @@ def reviewer_free_thread_params(kwargs: Mapping[str, Any], resume_thread_id: str
         ThreadStartParams,
     )
 
-    fields: dict[str, Any] = {
-        "approval_policy": AskForApproval(root=AskForApprovalValue.on_request),
-        "approvals_reviewer": ApprovalsReviewer.user,
-        "base_instructions": kwargs.get("base_instructions"),
-        "cwd": kwargs.get("cwd"),
-        "model": kwargs.get("model"),
-        "model_provider": kwargs.get("model_provider"),
-        "sandbox": _sandbox_mode(kwargs.get("sandbox")),
-    }
+    fields: dict[str, Any] = {key: value for key, value in kwargs.items() if key != "approval_mode"}
+    if "sandbox" in fields:
+        fields["sandbox"] = _sandbox_mode(fields["sandbox"])
+    fields["approval_policy"] = AskForApproval(root=AskForApprovalValue.on_request)
+    fields["approvals_reviewer"] = ApprovalsReviewer.user
+    model_cls = ThreadResumeParams if resume_thread_id else ThreadStartParams
+    unknown = sorted(set(fields) - set(model_cls.model_fields))
+    if unknown:  # pydantic would ignore them silently; a kwarg that never reaches Codex is a bug
+        raise TypeError(f"thread kwargs unknown to {model_cls.__name__}: {', '.join(unknown)}")
     if resume_thread_id:
         return ThreadResumeParams(thread_id=resume_thread_id, **fields)
     return ThreadStartParams(**fields)
@@ -683,6 +709,7 @@ class HailerAgent:
         self._handle: Any = None
         self._interrupt_requested = False
         self.thread_id: str | None = None
+        self.codex_reviewer: bool | None = None  # whether the current thread uses Codex's reviewer
         self._model = config.model.name
         self._provider_id = config.model.provider
         self._thread_provider_id: str | None = None
@@ -779,8 +806,8 @@ class HailerAgent:
 
         return {
             "sandbox": Sandbox.workspace_write,
-            # Only used when uses_codex_reviewer() is true (built-in provider on the ChatGPT
-            # login). auto_review, not deny_all: with approval_policy "never" Codex rejects
+            # Only used when the thread may use Codex's reviewer (see uses_codex_reviewer:
+            # built-in provider, ChatGPT account). auto_review, not deny_all: with approval_policy "never" Codex rejects
             # every MCP tool call ("MCP tool call requires approval, but approval policy is
             # never") regardless of per-server/per-tool approval settings (verified live).
             # Every other provider gets the same on-request policy without the reviewer
@@ -809,21 +836,35 @@ class HailerAgent:
         except Exception as exc:
             raise map_exception(exc, self.config, model=self._model, provider=self._provider_id) from exc
 
-    def uses_codex_reviewer(self) -> bool:
-        """Whether threads on the active provider may use Codex's reviewer model (see module docs)."""
+    def _reviewer_choice(self) -> bool:
+        """Whether the next thread may use Codex's reviewer; asks the runtime which account is signed in."""
         provider = _provider_by_id(self.config, self._provider_id)
-        return uses_codex_reviewer(provider, self.key_sources.get(provider.id, "missing"))
+        account_type = codex_account_type(self._codex) if provider.is_builtin_openai else None
+        return uses_codex_reviewer(provider, self.key_sources.get(provider.id, "missing"), account_type)
 
-    def _open_thread(self, resume_thread_id: str | None = None) -> Any:
-        """Start (or resume) a thread with the approval settings that fit the active provider."""
-        kwargs = self._thread_kwargs()
-        if self.uses_codex_reviewer():
-            log.debug("thread approvals: on-request with Codex's reviewer (ChatGPT login)")
+    def _thread_settings(self) -> tuple[dict[str, Any], bool]:
+        """The wrapper kwargs for the next thread and whether it may use Codex's reviewer."""
+        try:
+            return self._thread_kwargs(), self._reviewer_choice()
+        except HailerError:
+            raise
+        except Exception as exc:
+            raise map_exception(exc, self.config, model=self._model, provider=self._provider_id) from exc
+
+    def _open_thread(self, kwargs: Mapping[str, Any], use_reviewer: bool, resume_thread_id: str | None = None) -> Any:
+        """Start (or resume) a thread: the SDK wrapper with Codex's reviewer, else the raw client without it."""
+        if use_reviewer:
+            log.debug("thread approvals: on-request with Codex's reviewer (ChatGPT account)")
             if resume_thread_id:
                 return self._codex.thread_resume(resume_thread_id, **kwargs)
             return self._codex.thread_start(**kwargs)
         log.debug("thread approvals: on-request, reviewer=user (provider %s)", self._provider_id)
-        client = self._codex._client  # the SDK wrapper cannot express these settings
+        client = getattr(self._codex, "_client", None)  # the SDK wrapper cannot express these settings
+        if client is None:
+            raise AgentError(
+                "The Codex SDK does not expose the raw client Hailer needs to start a thread without Codex's reviewer.",
+                hint="Hailer pins openai-codex==0.154.0; run `uv sync` to restore that version, or report the version installed.",
+            )
         params = reviewer_free_thread_params(kwargs, resume_thread_id)
         if resume_thread_id:
             response = client.thread_resume(resume_thread_id, params)
@@ -831,30 +872,41 @@ class HailerAgent:
             response = client.thread_start(params)
         return _sdk_thread(client, response.thread.id)
 
+    def _adopt_thread(self, thread: Any, use_reviewer: bool) -> None:
+        self._thread = thread
+        self.thread_id = thread.id
+        self._thread_provider_id = self._provider_id
+        self.codex_reviewer = use_reviewer
+
     def start(self, *, resume_thread_id: str | None = None) -> str:
         """Start the runtime and a thread; returns the thread id."""
         self._require_key()
         self._ensure_codex()
         if resume_thread_id:
+            kwargs, use_reviewer = self._thread_settings()
             try:
-                self._thread = self._open_thread(resume_thread_id)
-                self.thread_id = self._thread.id
-                self._thread_provider_id = self._provider_id
-                log.debug("resumed thread %s", self.thread_id)
-                return self.thread_id
+                thread = self._open_thread(kwargs, use_reviewer, resume_thread_id)
+            except HailerError:
+                raise
             except Exception as exc:
                 log.warning("could not resume thread %s (%s); starting a new one", resume_thread_id, type(exc).__name__)
+            else:
+                self._adopt_thread(thread, use_reviewer)
+                log.debug("resumed thread %s", self.thread_id)
+                return self.thread_id
         return self.new_thread()
 
     def new_thread(self) -> str:
         self._require_key()
         self._ensure_codex()
+        kwargs, use_reviewer = self._thread_settings()
         try:
-            self._thread = self._open_thread()
+            thread = self._open_thread(kwargs, use_reviewer)
+        except HailerError:
+            raise
         except Exception as exc:
             raise map_exception(exc, self.config, model=self._model, provider=self._provider_id) from exc
-        self.thread_id = self._thread.id
-        self._thread_provider_id = self._provider_id
+        self._adopt_thread(thread, use_reviewer)
         log.debug("started thread %s", self.thread_id)
         return self.thread_id
 

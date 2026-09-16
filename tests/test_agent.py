@@ -129,11 +129,18 @@ class FakeClient:
         return SimpleNamespace(thread=SimpleNamespace(id=thread_id))
 
 
+REAL_SDK_THREAD = agent_mod._sdk_thread  # captured at import, before the autouse fixture replaces it
+
+
 class FakeCodex:
-    def __init__(self, cfg: Any, events: list[Any] | None = None, *, resume_fails: bool = False) -> None:
+    def __init__(
+        self, cfg: Any, events: list[Any] | None = None, *, resume_fails: bool = False, account: Any = "chatgpt"
+    ) -> None:
         self.cfg = cfg
         self.events = events or []
         self.resume_fails = resume_fails
+        self.account_kind = account  # "chatgpt" | "apiKey" | "amazonBedrock" | None (signed out) | "raise"
+        self.account_calls = 0
         self.start_calls: list[dict[str, Any]] = []  # SDK wrapper route (Codex reviewer on)
         self.resume_calls: list[tuple[str, dict[str, Any]]] = []
         self.closed = False
@@ -153,6 +160,15 @@ class FakeCodex:
 
     def close(self) -> None:
         self.closed = True
+
+    def account(self) -> SimpleNamespace:
+        self.account_calls += 1
+        if self.account_kind == "raise":
+            raise RuntimeError("account unavailable")
+        if self.account_kind is None:
+            return SimpleNamespace(account=None, requires_openai_auth=True)
+        # the SDK wraps the variants in a RootModel: response.account.root.type
+        return SimpleNamespace(account=SimpleNamespace(root=SimpleNamespace(type=self.account_kind)), requires_openai_auth=False)
 
 
 def N(method: str, **payload: Any) -> SimpleNamespace:
@@ -506,12 +522,12 @@ def test_packaged_prompt_covers_the_notebook_tools():
 # --------------------------------------------------------------------------- #
 
 
-def make_agent(tmp_path, *, events=None, resume_fails=False, env=None, **cfg_overrides):
+def make_agent(tmp_path, *, events=None, resume_fails=False, env=None, account="chatgpt", **cfg_overrides):
     cfg = make_config(tmp_path, **cfg_overrides)
     created: list[FakeCodex] = []
 
     def factory(codex_cfg):
-        codex = FakeCodex(codex_cfg, events or scripted_events(), resume_fails=resume_fails)
+        codex = FakeCodex(codex_cfg, events or scripted_events(), resume_fails=resume_fails, account=account)
         created.append(codex)
         return codex
 
@@ -560,15 +576,54 @@ def test_start_resumes_then_falls_back(tmp_path):
     assert created2[0]._client.resume_params and created2[0]._client.start_params
 
 
-def test_uses_codex_reviewer_only_for_builtin_openai_on_chatgpt_login():
+def test_uses_codex_reviewer_only_for_builtin_openai_on_a_chatgpt_account():
     builtin = ProviderConfig(id="openai", env_key="OPENAI_API_KEY", requires_openai_auth=True)
-    assert agent_mod.uses_codex_reviewer(builtin, "missing") is True
-    assert agent_mod.uses_codex_reviewer(builtin, "env") is False
-    assert agent_mod.uses_codex_reviewer(builtin, "keyring") is False
-    assert agent_mod.uses_codex_reviewer(CHAT_PROVIDER, "env") is False
-    assert agent_mod.uses_codex_reviewer(CHAT_PROVIDER, "missing") is False
+    assert agent_mod.uses_codex_reviewer(builtin, "missing", "chatgpt") is True
+    assert agent_mod.uses_codex_reviewer(builtin, "env", "chatgpt") is True  # the signed-in account wins
+    assert agent_mod.uses_codex_reviewer(builtin, "missing", "apiKey") is False  # codex login --api-key
+    assert agent_mod.uses_codex_reviewer(builtin, "missing", "amazonBedrock") is False
+    assert agent_mod.uses_codex_reviewer(builtin, "missing", "none") is False  # signed out
+    # lookup failed: the key source decides
+    assert agent_mod.uses_codex_reviewer(builtin, "missing", None) is True
+    assert agent_mod.uses_codex_reviewer(builtin, "env", None) is False
+    assert agent_mod.uses_codex_reviewer(builtin, "keyring", None) is False
+    assert agent_mod.uses_codex_reviewer(CHAT_PROVIDER, "env", "chatgpt") is False
+    assert agent_mod.uses_codex_reviewer(CHAT_PROVIDER, "missing", None) is False
     declared_openai = ProviderConfig(id="openai", base_url="https://gw.example/v1", env_key="OPENAI_API_KEY")
-    assert agent_mod.uses_codex_reviewer(declared_openai, "missing") is False  # a base_url makes it a gateway
+    assert agent_mod.uses_codex_reviewer(declared_openai, "missing", "chatgpt") is False  # a base_url makes it a gateway
+
+
+def test_codex_account_type_reads_every_sdk_shape():
+    from openai_codex.generated.v2_all import GetAccountResponse
+
+    class Codex:
+        def __init__(self, response):
+            self.response = response
+
+        def account(self):
+            if isinstance(self.response, Exception):
+                raise self.response
+            return self.response
+
+    chatgpt = GetAccountResponse.model_validate(
+        {"account": {"type": "chatgpt", "email": "a@b.c", "planType": "plus"}, "requiresOpenaiAuth": False}
+    )
+    api_key = GetAccountResponse.model_validate({"account": {"type": "apiKey"}, "requiresOpenaiAuth": False})
+    signed_out = GetAccountResponse.model_validate({"account": None, "requiresOpenaiAuth": True})
+    assert agent_mod.codex_account_type(Codex(chatgpt)) == "chatgpt"
+    assert agent_mod.codex_account_type(Codex(api_key)) == "apiKey"
+    assert agent_mod.codex_account_type(Codex(signed_out)) == "none"
+    assert agent_mod.codex_account_type(Codex(RuntimeError("no app-server"))) is None
+    assert agent_mod.codex_account_type(FakeCodex(None, account="apiKey")) == "apiKey"  # the test double's shape
+    assert agent_mod.codex_account_type(FakeCodex(None, account=None)) == "none"
+
+
+def test_real_sdk_thread_wraps_the_raw_client():
+    from openai_codex.api import Thread
+
+    client = object()
+    thread = REAL_SDK_THREAD(client, "t")
+    assert isinstance(thread, Thread) and thread._client is client and thread.id == "t"
 
 
 def test_reviewer_free_thread_params_carry_the_wrapper_kwargs():
@@ -593,45 +648,112 @@ def test_reviewer_free_thread_params_carry_the_wrapper_kwargs():
     assert wire["threadId"] == "old-thread" and wire["approvalsReviewer"] == "user" and wire["approvalPolicy"] == "on-request"
 
 
-def test_builtin_openai_without_key_keeps_codex_reviewer(tmp_path):
-    ag, created = make_agent(tmp_path, env={}, model=ModelConfig(name="gpt-5.5", provider="openai"))
-    assert ag.key_sources["openai"] == "missing" and ag.uses_codex_reviewer() is True
+def test_reviewer_free_thread_params_forward_every_kwarg_and_reject_unknown_ones():
+    kwargs = {"model": "m", "developer_instructions": "Prefer Polars."}
+    for resume_id in (None, "old-thread"):
+        wire = agent_mod.reviewer_free_thread_params(kwargs, resume_id).model_dump(by_alias=True, exclude_none=True, mode="json")
+        assert wire["developerInstructions"] == "Prefer Polars." and wire["model"] == "m"
+    start = agent_mod.reviewer_free_thread_params({"model": "m", "ephemeral": True}).model_dump(by_alias=True, exclude_none=True, mode="json")
+    assert start["ephemeral"] is True
+    with pytest.raises(TypeError, match="ephemeral"):  # start-only in the SDK as well
+        agent_mod.reviewer_free_thread_params({"model": "m", "ephemeral": True}, "old-thread")
+    with pytest.raises(TypeError, match="not_a_param"):
+        agent_mod.reviewer_free_thread_params({"model": "m", "not_a_param": 1})
+    with pytest.raises(TypeError, match="ThreadResumeParams"):
+        agent_mod.reviewer_free_thread_params({"model": "m", "not_a_param": 1}, "old-thread")
+
+
+OPENAI_MODEL = ModelConfig(name="gpt-5.5", provider="openai")
+
+
+def test_builtin_openai_on_a_chatgpt_account_keeps_codex_reviewer(tmp_path):
+    ag, created = make_agent(tmp_path, env={}, account="chatgpt", model=OPENAI_MODEL)
+    assert ag.key_sources["openai"] == "missing" and ag.codex_reviewer is None
     ag.start()
     codex = created[0]
+    assert codex.account_calls == 1 and ag.codex_reviewer is True
     assert codex.start_calls[0]["approval_mode"].value == "auto_review"
     assert codex._client.start_params == []
 
 
-def test_builtin_openai_with_api_key_starts_without_reviewer(tmp_path):
-    ag, created = make_agent(tmp_path, env={"OPENAI_API_KEY": "sk-x"}, model=ModelConfig(name="gpt-5.5", provider="openai"))
-    assert ag.key_sources["openai"] == "env" and ag.uses_codex_reviewer() is False
+@pytest.mark.parametrize("account", ["apiKey", "amazonBedrock", None])
+def test_builtin_openai_on_any_other_account_starts_without_reviewer(tmp_path, account):
+    # codex login --api-key (or the desktop app in API-key mode) leaves Hailer's key source "missing",
+    # so the account reported by the runtime, not the key, must decide.
+    ag, created = make_agent(tmp_path, env={}, account=account, model=OPENAI_MODEL)
     ag.start()
     codex = created[0]
-    assert codex.start_calls == []
+    assert ag.codex_reviewer is False and codex.start_calls == []
     assert codex._client.start_params[0].approvals_reviewer.value == "user"
     assert codex._client.start_params[0].model_provider == "openai"
 
 
+def test_builtin_openai_with_env_key_and_no_account_starts_without_reviewer(tmp_path):
+    ag, created = make_agent(tmp_path, env={"OPENAI_API_KEY": "sk-x"}, account=None, model=OPENAI_MODEL)
+    assert ag.key_sources["openai"] == "env"
+    ag.start()
+    assert ag.codex_reviewer is False and created[0].start_calls == []
+    assert created[0]._client.start_params[0].approvals_reviewer.value == "user"
+
+
+def test_account_lookup_failure_falls_back_to_the_key_source(tmp_path):
+    ag, created = make_agent(tmp_path, env={}, account="raise", model=OPENAI_MODEL)
+    ag.start()  # no key: Codex will use whatever login it has, so keep the reviewer
+    assert ag.codex_reviewer is True and created[0].start_calls[0]["approval_mode"].value == "auto_review"
+
+    ag2, created2 = make_agent(tmp_path, env={"OPENAI_API_KEY": "sk-x"}, account="raise", model=OPENAI_MODEL)
+    ag2.start()
+    assert ag2.codex_reviewer is False and created2[0]._client.start_params[0].approvals_reviewer.value == "user"
+
+
+def test_custom_provider_never_asks_for_the_account(tmp_path):
+    ag, created = make_agent(tmp_path, account="chatgpt")
+    ag.start()
+    assert created[0].account_calls == 0 and ag.codex_reviewer is False
+
+
 def test_builtin_openai_key_source_is_known_before_a_provider_switch(tmp_path):
-    ag, created = make_agent(tmp_path, env={"INTERNAL_MODEL_API_KEY": "sekrit", "OPENAI_API_KEY": "sk-x"})
+    ag, created = make_agent(tmp_path, env={"INTERNAL_MODEL_API_KEY": "sekrit", "OPENAI_API_KEY": "sk-x"}, account="raise")
     assert ag.key_sources == {"internal": "env", "openai": "env"}
     ag.start()
     assert created[0]._client.start_params[0].model_provider == "internal"
-    ag.set_model("gpt-5.5", provider="openai")  # the API key means no reviewer here either
+    ag.set_model("gpt-5.5", provider="openai")  # account unknown: the API key means no reviewer
     assert created[0].start_calls == []
     assert created[0]._client.start_params[-1].model_provider == "openai"
     assert created[0]._client.start_params[-1].approvals_reviewer.value == "user"
 
 
+def test_missing_raw_client_is_an_agent_error_naming_the_sdk_pin(tmp_path):
+    ag, created = make_agent(tmp_path)
+    ag._ensure_codex()
+    del created[0]._client
+    with pytest.raises(AgentError) as err:
+        ag.start()
+    assert "raw client" in str(err.value) and "openai-codex==0.154.0" in err.value.hint
+
+
+def test_resume_does_not_swallow_config_errors_from_the_thread_settings(tmp_path, monkeypatch, caplog):
+    ag, created = make_agent(tmp_path)
+
+    def broken_prompt(config, bundle):
+        raise ConfigError("bad prompt", hint="fix it")
+
+    monkeypatch.setattr(agent_mod, "system_prompt", broken_prompt)
+    with caplog.at_level("WARNING", logger="hailer"), pytest.raises(ConfigError, match="bad prompt"):
+        ag.start(resume_thread_id="old-thread")
+    assert "could not resume" not in caplog.text
+    assert created[0]._client.resume_params == [] and created[0]._client.start_params == []
+
+
 def test_provider_switch_recomputes_the_reviewer_choice(tmp_path):
-    ag, created = make_agent(tmp_path)  # internal key from env, no OpenAI key
+    ag, created = make_agent(tmp_path, account="chatgpt")  # internal key from env, ChatGPT account signed in
     ag.start()
-    assert created[0]._client.start_params[-1].model_provider == "internal"
-    ag.set_model("gpt-5.5", provider="openai")  # ChatGPT login: Codex's reviewer is available
-    assert created[0].start_calls[-1]["model_provider"] == "openai"
+    assert created[0]._client.start_params[-1].model_provider == "internal" and ag.codex_reviewer is False
+    ag.set_model("gpt-5.5", provider="openai")  # ChatGPT account: Codex's reviewer is available
+    assert created[0].start_calls[-1]["model_provider"] == "openai" and ag.codex_reviewer is True
     assert created[0].start_calls[-1]["approval_mode"].value == "auto_review"
     ag.set_model("internal-analyst", provider="internal")
-    assert created[0]._client.start_params[-1].model_provider == "internal"
+    assert created[0]._client.start_params[-1].model_provider == "internal" and ag.codex_reviewer is False
     assert created[0]._client.start_params[-1].approvals_reviewer.value == "user"
 
 
