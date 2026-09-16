@@ -597,6 +597,67 @@ def _default_codex_factory(cfg: Any) -> Any:
 
 
 # --------------------------------------------------------------------------- #
+# Thread approvals
+# --------------------------------------------------------------------------- #
+
+
+def uses_codex_reviewer(provider: ProviderConfig, key_source: str) -> bool:
+    """Whether a thread on ``provider`` may use Codex's automatic reviewer.
+
+    Under ``ApprovalMode.auto_review`` Codex sends every escalation (shell commands and MCP
+    tool calls alike) to its reviewer model, slug ``codex-auto-review``, and those requests
+    go to the provider in use. The slug exists only on the ChatGPT backend: api.openai.com
+    answers ``model_not_found`` for an API key and a custom gateway rejects it (a strict one
+    with ``422 ... model: String should match pattern``), which fails the whole turn. So the
+    reviewer is kept only for the built-in provider when no API key is available, i.e. when
+    Codex will use its ChatGPT login. Verified live with openai-codex 0.154.0.
+    """
+    return provider.is_builtin_openai and key_source == "missing"
+
+
+def reviewer_free_thread_params(kwargs: Mapping[str, Any], resume_thread_id: str | None = None) -> Any:
+    """Wire params for a thread with ``approval_policy = "on-request"`` and ``approvals_reviewer = "user"``.
+
+    The SDK's ``thread_start`` / ``thread_resume`` accept only ``ApprovalMode.deny_all``
+    (approval policy ``never``, under which Codex rejects every MCP tool call) and
+    ``ApprovalMode.auto_review`` (policy ``on-request`` plus the reviewer model that only the
+    ChatGPT backend serves); a thread-level ``config`` override of ``approvals_reviewer`` is
+    ignored because the explicit parameter wins (verified live). Hailer therefore builds the
+    app-server params itself from the same ``kwargs`` it would give the wrapper. With
+    ``"user"`` as reviewer the SDK's default handler still accepts command and file-change
+    approval requests, and Hailer's MCP tools run under their ``default_tools_approval_mode``.
+    """
+    from openai_codex._sandbox import _sandbox_mode
+    from openai_codex.generated.v2_all import (
+        ApprovalsReviewer,
+        AskForApproval,
+        AskForApprovalValue,
+        ThreadResumeParams,
+        ThreadStartParams,
+    )
+
+    fields: dict[str, Any] = {
+        "approval_policy": AskForApproval(root=AskForApprovalValue.on_request),
+        "approvals_reviewer": ApprovalsReviewer.user,
+        "base_instructions": kwargs.get("base_instructions"),
+        "cwd": kwargs.get("cwd"),
+        "model": kwargs.get("model"),
+        "model_provider": kwargs.get("model_provider"),
+        "sandbox": _sandbox_mode(kwargs.get("sandbox")),
+    }
+    if resume_thread_id:
+        return ThreadResumeParams(thread_id=resume_thread_id, **fields)
+    return ThreadStartParams(**fields)
+
+
+def _sdk_thread(client: Any, thread_id: str) -> Any:
+    """The SDK's thread facade for a thread started through the raw client."""
+    from openai_codex.api import Thread
+
+    return Thread(client, thread_id)
+
+
+# --------------------------------------------------------------------------- #
 # Agent
 # --------------------------------------------------------------------------- #
 
@@ -641,6 +702,14 @@ class HailerAgent:
                 extra[prov.env_key] = value
         self._child_env = build_child_env(config, key, extra, environ)
         del key, extra  # do not keep secrets on the instance
+        # Thread approvals depend on whether the built-in provider would run on an API key
+        # or on the ChatGPT login (see uses_codex_reviewer), so its key source is recorded
+        # even when another provider is active and /model may switch to it later.
+        if "openai" not in self.key_sources:
+            builtin = _provider_by_id(config, "openai")
+            if builtin.is_builtin_openai:
+                _, builtin_source = _secrets.resolve_provider_key(builtin, environ)
+                self.key_sources[builtin.id] = builtin_source
 
         self._user_codex_config = user_codex_config if user_codex_config is not None else read_user_codex_config(config.codex_home)
         build_config_overrides(config, self._user_codex_config)  # fail early on an undeclared provider
@@ -710,11 +779,12 @@ class HailerAgent:
 
         return {
             "sandbox": Sandbox.workspace_write,
-            # auto_review, not deny_all: with approval_policy "never" Codex rejects every MCP
-            # tool call ("MCP tool call requires approval, but approval policy is never")
-            # regardless of per-server/per-tool approval settings (verified live). With
-            # auto_review, Hailer's tools (default_tools_approval_mode="auto") run without
-            # prompting and the SDK auto-accepts command/file-change approvals.
+            # Only used when uses_codex_reviewer() is true (built-in provider on the ChatGPT
+            # login). auto_review, not deny_all: with approval_policy "never" Codex rejects
+            # every MCP tool call ("MCP tool call requires approval, but approval policy is
+            # never") regardless of per-server/per-tool approval settings (verified live).
+            # Every other provider gets the same on-request policy without the reviewer
+            # model, built by reviewer_free_thread_params.
             "approval_mode": ApprovalMode.auto_review,
             "base_instructions": system_prompt(self.config, self.bundle),
             "cwd": str(self.config.workspace),
@@ -739,14 +809,35 @@ class HailerAgent:
         except Exception as exc:
             raise map_exception(exc, self.config, model=self._model, provider=self._provider_id) from exc
 
+    def uses_codex_reviewer(self) -> bool:
+        """Whether threads on the active provider may use Codex's reviewer model (see module docs)."""
+        provider = _provider_by_id(self.config, self._provider_id)
+        return uses_codex_reviewer(provider, self.key_sources.get(provider.id, "missing"))
+
+    def _open_thread(self, resume_thread_id: str | None = None) -> Any:
+        """Start (or resume) a thread with the approval settings that fit the active provider."""
+        kwargs = self._thread_kwargs()
+        if self.uses_codex_reviewer():
+            log.debug("thread approvals: on-request with Codex's reviewer (ChatGPT login)")
+            if resume_thread_id:
+                return self._codex.thread_resume(resume_thread_id, **kwargs)
+            return self._codex.thread_start(**kwargs)
+        log.debug("thread approvals: on-request, reviewer=user (provider %s)", self._provider_id)
+        client = self._codex._client  # the SDK wrapper cannot express these settings
+        params = reviewer_free_thread_params(kwargs, resume_thread_id)
+        if resume_thread_id:
+            response = client.thread_resume(resume_thread_id, params)
+        else:
+            response = client.thread_start(params)
+        return _sdk_thread(client, response.thread.id)
+
     def start(self, *, resume_thread_id: str | None = None) -> str:
         """Start the runtime and a thread; returns the thread id."""
         self._require_key()
         self._ensure_codex()
-        kwargs = self._thread_kwargs()
         if resume_thread_id:
             try:
-                self._thread = self._codex.thread_resume(resume_thread_id, **kwargs)
+                self._thread = self._open_thread(resume_thread_id)
                 self.thread_id = self._thread.id
                 self._thread_provider_id = self._provider_id
                 log.debug("resumed thread %s", self.thread_id)
@@ -759,7 +850,7 @@ class HailerAgent:
         self._require_key()
         self._ensure_codex()
         try:
-            self._thread = self._codex.thread_start(**self._thread_kwargs())
+            self._thread = self._open_thread()
         except Exception as exc:
             raise map_exception(exc, self.config, model=self._model, provider=self._provider_id) from exc
         self.thread_id = self._thread.id

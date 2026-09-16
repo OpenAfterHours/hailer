@@ -227,6 +227,13 @@ provider = "openai"
 Codex reuses the ChatGPT login already on the machine. Alternatively store an API key with
 `uv run hailer login openai`, or set `OPENAI_API_KEY` in the terminal.
 
+With the ChatGPT login, Codex's automatic action reviewer (its `codex-auto-review` model) judges shell
+commands and tool calls before they run. That model exists only on the ChatGPT backend, so with an API
+key, and on every custom endpoint, Hailer starts the thread without it (approval policy `on-request`,
+reviewer `user`) and the Codex SDK accepts the approval requests itself, as it already did after a review.
+Without this, the first command or notebook tool call would fail with `model_not_found` from OpenAI or a
+`422`/`400` from a gateway that validates model names.
+
 ### A custom or internal endpoint
 
 ```toml
@@ -463,8 +470,9 @@ secrets (they travel only as an environment variable of the Codex child process 
 **Sandboxing:** the agent's shell runs in Codex's workspace-write sandbox. It cannot reach the internet
 unless `allow_shell_network` is on, can reach loopback (the marimo server), and on Windows cannot execute a
 Python interpreter outside the workspace. All Python the agent needs runs in the marimo kernel through the
-MCP server, which is the only tool namespace Hailer exposes. Approvals use Codex's `auto_review` mode;
-calls to Hailer's own MCP tools are auto-approved on that server.
+MCP server, which is the only tool namespace Hailer exposes. Approvals use Codex's `on-request` policy:
+with the ChatGPT login Codex's automatic reviewer judges escalations, elsewhere the SDK accepts them (see
+[OpenAI](#openai)); calls to Hailer's own MCP tools are auto-approved on that server.
 
 **Your own Codex configuration:** Codex reads `~/.codex/config.toml`, which for desktop-app users enables
 extra MCP servers and plugins (browser, computer use, spreadsheets, ...). Hailer disables those for its
@@ -488,6 +496,7 @@ when a session exists, confirms that marimo's code-mode API is available in the 
 | `no OPENAI_API_KEY found; Codex will use its existing ChatGPT login if you have one` | Informational. If the agent then fails to authenticate, `uv run hailer login openai`. |
 | `The model endpoint rejected the API key for provider '...'` | The gateway returned 401. Re-run `hailer login <provider>`. |
 | `Unknown model '...' for provider '...'` | Fix `[model].name`. |
+| The first command or notebook tool call fails and the message names `codex-auto-review` | Codex's reviewer model was sent to an endpoint that does not serve it (an API key on OpenAI, or a custom endpoint). Hailer now starts such threads without the reviewer; releases up to 0.2.1 did not, so upgrade. |
 | `Could not reach the model endpoint at <base_url>` | Check `base_url`, VPN or proxy, and that the endpoint is running. |
 | `The endpoint at <base_url> did not accept the request.` with the Responses-API hint | The gateway does not implement `POST /responses`. If it offers Chat Completions, set `wire_api = "chat"` for the provider. |
 | `The endpoint at <base_url> did not accept the request.` with the `/chat/completions` hint | `wire_api = "chat"` is set but the gateway rejected `POST /chat/completions` (wrong `base_url`, no function calling, or no streaming: try `stream = false` on the provider). |

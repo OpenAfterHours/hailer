@@ -109,15 +109,36 @@ class FakeThread:
         return self.last_handle
 
 
+class FakeClient:
+    """Stand-in for the SDK's raw CodexClient: the route Hailer takes when Codex's reviewer is off."""
+
+    def __init__(self, codex: "FakeCodex") -> None:
+        self.codex = codex
+        self.start_params: list[Any] = []
+        self.resume_params: list[tuple[str, Any]] = []
+
+    def thread_start(self, params: Any) -> SimpleNamespace:
+        self.start_params.append(params)
+        self.codex._n += 1
+        return SimpleNamespace(thread=SimpleNamespace(id=f"thread-{self.codex._n}"))
+
+    def thread_resume(self, thread_id: str, params: Any) -> SimpleNamespace:
+        self.resume_params.append((thread_id, params))
+        if self.codex.resume_fails:
+            raise RuntimeError("thread not found")
+        return SimpleNamespace(thread=SimpleNamespace(id=thread_id))
+
+
 class FakeCodex:
     def __init__(self, cfg: Any, events: list[Any] | None = None, *, resume_fails: bool = False) -> None:
         self.cfg = cfg
         self.events = events or []
         self.resume_fails = resume_fails
-        self.start_calls: list[dict[str, Any]] = []
+        self.start_calls: list[dict[str, Any]] = []  # SDK wrapper route (Codex reviewer on)
         self.resume_calls: list[tuple[str, dict[str, Any]]] = []
         self.closed = False
         self._n = 0
+        self._client = FakeClient(self)  # raw client route (reviewer off)
 
     def thread_start(self, **kwargs: Any) -> FakeThread:
         self.start_calls.append(kwargs)
@@ -179,6 +200,12 @@ def scripted_events() -> list[Any]:
 def no_real_keyring(monkeypatch):
     # Never touch the OS credential store from tests.
     monkeypatch.setattr(agent_mod._secrets, "_keyring_get", lambda username: None)
+
+
+@pytest.fixture(autouse=True)
+def fake_sdk_thread(monkeypatch):
+    # Threads started through the raw client get the same FakeThread the wrapper route returns.
+    monkeypatch.setattr(agent_mod, "_sdk_thread", lambda client, thread_id: FakeThread(thread_id, client.codex.events))
 
 
 # --------------------------------------------------------------------------- #
@@ -506,13 +533,16 @@ def test_start_uses_thread_start_with_expected_kwargs(tmp_path):
     assert codex.cfg.cwd == str(ag.config.workspace)
     assert codex.cfg.config_overrides == ag.overrides
     assert codex.cfg.env["INTERNAL_MODEL_API_KEY"] == "sekrit"
-    kwargs = codex.start_calls[0]
-    assert kwargs["model"] == "internal-analyst" and kwargs["model_provider"] == "internal"
-    assert kwargs["sandbox"].value == "workspace-write"
-    # auto_review: under deny_all Codex rejects every MCP tool call (verified live)
-    assert kwargs["approval_mode"].value == "auto_review"
-    assert kwargs["cwd"] == str(ag.config.workspace)
-    assert "Hailer" in kwargs["base_instructions"]
+    # A custom provider cannot serve Codex's reviewer model, so the thread is started through
+    # the raw client with approval policy on-request and reviewer "user" (verified live).
+    assert codex.start_calls == []
+    params = codex._client.start_params[0]
+    assert params.model == "internal-analyst" and params.model_provider == "internal"
+    assert params.sandbox.value == "workspace-write"
+    assert params.approval_policy.root.value == "on-request"
+    assert params.approvals_reviewer.value == "user"
+    assert params.cwd == str(ag.config.workspace)
+    assert "Hailer" in params.base_instructions
     assert ag.key_source == "env"
     assert not hasattr(ag, "_key")
 
@@ -520,12 +550,89 @@ def test_start_uses_thread_start_with_expected_kwargs(tmp_path):
 def test_start_resumes_then_falls_back(tmp_path):
     ag, created = make_agent(tmp_path)
     assert ag.start(resume_thread_id="old-thread") == "old-thread"
-    assert created[0].resume_calls[0][0] == "old-thread"
-    assert created[0].start_calls == []
+    thread_id, params = created[0]._client.resume_params[0]
+    assert thread_id == "old-thread" and params.thread_id == "old-thread"
+    assert params.approvals_reviewer.value == "user" and params.approval_policy.root.value == "on-request"
+    assert created[0]._client.start_params == [] and created[0].start_calls == []
 
     ag2, created2 = make_agent(tmp_path, resume_fails=True)
     assert ag2.start(resume_thread_id="old-thread") == "thread-1"
-    assert created2[0].resume_calls and created2[0].start_calls
+    assert created2[0]._client.resume_params and created2[0]._client.start_params
+
+
+def test_uses_codex_reviewer_only_for_builtin_openai_on_chatgpt_login():
+    builtin = ProviderConfig(id="openai", env_key="OPENAI_API_KEY", requires_openai_auth=True)
+    assert agent_mod.uses_codex_reviewer(builtin, "missing") is True
+    assert agent_mod.uses_codex_reviewer(builtin, "env") is False
+    assert agent_mod.uses_codex_reviewer(builtin, "keyring") is False
+    assert agent_mod.uses_codex_reviewer(CHAT_PROVIDER, "env") is False
+    assert agent_mod.uses_codex_reviewer(CHAT_PROVIDER, "missing") is False
+    declared_openai = ProviderConfig(id="openai", base_url="https://gw.example/v1", env_key="OPENAI_API_KEY")
+    assert agent_mod.uses_codex_reviewer(declared_openai, "missing") is False  # a base_url makes it a gateway
+
+
+def test_reviewer_free_thread_params_carry_the_wrapper_kwargs():
+    from openai_codex import ApprovalMode, Sandbox
+
+    kwargs = {
+        "sandbox": Sandbox.workspace_write,
+        "approval_mode": ApprovalMode.auto_review,  # ignored: the params say on-request + user
+        "base_instructions": "Be brief.",
+        "cwd": "C:\\ws",
+        "model": "m",
+        "model_provider": "internal",
+    }
+    start = agent_mod.reviewer_free_thread_params(kwargs)
+    wire = start.model_dump(by_alias=True, exclude_none=True, mode="json")
+    assert wire["approvalPolicy"] == "on-request" and wire["approvalsReviewer"] == "user"
+    assert wire["sandbox"] == "workspace-write" and wire["model"] == "m" and wire["modelProvider"] == "internal"
+    assert wire["baseInstructions"] == "Be brief." and wire["cwd"] == "C:\\ws"
+    assert "config" not in wire
+    resume = agent_mod.reviewer_free_thread_params(kwargs, "old-thread")
+    wire = resume.model_dump(by_alias=True, exclude_none=True, mode="json")
+    assert wire["threadId"] == "old-thread" and wire["approvalsReviewer"] == "user" and wire["approvalPolicy"] == "on-request"
+
+
+def test_builtin_openai_without_key_keeps_codex_reviewer(tmp_path):
+    ag, created = make_agent(tmp_path, env={}, model=ModelConfig(name="gpt-5.5", provider="openai"))
+    assert ag.key_sources["openai"] == "missing" and ag.uses_codex_reviewer() is True
+    ag.start()
+    codex = created[0]
+    assert codex.start_calls[0]["approval_mode"].value == "auto_review"
+    assert codex._client.start_params == []
+
+
+def test_builtin_openai_with_api_key_starts_without_reviewer(tmp_path):
+    ag, created = make_agent(tmp_path, env={"OPENAI_API_KEY": "sk-x"}, model=ModelConfig(name="gpt-5.5", provider="openai"))
+    assert ag.key_sources["openai"] == "env" and ag.uses_codex_reviewer() is False
+    ag.start()
+    codex = created[0]
+    assert codex.start_calls == []
+    assert codex._client.start_params[0].approvals_reviewer.value == "user"
+    assert codex._client.start_params[0].model_provider == "openai"
+
+
+def test_builtin_openai_key_source_is_known_before_a_provider_switch(tmp_path):
+    ag, created = make_agent(tmp_path, env={"INTERNAL_MODEL_API_KEY": "sekrit", "OPENAI_API_KEY": "sk-x"})
+    assert ag.key_sources == {"internal": "env", "openai": "env"}
+    ag.start()
+    assert created[0]._client.start_params[0].model_provider == "internal"
+    ag.set_model("gpt-5.5", provider="openai")  # the API key means no reviewer here either
+    assert created[0].start_calls == []
+    assert created[0]._client.start_params[-1].model_provider == "openai"
+    assert created[0]._client.start_params[-1].approvals_reviewer.value == "user"
+
+
+def test_provider_switch_recomputes_the_reviewer_choice(tmp_path):
+    ag, created = make_agent(tmp_path)  # internal key from env, no OpenAI key
+    ag.start()
+    assert created[0]._client.start_params[-1].model_provider == "internal"
+    ag.set_model("gpt-5.5", provider="openai")  # ChatGPT login: Codex's reviewer is available
+    assert created[0].start_calls[-1]["model_provider"] == "openai"
+    assert created[0].start_calls[-1]["approval_mode"].value == "auto_review"
+    ag.set_model("internal-analyst", provider="internal")
+    assert created[0]._client.start_params[-1].model_provider == "internal"
+    assert created[0]._client.start_params[-1].approvals_reviewer.value == "user"
 
 
 def test_missing_key_for_custom_provider_is_credentials_error(tmp_path):
