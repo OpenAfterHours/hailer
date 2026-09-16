@@ -25,7 +25,15 @@ from pathlib import Path
 from typing import Any
 
 from hailer.errors import ConfigError
-from hailer.models import HailerConfig, ModelConfig, ProviderConfig, WebConfig
+from hailer.models import (
+    VALID_WIRE_APIS,
+    WIRE_API_CHAT,
+    WIRE_API_RESPONSES,
+    HailerConfig,
+    ModelConfig,
+    ProviderConfig,
+    WebConfig,
+)
 
 CONFIG_FILENAMES: tuple[str, ...] = ("hailer.toml", ".config/hailer/hailer.toml")
 
@@ -99,13 +107,14 @@ name = "gpt-5.5"
 provider = "openai"                  # "openai" uses your existing Codex login or OPENAI_API_KEY
 # reasoning_effort = "medium"        # minimal | low | medium | high | xhigh
 
-# A bespoke / internal endpoint. It must implement the OpenAI Responses API
-# (streaming). If it only offers Chat Completions, run a translating proxy and
-# point base_url at that.
+# A bespoke / internal endpoint. wire_api picks the protocol the endpoint speaks:
+#   "responses" - the OpenAI Responses API, streaming (POST {base_url}/responses)
+#   "chat"      - Chat Completions, streaming (POST {base_url}/chat/completions);
+#                 Hailer translates between the two on a loopback bridge.
 #
 # [model_providers.internal]
 # base_url             = "https://llm.example.internal/v1"
-# wire_api             = "responses"
+# wire_api             = "responses"                      # or "chat"
 # env_key              = "INTERNAL_MODEL_API_KEY"   # env var name; value from `hailer login internal` or the shell
 # requires_openai_auth = false
 # name                 = "Internal"
@@ -335,7 +344,7 @@ def load_config(
         providers[provider_id] = ProviderConfig(
             id=provider_id,
             base_url=_clean_url(_str(raw, "base_url", section, path)),
-            wire_api=_str(raw, "wire_api", section, path, "responses") or "responses",
+            wire_api=_str(raw, "wire_api", section, path, WIRE_API_RESPONSES) or WIRE_API_RESPONSES,
             env_key=_str(raw, "env_key", section, path),
             requires_openai_auth=_bool(raw, "requires_openai_auth", section, path, False),
             name=_str(raw, "name", section, path),
@@ -483,18 +492,22 @@ def validate(config: HailerConfig) -> list[str]:
     if pid not in config.providers and pid != "openai":
         problems.append(
             f"Model provider {pid!r} is not declared. Add a [model_providers.{pid}] table with base_url, "
-            'wire_api = "responses" and env_key, or set [model].provider = "openai".'
+            'wire_api = "responses" or "chat", and env_key; or set [model].provider = "openai".'
         )
 
     for provider in config.providers.values():
         section = f"[model_providers.{provider.id}]"
-        if provider.wire_api != "responses":
+        if provider.wire_api not in VALID_WIRE_APIS:
             problems.append(
-                f'{section}.wire_api must be "responses" (got {provider.wire_api!r}); '
-                "Codex only speaks the OpenAI Responses API. If the endpoint offers Chat Completions only, "
-                "run a translating proxy and point base_url at it."
+                f'{section}.wire_api must be "responses" or "chat" (got {provider.wire_api!r}): '
+                '"responses" when the endpoint implements the OpenAI Responses API, '
+                '"chat" when it implements Chat Completions (POST <base_url>/chat/completions).'
             )
         if provider.is_builtin_openai:
+            if provider.wire_api == WIRE_API_CHAT:
+                problems.append(
+                    f'{section}.wire_api = "chat" needs a base_url; the built-in OpenAI provider always uses the Responses API.'
+                )
             continue
         if not provider.base_url:
             problems.append(f'{section}.base_url is missing; set it to the endpoint, e.g. "https://llm.example.internal/v1".')

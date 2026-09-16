@@ -363,14 +363,32 @@ def test_validate_undeclared_provider(tmp_path: Path) -> None:
 def test_validate_custom_provider_requirements(tmp_path: Path) -> None:
     ws = _make_workspace(
         tmp_path,
-        '[model]\nprovider = "internal"\n[model_providers.internal]\nwire_api = "chat"\n',
+        '[model]\nprovider = "internal"\n[model_providers.internal]\nwire_api = "grpc"\n',
     )
     problems = _errors(validate(load_config(workspace=ws, env={})))
     joined = "\n".join(problems)
     assert "[model_providers.internal].base_url is missing" in joined
     assert "[model_providers.internal].env_key is missing" in joined
-    assert 'wire_api must be "responses"' in joined
-    assert "Responses API" in joined
+    assert 'wire_api must be "responses" or "chat"' in joined
+    assert "chat/completions" in joined
+
+
+def test_validate_accepts_chat_wire_api(tmp_path: Path) -> None:
+    ws = _make_workspace(
+        tmp_path,
+        '[model]\nprovider = "internal"\n[model_providers.internal]\n'
+        'base_url = "https://llm.example.internal/v1"\nwire_api = "chat"\nenv_key = "K"\n',
+    )
+    cfg = load_config(workspace=ws, env={})
+    assert cfg.providers["internal"].wire_api == "chat"
+    assert cfg.providers["internal"].uses_chat_completions
+    assert not any("wire_api" in p for p in validate(cfg))
+
+
+def test_validate_chat_wire_api_needs_a_base_url_for_openai(tmp_path: Path) -> None:
+    ws = _make_workspace(tmp_path, '[model_providers.openai]\nwire_api = "chat"\n')
+    problems = _errors(validate(load_config(workspace=ws, env={})))
+    assert any('wire_api = "chat" needs a base_url' in p for p in problems)
 
 
 def test_validate_requires_openai_auth_provider_needs_no_env_key(tmp_path: Path) -> None:
