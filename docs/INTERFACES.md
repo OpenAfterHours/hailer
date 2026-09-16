@@ -71,13 +71,14 @@ module exposes so work can proceed in parallel. Shared types live in `src/hailer
   `SkillInput(name, path)` may be included in turn input. Errors: `openai_codex.errors.*`.
 - Provider config is native Codex config: `model`, `model_provider`, `model_providers.<id>.{base_url,
   wire_api="responses", env_key, requires_openai_auth, name, http_headers, env_http_headers, query_params}`,
-  plus Hailer's own `stream=true` (`ProviderConfig.stream`), which is never passed to Codex.
+  plus Hailer's own bridge settings `stream`, `merge_messages`, `stream_options` and `parallel_tool_calls`
+  (`ProviderConfig`, all default `true`, `"chat"` only), which are never passed to Codex.
   Codex 0.154 only speaks the Responses API and refuses `wire_api = "chat"`. Hailer accepts `wire_api = "chat"`
   in `hailer.toml` anyway: `agent.HailerAgent._ensure_bridge` starts `wire.ChatBridge` (loopback HTTP server,
   one route per chat provider at `http://127.0.0.1:<port>/<id>`) before the app-server, and
   `build_config_overrides(config, user_cfg, bridge_urls)` hands such providers to Codex as
   `wire_api="responses"` at the bridge URL. The bridge translates `POST /<id>/responses` (Responses request →
-  `chat_request_from_responses(body, stream=...)`) into `POST {base_url}/chat/completions` and the reply back
+  `chat_request_from_responses(body, stream=..., merge_messages=..., stream_options=..., parallel_tool_calls=...)`) into `POST {base_url}/chat/completions` and the reply back
   into Responses SSE events. `chat_request_from_responses` returns `(chat_body, wire.ChatToolMap)`: Codex 0.154
   sends an MCP server's tools as ONE Responses tool `{type: "namespace", name: "mcp__hailer", description,
   tools: [{type: "function", name, description, parameters, strict}, ...]}` (verified live 2026-09-16), which the
@@ -89,8 +90,13 @@ module exposes so work can proceed in parallel. Shared types live in `src/hailer
   `<namespace>__<name>` for a tool advertised under its bare name is mapped the same way. Replayed
   `function_call` input items that carry `namespace` are renamed to the advertised name, as is a namespaced
   `tool_choice`; a `tool_choice` naming a clashing bare name without `namespace` resolves to the top-level tool.
-  `chat_completion_upstreams(config)` gives the bridge one `wire.ChatUpstream(base_url,
-  stream)` per provider: with `stream=True` (default) the request carries `stream: true` plus
+  With `merge_messages` (default) each run of consecutive `system` messages and of consecutive `user`
+  messages is collapsed into one message (strings joined by a blank line; when either side is a parts list
+  the result is a parts list with text and image parts in order); assistant and tool messages are never
+  merged. `stream_options=False` omits `stream_options` from a streamed request and `parallel_tool_calls=False`
+  omits that field entirely, for gateways that reject them.
+  `chat_completion_upstreams(config)` gives the bridge one `wire.ChatUpstream(base_url, stream,
+  merge_messages, stream_options, parallel_tool_calls)` per provider: with `stream=True` (default) the request carries `stream: true` plus
   `stream_options.include_usage` and the chunks are relayed as they arrive; with `stream=False`
   (`stream = false` in `hailer.toml`, for gateways that reject or cannot deliver SSE) it carries `stream: false`,
   `Accept: application/json`, and the single `chat.completion` body is fed to the translator as one chunk, so
@@ -148,7 +154,8 @@ filled in by `load_config` (`HailerConfig.notebooks_dir`; use `HailerConfig.note
 to `notebook.parent` for hand-built configs). `validate` checks: notebook exists, notebook is inside
 `notebooks_dir` (fatal, names both keys), `notebooks_dir` exists (warning only), data_dir exists (warning
 only), active provider declared (or `openai`), custom provider has `base_url` and `env_key`,
-`wire_api in ("responses", "chat")` (`"chat"` requires a `base_url`), `stream = false` only with `wire_api = "chat"`,
+`wire_api in ("responses", "chat")` (`"chat"` requires a `base_url`), `stream = false` (likewise `merge_messages`, `stream_options` and `parallel_tool_calls = false`) only with
+`wire_api = "chat"`,
 domains are well-formed.
 
 Errors added for the notebook feature (`errors.py`): `NotebookExistsError` (create: name taken) and

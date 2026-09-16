@@ -64,10 +64,17 @@ class ChatUpstream:
 
     ``stream`` is whether to ask the gateway for server-sent events (``stream: true``); when
     False the bridge sends ``stream: false`` and expects one JSON ``chat.completion`` body.
+    The other flags shape the request for strict gateways (see
+    :func:`chat_request_from_responses`): ``merge_messages`` collapses Codex's consecutive
+    ``system`` and ``user`` messages, ``stream_options`` False omits ``stream_options`` and
+    ``parallel_tool_calls`` False omits the ``parallel_tool_calls`` field.
     """
 
     base_url: str
     stream: bool = True
+    merge_messages: bool = True
+    stream_options: bool = True
+    parallel_tool_calls: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "base_url", self.base_url.rstrip("/"))
@@ -264,6 +271,45 @@ def _tool_choice(choice: Any, tool_map: ChatToolMap) -> Any:
     return None
 
 
+#: Roles whose consecutive messages are collapsed into one by ``_merge_consecutive_messages``.
+_MERGEABLE_ROLES = ("system", "user")
+
+
+def _as_parts(content: Any) -> list[Any]:
+    """Chat content as a parts list (a plain string becomes one text part; empty text is dropped)."""
+    if isinstance(content, list):
+        return list(content)
+    if isinstance(content, str) and content:
+        return [{"type": "text", "text": content}]
+    return []
+
+
+def _join_content(first: Any, second: Any) -> Any:
+    """Merge two messages' content: strings join with a blank line, anything else becomes parts in order."""
+    if isinstance(first, str) and isinstance(second, str):
+        return "\n\n".join(part for part in (first, second) if part)
+    return _as_parts(first) + _as_parts(second)
+
+
+def _merge_consecutive_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse each run of consecutive ``system`` or ``user`` messages into one message.
+
+    Codex sends its instructions and its developer message as two system items, and the
+    environment context ahead of the user's text as two user items; strict chat templates
+    reject both ("roles must alternate"). Assistant and tool messages are never merged. Any
+    other key on the first message of a run is kept; a run whose merged content is empty is dropped.
+    """
+    out: list[dict[str, Any]] = []
+    for message in messages:
+        role = message.get("role")
+        if out and role in _MERGEABLE_ROLES and out[-1].get("role") == role:
+            out[-1] = {**out[-1], "content": _join_content(out[-1].get("content"), message.get("content"))}
+            continue
+        out.append(message)
+    # A run that carried no text at all (e.g. only empty parts) has nothing to say.
+    return [m for m in out if not (m.get("role") in _MERGEABLE_ROLES and m.get("content") in ("", []))]
+
+
 def _append_tool_call(messages: list[dict[str, Any]], call: dict[str, Any]) -> None:
     """Attach a tool call to the trailing assistant message, or open a new one."""
     if messages and messages[-1].get("role") == "assistant":
@@ -275,12 +321,24 @@ def _append_tool_call(messages: list[dict[str, Any]], call: dict[str, Any]) -> N
     messages.append({"role": "assistant", "content": None, "tool_calls": [call]})
 
 
-def chat_request_from_responses(body: Mapping[str, Any], *, stream: bool = True) -> tuple[dict[str, Any], ChatToolMap]:
+def chat_request_from_responses(
+    body: Mapping[str, Any],
+    *,
+    stream: bool = True,
+    merge_messages: bool = True,
+    stream_options: bool = True,
+    parallel_tool_calls: bool = True,
+) -> tuple[dict[str, Any], ChatToolMap]:
     """Build the Chat Completions request body for a Responses API request.
 
     Returns the body and the :class:`ChatToolMap` describing how the tools were advertised;
     hand the map to :class:`ChatStreamTranslator` so the reply's tool calls are translated
     back consistently. Earlier calls replayed in ``input`` use the same chat-side names.
+
+    The keyword flags mirror :class:`ChatUpstream`: ``merge_messages`` collapses consecutive
+    ``system`` / ``user`` messages into one each (strict chat templates insist on alternating
+    roles); ``stream_options`` False leaves ``stream_options`` out of a streamed request;
+    ``parallel_tool_calls`` False leaves the ``parallel_tool_calls`` field out entirely.
     """
     tools, tool_map = _chat_tools(body.get("tools"))
 
@@ -328,9 +386,11 @@ def chat_request_from_responses(body: Mapping[str, Any], *, stream: bool = True)
         else:
             # reasoning items, hosted tool calls, compaction markers: nothing to send.
             log.debug("dropping input item of type %r for chat completions", kind)
+    if merge_messages:
+        messages = _merge_consecutive_messages(messages)
 
     chat: dict[str, Any] = {"model": body.get("model"), "messages": messages, "stream": stream}
-    if stream:
+    if stream and stream_options:
         chat["stream_options"] = {"include_usage": True}
 
     if tools:
@@ -338,7 +398,7 @@ def chat_request_from_responses(body: Mapping[str, Any], *, stream: bool = True)
         choice = _tool_choice(body.get("tool_choice"), tool_map)
         if choice is not None:
             chat["tool_choice"] = choice
-        if isinstance(body.get("parallel_tool_calls"), bool):
+        if parallel_tool_calls and isinstance(body.get("parallel_tool_calls"), bool):
             chat["parallel_tool_calls"] = body["parallel_tool_calls"]
 
     reasoning = body.get("reasoning")
@@ -798,7 +858,13 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             self._send_error_json(400, "request body must be a JSON object", "invalid_request_error")
             return
 
-        chat_body, tool_map = chat_request_from_responses(request, stream=upstream.stream)
+        chat_body, tool_map = chat_request_from_responses(
+            request,
+            stream=upstream.stream,
+            merge_messages=upstream.merge_messages,
+            stream_options=upstream.stream_options,
+            parallel_tool_calls=upstream.parallel_tool_calls,
+        )
         url = upstream.base_url + "/chat/completions" + (f"?{query}" if query else "")
         headers = self._forward_headers()
         headers["Content-Type"] = "application/json"

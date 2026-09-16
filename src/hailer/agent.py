@@ -171,12 +171,23 @@ def _custom_providers(config: HailerConfig) -> list[ProviderConfig]:
 
 
 def chat_completion_upstreams(config: HailerConfig) -> dict[str, ChatUpstream]:
-    """Provider id -> bridge upstream (``base_url`` and ``stream``) for every ``wire_api = "chat"`` provider.
+    """Provider id -> bridge upstream for every ``wire_api = "chat"`` provider.
 
-    ``stream`` is a bridge setting, not a Codex one: it is never passed through as a
-    ``model_providers.<id>.*`` override (see ``_PROVIDER_FIELDS``).
+    ``stream``, ``merge_messages``, ``stream_options`` and ``parallel_tool_calls`` are bridge
+    settings, not Codex ones: they are never passed through as ``model_providers.<id>.*``
+    overrides (see ``_PROVIDER_FIELDS``).
     """
-    return {p.id: ChatUpstream(p.base_url, stream=p.stream) for p in _custom_providers(config) if p.uses_chat_completions and p.base_url}
+    return {
+        p.id: ChatUpstream(
+            p.base_url,
+            stream=p.stream,
+            merge_messages=p.merge_messages,
+            stream_options=p.stream_options,
+            parallel_tool_calls=p.parallel_tool_calls,
+        )
+        for p in _custom_providers(config)
+        if p.uses_chat_completions and p.base_url
+    }
 
 
 def build_config_overrides(
@@ -478,6 +489,23 @@ def _turn_error_text(error: Any) -> str:
     return text
 
 
+#: The bridge's per-provider request switches, in the order the rejected-request hint lists them.
+_CHAT_SWITCHES = ("stream", "stream_options", "parallel_tool_calls", "merge_messages")
+
+
+def _chat_switches_still_on(provider: ProviderConfig) -> tuple[str, ...]:
+    """The chat bridge switches a user could still turn off for this provider."""
+    return tuple(name for name in _CHAT_SWITCHES if getattr(provider, name))
+
+
+def _switch_list(names: tuple[str, ...]) -> str:
+    """``a = false, b = false or c = false`` for the hint."""
+    items = [f"{name} = false" for name in names]
+    if len(items) == 1:
+        return items[0]
+    return ", ".join(items[:-1]) + " or " + items[-1]
+
+
 def _provider_by_id(config: HailerConfig, provider_id: str | None) -> ProviderConfig:
     """The provider the agent is currently using (``/model`` may have switched it)."""
     if provider_id is None or provider_id == config.model.provider:
@@ -617,10 +645,13 @@ def map_exception(
                 f"Hailer sent POST {base_url}/chat/completions (wire_api = \"chat\", translated from Codex's "
                 f"Responses call{'' if provider.stream else ', stream = false'})."
             )
-            if provider.stream:
-                where = f"the provider's chat switches in its [model_providers] table in hailer.toml (for example stream = false) and {effort}"
+            switches = _chat_switches_still_on(provider)
+            if len(switches) == len(_CHAT_SWITCHES):
+                where = f"the provider's chat switches in its [model_providers] table in hailer.toml ({_switch_list(switches)}) and {effort}"
+            elif switches:
+                where = f"the provider's other chat switches in its [model_providers] table in hailer.toml ({_switch_list(switches)}) and {effort}"
             else:
-                where = f"the provider's other chat switches in its [model_providers] table in hailer.toml and {effort}"
+                where = f"the provider's [model_providers] table in hailer.toml (every chat switch is already off) and {effort}"
         elif provider.is_builtin_openai:
             sent = f"Hailer sent POST {base_url}/responses straight from Codex."
             where = effort + " in hailer.toml"
