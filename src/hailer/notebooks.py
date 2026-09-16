@@ -368,17 +368,20 @@ def resolve_notebook(config: HailerConfig, ref: str) -> Path:
     """Map a user's reference to an existing notebook inside the notebooks folder.
 
     Accepted forms: a bare name (``q2 churn``, ``q2_churn``), a filename (``q2_churn.py``), a
-    notebooks-folder-relative path (``sub/x.py``, ``sub/x``), a workspace-relative path
-    (``notebooks/q2_churn.py``) or an absolute path. Candidates inside the notebooks folder are
-    tried first (with and without ``.py``), then workspace-relative ones, then ``<slug>.py`` under
-    the folder, then a case-insensitive unique match on the notebook name; a file outside the
-    folder can therefore never shadow one inside it. Raises ``NotebookPathError`` when the
-    reference points outside the folder or at a file that is not a marimo notebook, and
+    notebooks-folder-relative path (``sub/x.py``, ``sub/x``, with either separator), a
+    workspace-relative path (``notebooks/q2_churn.py``) or an absolute path. Candidates inside the
+    notebooks folder are tried first (with and without ``.py``), then workspace-relative ones, then
+    ``<slug>.py`` under the folder, then a case-insensitive unique match on the notebook name; a
+    file outside the folder can therefore never shadow one inside it. Raises ``NotebookPathError``
+    when the reference points outside the folder or at a file that is not a marimo notebook, and
     ``NotebookNotFoundError`` when nothing matches.
     """
     text = (ref or "").strip().strip("\"'").strip()
     if not text:
         raise NotebookNotFoundError("No notebook was given.", hint=_available_hint(config))
+    # Accept either separator: the agent may send Windows-style paths, and on POSIX a backslash
+    # would otherwise be a literal character in the file name, so "sub\x.py" would never resolve.
+    text = text.replace("\\", "/")
     root = Path(config.notebooks_root).resolve()
     root_shown = notebook_display_name(config, root)
     given = Path(text).expanduser()
