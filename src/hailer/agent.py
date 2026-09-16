@@ -555,13 +555,15 @@ def map_exception(
             ),
         )
     if any(s in low for s in _CONNECTION_SIGNALS):
-        return ProviderError(
-            f"Could not reach the model endpoint at {base_url}.",
-            hint=(
-                "Check [model_providers].base_url in hailer.toml, your VPN/proxy, and that the "
-                "endpoint is running. Run `hailer doctor` to test reachability."
-            ),
+        hint = (
+            "Check [model_providers].base_url in hailer.toml, your VPN/proxy, and that the "
+            "endpoint is running. Run `hailer doctor` to test reachability."
         )
+        # A gateway reply (504 body, mid-stream failure naming the upstream) is worth quoting; a
+        # bare "connection refused" / "dns error" adds nothing beyond the reason.
+        if gateway_like or "upstream stream from" in low:
+            hint += "\n" + _endpoint_said(endpoint_text)
+        return ProviderError(f"Could not reach the model endpoint at {base_url}.", hint=hint)
     if "chat completions bridge" in low:
         return ProviderError(
             f"Codex asked for a Responses API endpoint the Chat Completions bridge for provider '{provider.id}' does not offer.",
@@ -612,7 +614,10 @@ def map_exception(
                 f"Hailer sent POST {base_url}/chat/completions (wire_api = \"chat\", translated from Codex's "
                 f"Responses call{'' if provider.stream else ', stream = false'})."
             )
-            where = f"the provider's [model_providers] table in hailer.toml (for example stream = false) and {effort}"
+            if provider.stream:
+                where = f"the provider's chat switches in its [model_providers] table in hailer.toml (for example stream = false) and {effort}"
+            else:
+                where = f"the provider's other chat switches in its [model_providers] table in hailer.toml and {effort}"
         elif provider.is_builtin_openai:
             sent = f"Hailer sent POST {base_url}/responses straight from Codex."
             where = effort + " in hailer.toml"
