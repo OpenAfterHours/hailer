@@ -139,3 +139,8 @@ def test_get_logger_names() -> None:
     assert get_logger().name == "hailer"
     assert get_logger("marimo_client").name == "hailer.marimo_client"
     assert get_logger("hailer.cli").name == "hailer.cli"
+
+
+def test_redact_masks_bare_api_keys() -> None:
+    assert redact("key sk-abcdefghijklmnopqrstuvwxyz123456 rejected", {}) == "key <redacted> rejected"
+    assert redact("sk-short is not a key", {}) == "sk-short is not a key"

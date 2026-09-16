@@ -945,3 +945,96 @@ def test_error_notification_previews_the_turn_error_message(tmp_path):
     statuses = [e.text for e in seen if e.kind == "status"]
     assert statuses and statuses[0].startswith("unexpected status 422 Unprocessable Entity")
     assert "TurnError(" not in statuses[0] and "namespace(" not in statuses[0]
+
+
+# ---- review follow-ups: local errors, unknown-model naming, provider-specific hints ---------
+
+
+def test_map_local_validation_error_is_not_blamed_on_the_endpoint(tmp_path):
+    text = "1 validation error for ThreadStartParams\napproval_policy\n  Input should be 'untrusted', 'on-request' or 'never' [type=enum]"
+    mapped = map_exception(RuntimeError(text), make_config(tmp_path))
+    assert isinstance(mapped, AgentError) and "validation error for ThreadStartParams" in mapped.hint
+    assert "The endpoint" not in str(mapped)
+
+
+def test_map_local_unsupported_operation_is_not_blamed_on_the_endpoint(tmp_path):
+    mapped = map_exception(RuntimeError("unsupported operation: thread/fork"), make_config(tmp_path))
+    assert isinstance(mapped, AgentError) and "unsupported operation: thread/fork" in mapped.hint
+
+
+def test_map_unknown_model_names_the_model_the_endpoint_rejected(tmp_path):
+    body = (
+        '{"error": {"message": "The model \'codex-auto-review\' does not exist", '
+        '"type": "invalid_request_error", "param": "model", "code": "model_not_found"}}'
+    )
+    mapped = map_exception(RuntimeError(body), make_config(tmp_path))
+    assert isinstance(mapped, ProviderError)
+    assert "Unknown model 'codex-auto-review'" in str(mapped) and "internal-analyst" not in str(mapped)
+    assert "not the configured 'internal-analyst'" in mapped.hint and "codex-auto-review" in mapped.hint
+    assert mapped.hint.splitlines()[-1].startswith("The endpoint said: ")
+
+
+def test_map_unknown_model_marker_without_a_quoted_name_uses_the_configured_one(tmp_path):
+    body = '{"error": {"message": "model not found", "code": "model_not_found"}}'
+    mapped = map_exception(RuntimeError(body), make_config(tmp_path), model="gpt-9")
+    assert "Unknown model 'gpt-9'" in str(mapped) and "not the configured" not in mapped.hint
+
+
+def test_map_tool_registry_not_found_is_not_an_unknown_model(tmp_path):
+    mapped = map_exception(RuntimeError("Tool exec_command not found in model tool registry"), make_config(tmp_path))
+    assert isinstance(mapped, AgentError) and "Unknown model" not in str(mapped)
+
+
+def test_map_rejected_hint_matches_the_provider_kind(tmp_path):
+    text = 'unexpected status 400 Bad Request: {"error": {"message": "nope"}}'
+    responses_provider = map_exception(RuntimeError(text), make_config(tmp_path))
+    assert "rejected the request" in str(responses_provider)
+    assert "stream = false" not in responses_provider.hint and "[model_providers]" in responses_provider.hint
+    assert "https://llm.example.internal/v1/responses" in responses_provider.hint
+
+    builtin = make_config(tmp_path, model=ModelConfig(name="gpt-5.5", provider="openai"), providers={})
+    openai_builtin = map_exception(RuntimeError(text), builtin)
+    assert "rejected the request" in str(openai_builtin)
+    assert "[model_providers]" not in openai_builtin.hint and "stream = false" not in openai_builtin.hint
+    assert "https://api.openai.com/v1/responses" in openai_builtin.hint and "reasoning_effort" in openai_builtin.hint
+
+    chat = map_exception(RuntimeError(text), make_config(tmp_path, providers={"internal": CHAT_PROVIDER}))
+    assert "stream = false" in chat.hint and "/chat/completions" in chat.hint
+
+
+def test_map_endpoint_quote_masks_bare_api_keys(tmp_path):
+    text = 'unexpected status 400 Bad Request: {"error": {"message": "key sk-abcdefghijklmnopqrstuvwxyz123456 is not valid here"}}'
+    mapped = map_exception(RuntimeError(text), make_config(tmp_path))
+    assert "sk-abcdefghijklmnopqrstuvwxyz123456" not in mapped.hint and "<redacted>" in mapped.hint
+
+
+def test_map_retry_exhaustion_is_unavailable(tmp_path):
+    mapped = map_exception(RuntimeError("exceeded retry limit, last status: 502 Bad Gateway"), make_config(tmp_path))
+    assert isinstance(mapped, ProviderError) and "unavailable (HTTP 502)" in str(mapped)
+
+
+def test_map_403_gets_the_access_hint(tmp_path):
+    text = 'unexpected status 403 Forbidden: {"error": {"message": "model not allowed for this key"}}, url: http://127.0.0.1:7/internal/responses'
+    mapped = map_exception(RuntimeError(text), make_config(tmp_path, providers={"internal": CHAT_PROVIDER}))
+    assert isinstance(mapped, ProviderError) and "refused access (HTTP 403)" in str(mapped)
+    assert "access policy" in mapped.hint and "model not allowed" in mapped.hint and "127.0.0.1" not in mapped.hint
+    # a local "forbidden" without gateway markers is not an endpoint error
+    local = map_exception(RuntimeError("forbidden by sandbox policy"), make_config(tmp_path))
+    assert isinstance(local, AgentError)
+
+
+def test_error_notification_marks_retries(tmp_path):
+    error = SimpleNamespace(message="unexpected status 503 Service Unavailable: busy", additional_details=None)
+    events = [
+        N("turn/started", turn=SimpleNamespace(id="turn-1")),
+        N("error", error=error, thread_id="t", turn_id="turn-1", will_retry=True),
+        turn_completed("failed", error_message="exceeded retry limit, last status: 503 Service Unavailable"),
+    ]
+    ag, _ = make_agent(tmp_path, events=events)
+    ag.start()
+    seen: list[AgentEvent] = []
+    with pytest.raises(ProviderError) as info:
+        ag.run_turn("hi", on_event=seen.append)
+    assert "unavailable (HTTP 503)" in str(info.value)
+    statuses = [e.text for e in seen if e.kind == "status"]
+    assert statuses and statuses[0].startswith("retrying: unexpected status 503")

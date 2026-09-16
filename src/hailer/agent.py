@@ -433,7 +433,13 @@ _REJECTED_REQUEST_SIGNALS = (
 #: loopback bridge, which says nothing about the gateway.
 _URL_SUFFIX_RE = re.compile(r",\s*url:\s*(\S+)\s*$")
 _LOOPBACK_URL_RE = re.compile(r"^https?://(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(/|$)", re.IGNORECASE)
-_UNEXPECTED_STATUS_RE = re.compile(r"unexpected status (\d{3})")
+#: "unexpected status 422 ..." (one failed call) or "exceeded retry limit, last status: 502 ..." (retries).
+_UNEXPECTED_STATUS_RE = re.compile(r"(?:unexpected status|last status:?)\s*(\d{3})", re.IGNORECASE)
+#: Text that came from a gateway rather than from Codex or the SDK: an HTTP status, or a JSON error body.
+_GATEWAY_BODY_RE = re.compile(r'\{\s*"(?:error|detail)"|invalid_request_error|unexpected status')
+#: The model name a gateway quotes ("The model 'x' does not exist", "model `x` ...").
+_QUOTED_MODEL_RE = re.compile(r"model[^'\"`\n]{0,24}['\"`]([^'\"`\s]+)['\"`]", re.IGNORECASE)
+_MODEL_PARAM_RE = re.compile(r'"param"\s*:\s*"model"|model_not_found')
 _ENDPOINT_SAID_LIMIT = 500
 
 
@@ -510,15 +516,30 @@ def map_exception(
             )
         return AgentError("The Codex runtime stopped unexpectedly.", hint=text[:600])
 
-    # An unknown model must not be mistaken for an incompatible endpoint.
+    gateway_like = status is not None or _GATEWAY_BODY_RE.search(low) is not None
+
+    # An unknown model must not be mistaken for an incompatible endpoint; "model" plus "not found"
+    # alone is not enough (Codex: "Tool x not found in model tool registry"), the text has to name
+    # the configured model, quote a model name, or carry the model_not_found / param markers.
     if "model" in low and any(s in low for s in _MODEL_NOT_FOUND_SIGNALS):
-        return ProviderError(
-            f"Unknown model '{model_name}' for provider '{provider.id}'.",
-            hint=(
+        quoted = _QUOTED_MODEL_RE.search(endpoint_text)
+        named = quoted.group(1) if quoted else None
+        configured_named = bool(model_name) and model_name.lower() in low
+        if named or configured_named or _MODEL_PARAM_RE.search(low):
+            named = named or model_name
+            hint = (
                 "Check [model].name in hailer.toml (or the name given to /model). "
                 "Run `hailer status` to see the active provider and endpoint."
-            ),
-        )
+            )
+            if named != model_name:
+                hint = (
+                    f"The rejected request named model '{named}', not the configured '{model_name}': Codex sends "
+                    "its own model names for side requests such as the approval reviewer ('codex-auto-review'), "
+                    "which only exist behind a ChatGPT login. " + hint
+                )
+            return ProviderError(
+                f"Unknown model '{named}' for provider '{provider.id}'.", hint=hint + "\n" + _endpoint_said(endpoint_text)
+            )
     if "401" in low or "unauthorized" in low or "invalid api key" in low or "incorrect api key" in low:
         return CredentialsError(
             f"The model endpoint rejected the API key for provider '{provider.id}'.",
@@ -571,19 +592,37 @@ def map_exception(
                 "[model_providers] table instead."
             )
         return ProviderError(f"The endpoint at {base_url} did not accept the request.", hint=hint + "\n" + _endpoint_said(endpoint_text))
-    if (status is not None and 400 <= status < 500 and status != 429) or any(s in low for s in _REJECTED_REQUEST_SIGNALS):
+    if status == 403 or (gateway_like and "forbidden" in low):
+        return ProviderError(
+            f"The endpoint at {base_url} refused access (HTTP 403).",
+            hint=(
+                "The key was accepted but is not allowed for this model, route or organisation: check the "
+                "gateway's access policy and any http_headers / env_http_headers the provider needs.\n"
+                + _endpoint_said(endpoint_text)
+            ),
+        )
+    # Wording alone ("unsupported", "validation error") is only evidence when the text came from a
+    # gateway; the SDK and Codex use the same words for local failures.
+    if (status is not None and 400 <= status < 500 and status != 429) or (
+        gateway_like and any(s in low for s in _REJECTED_REQUEST_SIGNALS)
+    ):
+        effort = '[model].reasoning_effort (reasoning_effort = "" stops sending it)'
         if provider.uses_chat_completions:
             sent = (
                 f"Hailer sent POST {base_url}/chat/completions (wire_api = \"chat\", translated from Codex's "
                 f"Responses call{'' if provider.stream else ', stream = false'})."
             )
+            where = f"the provider's [model_providers] table in hailer.toml (for example stream = false) and {effort}"
+        elif provider.is_builtin_openai:
+            sent = f"Hailer sent POST {base_url}/responses straight from Codex."
+            where = effort + " in hailer.toml"
         else:
             sent = f"Hailer sent POST {base_url}/responses (wire_api = \"responses\", straight from Codex)."
+            where = f"the provider's [model_providers] table in hailer.toml and {effort}"
         hint = (
-            f"{sent} If the message names a request field the gateway does not support, check the provider's "
-            "[model_providers] table in hailer.toml (for example stream = false) and [model].reasoning_effort "
-            '(reasoning_effort = "" stops sending it); if it names the model, check [model].name. '
-            "Run `hailer --verbose` to see every upstream reply.\n" + _endpoint_said(endpoint_text)
+            f"{sent} If the message names a request field the gateway does not support, check {where}; "
+            "if it names the model, check [model].name. Run `hailer --verbose` to see every upstream reply.\n"
+            + _endpoint_said(endpoint_text)
         )
         return ProviderError(f"The endpoint at {base_url} rejected the request.", hint=hint)
     if status is not None and (status >= 500 or status == 429):
@@ -979,6 +1018,8 @@ class HailerAgent:
             elif method == "error":
                 # ErrorNotification carries the text under .error (a TurnError), not .message.
                 text = _turn_error_text(getattr(payload, "error", None)) or _turn_error_text(payload) or payload
+                if getattr(payload, "will_retry", False) is True:
+                    text = f"retrying: {text}"
                 log.debug("codex error notification: %s", text)
                 if not quiet:
                     emit(AgentEvent("status", _preview(text, 200)))
