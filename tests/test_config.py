@@ -203,6 +203,8 @@ def test_full_file_is_mapped(tmp_path: Path) -> None:
     assert not internal.is_builtin_openai
     assert cfg.provider is internal
 
+    assert internal.stream is True  # default
+
     azure = cfg.providers["azure"]
     assert azure.wire_api == "responses"  # default
     assert azure.http_headers == {}
@@ -383,6 +385,27 @@ def test_validate_accepts_chat_wire_api(tmp_path: Path) -> None:
     assert cfg.providers["internal"].wire_api == "chat"
     assert cfg.providers["internal"].uses_chat_completions
     assert not any("wire_api" in p for p in validate(cfg))
+
+
+def test_chat_provider_can_turn_streaming_off(tmp_path: Path) -> None:
+    ws = _make_workspace(
+        tmp_path,
+        '[model]\nprovider = "internal"\n[model_providers.internal]\n'
+        'base_url = "https://llm.example.internal/v1"\nwire_api = "chat"\nstream = false\nenv_key = "K"\n',
+    )
+    cfg = load_config(workspace=ws, env={})
+    assert cfg.providers["internal"].stream is False
+    assert not any("stream" in p for p in validate(cfg))
+
+
+def test_validate_rejects_stream_false_for_responses_providers(tmp_path: Path) -> None:
+    ws = _make_workspace(
+        tmp_path,
+        '[model]\nprovider = "internal"\n[model_providers.internal]\n'
+        'base_url = "https://llm.example.internal/v1"\nstream = false\nenv_key = "K"\n',
+    )
+    problems = _errors(validate(load_config(workspace=ws, env={})))
+    assert any('stream = false only applies to wire_api = "chat"' in p for p in problems)
 
 
 def test_validate_chat_wire_api_needs_a_base_url_for_openai(tmp_path: Path) -> None:

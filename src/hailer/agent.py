@@ -31,7 +31,7 @@ from hailer.models import (
     SkillInfo,
     TurnSummary,
 )
-from hailer.wire import ChatBridge
+from hailer.wire import ChatBridge, ChatUpstream
 
 try:  # log.py is written by another owner; fall back to plain logging if absent.
     from hailer.log import get_logger
@@ -163,9 +163,13 @@ def _custom_providers(config: HailerConfig) -> list[ProviderConfig]:
     return [p for pid, p in sorted(config.providers.items()) if not p.is_builtin_openai]
 
 
-def chat_completion_upstreams(config: HailerConfig) -> dict[str, str]:
-    """Provider id -> ``base_url`` for every declared provider with ``wire_api = "chat"``."""
-    return {p.id: p.base_url for p in _custom_providers(config) if p.uses_chat_completions and p.base_url}
+def chat_completion_upstreams(config: HailerConfig) -> dict[str, ChatUpstream]:
+    """Provider id -> bridge upstream (``base_url`` and ``stream``) for every ``wire_api = "chat"`` provider.
+
+    ``stream`` is a bridge setting, not a Codex one: it is never passed through as a
+    ``model_providers.<id>.*`` override (see ``_PROVIDER_FIELDS``).
+    """
+    return {p.id: ChatUpstream(p.base_url, stream=p.stream) for p in _custom_providers(config) if p.uses_chat_completions and p.base_url}
 
 
 def build_config_overrides(
@@ -487,11 +491,18 @@ def map_exception(
             ),
         )
     if any(s in low for s in _RESPONSES_API_SIGNALS):
-        if provider.uses_chat_completions:
+        if provider.uses_chat_completions and provider.stream:
             hint = (
                 f"This provider uses wire_api = \"chat\": Hailer sends POST {base_url}/chat/completions "
                 "(streaming, with function tools). Check that the gateway implements Chat Completions with "
-                'streaming at that path, or set wire_api = "responses" if it implements the Responses API.'
+                "function calling at that path; set stream = false in its [model_providers] table if it "
+                'rejects stream = true, or set wire_api = "responses" if it implements the Responses API.'
+            )
+        elif provider.uses_chat_completions:
+            hint = (
+                f"This provider uses wire_api = \"chat\" with stream = false: Hailer sends POST {base_url}/chat/completions "
+                "(one JSON reply, with function tools). Check that the gateway implements Chat Completions with "
+                'function calling at that path, or set wire_api = "responses" if it implements the Responses API.'
             )
         else:
             hint = (

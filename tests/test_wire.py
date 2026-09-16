@@ -15,6 +15,7 @@ from hailer import wire as wire_mod
 from hailer.wire import (
     ChatBridge,
     ChatStreamTranslator,
+    ChatUpstream,
     _reason,
     chat_request_from_responses,
     iter_sse_data,
@@ -103,6 +104,13 @@ def test_request_translation_minimal_and_string_input():
     chat, custom = chat_request_from_responses({"model": "m", "input": "hi"})
     assert chat == {"model": "m", "messages": [{"role": "user", "content": "hi"}], "stream": True, "stream_options": {"include_usage": True}}
     assert custom == set()
+
+
+def test_request_translation_without_streaming_sends_stream_false():
+    chat, _ = chat_request_from_responses(RESPONSES_REQUEST, stream=False)
+    assert chat["stream"] is False
+    assert "stream_options" not in chat  # only meaningful with stream=true; some gateways reject it otherwise
+    assert chat["tools"][0]["function"]["name"] == "shell"  # everything else is translated as usual
 
 
 def test_request_translation_named_tool_choice_and_json_schema():
@@ -492,6 +500,43 @@ def test_bridge_accepts_a_non_streamed_json_reply(no_proxy):
     assert completed["type"] == "response.completed"
     assert completed["response"]["output"][0]["content"][0]["text"] == "whole"
     assert completed["response"]["usage"]["total_tokens"] == 2
+
+
+def test_bridge_asks_for_one_json_reply_when_streaming_is_off(no_proxy):
+    reply = {
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "whole", "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "shell", "arguments": "{\"cmd\": \"ls\"}"}}]},
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 4},
+    }
+    upstream = FakeUpstream([], content_type="application/json", body=json.dumps(reply).encode())
+    with upstream as up, ChatBridge({"p": ChatUpstream(up.base_url, stream=False)}) as bridge:
+        assert bridge.streaming == {"p": False}
+        status, headers, body = _post(
+            bridge.urls["p"] + "/responses",
+            {"model": "m", "input": "hi", "tools": [{"type": "function", "name": "shell", "parameters": {}}], "stream": True},
+            {"Accept": "text/event-stream"},
+        )
+    assert status == 200 and headers["Content-Type"].startswith("text/event-stream")  # Codex still gets SSE
+    (req,) = up.requests
+    assert req["json"]["stream"] is False and "stream_options" not in req["json"]
+    assert req["headers"]["Accept"] == "application/json"
+    events = _events(body)
+    assert events[0]["type"] == "response.created" and events[-1]["type"] == "response.completed"
+    output = events[-1]["response"]["output"]
+    assert output[0]["content"][0]["text"] == "whole"
+    assert output[1]["type"] == "function_call" and output[1]["call_id"] == "call_1" and output[1]["arguments"] == '{"cmd": "ls"}'
+    assert events[-1]["response"]["usage"]["total_tokens"] == 7
+
+
+def test_bridge_streams_by_default_for_plain_string_upstreams():
+    bridge = ChatBridge({"p": "http://127.0.0.1:1/v1/", "q": ChatUpstream("http://127.0.0.1:2/v1/")})
+    assert bridge.upstreams == {"p": "http://127.0.0.1:1/v1", "q": "http://127.0.0.1:2/v1"}
+    assert bridge.streaming == {"p": True, "q": True}
 
 
 def test_bridge_ends_the_stream_cleanly_when_translation_raises(no_proxy, monkeypatch):

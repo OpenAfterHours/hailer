@@ -70,14 +70,20 @@ module exposes so work can proceed in parallel. Shared types live in `src/hailer
   `turn/completed`), `.interrupt()`, `.run() -> TurnResult(final_response, items, usage, status, error)`.
   `SkillInput(name, path)` may be included in turn input. Errors: `openai_codex.errors.*`.
 - Provider config is native Codex config: `model`, `model_provider`, `model_providers.<id>.{base_url,
-  wire_api="responses", env_key, requires_openai_auth, name, http_headers, env_http_headers, query_params}`.
+  wire_api="responses", env_key, requires_openai_auth, name, http_headers, env_http_headers, query_params}`,
+  plus Hailer's own `stream=true` (`ProviderConfig.stream`), which is never passed to Codex.
   Codex 0.154 only speaks the Responses API and refuses `wire_api = "chat"`. Hailer accepts `wire_api = "chat"`
   in `hailer.toml` anyway: `agent.HailerAgent._ensure_bridge` starts `wire.ChatBridge` (loopback HTTP server,
   one route per chat provider at `http://127.0.0.1:<port>/<id>`) before the app-server, and
   `build_config_overrides(config, user_cfg, bridge_urls)` hands such providers to Codex as
   `wire_api="responses"` at the bridge URL. The bridge translates `POST /<id>/responses` (Responses request →
-  `chat_request_from_responses`) into `POST {base_url}/chat/completions` (streaming) and the chunks back into
-  Responses SSE events (`ChatStreamTranslator`: `response.created`, `response.output_item.added`,
+  `chat_request_from_responses(body, stream=...)`) into `POST {base_url}/chat/completions` and the reply back
+  into Responses SSE events. `chat_completion_upstreams(config)` gives the bridge one `wire.ChatUpstream(base_url,
+  stream)` per provider: with `stream=True` (default) the request carries `stream: true` plus
+  `stream_options.include_usage` and the chunks are relayed as they arrive; with `stream=False`
+  (`stream = false` in `hailer.toml`, for gateways that reject or cannot deliver SSE) it carries `stream: false`,
+  `Accept: application/json`, and the single `chat.completion` body is fed to the translator as one chunk, so
+  Codex still receives the full event sequence (`ChatStreamTranslator`: `response.created`, `response.output_item.added`,
   `response.output_text.delta`, `response.reasoning_summary_text.delta`, `response.output_item.done` for
   `message` / `function_call` / `custom_tool_call` / `reasoning`, `response.completed` with `usage`,
   `response.failed`). It forwards Codex's request headers and query string upstream, so credentials stay on
@@ -131,7 +137,8 @@ filled in by `load_config` (`HailerConfig.notebooks_dir`; use `HailerConfig.note
 to `notebook.parent` for hand-built configs). `validate` checks: notebook exists, notebook is inside
 `notebooks_dir` (fatal, names both keys), `notebooks_dir` exists (warning only), data_dir exists (warning
 only), active provider declared (or `openai`), custom provider has `base_url` and `env_key`,
-`wire_api in ("responses", "chat")` (`"chat"` requires a `base_url`), domains are well-formed.
+`wire_api in ("responses", "chat")` (`"chat"` requires a `base_url`), `stream = false` only with `wire_api = "chat"`,
+domains are well-formed.
 
 Errors added for the notebook feature (`errors.py`): `NotebookExistsError` (create: name taken) and
 `NotebookPathError` (outside the notebooks folder, or not a marimo notebook).

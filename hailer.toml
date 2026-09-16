@@ -22,12 +22,13 @@ provider = "openai"                  # "openai" uses your existing Codex login o
 
 # A bespoke / internal endpoint. wire_api picks the protocol the endpoint speaks:
 #   "responses" - the OpenAI Responses API, streaming (POST {base_url}/responses)
-#   "chat"      - Chat Completions, streaming (POST {base_url}/chat/completions);
-#                 Hailer translates between the two on a loopback bridge.
+#   "chat"      - Chat Completions (POST {base_url}/chat/completions), streamed unless
+#                 stream = false; Hailer translates between the two on a loopback bridge.
 #
 # [model_providers.internal]
 # base_url             = "https://llm.example.internal/v1"
 # wire_api             = "responses"                      # or "chat"
+# stream               = true                             # "chat" only: false if the gateway rejects stream = true
 # env_key              = "INTERNAL_MODEL_API_KEY"   # env var name; value from `hailer login internal` or the shell
 # requires_openai_auth = false
 # name                 = "Internal"
