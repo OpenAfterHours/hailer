@@ -116,6 +116,13 @@ class FakeClient:
         self.codex = codex
         self.start_params: list[Any] = []
         self.resume_params: list[tuple[str, Any]] = []
+        self._approval_handler = self._default_approval_handler  # as CodexClient.__init__ does
+
+    def _default_approval_handler(self, method: str, params: Any) -> dict:
+        # the SDK's default: accept commands and file changes, answer {} to anything else
+        if method in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval"):
+            return {"decision": "accept"}
+        return {}
 
     def thread_start(self, params: Any) -> SimpleNamespace:
         self.start_params.append(params)
@@ -616,6 +623,81 @@ def test_codex_account_type_reads_every_sdk_shape():
     assert agent_mod.codex_account_type(Codex(RuntimeError("no app-server"))) is None
     assert agent_mod.codex_account_type(FakeCodex(None, account="apiKey")) == "apiKey"  # the test double's shape
     assert agent_mod.codex_account_type(FakeCodex(None, account=None)) == "none"
+
+
+HAILER_TOOL_CALL = {
+    "serverName": "hailer",
+    "_meta": {"codex_approval_kind": "mcp_tool_call"},
+    "message": 'Allow the hailer MCP server to run tool "marimo_status"?',
+}
+
+
+def test_approval_handler_accepts_only_hailer_mcp_tool_calls():
+    from openai_codex.client import CodexClient
+
+    sdk_default = CodexClient()._default_approval_handler  # constructing a client does not start Codex
+    seen: list[tuple[str, Any]] = []
+
+    def default(method, params):
+        seen.append((method, params))
+        return sdk_default(method, params)
+
+    handle = agent_mod.approval_handler(default)
+    assert handle("mcpServer/elicitation/request", HAILER_TOOL_CALL) == {"action": "accept", "content": {}}
+    persistable = dict(HAILER_TOOL_CALL, _meta={"codex_approval_kind": "mcp_tool_call", "persist": ["session", "always"]})
+    assert handle("mcpServer/elicitation/request", persistable) == {
+        "action": "accept",
+        "content": {},
+        "_meta": {"persist": "session"},  # one request per tool per thread, never "always"
+    }
+    always_only = dict(HAILER_TOOL_CALL, _meta={"codex_approval_kind": "mcp_tool_call", "persist": ["always"]})
+    assert handle("mcpServer/elicitation/request", always_only) == {"action": "accept", "content": {}}
+    assert seen == []
+    other_server = dict(HAILER_TOOL_CALL, serverName="cua_repl")
+    other_kind = dict(HAILER_TOOL_CALL, _meta={"codex_approval_kind": "mcp_elicitation"})
+    assert handle("mcpServer/elicitation/request", other_server) == {}
+    assert handle("mcpServer/elicitation/request", other_kind) == {}
+    assert handle("mcpServer/elicitation/request", None) == {}
+    assert handle("mcpServer/elicitation/request", {"serverName": "hailer"}) == {}  # no _meta: not a tool call
+    assert handle("item/commandExecution/requestApproval", {"itemId": "c1"}) == {"decision": "accept"}
+    assert handle("item/fileChange/requestApproval", {"itemId": "f1"}) == {"decision": "accept"}
+    assert handle("some/unknown/request", {}) == {}
+    assert [m for m, _ in seen] == [
+        "mcpServer/elicitation/request",
+        "mcpServer/elicitation/request",
+        "mcpServer/elicitation/request",
+        "mcpServer/elicitation/request",
+        "item/commandExecution/requestApproval",
+        "item/fileChange/requestApproval",
+        "some/unknown/request",
+    ]
+
+
+def test_agent_installs_the_approval_handler_on_the_client_it_uses(tmp_path):
+    ag, created = make_agent(tmp_path)
+    ag._ensure_codex()
+    handler = created[0]._client._approval_handler
+    assert handler("mcpServer/elicitation/request", HAILER_TOOL_CALL) == {"action": "accept", "content": {}}
+    assert handler("mcpServer/elicitation/request", dict(HAILER_TOOL_CALL, serverName="other")) == {}
+    assert handler("item/commandExecution/requestApproval", {}) == {"decision": "accept"}
+    ag._ensure_codex()  # idempotent: the runtime, and its handler, are created once
+    assert created[0]._client._approval_handler is handler and len(created) == 1
+
+
+def test_runtime_without_an_approval_handler_is_an_agent_error(tmp_path):
+    class BareCodex:
+        def __init__(self, cfg):
+            self._client = SimpleNamespace()  # no _approval_handler
+
+        def close(self):
+            pass
+
+    cfg = make_config(tmp_path)
+    ag = HailerAgent(cfg, ContextBundle(), codex_factory=BareCodex, user_codex_config={}, env={"INTERNAL_MODEL_API_KEY": "k"})
+    with pytest.raises(AgentError) as err:
+        ag.start()
+    assert "approval handler" in str(err.value) and "openai-codex==0.154.0" in err.value.hint
+    assert ag._codex is None
 
 
 def test_real_sdk_thread_wraps_the_raw_client():

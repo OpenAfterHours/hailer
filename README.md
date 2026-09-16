@@ -232,9 +232,10 @@ model) judges shell commands and tool calls before they run. That model exists o
 backend, so Hailer asks the runtime which account is signed in and keeps the reviewer only for a ChatGPT
 account on the built-in provider. With an API key (whether set for Hailer, stored with `codex login
 --api-key`, or used by the desktop app), and on every custom endpoint, the thread starts without it
-(approval policy `on-request`, reviewer `user`) and the Codex SDK accepts the approval requests itself, as
-it already did after a review. Without this, the first command or notebook tool call would fail with
-`model_not_found` from OpenAI or a `422`/`400` from a gateway that validates model names.
+(approval policy `on-request`, reviewer `user`) and Hailer answers Codex's approval requests itself: the
+Codex SDK accepts command and file-change approvals, and Hailer accepts the approval request Codex sends
+for each call to its own MCP server's tools. Without this, the first command or notebook tool call would
+fail with `model_not_found` from OpenAI or a `422`/`400` from a gateway that validates model names.
 
 ### A custom or internal endpoint
 
@@ -476,9 +477,10 @@ secrets (they travel only as an environment variable of the Codex child process 
 unless `allow_shell_network` is on, can reach loopback (the marimo server), and on Windows cannot execute a
 Python interpreter outside the workspace. All Python the agent needs runs in the marimo kernel through the
 MCP server, which is the only tool namespace Hailer exposes. Approvals use Codex's `on-request` policy:
-with a ChatGPT account on the built-in provider Codex's automatic reviewer judges escalations, elsewhere
-the SDK accepts them (see [OpenAI](#openai)); calls to Hailer's own MCP tools are auto-approved on that
-server.
+with a ChatGPT account on the built-in provider Codex's automatic reviewer judges escalations; elsewhere
+the SDK accepts command and file-change approvals and Hailer itself answers the approval request Codex
+sends for every call to its own MCP server's tools (see [OpenAI](#openai)). Tools of any other MCP server
+are not approved by Hailer.
 
 **Your own Codex configuration:** Codex reads `~/.codex/config.toml`, which for desktop-app users enables
 extra MCP servers and plugins (browser, computer use, spreadsheets, ...). Hailer disables those for its
