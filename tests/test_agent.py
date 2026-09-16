@@ -324,7 +324,7 @@ def test_system_prompt_sections(tmp_path):
     assert "## Project context" in text and "PRA101 is the counterparty" in text
     assert "## Available skills" in text and "pra101-recon — Reconcile PRA101" in text and "load_skill" in text
     assert "## Web access" in text and "docs.pola.rs" in text and "fetch_page" in text
-    assert "## Workspace" in text and str(cfg.notebook) in text and "http://127.0.0.1:2718" in text
+    assert "## Workspace" in text and str(cfg.notebooks_root) in text and "http://127.0.0.1:2718" in text
     assert text == system_prompt(cfg, bundle)  # deterministic
 
 
@@ -333,6 +333,40 @@ def test_system_prompt_no_web(tmp_path):
     assert "No internet access is available" in text
     assert "## Project context" not in text
     assert "## Available skills" not in text
+
+
+def test_system_prompt_names_the_notebooks_folder_not_the_notebook(tmp_path):
+    ws = tmp_path / "ws"
+    cfg = make_config(tmp_path, notebook=ws / "notebooks" / "q2_churn.py", notebooks_dir=ws / "notebooks")
+    text = system_prompt(cfg, ContextBundle())
+    assert f"- Notebooks folder: {cfg.notebooks_root}" in text
+    assert "- Notebook:" not in text
+    assert str(cfg.notebook) not in text  # the active notebook changes mid-thread; it must not be baked in
+
+
+def test_system_prompt_is_stable_across_notebook_switches(tmp_path):
+    ws = tmp_path / "ws"
+    before = make_config(tmp_path, notebook=ws / "notebooks" / "analysis.py", notebooks_dir=ws / "notebooks")
+    after = make_config(tmp_path, notebook=ws / "notebooks" / "q2_churn.py", notebooks_dir=ws / "notebooks")
+    bundle = ContextBundle(context_text="PRA101 is the counterparty credit risk return.")
+    assert system_prompt(before, bundle) == system_prompt(after, bundle)
+
+
+def test_system_prompt_folder_falls_back_to_the_notebook_parent(tmp_path):
+    cfg = make_config(tmp_path)  # hand-built config: notebooks_dir is None
+    assert f"- Notebooks folder: {cfg.notebook.parent}" in system_prompt(cfg, ContextBundle())
+
+
+def test_packaged_prompt_covers_the_notebook_tools():
+    text = agent_mod._base_prompt_text()
+    assert text != agent_mod._FALLBACK_SYSTEM_PROMPT, "prompts/system.md must be packaged and non-empty"
+    for name in ("notebook_list", "notebook_create", "notebook_open", "notebook_close"):
+        assert f"`{name}(" in text, name
+    assert "## Notebooks" in text
+    assert "[Hailer]" in text and "not the user's words" in text
+    assert "active notebook" in text
+    # the starter globals are still documented, but scoped to starter-template notebooks
+    assert "period_files" in text and "starter template" in text
 
 
 # --------------------------------------------------------------------------- #
@@ -444,6 +478,39 @@ def test_run_turn_with_skill_input(tmp_path):
     assert isinstance(turn_input, list) and len(turn_input) == 2
     assert turn_input[0].name == "pra101-recon" and turn_input[0].path.endswith("SKILL.md")
     assert turn_input[1].text == "reconcile"
+
+
+NOTICE = "[Hailer] The active notebook is now notebooks/q2_churn.py (reopened, 7 cells). Call notebook_cells before editing."
+
+
+def test_run_turn_with_preamble_sends_notice_then_message(tmp_path):
+    ag, _ = make_agent(tmp_path)
+    ag.start()
+    ag.run_turn("continue with the churn table", preamble=NOTICE)
+    turn_input = ag._thread.turn_calls[0][0]
+    assert isinstance(turn_input, list) and len(turn_input) == 2
+    assert turn_input[0].text == NOTICE
+    assert turn_input[1].text == "continue with the churn table"
+
+
+def test_run_turn_with_skill_and_preamble_orders_skill_notice_message(tmp_path):
+    ag, _ = make_agent(tmp_path)
+    ag.start()
+    skill = SkillInfo(name="pra101-recon", description="d", path=tmp_path / "skills" / "pra101-recon")
+    ag.run_turn("reconcile", skill=skill, preamble=NOTICE)
+    turn_input = ag._thread.turn_calls[0][0]
+    assert len(turn_input) == 3
+    assert turn_input[0].name == "pra101-recon" and turn_input[0].path.endswith("SKILL.md")
+    assert turn_input[1].text == NOTICE
+    assert turn_input[2].text == "reconcile"
+
+
+@pytest.mark.parametrize("preamble", [None, "", "   \n"])
+def test_run_turn_without_preamble_keeps_plain_string_input(tmp_path, preamble):
+    ag, _ = make_agent(tmp_path)
+    ag.start()
+    ag.run_turn("hello", preamble=preamble)
+    assert ag._thread.turn_calls[0][0] == "hello"
 
 
 def test_final_response_falls_back_to_deltas_when_no_final_item(tmp_path):

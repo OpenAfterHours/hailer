@@ -70,7 +70,9 @@ _FALLBACK_SYSTEM_PROMPT = (
     "conversation; a live Marimo notebook is your visual workspace. Prefer Polars for "
     "DataFrames, use DuckDB for SQL over many files, keep raw data local and inspect compact "
     "summaries rather than dumping tables. Change the notebook through the marimo_execute tool "
-    "and marimo._code_mode, never by editing the notebook file. Explain briefly what you changed."
+    "and marimo._code_mode, never by editing the notebook file. One notebook is active at a time: "
+    "marimo_status names it, and notebook_list / notebook_create / notebook_open switch to another "
+    "notebook in the notebooks folder when the user asks for one. Explain briefly what you changed."
 )
 
 _PROVIDER_FIELDS = (
@@ -307,11 +309,14 @@ def system_prompt(config: HailerConfig, bundle: ContextBundle) -> str:
             "project context only."
         )
 
+    # The active notebook is deliberately absent: it changes with /notebook and the notebook tools
+    # while the thread lives, and the prompt fingerprint must stay stable across those switches.
+    # The model learns the active notebook from marimo_status() and from CLI notices.
     marimo_line = f"- Marimo URL: {config.marimo_url}\n" if config.marimo_url else ""
     parts.append(
         "## Workspace\n\n"
         f"- Workspace: {config.workspace}\n"
-        f"- Notebook: {config.notebook}\n"
+        f"- Notebooks folder: {config.notebooks_root}\n"
         f"- Data directory: {config.data_dir}\n" + marimo_line
     )
     return "\n\n".join(p.rstrip() for p in parts) + "\n"
@@ -689,7 +694,15 @@ class HailerAgent:
         *,
         on_event: Callable[[AgentEvent], None] | None = None,
         skill: SkillInfo | None = None,
+        preamble: str | None = None,
     ) -> TurnSummary:
+        """Run one turn with ``text`` as the user's message.
+
+        ``preamble`` is a notice from the CLI (for example ``[Hailer] The active notebook is now
+        notebooks/q2_churn.py ...``) sent as its own text item ahead of the user's message; the
+        system prompt tells the model to treat such lines as facts, not as the user's words. A
+        blank preamble is ignored, so a plain turn stays a plain string input.
+        """
         if self._thread is None:
             self.start()
         assert self._thread is not None
@@ -697,8 +710,15 @@ class HailerAgent:
         from openai_codex import SkillInput, TextInput
 
         turn_input: Any = text
-        if skill is not None:
-            turn_input = [SkillInput(name=skill.name, path=str(Path(skill.path) / "SKILL.md")), TextInput(text)]
+        notice = preamble if preamble and preamble.strip() else None
+        if skill is not None or notice is not None:
+            items_in: list[Any] = []
+            if skill is not None:
+                items_in.append(SkillInput(name=skill.name, path=str(Path(skill.path) / "SKILL.md")))
+            if notice is not None:
+                items_in.append(TextInput(notice))
+            items_in.append(TextInput(text))
+            turn_input = items_in
 
         emit = on_event or (lambda _e: None)
         started = time.monotonic()
