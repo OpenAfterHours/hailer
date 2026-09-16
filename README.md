@@ -242,11 +242,15 @@ it already did after a review. Without this, the first command or notebook tool 
 [model]
 name     = "risk-analyst-v3"          # whatever model id the gateway expects
 provider = "internal"
+# reasoning_effort = "medium"         # minimal | low | medium | high | xhigh; "" sends no reasoning effort
 
 [model_providers.internal]
 base_url             = "https://llm.example.internal/v1"
 wire_api             = "responses"                # or "chat" for a Chat Completions endpoint
 # stream             = true                       # "chat" only: false if the gateway rejects stream = true
+# merge_messages     = true                       # "chat" only: false keeps consecutive system/user messages separate
+# stream_options     = true                       # "chat" only: false omits stream_options (token counts may be lost)
+# parallel_tool_calls = true                      # "chat" only: false omits the parallel_tool_calls field
 env_key              = "INTERNAL_MODEL_API_KEY"   # env var name; value from `hailer login internal` or the shell
 requires_openai_auth = false
 # name             = "Internal"
@@ -296,6 +300,16 @@ always streams the Responses API. The bridge listens on `127.0.0.1` only and is 
 `HTTP(S)_PROXY` via `NO_PROXY` in the Codex child environment. Nothing else changes: the startup panel and
 `/status` show the provider as `internal (https://..., chat completions)` (`chat completions, no streaming`
 with `stream = false`), and endpoint errors name `/chat/completions`.
+
+Three more per-provider switches shape the request for strict gateways; all apply to `"chat"` only and
+all default to `true`. `merge_messages` collapses the two system messages Codex sends (Hailer's
+instructions and Codex's own developer message) into one, and the two user messages (the environment
+context and the user's text) into one, because many chat templates insist on alternating roles; set it
+to `false` to keep them separate. `stream_options = false` omits the `stream_options` field from streamed
+requests (some Azure API versions and proxies reject it; token counts are then whatever the final chunk
+carries). `parallel_tool_calls = false` omits the `parallel_tool_calls` field entirely. Independently of
+the provider, `reasoning_effort = ""` under `[model]` stops the `reasoning_effort` field being sent at all,
+for gateways or models that reject it.
 
 Hailer keeps the request small and predictable for gateways: its own system prompt replaces Codex's
 built-in coding-agent prompt, and web search, multi-agent, plugin and app features are switched off for

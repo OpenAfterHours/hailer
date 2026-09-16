@@ -769,3 +769,141 @@ def test_bridge_logs_upstream_http_errors_at_debug(no_proxy):
         "answered 422" in m and "String should match pattern" in m and up.base_url + "/chat/completions" in m
         for m in messages
     ), messages
+
+
+# --------------------------------------------------------------------------- #
+# Strict-gateway request shaping: merged messages, optional fields
+# --------------------------------------------------------------------------- #
+
+
+def _codex_like_request():
+    """Codex's real shape: instructions plus a developer message, then environment context plus the user's text."""
+    return {
+        "model": "m",
+        "instructions": "# Hailer agent instructions",
+        "input": [
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "<skills_instructions>...</skills_instructions>"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "<environment_context>cwd</environment_context>"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Reply with pong"}]},
+        ],
+        "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}],
+        "parallel_tool_calls": True,
+        "stream": True,
+    }
+
+
+def test_request_translation_merges_consecutive_system_and_user_messages():
+    chat, _ = chat_request_from_responses(_codex_like_request())
+    assert [m["role"] for m in chat["messages"]] == ["system", "user"]
+    assert chat["messages"][0]["content"] == "# Hailer agent instructions\n\n<skills_instructions>...</skills_instructions>"
+    assert chat["messages"][1]["content"] == "<environment_context>cwd</environment_context>\n\nReply with pong"
+
+
+def test_request_translation_merge_can_be_turned_off():
+    chat, _ = chat_request_from_responses(_codex_like_request(), merge_messages=False)
+    assert [m["role"] for m in chat["messages"]] == ["system", "system", "user", "user"]
+
+
+def test_request_translation_merge_keeps_text_and_image_parts_in_order():
+    body = {
+        "model": "m",
+        "input": [
+            {"type": "message", "role": "user", "content": "Look at this"},
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "the chart"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AAAA", "detail": "low"},
+                ],
+            },
+            {"type": "message", "role": "user", "content": "and say what you see"},
+        ],
+    }
+    chat, _ = chat_request_from_responses(body)
+    (user,) = chat["messages"]
+    assert user["role"] == "user"
+    assert user["content"] == [
+        {"type": "text", "text": "Look at this"},
+        {"type": "text", "text": "the chart"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA", "detail": "low"}},
+        {"type": "text", "text": "and say what you see"},
+    ]
+
+
+def test_request_translation_never_merges_assistant_or_tool_messages():
+    body = {
+        "model": "m",
+        "input": [
+            {"type": "message", "role": "user", "content": "run two things"},
+            {"type": "message", "role": "assistant", "content": "First."},
+            {"type": "message", "role": "assistant", "content": "Second."},
+            {"type": "function_call", "call_id": "a", "name": "shell", "arguments": "{}"},
+            {"type": "function_call", "call_id": "b", "name": "shell", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "a", "output": "one"},
+            {"type": "function_call_output", "call_id": "b", "output": "two"},
+            {"type": "message", "role": "user", "content": "thanks"},
+        ],
+    }
+    chat, _ = chat_request_from_responses(body)
+    assert [m["role"] for m in chat["messages"]] == ["user", "assistant", "assistant", "tool", "tool", "user"]
+    assert chat["messages"][1]["content"] == "First." and chat["messages"][2]["content"] == "Second."
+    assert [c["id"] for c in chat["messages"][2]["tool_calls"]] == ["a", "b"]  # calls still attach to the trailing assistant message
+    assert [m["tool_call_id"] for m in chat["messages"][3:5]] == ["a", "b"]
+
+
+def test_request_translation_merge_drops_empty_text():
+    body = {
+        "model": "m",
+        "instructions": "",
+        "input": [
+            {"type": "message", "role": "system", "content": ""},
+            {"type": "message", "role": "system", "content": "rules"},
+            {"type": "message", "role": "user", "content": "hi"},
+        ],
+    }
+    chat, _ = chat_request_from_responses(body)
+    assert chat["messages"] == [{"role": "system", "content": "rules"}, {"role": "user", "content": "hi"}]
+
+
+def test_request_translation_can_omit_stream_options():
+    chat, _ = chat_request_from_responses(_codex_like_request(), stream_options=False)
+    assert chat["stream"] is True and "stream_options" not in chat
+    chat, _ = chat_request_from_responses(_codex_like_request())
+    assert chat["stream_options"] == {"include_usage": True}  # the default is unchanged
+
+
+def test_request_translation_can_omit_parallel_tool_calls():
+    chat, _ = chat_request_from_responses(_codex_like_request(), parallel_tool_calls=False)
+    assert chat["tools"] and "parallel_tool_calls" not in chat  # left out, never sent as false
+    body = dict(_codex_like_request(), parallel_tool_calls=False)
+    chat, _ = chat_request_from_responses(body, parallel_tool_calls=False)
+    assert "parallel_tool_calls" not in chat
+    chat, _ = chat_request_from_responses(body)
+    assert chat["parallel_tool_calls"] is False  # by default Codex's own value passes through
+
+
+def test_chat_upstream_request_options_default_on():
+    up = ChatUpstream("http://gateway.example/v1/")
+    assert (up.stream, up.merge_messages, up.stream_options, up.parallel_tool_calls) == (True, True, True, True)
+
+
+def test_bridge_applies_the_upstream_request_options(no_proxy):
+    chunks = [_chunk(role="assistant", content="ok"), {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}]
+    with FakeUpstream(chunks) as up:
+        strict = ChatUpstream(up.base_url, merge_messages=False, stream_options=False, parallel_tool_calls=False)
+        with ChatBridge({"internal": strict}) as bridge:
+            status, _, body = _post(bridge.urls["internal"] + "/responses", _codex_like_request(), {"Accept": "text/event-stream"})
+    assert status == 200 and _events(body)[-1]["type"] == "response.completed"
+    sent = up.requests[-1]["json"]
+    assert [m["role"] for m in sent["messages"]] == ["system", "system", "user", "user"]
+    assert sent["stream"] is True and "stream_options" not in sent and "parallel_tool_calls" not in sent
+
+
+def test_bridge_merges_messages_and_keeps_the_optional_fields_by_default(no_proxy):
+    chunks = [_chunk(role="assistant", content="ok"), {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}]
+    with FakeUpstream(chunks) as up, ChatBridge({"internal": up.base_url}) as bridge:
+        _post(bridge.urls["internal"] + "/responses", _codex_like_request(), {"Accept": "text/event-stream"})
+    sent = up.requests[-1]["json"]
+    assert [m["role"] for m in sent["messages"]] == ["system", "user"]
+    assert sent["stream_options"] == {"include_usage": True} and sent["parallel_tool_calls"] is True

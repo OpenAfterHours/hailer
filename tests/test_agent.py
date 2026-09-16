@@ -1267,3 +1267,22 @@ def test_error_notification_marks_retries(tmp_path):
     assert "unavailable (HTTP 503)" in str(info.value)
     statuses = [e.text for e in seen if e.kind == "status"]
     assert statuses and statuses[0].startswith("retrying: unexpected status 503")
+
+
+def test_chat_upstreams_carry_the_bridge_options_but_codex_never_sees_them(tmp_path):
+    strict = ProviderConfig(
+        id="strict",
+        base_url="https://strict.example/v1",
+        wire_api="chat",
+        env_key="S",
+        merge_messages=False,
+        stream_options=False,
+        parallel_tool_calls=False,
+    )
+    cfg = make_config(tmp_path, providers={"internal": CHAT_PROVIDER, "strict": strict})
+    upstreams = chat_completion_upstreams(cfg)
+    lenient, hard = upstreams["internal"], upstreams["strict"]
+    assert (lenient.merge_messages, lenient.stream_options, lenient.parallel_tool_calls) == (True, True, True)
+    assert (hard.merge_messages, hard.stream_options, hard.parallel_tool_calls) == (False, False, False)
+    ov = build_config_overrides(cfg, USER_CODEX_CONFIG, {"internal": "http://127.0.0.1:1/internal", "strict": "http://127.0.0.1:1/strict"})
+    assert not any(key in o for o in ov for key in (".merge_messages=", ".stream_options=", ".parallel_tool_calls="))

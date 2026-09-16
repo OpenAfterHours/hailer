@@ -67,6 +67,9 @@ _KNOWN_PROVIDER = {
     "base_url",
     "wire_api",
     "stream",
+    "merge_messages",
+    "stream_options",
+    "parallel_tool_calls",
     "env_key",
     "requires_openai_auth",
     "name",
@@ -106,7 +109,8 @@ data_dir = "data"                    # where the monthly parquet files live
 [model]
 name = "gpt-5.5"
 provider = "openai"                  # "openai" uses your existing Codex login or OPENAI_API_KEY
-# reasoning_effort = "medium"        # minimal | low | medium | high | xhigh
+# reasoning_effort = "medium"        # minimal | low | medium | high | xhigh; "" sends no reasoning
+#                                    # effort at all (for gateways that reject the field)
 
 # A bespoke / internal endpoint. wire_api picks the protocol the endpoint speaks:
 #   "responses" - the OpenAI Responses API, streaming (POST {base_url}/responses)
@@ -117,6 +121,9 @@ provider = "openai"                  # "openai" uses your existing Codex login o
 # base_url             = "https://llm.example.internal/v1"
 # wire_api             = "responses"                      # or "chat"
 # stream               = true                             # "chat" only: false if the gateway rejects stream = true
+# merge_messages       = true                             # "chat" only: false keeps consecutive system/user messages separate
+# stream_options       = true                             # "chat" only: false omits stream_options (token counts may be lost)
+# parallel_tool_calls  = true                             # "chat" only: false omits the parallel_tool_calls field
 # env_key              = "INTERNAL_MODEL_API_KEY"   # env var name; value from `hailer login internal` or the shell
 # requires_openai_auth = false
 # name                 = "Internal"
@@ -348,6 +355,9 @@ def load_config(
             base_url=_clean_url(_str(raw, "base_url", section, path)),
             wire_api=_str(raw, "wire_api", section, path, WIRE_API_RESPONSES) or WIRE_API_RESPONSES,
             stream=_bool(raw, "stream", section, path, True),
+            merge_messages=_bool(raw, "merge_messages", section, path, True),
+            stream_options=_bool(raw, "stream_options", section, path, True),
+            parallel_tool_calls=_bool(raw, "parallel_tool_calls", section, path, True),
             env_key=_str(raw, "env_key", section, path),
             requires_openai_auth=_bool(raw, "requires_openai_auth", section, path, False),
             name=_str(raw, "name", section, path),
@@ -511,6 +521,12 @@ def validate(config: HailerConfig) -> list[str]:
                 f'{section}.stream = false only applies to wire_api = "chat"; Codex always streams the Responses API. '
                 'Remove the key, or set wire_api = "chat" if the endpoint implements Chat Completions.'
             )
+        for bridge_key in ("merge_messages", "stream_options", "parallel_tool_calls"):
+            if not getattr(provider, bridge_key) and provider.wire_api != WIRE_API_CHAT:
+                problems.append(
+                    f'{section}.{bridge_key} = false only applies to wire_api = "chat"; it is a setting of Hailer\'s '
+                    'Chat Completions bridge. Remove the key, or set wire_api = "chat" if the endpoint implements Chat Completions.'
+                )
         if provider.is_builtin_openai:
             if provider.wire_api == WIRE_API_CHAT:
                 problems.append(

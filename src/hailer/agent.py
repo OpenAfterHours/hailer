@@ -168,12 +168,23 @@ def _custom_providers(config: HailerConfig) -> list[ProviderConfig]:
 
 
 def chat_completion_upstreams(config: HailerConfig) -> dict[str, ChatUpstream]:
-    """Provider id -> bridge upstream (``base_url`` and ``stream``) for every ``wire_api = "chat"`` provider.
+    """Provider id -> bridge upstream for every ``wire_api = "chat"`` provider.
 
-    ``stream`` is a bridge setting, not a Codex one: it is never passed through as a
-    ``model_providers.<id>.*`` override (see ``_PROVIDER_FIELDS``).
+    ``stream``, ``merge_messages``, ``stream_options`` and ``parallel_tool_calls`` are bridge
+    settings, not Codex ones: they are never passed through as ``model_providers.<id>.*``
+    overrides (see ``_PROVIDER_FIELDS``).
     """
-    return {p.id: ChatUpstream(p.base_url, stream=p.stream) for p in _custom_providers(config) if p.uses_chat_completions and p.base_url}
+    return {
+        p.id: ChatUpstream(
+            p.base_url,
+            stream=p.stream,
+            merge_messages=p.merge_messages,
+            stream_options=p.stream_options,
+            parallel_tool_calls=p.parallel_tool_calls,
+        )
+        for p in _custom_providers(config)
+        if p.uses_chat_completions and p.base_url
+    }
 
 
 def build_config_overrides(
