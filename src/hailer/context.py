@@ -214,8 +214,11 @@ def read_skill(config: HailerConfig, name: str) -> str:
 def read_skill_file(config: HailerConfig, name: str, relative: str) -> str:
     """Read one file bundled with a skill. Rejects absolute paths and traversal."""
     skill, _ = _find_skill(config, name)
-    rel = Path(relative.strip())
-    if not relative.strip() or rel.is_absolute() or rel.drive or relative.strip().startswith(("/", "\\")):
+    # Accept either separator: the agent may send Windows-style paths, and on POSIX a
+    # backslash would otherwise be a literal character in the file name.
+    cleaned = relative.strip().replace("\\", "/")
+    rel = Path(cleaned)
+    if not cleaned or rel.is_absolute() or rel.drive or cleaned.startswith("/"):
         raise HailerError(
             f"Skill file path must be relative to the skill folder: '{relative}'",
             "Use a path such as reference/checks.md.",

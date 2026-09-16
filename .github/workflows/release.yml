@@ -1,0 +1,104 @@
+# Publish a release to PyPI.
+#
+# Triggered by the vX.Y.Z tag that `uv run python -m scripts.release` pushes after the
+# tests pass locally. Runs the test suite again on every supported platform
+# (test.yml) and builds the sdist and wheel; only if both succeed does it publish
+# through the "pypi" environment using PyPI trusted publishing (OIDC, no API token
+# to store) and then create the GitHub release with the distributions attached.
+#
+# PyPI's trusted publisher for this project is configured as:
+#   owner OpenAfterHours, repository hailer, workflow release.yml, environment pypi.
+# Renaming this file or the environment breaks publishing.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests
+    uses: ./.github/workflows/test.yml
+
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.1.0 # setup-uv publishes no floating major tag
+        with:
+          python-version: "3.12"
+
+      - name: Check that the tag matches the package version
+        id: version
+        run: |
+          version="$(uv version --short --color never)"
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match the pyproject.toml version ${version}"
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Check distribution metadata
+        run: uvx twine check --strict dist/*
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/hailer/${{ needs.build.outputs.version }}/
+    permissions:
+      id-token: write # mint the OIDC token PyPI trusted publishing exchanges for an upload token
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    name: Create GitHub release
+    needs: [build, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+
+      - name: Create the release with the distributions attached
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          flags=()
+          case "$VERSION" in
+            *[a-z]*) flags+=(--prerelease) ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "hailer $VERSION" \
+            --generate-notes \
+            "${flags[@]}"

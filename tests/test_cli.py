@@ -14,7 +14,7 @@ from rich.console import Console
 from typer.testing import CliRunner
 
 import hailer.cli as cli
-from hailer import notebooks
+from hailer import notebooks, __version__
 from hailer.errors import ConfigError, CredentialsError, HailerError, NoSessionError
 from hailer.models import (
     AgentEvent,
@@ -841,7 +841,7 @@ def test_init_writes_config_and_skeleton(harness, tmp_path, monkeypatch):
 def test_version_flag():
     result = runner.invoke(cli.app, ["--version"], catch_exceptions=False)
     assert result.exit_code == 0
-    assert "hailer 0.1.0" in result.output
+    assert f"hailer {__version__}" in result.output
 
 
 # --------------------------------------------------------------------------- #
