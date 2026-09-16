@@ -35,6 +35,7 @@ import uuid
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import MappingProxyType
 from typing import Any
 
 from hailer.models import VALID_WIRE_APIS, WIRE_API_CHAT, WIRE_API_RESPONSES  # noqa: F401 - re-exported
@@ -150,6 +151,11 @@ class ChatToolMap:
     custom: frozenset[str] = frozenset()
     namespaced: Mapping[str, tuple[str, str]] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        # A frozen value object must not hand out a mutable dict: keep a read-only view.
+        object.__setattr__(self, "custom", frozenset(self.custom))
+        object.__setattr__(self, "namespaced", MappingProxyType(dict(self.namespaced)))
+
     def chat_name(self, name: str, namespace: str | None = None) -> str:
         """The chat-side function name for a Responses tool call, as advertised in ``tools``.
 
@@ -161,6 +167,20 @@ class ChatToolMap:
                 if ns == namespace and bare == name:
                     return chat
         return name
+
+    def source(self, chat_name: str) -> tuple[str, str] | None:
+        """The ``(namespace, bare name)`` a function name in the reply stands for; None for a plain function.
+
+        Accepts the advertised name and, as a fallback, the prefixed form ``<namespace>__<name>``
+        that a model may produce even when the bare name was advertised.
+        """
+        mapped = self.namespaced.get(chat_name)
+        if mapped is not None:
+            return mapped
+        for ns, bare in self.namespaced.values():
+            if chat_name == f"{ns}__{bare}":
+                return (ns, bare)
+        return None
 
 
 def _function_tool(name: str, tool: Mapping[str, Any]) -> dict[str, Any]:
@@ -181,9 +201,9 @@ def _chat_tools(tools: Any) -> tuple[list[dict[str, Any]], ChatToolMap]:
     ``custom_tool_call`` item. A ``namespace`` tool (the shape Codex uses for an MCP server's
     tools) is flattened: every function inside it becomes an ordinary function tool under its
     bare name, or under ``<namespace>__<name>`` when that name is already taken by a top-level
-    tool or by an earlier namespace, so the order of the tools decides deterministically. The
-    namespace's own description is not sent; each tool keeps its own. Hosted tools (web search,
-    local shell, ...) are dropped.
+    tool, by an earlier namespace or by an earlier tool of the same namespace, so the order of
+    the tools decides deterministically. The namespace's own description is not sent; each tool
+    keeps its own. Hosted tools (web search, local shell, ...) are dropped.
     """
     entries = [t for t in tools or [] if isinstance(t, Mapping)]
     out: list[dict[str, Any]] = []
@@ -212,6 +232,8 @@ def _chat_tools(tools: Any) -> tuple[list[dict[str, Any]], ChatToolMap]:
                 fn["description"] = tool["description"]
             out.append({"type": "function", "function": fn})
         elif kind == "namespace":
+            if tool.get("description"):
+                log.debug("namespace %r description (%d chars) is not sent to chat completions; each tool keeps its own", name, len(str(tool["description"])))
             for inner in tool.get("tools") or []:
                 if not isinstance(inner, Mapping):
                     continue
@@ -460,7 +482,7 @@ class ChatStreamTranslator:
                     "arguments": arguments or "{}",
                     "status": "completed",
                 }
-                mapped = self._tools.namespaced.get(name)
+                mapped = self._tools.source(name)
                 if mapped is not None:
                     # Codex routes a namespaced call by (namespace, bare name); a prefixed name alone is unknown to it.
                     item["namespace"], item["name"] = mapped

@@ -82,11 +82,14 @@ module exposes so work can proceed in parallel. Shared types live in `src/hailer
   sends an MCP server's tools as ONE Responses tool `{type: "namespace", name: "mcp__hailer", description,
   tools: [{type: "function", name, description, parameters, strict}, ...]}` (verified live 2026-09-16), which the
   bridge flattens into ordinary function tools under their bare names (`<namespace>__<name>` when a name is
-  already taken by a top-level tool or an earlier namespace; the namespace description is not sent). The map is
-  handed to `ChatStreamTranslator(tools=...)`, which emits such calls as `function_call` items carrying
-  `namespace` plus the bare `name` (Codex routes MCP calls by that pair; a prefixed name alone is not routed),
-  and replayed `function_call` input items that carry `namespace` are renamed the same way, as is a namespaced
-  `tool_choice`. `chat_completion_upstreams(config)` gives the bridge one `wire.ChatUpstream(base_url,
+  already taken by a top-level tool, an earlier namespace or an earlier tool of the same namespace; the
+  namespace description is not sent, a debug log says so). The map is handed to
+  `ChatStreamTranslator(tools=...)`, which emits such calls as `function_call` items carrying `namespace` plus
+  the bare `name` (Codex routes MCP calls by that pair; a prefixed name alone is not routed); a reply that names
+  `<namespace>__<name>` for a tool advertised under its bare name is mapped the same way. Replayed
+  `function_call` input items that carry `namespace` are renamed to the advertised name, as is a namespaced
+  `tool_choice`; a `tool_choice` naming a clashing bare name without `namespace` resolves to the top-level tool.
+  `chat_completion_upstreams(config)` gives the bridge one `wire.ChatUpstream(base_url,
   stream)` per provider: with `stream=True` (default) the request carries `stream: true` plus
   `stream_options.include_usage` and the chunks are relayed as they arrive; with `stream=False`
   (`stream = false` in `hailer.toml`, for gateways that reject or cannot deliver SSE) it carries `stream: false`,

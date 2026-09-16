@@ -172,6 +172,23 @@ def test_request_translation_flattens_namespace_tools():
     assert tools.chat_name("gone", "mcp__hailer") == "gone"  # unknown tool: bare name, never an error
 
 
+def test_chat_tool_map_is_a_read_only_value_object():
+    tools = ChatToolMap(custom={"apply_patch"}, namespaced={"a": ("ns", "a")})
+    assert tools == ChatToolMap(custom=frozenset({"apply_patch"}), namespaced={"a": ("ns", "a")})
+    assert tools.namespaced == {"a": ("ns", "a")} and tools.namespaced.get("a") == ("ns", "a")
+    with pytest.raises(TypeError):
+        tools.namespaced["b"] = ("ns", "b")  # type: ignore[index]
+    assert tools.source("a") == ("ns", "a") and tools.source("ns__a") == ("ns", "a")
+    assert tools.source("ns__b") is None and tools.source("a__x") is None
+
+
+def test_request_translation_duplicate_name_inside_one_namespace_gets_the_prefixed_form():
+    dup = {"type": "namespace", "name": "ns", "tools": [{"type": "function", "name": "f"}, {"type": "function", "name": "f"}]}
+    chat, tools = chat_request_from_responses({"model": "m", "input": [], "tools": [dup]})
+    assert [t["function"]["name"] for t in chat["tools"]] == ["f", "ns__f"]
+    assert tools.namespaced == {"f": ("ns", "f"), "ns__f": ("ns", "f")}
+
+
 def test_request_translation_top_level_tools_win_even_when_listed_after_a_namespace():
     chat, tools = chat_request_from_responses({"model": "m", "input": [], "tools": [NAMESPACE_TOOLS[1], NAMESPACE_TOOLS[0]]})
     assert [t["function"]["name"] for t in chat["tools"]] == ["marimo_status", "mcp__hailer__shell", "notebook_cells", "shell"]
@@ -270,6 +287,41 @@ def test_stream_namespaced_tool_calls_come_back_with_namespace_and_bare_name():
     added = [e["item"] for e in done if e["type"] == "response.output_item.added"]
     assert added[1]["namespace"] == "mcp__hailer" and added[1]["name"] == "shell" and added[1]["status"] == "in_progress"
     assert [o.get("namespace") for o in done[-1]["response"]["output"]] == ["mcp__hailer", "mcp__hailer", None]
+
+
+def test_stream_prefixed_reply_name_for_a_bare_advertised_tool_is_still_routed():
+    _, tools = chat_request_from_responses({"model": "m", "input": [], "tools": NAMESPACE_TOOLS})
+    assert "mcp__hailer__marimo_status" not in tools.namespaced  # advertised as the bare name
+    t = ChatStreamTranslator(tools=tools)
+    t.start()
+    t.feed(_chunk(tool_calls=[{"index": 0, "id": "call_1", "type": "function", "function": {"name": "mcp__hailer__marimo_status", "arguments": "{}"}}]))
+    t.feed(_chunk(tool_calls=[{"index": 1, "id": "call_2", "type": "function", "function": {"name": "mcp__hailer__nope", "arguments": "{}"}}]))
+    done = t.finish()
+    items = [e["item"] for e in done if e["type"] == "response.output_item.done"]
+    assert items[0]["name"] == "marimo_status" and items[0]["namespace"] == "mcp__hailer"
+    assert items[1]["name"] == "mcp__hailer__nope" and "namespace" not in items[1]  # unknown remainder: left alone
+
+
+def test_stream_whole_body_reply_with_a_namespaced_tool_call():
+    _, tools = chat_request_from_responses({"model": "m", "input": [], "tools": NAMESPACE_TOOLS})
+    t = ChatStreamTranslator(tools=tools)
+    t.start()
+    whole = {
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": None, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "notebook_cells", "arguments": "{}"}}]},
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 4},
+    }
+    t.feed(whole)
+    done = t.finish()
+    output = done[-1]["response"]["output"]
+    assert output == [
+        {"type": "function_call", "id": output[0]["id"], "call_id": "call_1", "name": "notebook_cells", "namespace": "mcp__hailer", "arguments": "{}", "status": "completed"}
+    ]
 
 
 def test_stream_tool_calls_including_custom_and_parallel():
@@ -633,6 +685,28 @@ def test_bridge_asks_for_one_json_reply_when_streaming_is_off(no_proxy):
     assert output[0]["content"][0]["text"] == "whole"
     assert output[1]["type"] == "function_call" and output[1]["call_id"] == "call_1" and output[1]["arguments"] == '{"cmd": "ls"}'
     assert events[-1]["response"]["usage"]["total_tokens"] == 7
+
+
+def test_bridge_non_streamed_reply_routes_a_namespaced_tool_call(no_proxy):
+    reply = {
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": None, "tool_calls": [{"id": "call_7", "type": "function", "function": {"name": "marimo_status", "arguments": "{}"}}]},
+                "finish_reason": "tool_calls",
+            }
+        ]
+    }
+    tools = [{"type": "namespace", "name": "mcp__hailer", "tools": [{"type": "function", "name": "marimo_status", "parameters": {"type": "object"}}]}]
+    upstream = FakeUpstream([], content_type="application/json", body=json.dumps(reply).encode())
+    with upstream as up, ChatBridge({"p": ChatUpstream(up.base_url, stream=False)}) as bridge:
+        status, _, body = _post(bridge.urls["p"] + "/responses", {"model": "m", "input": "hi", "tools": tools, "stream": True})
+    assert status == 200
+    (req,) = up.requests
+    assert req["json"]["stream"] is False and [t["function"]["name"] for t in req["json"]["tools"]] == ["marimo_status"]
+    (call,) = _events(body)[-1]["response"]["output"]
+    assert call["type"] == "function_call" and call["call_id"] == "call_7"
+    assert call["name"] == "marimo_status" and call["namespace"] == "mcp__hailer"
 
 
 def test_bridge_streams_by_default_for_plain_string_upstreams():
