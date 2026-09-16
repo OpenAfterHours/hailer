@@ -744,3 +744,28 @@ def test_bridge_close_is_idempotent_and_urls_empty_before_start():
     assert bridge.port
     bridge.close()
     bridge.close()
+
+
+def test_bridge_logs_upstream_http_errors_at_debug(no_proxy):
+    import logging
+
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign]
+    logger = logging.getLogger("hailer.wire")
+    previous = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    body = b'{"detail": [{"loc": ["body", "model"], "msg": "String should match pattern"}]}'
+    try:
+        with FakeUpstream([], status=422, body=body) as up, ChatBridge({"p": up.base_url}) as bridge:
+            status, _, relayed = _post(bridge.urls["p"] + "/responses", {"model": "m", "input": "hi"})
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous)
+    assert status == 422 and relayed == body  # relay unchanged
+    messages = [r.getMessage() for r in records]
+    assert any(
+        "answered 422" in m and "String should match pattern" in m and up.base_url + "/chat/completions" in m
+        for m in messages
+    ), messages

@@ -26,6 +26,8 @@ REDACTED = "<redacted>"
 
 _AUTH_HEADER_RE = re.compile(r"(?i)(authorization\s*[:=]\s*)[^\r\n;,]+")
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=\-]+")
+#: A bare OpenAI-style key inside quoted text (a keyring-sourced key is not in the environment).
+_TOKEN_RE = re.compile(r"\bsk-[A-Za-z0-9_\-]{16,}")
 
 _NOISY_LOGGERS = ("openai_codex", "urllib3", "httpx", "httpcore", "asyncio", "mcp")
 
@@ -51,6 +53,7 @@ class RedactingFilter(logging.Filter):
     def redact(self, text: str) -> str:
         text = _AUTH_HEADER_RE.sub(lambda m: m.group(1) + REDACTED, text)
         text = _BEARER_RE.sub("Bearer " + REDACTED, text)
+        text = _TOKEN_RE.sub(REDACTED, text)
         for value in self.secret_values():
             if value in text:
                 text = text.replace(value, REDACTED)
