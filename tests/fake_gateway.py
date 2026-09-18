@@ -23,7 +23,15 @@ ALLOWED_FIELDS = {"model", "messages", "tools", "tool_choice", "stream", "temper
 
 
 class FakeGateway:
-    def __init__(self, *, allow_stream: bool = True, usage_without_stream_options: bool = True, chunk_delay: float = 0.0, reply_delay: float = 0.0):
+    def __init__(
+        self,
+        *,
+        allow_stream: bool = True,
+        usage_without_stream_options: bool = True,
+        chunk_delay: float = 0.0,
+        reply_delay: float = 0.0,
+        port: int = 0,  # 0: any free port (tests); a fixed one for manual end-to-end runs
+    ):
         self.allow_stream = allow_stream
         self.usage_without_stream_options = usage_without_stream_options
         self.chunk_delay = chunk_delay
@@ -116,7 +124,7 @@ class FakeGateway:
                 except (BrokenPipeError, ConnectionError, OSError):
                     gateway.aborted += 1  # the client went away mid-stream (a cancelled turn)
 
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
         self._server.daemon_threads = True
         self.port = self._server.server_address[1]
         self.base_url = f"http://127.0.0.1:{self.port}/v1"

@@ -61,6 +61,7 @@ class FakeAgent:
     turns: list = field(default_factory=list)
     preambles: list = field(default_factory=list)
     started: list = field(default_factory=list)
+    forgotten: list = field(default_factory=list)
     model: tuple | None = None
     closed: bool = False
     bundle: ContextBundle | None = None
@@ -68,8 +69,9 @@ class FakeAgent:
     new_threads: int = 0
     on_turn: object = None  # callable run inside run_turn, e.g. to mimic a notebook switch made by the model
 
-    def start(self, *, resume_thread_id=None):
+    def start(self, *, resume_thread_id=None, forget_thread_id=None):
         self.started.append(resume_thread_id)
+        self.forgotten.append(forget_thread_id)
         return resume_thread_id or self.thread_id
 
     def run_turn(self, text, *, on_event=None, skill=None, preamble=None):
@@ -398,7 +400,7 @@ def test_resume_and_new_flag(harness):
 def test_resume_fallback_message(harness):
     save_session(harness.config.workspace, SessionState(thread_id="gone", turns=2))
     harness.agent = FakeAgent()
-    harness.agent.start = lambda *, resume_thread_id=None: "fresh"  # resume failed inside the agent
+    harness.agent.start = lambda *, resume_thread_id=None, forget_thread_id=None: "fresh"  # the thread is not in the store
     result = chat()
     assert "could not be resumed" in result.output
     saved = json.loads(session_path(harness.config.workspace).read_text())
@@ -977,7 +979,17 @@ def test_resume_has_no_stale_prompt_warning(harness):
     result = chat()
     assert "Resumed conversation (1 turns so far)" in result.output
     assert "use /new to apply" not in result.output
-    assert harness.agent.started == ["old-thread"]
+    assert harness.agent.started == ["old-thread"] and harness.agent.forgotten == [None]
+
+
+def test_new_flag_starts_fresh_and_has_the_stored_conversation_deleted(harness):
+    save_session(harness.config.workspace, SessionState(thread_id="old-thread", turns=4))
+    result = chat(args=["--new"])
+    assert result.exit_code == 0, result.output
+    assert "Resumed conversation" not in result.output
+    assert harness.agent.started == [None] and harness.agent.forgotten == ["old-thread"]
+    saved = json.loads(session_path(harness.config.workspace).read_text())
+    assert (saved["thread_id"], saved["turns"]) == ("thread-1", 0)
 
 
 def test_commentary_deltas_are_not_printed_and_answer_appears_once(harness):

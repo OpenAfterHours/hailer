@@ -637,7 +637,8 @@ class ChatLoop:
         self._print_context_warnings()
         self.agent = _make_agent(self.config, self.bundle)
         resume = None if self.opts.new_thread else self.state.thread_id
-        thread_id = self.agent.start(resume_thread_id=resume)
+        forget = self.state.thread_id if self.opts.new_thread else None  # --new: drop the stored conversation
+        thread_id = self.agent.start(resume_thread_id=resume, forget_thread_id=forget)
         if resume and thread_id != resume:
             self.console.print(Text("Previous conversation could not be resumed; started a new one.", style="dim"))
             self.state = SessionState()

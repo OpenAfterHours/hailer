@@ -358,14 +358,14 @@ def map_exception(
     if isinstance(exc, openai.APITimeoutError):
         return ProviderError(
             f"The model endpoint at {base_url} did not answer in time.",
-            hint="Retry in a moment. Run `hailer doctor` to test reachability.",
+            hint="Retry in a moment. `hailer status` shows the endpoint and model in use.",
         )
     if isinstance(exc, openai.APIConnectionError):
         return ProviderError(
             f"Could not reach the model endpoint at {base_url}.",
             hint=(
-                "Check base_url in hailer.toml, your VPN/proxy, and that the endpoint is running. "
-                "Run `hailer doctor` to test reachability."
+                "Check base_url in hailer.toml, that the endpoint is running, and your VPN or proxy "
+                "(HTTP_PROXY, HTTPS_PROXY and NO_PROXY are honoured). `hailer status` shows the endpoint in use."
             ),
         )
     return AgentError("The agent run failed.", hint=redact(f"{type(exc).__name__}: {exc}")[:600])
@@ -379,10 +379,14 @@ def map_exception(
 def _message_text(message: Any) -> str:
     """The plain text of a model message (Responses replies arrive as a list of content blocks)."""
     text = getattr(message, "text", None)
-    if callable(text):  # older langchain-core: a method
-        text = text()
+    # langchain-core 1.x: ``.text`` is a str that can also be called, and calling it warns. Test for
+    # str first; only a core old enough to have ``text()`` as a plain method gets called.
     if isinstance(text, str):
-        return text
+        return str(text)
+    if callable(text):
+        text = text()
+        if isinstance(text, str):
+            return text
     content = getattr(message, "content", "")
     return content if isinstance(content, str) else ""
 
@@ -524,11 +528,24 @@ class HailerAgent:
     def _thread_config(self) -> dict[str, Any]:
         return {"configurable": {"thread_id": self.thread_id}}
 
-    def start(self, *, resume_thread_id: str | None = None) -> str:
-        """Open the conversation store and pick the thread: ``resume_thread_id`` when it exists, else a new one."""
+    async def _forget(self, thread_id: str | None) -> None:
+        """Delete a conversation from the store. Hailer only ever resumes the latest, so the rest is dead weight."""
+        if not thread_id:
+            return
+        try:
+            await self._saver.adelete_thread(thread_id)
+        except Exception as exc:  # noqa: BLE001 - housekeeping, never fatal
+            log.debug("could not delete thread %s: %s", thread_id, type(exc).__name__)
+
+    def start(self, *, resume_thread_id: str | None = None, forget_thread_id: str | None = None) -> str:
+        """Open the conversation store and pick the thread: ``resume_thread_id`` when it exists, else a new one.
+
+        ``forget_thread_id`` names a conversation the user chose not to resume (``hailer --new``); it is deleted.
+        """
 
         async def go() -> str:
             await self._ensure_graph()
+            await self._forget(forget_thread_id)
             if resume_thread_id:
                 saved = await self._saver.aget_tuple({"configurable": {"thread_id": resume_thread_id}})
                 if saved is not None:
@@ -546,16 +563,12 @@ class HailerAgent:
         return self.thread_id
 
     def new_thread(self) -> str:
-        """Start a new conversation. The previous one is deleted: Hailer only ever resumes the latest."""
+        """Start a new conversation; the previous one is deleted."""
         previous = self.thread_id
 
         async def go() -> str:
             await self._ensure_graph()
-            if previous:
-                try:
-                    await self._saver.adelete_thread(previous)
-                except Exception as exc:  # noqa: BLE001 - housekeeping, never fatal
-                    log.debug("could not delete thread %s: %s", previous, type(exc).__name__)
+            await self._forget(previous)
             return self._new_thread_id()
 
         return self._guarded(go())

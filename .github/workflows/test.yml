@@ -2,7 +2,7 @@
 #
 # Runs on pushes to main and on pull requests, and is called by release.yml so a
 # release cannot be published to PyPI unless the suite passes on every platform
-# here. The suite is offline (no API key, marimo server, Codex process or network).
+# here. The suite is offline (no API key, marimo server, model endpoint or network).
 
 name: Tests
 

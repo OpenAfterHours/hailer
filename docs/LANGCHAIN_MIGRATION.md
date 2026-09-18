@@ -1,7 +1,47 @@
 # Proposal: replace the Codex SDK with LangChain
 
-Status: proposal, 2026-09-18. Nothing in `src/` has changed. The evidence is a runnable spike in
-`spikes/langchain/` (34/34 checks pass on Windows 11, Python 3.12).
+Status: **accepted and implemented on 2026-09-18** (branch `worktree-langchain-migration`). The decisions
+in section 9 were: go with `create_agent`, remove everything Codex (so the ChatGPT-login path and the shell
+are gone), keep custom endpoints and stored API keys. The text below is the proposal as written, kept as
+the record of why; line references are to v0.2.2. The evidence is a runnable spike in `spikes/langchain/`
+(34/34 checks pass on Windows 11, Python 3.12).
+
+Where the implementation differs from the proposal:
+
+- **`/model` still starts a new thread**, as it always has. Keeping a conversation across providers would
+  replay one wire API's message history through the other, which the spike did not cover.
+- **`merge_messages` and `parallel_tool_calls` were removed outright** rather than accepted as no-ops. An
+  old `hailer.toml` still loads; the keys are reported as unknown and ignored.
+- **Interrupted turns keep the user's message.** Instead of dropping it, the next message is merged into
+  it (same message id), so strict chat templates never see two user messages in a row and "try again"
+  still has something to retry. Interrupted tool calls get a result, as proposed.
+- **Blocking tools run on daemon threads** (`hailer.tools._in_daemon_thread`) instead of sending marimo's
+  kernel interrupt on cancel. That fixes the slow-exit edge from section 3 without depending on a marimo
+  behaviour that could not be checked offline. The kernel call itself still runs to completion.
+- **The agent owns its HTTP client** (`openai.DefaultAsyncHttpxClient`), which removes finding 2's
+  "one event loop per process" constraint, and passes `http_socket_options=()` because langchain-openai's
+  default keep-alive transport switches off httpx's proxy detection when a system proxy is present.
+- **`hailer --new` and `/new` delete the conversation they replace**, so the checkpoint file does not grow
+  with threads nobody can resume.
+- **Measured result:** `src/` and `tests/` lost 4,932 lines and gained 1,605, net −3,327. The proposal
+  estimated about −4,100; the difference is the new agent tests and the fake gateway they run against.
+
+Verified live on 2026-09-18 with the real `hailer` CLI (Windows 11, Python 3.13, a headless marimo 0.24.2
+server and a kernel session opened through headless Chrome):
+
+- **Custom endpoint, Chat Completions:** against the strict fake gateway on loopback, the model's
+  `marimo_execute("print(1 + 1)")` ran in the real kernel and `2` came back in the answer. The gateway saw
+  only `messages`, `model`, `stream` and `tools`, the eleven tools as plain functions, the configured model
+  on every request, the `api-version` query parameter and the custom header.
+- **Resume:** a second `hailer` run printed "Resumed conversation (1 turns so far)", kept the thread id and
+  sent the earlier turns to the endpoint.
+- **OpenAI, Responses API, real key:** `gpt-5.5` called `marimo_status`, then `marimo_execute`, and
+  answered `391` for 17 × 23 computed in the kernel (9,223 tokens in, 91 out).
+- The first live run also caught a bug the suite had missed: a LangChain deprecation warning printed into
+  the chat (the suite ignores `DeprecationWarning`). Fixed, with a test that fails on any warning in a turn.
+
+Still owed: a physical Ctrl+C in a console. The suite raises SIGINT with `_thread.interrupt_main()`, which
+takes the same path inside CPython, but nobody has pressed the key against the new agent yet.
 
 ## 1. Recommendation
 

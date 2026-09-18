@@ -400,7 +400,7 @@ def test_map_connection_and_timeout_errors(tmp_path):
     unreachable = map_exception(openai.APIConnectionError(request=object()), cfg)  # type: ignore[arg-type]
     assert isinstance(unreachable, ProviderError)
     assert str(unreachable) == "Could not reach the model endpoint at https://llm.example.internal/v1."
-    assert "hailer doctor" in unreachable.hint
+    assert "NO_PROXY" in unreachable.hint and "hailer status" in unreachable.hint
     timeout = map_exception(openai.APITimeoutError(request=object()), cfg)  # type: ignore[arg-type]
     assert "did not answer in time" in str(timeout)
 
@@ -492,6 +492,21 @@ def test_new_thread_forgets_the_previous_conversation(harness):
         other.close()
 
 
+def test_start_can_be_told_to_forget_a_conversation(harness):
+    """`hailer --new`: the stored conversation is not resumed, so it is deleted rather than left in the file."""
+    h = harness([say("one")])
+    old = h.agent.start()
+    h.agent.run_turn("hello")
+    h.agent.close()
+    fresh = h.new_agent()
+    try:
+        assert fresh.start(forget_thread_id=old) != old
+        fresh.close()
+        assert fresh.start(resume_thread_id=old) != old  # gone
+    finally:
+        fresh.close()
+
+
 def test_set_model_rebuilds_the_model_and_rejects_undeclared_providers(harness):
     providers = {"internal": CHAT_PROVIDER, "azure": ProviderConfig(id="azure", base_url="https://az/v1", env_key="AZURE_KEY")}
     h = harness([say("ok")], env={**KEY_ENV, "AZURE_KEY": "az-key"}, providers=providers)
@@ -539,6 +554,17 @@ def test_run_turn_runs_tools_reports_events_and_sums_usage(harness):
     assert isinstance(first[0], SystemMessage) and "PRA101 is the counterparty" in first[0].content
     assert roles(first) == ["system", "human"] and first[1].content == "please echo hi"
     assert roles(second) == ["system", "human", "ai", "tool"] and second[-1].content == "echo: hi"
+
+
+def test_a_turn_raises_no_warnings_into_the_users_terminal(harness):
+    """The suite ignores DeprecationWarning globally; the chat must not print one mid-answer (it did, live)."""
+    import warnings
+
+    h = harness([call("echo", {"text": "hi"}, text="Checking."), say("Done.")])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        summary = h.agent.run_turn("please echo hi", on_event=lambda _event: None)
+    assert summary.final_response == "Done."
 
 
 def test_usage_is_none_when_the_endpoint_reports_none(harness):
