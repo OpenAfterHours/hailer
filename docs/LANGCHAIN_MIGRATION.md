@@ -23,8 +23,10 @@ Where the implementation differs from the proposal:
   default keep-alive transport switches off httpx's proxy detection when a system proxy is present.
 - **`hailer --new` and `/new` delete the conversation they replace**, so the checkpoint file does not grow
   with threads nobody can resume.
-- **Measured result:** `src/` and `tests/` lost 4,932 lines and gained 1,605, net −3,327. The proposal
-  estimated about −4,100; the difference is the new agent tests and the fake gateway they run against.
+- **Measured result:** `src/` and `tests/` lost 4,933 lines and gained 1,666, net −3,267. The proposal
+  estimated about −4,100. `agent.py` came out at 724 lines, not the 430 estimated (1,343 before): the
+  user-facing error hints, the history repair and the docstrings that explain each LangChain finding take
+  more room than guessed. The rest of the difference is the new agent tests and their fake gateway.
 
 Verified live on 2026-09-18 with the real `hailer` CLI (Windows 11, Python 3.13, a headless marimo 0.24.2
 server and a kernel session opened through headless Chrome):
