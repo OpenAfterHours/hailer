@@ -29,7 +29,21 @@ _BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=\-]+")
 #: A bare OpenAI-style key inside quoted text (a keyring-sourced key is not in the environment).
 _TOKEN_RE = re.compile(r"\bsk-[A-Za-z0-9_\-]{16,}")
 
-_NOISY_LOGGERS = ("openai_codex", "urllib3", "httpx", "httpcore", "asyncio", "mcp")
+_NOISY_LOGGERS = (
+    "openai",
+    "langchain",
+    "langchain_core",
+    "langchain_openai",
+    "langgraph",
+    "langsmith",
+    "urllib3",
+    "httpx",
+    "httpx2",
+    "httpcore",
+    "httpcore2",
+    "asyncio",
+    "aiosqlite",
+)
 
 
 class RedactingFilter(logging.Filter):

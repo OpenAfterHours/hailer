@@ -1,4 +1,4 @@
-"""CLI tests: every collaborator is faked; no marimo, Codex, keyring or network."""
+"""CLI tests: every collaborator is faked; no marimo, model endpoint, keyring or network."""
 
 from __future__ import annotations
 
@@ -40,7 +40,6 @@ INTERNAL = ProviderConfig(
     id="internal",
     base_url="https://llm.example.internal/v1",
     env_key="INTERNAL_MODEL_API_KEY",
-    requires_openai_auth=False,
 )
 
 
@@ -63,10 +62,8 @@ class FakeAgent:
     preambles: list = field(default_factory=list)
     started: list = field(default_factory=list)
     model: tuple | None = None
-    interrupted: bool = False
     closed: bool = False
     bundle: ContextBundle | None = None
-    set_model_restarts: bool = False  # True: set_model starts its own thread (provider change) and returns True
     key_source: str | None = None
     new_threads: int = 0
     on_turn: object = None  # callable run inside run_turn, e.g. to mimic a notebook switch made by the model
@@ -81,21 +78,15 @@ class FakeAgent:
         if self.on_turn is not None:
             self.on_turn()
         if self.fail_with is not None:
-            if isinstance(self.fail_with, KeyboardInterrupt):
-                self.interrupted = True  # the real agent interrupts the turn before re-raising
-            raise self.fail_with
+            raise self.fail_with  # for Ctrl+C the real agent has cancelled the turn before re-raising
         final = f"Answer to: {text}"
         if on_event:
-            on_event(AgentEvent("command", "dir data"))
             on_event(AgentEvent("tool_call", "marimo_execute"))
             if self.stream:
-                # Codex streams interim commentary and the final answer as separate messages
+                # a model can stream interim commentary and then the final answer
                 for chunk in ("Checking the ", "notebook...", "Answer ", "to: ", text):
                     on_event(AgentEvent("message_delta", chunk))
-        return TurnSummary(final_response=final, thread_id=self.thread_id, turn_id="turn-1", input_tokens=10, output_tokens=5)
-
-    def interrupt(self):
-        self.interrupted = True
+        return TurnSummary(final_response=final, thread_id=self.thread_id, input_tokens=10, output_tokens=5)
 
     def new_thread(self):
         self.new_threads += 1
@@ -104,10 +95,6 @@ class FakeAgent:
 
     def set_model(self, name, provider=None):
         self.model = (name, provider)
-        if self.set_model_restarts:
-            self.thread_id = "thread-restarted"
-            return True
-        return False
 
     def close(self):
         self.closed = True
@@ -227,7 +214,6 @@ class Harness:
     key_source: tuple = ("x", "env")
     server: MarimoServer | None = SERVER
     bundle: ContextBundle = field(default_factory=ContextBundle)
-    prompt_hash: str = "hash-1"
     session_waits: list = field(default_factory=list)
     waited_session: object = "default"  # what _wait_for_session returns ("default" -> session s9)
 
@@ -259,8 +245,6 @@ def harness(tmp_path, monkeypatch):
         if getattr(h.client, "workspace", None) is None:
             h.client.workspace = config.workspace
         return h.client
-
-    monkeypatch.setattr(cli, "_prompt_hash", lambda config, bundle: h.prompt_hash)
 
     monkeypatch.setattr(cli, "console_factory", lambda: Console(force_terminal=False, width=120, highlight=False, soft_wrap=True, color_system=None))
     monkeypatch.setattr(cli, "_load_config", lambda opts: h.config)
@@ -471,11 +455,13 @@ def test_missing_key_for_custom_provider_is_fatal(harness):
     assert "uv run hailer login internal" in result.output
 
 
-def test_missing_openai_key_is_only_a_warning(harness):
+def test_missing_openai_key_is_fatal_too(harness):
+    """The built-in provider needs OPENAI_API_KEY like any other endpoint needs its key."""
     harness.key_source = (None, "missing")
     result = chat()
-    assert result.exit_code == 0, result.output
-    assert "ChatGPT login" in result.output
+    assert result.exit_code == 1
+    assert "OPENAI_API_KEY is not set" in result.output
+    assert "uv run hailer login openai" in result.output
     assert harness.agent.turns == []
 
 
@@ -887,8 +873,7 @@ def test_ctrl_c_during_turn_interrupts_and_keeps_loop(harness):
     result = chat(input_text="long running\n/exit\n")
     assert result.exit_code == 0, result.output
     assert "Interrupted." in result.output
-    assert harness.agent.interrupted
-    assert "Bye." in result.output
+    assert "Bye." in result.output  # the loop survived and took the next command
 
 
 def test_ctrl_c_at_prompt_exits_cleanly(harness, monkeypatch):
@@ -933,7 +918,7 @@ def test_login_openai_then_status_reports_keyring(harness, monkeypatch):
     monkeypatch.setattr(cli, "_store_key", lambda provider, value: stored.__setitem__(provider.id, value))
     monkeypatch.setattr(cli, "_resolve_key", lambda provider: ("v", "keyring") if provider.id in stored else (None, "missing"))
     result = runner.invoke(cli.app, ["status"], catch_exceptions=False)
-    assert "Credentials: Codex login (no OPENAI_API_KEY set)" in result.output
+    assert "Credentials: OPENAI_API_KEY missing (run: uv run hailer login openai)" in result.output
     result = runner.invoke(cli.app, ["login", "openai"], input="sk-test\n", catch_exceptions=False)
     assert result.exit_code == 0, result.output
     assert stored == {"openai": "sk-test"}
@@ -975,34 +960,24 @@ def test_status_command_marks_non_streaming_chat_providers(harness):
     assert "internal (https://llm.example.internal/v1, chat completions, no streaming)" in result.output
 
 
-def test_model_switch_does_not_start_a_second_thread(harness):
+def test_model_switch_to_another_provider_starts_exactly_one_thread(harness):
     harness.config = make_config(harness.config.workspace, providers={"internal": INTERNAL})
-    harness.agent.set_model_restarts = True
     result = chat(input_text="/model internal:foo\n/exit\n")
     assert result.exit_code == 0, result.output
-    assert harness.agent.new_threads == 0
+    assert harness.agent.model == ("foo", "internal")
+    assert harness.agent.new_threads == 1
     assert result.output.count("started a new thread") == 1
     saved = json.loads(session_path(harness.config.workspace).read_text())
-    assert saved["thread_id"] == "thread-restarted"
+    assert (saved["thread_id"], saved["model"], saved["provider"]) == ("thread-2", "foo", "internal")
 
 
-def test_resume_warns_when_prompt_changed(harness):
-    save_session(harness.config.workspace, SessionState(thread_id="old-thread", turns=1), prompt_hash="hash-0")
+def test_resume_has_no_stale_prompt_warning(harness):
+    """The instructions are sent with every turn, so a resumed conversation always uses the current ones."""
+    save_session(harness.config.workspace, SessionState(thread_id="old-thread", turns=1))
     result = chat()
-    assert "Resumed conversation" in result.output
-    assert "use /new to apply" in result.output
-    # a resume keeps the hash the thread was started with
-    assert json.loads(session_path(harness.config.workspace).read_text())["prompt_hash"] == "hash-0"
-
-
-def test_new_thread_records_current_prompt_hash(harness):
-    save_session(harness.config.workspace, SessionState(thread_id="old-thread", turns=1), prompt_hash="hash-0")
-    result = chat(input_text="/new\n/exit\n")
-    assert result.exit_code == 0
-    assert json.loads(session_path(harness.config.workspace).read_text())["prompt_hash"] == "hash-1"
-    harness.agent = FakeAgent()
-    result = chat()
+    assert "Resumed conversation (1 turns so far)" in result.output
     assert "use /new to apply" not in result.output
+    assert harness.agent.started == ["old-thread"]
 
 
 def test_commentary_deltas_are_not_printed_and_answer_appears_once(harness):
@@ -1012,30 +987,13 @@ def test_commentary_deltas_are_not_printed_and_answer_appears_once(harness):
     assert "Checking the notebook" not in result.output
 
 
-@pytest.mark.parametrize(
-    "raw, shown",
-    [
-        (
-            '"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command \'Get-ChildItem data\'',
-            "Get-ChildItem data",
-        ),
-        ('powershell -NoProfile -Command "dir data"', "dir data"),
-        ("cmd.exe /d /s /c dir data", "dir data"),
-        ("cmd /c type hailer.toml", "type hailer.toml"),
-        ("bash -lc 'ls data'", "ls data"),
-        ('/bin/sh -c "ls"', "ls"),
-        ("uv run pytest -q", "uv run pytest -q"),
-    ],
-)
-def test_display_command_strips_shell_wrappers(raw, shown):
-    assert cli._display_command(raw) == shown
-
-
-def test_progress_line_shows_inner_command(harness):
+def test_progress_line_shows_the_tool_in_use(harness):
     console = Console(force_terminal=False, width=100, highlight=False, color_system=None)
     display = cli._TurnDisplay(console)
-    display(cli.AgentEvent("command", '"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command \'dir data\''))
-    assert display.last_activity == "dir data"
+    display(cli.AgentEvent("tool_call", "marimo_execute", {"arguments": "{'code': 'df.head()'}"}))
+    assert display.last_activity == "marimo_execute"
+    display(cli.AgentEvent("tool_call", "notebook_open\nq2"))
+    assert display.last_activity == "notebook_open q2"  # one line, whatever the event carries
 
 
 # --------------------------------------------------------------------------- #

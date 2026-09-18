@@ -1,8 +1,7 @@
 """Allow-listed web access for context gathering.
 
 The agent may only read pages whose host matches ``[web].allowed_domains`` in
-``hailer.toml``. With an empty list nothing can be fetched. Matching rules mirror
-Codex's network proxy so both enforcement layers agree:
+``hailer.toml``. With an empty list nothing can be fetched. Matching rules:
 
 - ``example.com``      exact host only
 - ``*.example.com``    subdomains only (not the apex)
@@ -244,7 +243,7 @@ def html_to_text(html: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Truncation (shared with the MCP server)
+# Truncation (shared with hailer.tools)
 # --------------------------------------------------------------------------- #
 
 

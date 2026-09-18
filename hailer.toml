@@ -17,24 +17,22 @@ data_dir = "data"                    # where the monthly parquet files live
 
 [model]
 name = "gpt-5.5"
-provider = "openai"                  # "openai" uses your existing Codex login or OPENAI_API_KEY
+provider = "openai"                  # "openai" = api.openai.com with OPENAI_API_KEY (`uv run hailer login openai`)
 # reasoning_effort = "medium"        # minimal | low | medium | high | xhigh; "" sends no reasoning
-#                                      effort at all (for gateways that reject the field)
+#                                      effort at all (for endpoints that reject the field)
+# summarize_after_tokens = 100000    # summarise older turns past this size; lower it for small
+#                                      context windows, 0 turns it off
 
 # A bespoke / internal endpoint. wire_api picks the protocol the endpoint speaks:
-#   "responses" - the OpenAI Responses API, streaming (POST {base_url}/responses)
-#   "chat"      - Chat Completions (POST {base_url}/chat/completions), streamed unless
-#                 stream = false; Hailer translates between the two on a loopback bridge.
+#   "responses" - the OpenAI Responses API (POST {base_url}/responses)
+#   "chat"      - Chat Completions (POST {base_url}/chat/completions)
 #
 # [model_providers.internal]
 # base_url             = "https://llm.example.internal/v1"
 # wire_api             = "responses"                      # or "chat"
-# stream               = true                             # "chat" only: false if the gateway rejects stream = true
-# merge_messages       = true                             # "chat" only: false keeps consecutive system/user messages separate
-# stream_options       = true                             # "chat" only: false omits stream_options (token counts may be lost)
-# parallel_tool_calls  = true                             # "chat" only: false omits the parallel_tool_calls field
+# stream               = true                             # false if the endpoint rejects stream = true
+# stream_options       = true                             # false omits stream_options (token counts may be lost)
 # env_key              = "INTERNAL_MODEL_API_KEY"   # env var name; value from `hailer login internal` or the shell
-# requires_openai_auth = false
 # name                 = "Internal"
 # http_headers         = { "X-Team" = "risk-analytics" }
 # env_http_headers     = { "X-Client-Id" = "INTERNAL_CLIENT_ID" }
@@ -46,4 +44,3 @@ provider = "openai"                  # "openai" uses your existing Codex login o
 # [web]
 # allowed_domains = ["docs.pola.rs", "duckdb.org", "**.bankofengland.co.uk"]
 # max_page_bytes = 200000
-# allow_shell_network = false        # also let shell commands reach the same domains

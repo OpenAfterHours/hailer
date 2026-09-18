@@ -64,12 +64,11 @@ def test_defaults_without_config_file(tmp_path: Path) -> None:
     assert cfg.model.name == "gpt-5.5"
     assert cfg.model.provider == "openai"
     assert cfg.model.reasoning_effort == "medium"
+    assert cfg.model.summarize_after_tokens == 100_000
     assert cfg.providers == {}
     assert cfg.web.allowed_domains == ()
-    assert cfg.web.allow_shell_network is False
     assert cfg.marimo_url is None
     assert cfg.marimo_token is None
-    assert cfg.codex_home is None
     assert cfg.log_level == "WARNING"
     assert cfg.max_tool_output_chars == 12_000
     assert cfg.max_context_bytes == 24_000
@@ -81,8 +80,18 @@ def test_builtin_openai_provider_is_synthesised(tmp_path: Path) -> None:
     provider = cfg.provider
     assert provider.id == "openai"
     assert provider.env_key == "OPENAI_API_KEY"
-    assert provider.requires_openai_auth is True
+    assert provider.base_url is None and provider.wire_api == "responses"
     assert provider.is_builtin_openai
+
+
+def test_declared_openai_provider_keeps_the_default_key_name(tmp_path: Path) -> None:
+    """[model_providers.openai] without base_url only tunes the built-in endpoint (here: Chat Completions)."""
+    ws = _make_workspace(tmp_path, '[model_providers.openai]\nwire_api = "chat"\nstream = false\n')
+    cfg = load_config(workspace=ws, env={})
+    provider = cfg.provider
+    assert provider.is_builtin_openai and provider.env_key == "OPENAI_API_KEY"
+    assert (provider.wire_api, provider.stream) == ("chat", False)
+    assert not [p for p in validate(cfg) if not p.startswith("Warning:")]
 
 
 def test_find_config_path_prefers_root_then_dot_config(tmp_path: Path) -> None:
@@ -141,19 +150,18 @@ skills_dir = "sk"
 prompts_dir = "pr"
 max_tool_output_chars = 5000
 max_context_bytes = 1000
-codex_home = ".codex-home"
 log_level = "info"
 
 [model]
 name = "risk-analyst-v3"
 provider = "internal"
 reasoning_effort = "high"
+summarize_after_tokens = 24000
 
 [model_providers.internal]
 base_url = "https://llm.example.internal/v1/"
 wire_api = "responses"
 env_key = "INTERNAL_MODEL_API_KEY"
-requires_openai_auth = false
 name = "Internal"
 http_headers = { "X-Team" = "risk" }
 env_http_headers = { "X-Client-Id" = "INTERNAL_CLIENT_ID" }
@@ -166,7 +174,6 @@ env_key = "AZURE_OPENAI_API_KEY"
 [web]
 allowed_domains = ["Docs.pola.rs", "**.bankofengland.co.uk", " duckdb.org "]
 max_page_bytes = 50000
-allow_shell_network = true
 """
 
 
@@ -183,19 +190,18 @@ def test_full_file_is_mapped(tmp_path: Path) -> None:
     assert cfg.prompts_dir == (ws / "pr").resolve()
     assert cfg.max_tool_output_chars == 5000
     assert cfg.max_context_bytes == 1000
-    assert cfg.codex_home == (ws / ".codex-home").resolve()
     assert cfg.log_level == "INFO"
 
     assert cfg.model.name == "risk-analyst-v3"
     assert cfg.model.provider == "internal"
     assert cfg.model.reasoning_effort == "high"
+    assert cfg.model.summarize_after_tokens == 24_000
 
     internal = cfg.providers["internal"]
     assert internal.id == "internal"
     assert internal.base_url == "https://llm.example.internal/v1"
     assert internal.wire_api == "responses"
     assert internal.env_key == "INTERNAL_MODEL_API_KEY"
-    assert internal.requires_openai_auth is False
     assert internal.name == "Internal"
     assert internal.http_headers == {"X-Team": "risk"}
     assert internal.env_http_headers == {"X-Client-Id": "INTERNAL_CLIENT_ID"}
@@ -211,7 +217,6 @@ def test_full_file_is_mapped(tmp_path: Path) -> None:
 
     assert cfg.web.allowed_domains == ("docs.pola.rs", "**.bankofengland.co.uk", "duckdb.org")
     assert cfg.web.max_page_bytes == 50000
-    assert cfg.web.allow_shell_network is True
 
 
 def test_absolute_paths_are_kept(tmp_path: Path) -> None:
@@ -237,7 +242,8 @@ def test_invalid_toml_reports_file_and_line(tmp_path: Path) -> None:
         ('[hailer]\nnotebook = 3\n', "[hailer].notebook"),
         ('[hailer]\nmax_context_bytes = "big"\n', "[hailer].max_context_bytes"),
         ('[web]\nallowed_domains = "docs.pola.rs"\n', "[web].allowed_domains"),
-        ('[web]\nallow_shell_network = "yes"\n', "[web].allow_shell_network"),
+        ('[model]\nsummarize_after_tokens = "lots"\n', "[model].summarize_after_tokens"),
+        ('[model_providers.x]\nstream = "no"\n', "[model_providers.x].stream"),
         ('[model_providers.x]\nhttp_headers = { a = 1 }\n', "[model_providers.x].http_headers"),
         ('[model_providers]\nx = "nope"\n', "[model_providers.x]"),
         ('hailer = "nope"\n', "[hailer]"),
@@ -268,7 +274,6 @@ def test_every_env_override(tmp_path: Path) -> None:
         "HAILER_MODEL": "gpt-5.5",
         "HAILER_MODEL_PROVIDER": "openai",
         "HAILER_LOG_LEVEL": "debug",
-        "HAILER_CODEX_HOME": str(tmp_path / "ch"),
     }
     cfg = load_config(workspace=ws, env=env)
     assert cfg.notebook == other_nb.resolve()
@@ -280,7 +285,6 @@ def test_every_env_override(tmp_path: Path) -> None:
     assert cfg.model.provider == "openai"
     assert cfg.model.reasoning_effort == "high"  # not overridden by env
     assert cfg.log_level == "DEBUG"
-    assert cfg.codex_home == (tmp_path / "ch").resolve()
 
 
 def test_env_config_and_workspace_override(tmp_path: Path) -> None:
@@ -383,7 +387,6 @@ def test_validate_accepts_chat_wire_api(tmp_path: Path) -> None:
     )
     cfg = load_config(workspace=ws, env={})
     assert cfg.providers["internal"].wire_api == "chat"
-    assert cfg.providers["internal"].uses_chat_completions
     assert not any("wire_api" in p for p in validate(cfg))
 
 
@@ -398,28 +401,43 @@ def test_chat_provider_can_turn_streaming_off(tmp_path: Path) -> None:
     assert not any("stream" in p for p in validate(cfg))
 
 
-def test_validate_rejects_stream_false_for_responses_providers(tmp_path: Path) -> None:
+def test_stream_switches_apply_to_either_wire_api(tmp_path: Path) -> None:
+    """Hailer talks to the endpoint itself, so stream / stream_options work for the Responses API too."""
     ws = _make_workspace(
         tmp_path,
         '[model]\nprovider = "internal"\n[model_providers.internal]\n'
-        'base_url = "https://llm.example.internal/v1"\nstream = false\nenv_key = "K"\n',
+        'base_url = "https://llm.example.internal/v1"\nstream = false\nstream_options = false\nenv_key = "K"\n',
     )
-    problems = _errors(validate(load_config(workspace=ws, env={})))
-    assert any('stream = false only applies to wire_api = "chat"' in p for p in problems)
+    cfg = load_config(workspace=ws, env={})
+    provider = cfg.providers["internal"]
+    assert (provider.wire_api, provider.stream, provider.stream_options) == ("responses", False, False)
+    assert _errors(validate(cfg)) == []
 
 
-def test_validate_chat_wire_api_needs_a_base_url_for_openai(tmp_path: Path) -> None:
-    ws = _make_workspace(tmp_path, '[model_providers.openai]\nwire_api = "chat"\n')
-    problems = _errors(validate(load_config(workspace=ws, env={})))
-    assert any('wire_api = "chat" needs a base_url' in p for p in problems)
+def test_validate_negative_summarize_after_tokens(tmp_path: Path) -> None:
+    ws = _make_workspace(tmp_path, "[model]\nsummarize_after_tokens = -1\n")
+    assert any("summarize_after_tokens" in p for p in _errors(validate(load_config(workspace=ws, env={}))))
+    (tmp_path / "off").mkdir()
+    off = _make_workspace(tmp_path / "off", "[model]\nsummarize_after_tokens = 0\n")
+    assert _errors(validate(load_config(workspace=off, env={}))) == []
 
 
-def test_validate_requires_openai_auth_provider_needs_no_env_key(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "key",
+    ["requires_openai_auth = true", "merge_messages = false", "parallel_tool_calls = false"],
+)
+def test_keys_from_the_codex_releases_are_ignored_with_a_warning(tmp_path: Path, key: str) -> None:
+    """A hailer.toml written for 0.2 still loads: keys that no longer mean anything are reported, not fatal."""
     ws = _make_workspace(
         tmp_path,
-        '[model]\nprovider = "gw"\n[model_providers.gw]\nbase_url = "https://gw.example/v1"\nrequires_openai_auth = true\n',
+        f'[hailer]\ncodex_home = ".codex-home"\n[model]\nprovider = "gw"\n[model_providers.gw]\n'
+        f'base_url = "https://gw.example/v1"\nenv_key = "GW_KEY"\n{key}\n[web]\nallow_shell_network = true\n',
     )
-    assert _errors(validate(load_config(workspace=ws, env={}))) == []
+    problems = validate(load_config(workspace=ws, env={}))
+    assert _errors(problems) == []
+    name = key.split(" ")[0]
+    assert any(f"[model_providers.gw].{name}" in p and "ignored" in p for p in problems)
+    assert any("[hailer].codex_home" in p for p in problems) and any("[web].allow_shell_network" in p for p in problems)
 
 
 def test_validate_base_url_scheme(tmp_path: Path) -> None:
@@ -530,45 +548,21 @@ def test_repo_example_matches_template() -> None:
     assert example.read_text(encoding="utf-8").replace("\r\n", "\n") == DEFAULT_CONFIG_TEMPLATE
 
 
-def test_chat_provider_bridge_options_default_to_true(tmp_path: Path) -> None:
+def test_provider_stream_switches_default_to_on(tmp_path: Path) -> None:
     ws = _make_workspace(
         tmp_path,
         '[model]\nprovider = "internal"\n[model_providers.internal]\n'
         'base_url = "https://llm.example.internal/v1"\nwire_api = "chat"\nenv_key = "K"\n',
     )
     p = load_config(workspace=ws, env={}).providers["internal"]
-    assert (p.merge_messages, p.stream_options, p.parallel_tool_calls) == (True, True, True)
+    assert (p.stream, p.stream_options) == (True, True)
 
 
-def test_chat_provider_bridge_options_can_be_turned_off(tmp_path: Path) -> None:
+def test_validate_provider_key_typo_is_an_unknown_key_warning(tmp_path: Path) -> None:
     ws = _make_workspace(
         tmp_path,
         '[model]\nprovider = "internal"\n[model_providers.internal]\n'
-        'base_url = "https://llm.example.internal/v1"\nwire_api = "chat"\nenv_key = "K"\n'
-        "merge_messages = false\nstream_options = false\nparallel_tool_calls = false\n",
-    )
-    cfg = load_config(workspace=ws, env={})
-    p = cfg.providers["internal"]
-    assert (p.merge_messages, p.stream_options, p.parallel_tool_calls) == (False, False, False)
-    assert not any(key in problem for problem in validate(cfg) for key in ("merge_messages", "stream_options", "parallel_tool_calls"))
-
-
-@pytest.mark.parametrize("key", ["merge_messages", "stream_options", "parallel_tool_calls"])
-def test_validate_rejects_bridge_options_for_responses_providers(tmp_path: Path, key: str) -> None:
-    ws = _make_workspace(
-        tmp_path,
-        '[model]\nprovider = "internal"\n[model_providers.internal]\n'
-        f'base_url = "https://llm.example.internal/v1"\n{key} = false\nenv_key = "K"\n',
-    )
-    problems = _errors(validate(load_config(workspace=ws, env={})))
-    assert any(f'{key} = false only applies to wire_api = "chat"' in p for p in problems)
-
-
-def test_validate_bridge_option_typo_is_an_unknown_key_warning(tmp_path: Path) -> None:
-    ws = _make_workspace(
-        tmp_path,
-        '[model]\nprovider = "internal"\n[model_providers.internal]\n'
-        'base_url = "https://llm.example.internal/v1"\nwire_api = "chat"\nenv_key = "K"\nmerge_message = false\n',
+        'base_url = "https://llm.example.internal/v1"\nwire_api = "chat"\nenv_key = "K"\nstream_option = false\n',
     )
     problems = validate(load_config(workspace=ws, env={}))
-    assert any("merge_message" in p and "unknown" in p.lower() for p in problems)
+    assert any("stream_option" in p and "unknown" in p.lower() for p in problems)

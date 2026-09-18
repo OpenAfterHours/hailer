@@ -5,7 +5,6 @@ The CLI owns all printing; this module is pure logic so it is easy to test.
 
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import asdict
 from pathlib import Path
@@ -14,7 +13,6 @@ from hailer.models import Command, SessionState
 
 SESSION_DIRNAME = ".hailer"
 SESSION_FILENAME = "session.json"
-PROMPT_HASH_KEY = "prompt_hash"
 
 # name -> one-line description (order is the order shown by /help)
 COMMANDS: dict[str, str] = {
@@ -26,7 +24,7 @@ COMMANDS: dict[str, str] = {
     "context": "List loaded context files, skills, prompts and the web allowlist.",
     "skill": "Run a turn with a project skill attached. Usage: /skill <name> [message]",
     "prompt": "Send a saved prompt from .config/hailer/prompts. Usage: /prompt <name> [args]",
-    "reload": "Re-read .config/hailer; applies to the next thread (/new).",
+    "reload": "Re-read .config/hailer; applies from your next message.",
     "clear": "Clear the screen.",
     "exit": "Exit Hailer.",
     "quit": "Exit Hailer.",
@@ -65,11 +63,6 @@ def session_path(workspace: Path) -> Path:
     return Path(workspace) / SESSION_DIRNAME / SESSION_FILENAME
 
 
-def prompt_hash(text: str) -> str:
-    """Stable fingerprint of the system prompt a thread was started with."""
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
 def _read_raw(workspace: Path) -> dict:
     path = session_path(workspace)
     try:
@@ -94,20 +87,11 @@ def load_session(workspace: Path) -> SessionState:
     return state
 
 
-def load_prompt_hash(workspace: Path) -> str | None:
-    """The prompt fingerprint stored with the session, if any (tolerant of absence)."""
-    value = _read_raw(workspace).get(PROMPT_HASH_KEY)
-    return value if isinstance(value, str) and value else None
-
-
-def save_session(workspace: Path, state: SessionState, *, prompt_hash: str | None = None) -> None:
-    """Persist ``state``. ``prompt_hash`` is stored when given, otherwise the existing one is kept."""
+def save_session(workspace: Path, state: SessionState) -> None:
+    """Persist ``state``."""
     path = session_path(workspace)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = asdict(state)
-    stored = prompt_hash if prompt_hash is not None else load_prompt_hash(workspace)
-    if stored:
-        payload[PROMPT_HASH_KEY] = stored
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     tmp.replace(path)

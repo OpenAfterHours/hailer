@@ -1,24 +1,35 @@
-"""Offline tests for hailer.agent using a fake Codex runtime."""
+"""Offline tests for hailer.agent: a scripted chat model for the unit tests, and a strict fake
+gateway on loopback for what actually goes over the wire."""
 
 from __future__ import annotations
 
-import sys
+import _thread
+import asyncio
+import threading
+import time
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
+import openai
 import pytest
-from openai_codex.errors import TransportClosedError
+from fake_gateway import FakeGateway
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.tools import tool
+from pydantic import ConfigDict, Field
 
 from hailer import agent as agent_mod
 from hailer.agent import (
+    INTERRUPTED_TOOL_RESULT,
+    OPENAI_BASE_URL,
     HailerAgent,
-    build_child_env,
-    build_config_overrides,
-    chat_completion_upstreams,
+    build_model,
+    disable_tracing_unless_opted_in,
     map_exception,
+    provider_by_id,
+    request_headers,
     system_prompt,
-    toml_value,
 )
 from hailer.errors import AgentError, ConfigError, CredentialsError, ProviderError
 from hailer.models import (
@@ -35,6 +46,17 @@ from hailer.models import (
 # Fixtures
 # --------------------------------------------------------------------------- #
 
+KEY_ENV = {"INTERNAL_MODEL_API_KEY": "sk-internal-test-key-000000"}
+
+CHAT_PROVIDER = ProviderConfig(
+    id="internal",
+    name="Internal",
+    base_url="https://llm.example.internal/v1/",
+    wire_api="chat",
+    env_key="INTERNAL_MODEL_API_KEY",
+    http_headers={"X-Team": "risk"},
+)
+
 
 def make_config(tmp_path: Path, **overrides: Any) -> HailerConfig:
     ws = tmp_path / "ws"
@@ -46,421 +68,202 @@ def make_config(tmp_path: Path, **overrides: Any) -> HailerConfig:
         context_dir=ws / ".config" / "hailer" / "context",
         skills_dir=ws / ".config" / "hailer" / "skills",
         prompts_dir=ws / ".config" / "hailer" / "prompts",
-        model=ModelConfig(name="internal-analyst", provider="internal", reasoning_effort="medium"),
-        providers={
-            "internal": ProviderConfig(
-                id="internal",
-                name="Internal",
-                base_url="https://llm.example.internal/v1",
-                env_key="INTERNAL_MODEL_API_KEY",
-                requires_openai_auth=False,
-                http_headers={"X-Team": "risk"},
-            )
-        },
+        model=ModelConfig(name="internal-analyst", provider="internal", reasoning_effort="medium", summarize_after_tokens=0),
+        providers={"internal": CHAT_PROVIDER},
         config_path=ws / "hailer.toml",
     )
     base.update(overrides)
     return HailerConfig(**base)
 
 
-CHAT_PROVIDER = ProviderConfig(
-    id="internal",
-    name="Internal",
-    base_url="https://llm.example.internal/v1",
-    wire_api="chat",
-    env_key="INTERNAL_MODEL_API_KEY",
-    http_headers={"X-Team": "risk"},
-)
-
-USER_CODEX_CONFIG = {
-    "model": "gpt-6-astra",
-    "plugins": {"browser@openai-bundled": {"enabled": True}, "sites@openai-bundled": {"enabled": True}},
-    "mcp_servers": {"node_repl": {"command": "node_repl.exe"}},
-}
-
-
-class FakeHandle:
-    def __init__(self, events: list[Any]) -> None:
-        self.events = events
-        self.interrupted = False
-
-    def stream(self):
-        # Like the real runtime: after an interrupt, remaining work is skipped but the
-        # turn still ends with a turn/completed notification (status "interrupted").
-        for ev in self.events:
-            if self.interrupted and ev.method != "turn/completed":
-                continue
-            yield ev
-
-    def interrupt(self) -> None:
-        self.interrupted = True
-
-
-class FakeThread:
-    def __init__(self, thread_id: str, events: list[Any]) -> None:
-        self.id = thread_id
-        self.events = events
-        self.turn_calls: list[tuple[Any, dict[str, Any]]] = []
-        self.last_handle: FakeHandle | None = None
-
-    def turn(self, input: Any, **kwargs: Any) -> FakeHandle:
-        self.turn_calls.append((input, kwargs))
-        self.last_handle = FakeHandle(self.events)
-        return self.last_handle
-
-
-class FakeClient:
-    """Stand-in for the SDK's raw CodexClient: the route Hailer takes when Codex's reviewer is off."""
-
-    def __init__(self, codex: "FakeCodex") -> None:
-        self.codex = codex
-        self.start_params: list[Any] = []
-        self.resume_params: list[tuple[str, Any]] = []
-        self._approval_handler = self._default_approval_handler  # as CodexClient.__init__ does
-
-    def _default_approval_handler(self, method: str, params: Any) -> dict:
-        # the SDK's default: accept commands and file changes, answer {} to anything else
-        if method in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval"):
-            return {"decision": "accept"}
-        return {}
-
-    def thread_start(self, params: Any) -> SimpleNamespace:
-        self.start_params.append(params)
-        self.codex._n += 1
-        return SimpleNamespace(thread=SimpleNamespace(id=f"thread-{self.codex._n}"))
-
-    def thread_resume(self, thread_id: str, params: Any) -> SimpleNamespace:
-        self.resume_params.append((thread_id, params))
-        if self.codex.resume_fails:
-            raise RuntimeError("thread not found")
-        return SimpleNamespace(thread=SimpleNamespace(id=thread_id))
-
-
-REAL_SDK_THREAD = agent_mod._sdk_thread  # captured at import, before the autouse fixture replaces it
-
-
-class FakeCodex:
-    def __init__(
-        self, cfg: Any, events: list[Any] | None = None, *, resume_fails: bool = False, account: Any = "chatgpt"
-    ) -> None:
-        self.cfg = cfg
-        self.events = events or []
-        self.resume_fails = resume_fails
-        self.account_kind = account  # "chatgpt" | "apiKey" | "amazonBedrock" | None (signed out) | "raise"
-        self.account_calls = 0
-        self.start_calls: list[dict[str, Any]] = []  # SDK wrapper route (Codex reviewer on)
-        self.resume_calls: list[tuple[str, dict[str, Any]]] = []
-        self.closed = False
-        self._n = 0
-        self._client = FakeClient(self)  # raw client route (reviewer off)
-
-    def thread_start(self, **kwargs: Any) -> FakeThread:
-        self.start_calls.append(kwargs)
-        self._n += 1
-        return FakeThread(f"thread-{self._n}", self.events)
-
-    def thread_resume(self, thread_id: str, **kwargs: Any) -> FakeThread:
-        self.resume_calls.append((thread_id, kwargs))
-        if self.resume_fails:
-            raise RuntimeError("thread not found")
-        return FakeThread(thread_id, self.events)
-
-    def close(self) -> None:
-        self.closed = True
-
-    def account(self) -> SimpleNamespace:
-        self.account_calls += 1
-        if self.account_kind == "raise":
-            raise RuntimeError("account unavailable")
-        if self.account_kind is None:
-            return SimpleNamespace(account=None, requires_openai_auth=True)
-        # the SDK wraps the variants in a RootModel: response.account.root.type
-        return SimpleNamespace(account=SimpleNamespace(root=SimpleNamespace(type=self.account_kind)), requires_openai_auth=False)
-
-
-def N(method: str, **payload: Any) -> SimpleNamespace:
-    """A stand-in for openai_codex.models.Notification (.method / .payload)."""
-    return SimpleNamespace(method=method, payload=SimpleNamespace(**payload))
-
-
-def turn_completed(status: str = "completed", error_message: str | None = None, turn_id: str = "turn-1"):
-    error = SimpleNamespace(message=error_message) if error_message else None
-    return N("turn/completed", turn=SimpleNamespace(id=turn_id, status=status, error=error, duration_ms=321))
-
-
-def scripted_events() -> list[Any]:
-    cmd_item = SimpleNamespace(type="commandExecution", id="c1", command="dir data", cwd="C:\\ws")
-    tool_item = SimpleNamespace(
-        type="mcpToolCall", id="m1", server="hailer", tool="marimo_execute", arguments={"code": "print(1)"}
-    )
-    final_msg = SimpleNamespace(type="agentMessage", id="a1", text="RWA rose 5.6%.", phase="final_answer")
-    commentary = SimpleNamespace(type="agentMessage", id="a0", text="Looking...", phase="commentary")
-    return [
-        N("turn/started", turn=SimpleNamespace(id="turn-1")),
-        N("item/started", item=cmd_item, thread_id="t", turn_id="turn-1"),
-        N("item/commandExecution/outputDelta", delta="25-01 pra101.parquet\n", item_id="c1"),
-        N("item/completed", item=cmd_item, turn_id="turn-1"),
-        N("item/started", item=tool_item, turn_id="turn-1"),
-        N("item/completed", item=tool_item, turn_id="turn-1"),
-        N("item/reasoning/summaryTextDelta", delta="thinking", item_id="r1"),
-        N("item/completed", item=commentary, turn_id="turn-1"),
-        N("item/agentMessage/delta", delta="RWA rose ", item_id="a1"),
-        N("item/agentMessage/delta", delta="5.6%.", item_id="a1"),
-        N("item/completed", item=final_msg, turn_id="turn-1"),
-        N(
-            "thread/tokenUsage/updated",
-            token_usage=SimpleNamespace(
-                last=SimpleNamespace(input_tokens=1200, output_tokens=80),
-                total=SimpleNamespace(input_tokens=1200, output_tokens=80),
-            ),
-            turn_id="turn-1",
-        ),
-        turn_completed(),
-    ]
-
-
 @pytest.fixture(autouse=True)
 def no_real_keyring(monkeypatch):
-    # Never touch the OS credential store from tests.
+    """Never touch the developer's OS credential store."""
     monkeypatch.setattr(agent_mod._secrets, "_keyring_get", lambda username: None)
 
 
-@pytest.fixture(autouse=True)
-def fake_sdk_thread(monkeypatch):
-    # Threads started through the raw client get the same FakeThread the wrapper route returns.
-    monkeypatch.setattr(agent_mod, "_sdk_thread", lambda client, thread_id: FakeThread(thread_id, client.codex.events))
+class ScriptedModel(BaseChatModel):
+    """A chat model that replays ``script``: messages, exceptions, or callables of the input messages."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    script: list[Any] = Field(default_factory=list)
+    seen: list[list[Any]] = Field(default_factory=list)
+    bound: list[str] = Field(default_factory=list)
+
+    @property
+    def _llm_type(self) -> str:
+        return "scripted"
+
+    def bind_tools(self, tools: Any, **kwargs: Any) -> Any:
+        self.bound[:] = [getattr(t, "name", str(t)) for t in tools]
+        return self
+
+    def _next(self, messages: list[Any]) -> Any:
+        self.seen.append(list(messages))
+        step = self.script.pop(0) if self.script else AIMessage("(script exhausted)")
+        return step(messages) if callable(step) and not isinstance(step, AIMessage) else step
+
+    def _generate(self, messages: list[Any], stop: Any = None, run_manager: Any = None, **kwargs: Any) -> ChatResult:
+        step = self._next(messages)
+        if isinstance(step, BaseException):
+            raise step
+        return ChatResult(generations=[ChatGeneration(message=step)])
+
+    async def _agenerate(self, messages: list[Any], stop: Any = None, run_manager: Any = None, **kwargs: Any) -> ChatResult:
+        step = self._next(messages)
+        if asyncio.iscoroutine(step):
+            step = await step
+        if isinstance(step, BaseException):
+            raise step
+        return ChatResult(generations=[ChatGeneration(message=step)])
 
 
-# --------------------------------------------------------------------------- #
-# TOML rendering
-# --------------------------------------------------------------------------- #
-
-
-def test_toml_value_rendering():
-    assert toml_value(True) == "true"
-    assert toml_value(600) == "600"
-    assert toml_value("plain") == '"plain"'
-    assert toml_value("C:\\Users\\x\\.venv") == '"C:\\\\Users\\\\x\\\\.venv"'
-    assert toml_value('say "hi"') == '"say \\"hi\\""'
-    assert toml_value(["-m", "hailer.mcp_server"]) == '["-m", "hailer.mcp_server"]'
-    assert toml_value({"HAILER_WORKSPACE": "C:\\ws", "X-Team": "risk"}) == '{HAILER_WORKSPACE = "C:\\\\ws", X-Team = "risk"}'
-    assert toml_value({"127.0.0.1": "allow"}) == '{"127.0.0.1" = "allow"}'
-
-
-# --------------------------------------------------------------------------- #
-# Overrides
-# --------------------------------------------------------------------------- #
-
-
-def test_overrides_for_custom_provider(tmp_path):
-    cfg = make_config(tmp_path)
-    ov = build_config_overrides(cfg, USER_CODEX_CONFIG)
-    assert ov[0] == 'model="internal-analyst"'
-    assert ov[1] == 'model_provider="internal"'
-    assert 'model_providers.internal.base_url="https://llm.example.internal/v1"' in ov
-    assert 'model_providers.internal.wire_api="responses"' in ov
-    assert 'model_providers.internal.env_key="INTERNAL_MODEL_API_KEY"' in ov
-    assert "model_providers.internal.requires_openai_auth=false" in ov
-    assert 'model_providers.internal.name="Internal"' in ov
-    assert 'model_providers.internal.http_headers={X-Team = "risk"}' in ov
-    assert 'model_reasoning_effort="medium"' in ov
-    # trimming set
-    for expected in (
-        'web_search="disabled"',
-        "features.web_search_request=false",
-        "features.multi_agent=false",
-        "features.multi_agent_v2=false",
-        "features.plugins=false",
-        "features.apps=false",
-        "features.codex_apps=false",
-        "features.connectors=false",
-        "features.image_generation=false",
-    ):
-        assert expected in ov
-    # user-config-derived disabling
-    assert 'plugins."browser@openai-bundled".enabled=false' in ov
-    assert 'plugins."sites@openai-bundled".enabled=false' in ov
-    assert "mcp_servers.node_repl.enabled=false" in ov
-    # Hailer MCP server, with Windows paths escaped
-    exe = toml_value(sys.executable)
-    assert f"mcp_servers.hailer.command={exe}" in ov
-    assert 'mcp_servers.hailer.args=["-m", "hailer.mcp_server"]' in ov
-    env_override = next(o for o in ov if o.startswith("mcp_servers.hailer.env="))
-    assert "HAILER_WORKSPACE = " in env_override and "HAILER_CONFIG = " in env_override
-    assert "HAILER_LOG_LEVEL = " in env_override
-    assert "HAILER_MARIMO_TOKEN" not in env_override  # secrets never go on the command line
-    assert toml_value(str(cfg.workspace)) in env_override
-    assert "mcp_servers.hailer.tool_timeout_sec=600" in ov
-    assert "mcp_servers.hailer.startup_timeout_sec=60" in ov
-    assert 'mcp_servers.hailer.default_tools_approval_mode="auto"' in ov
-    # no network overrides by default, no sandbox/approval overrides ever
-    assert not any(o.startswith(("network.", "features.network_proxy", "sandbox_")) for o in ov)
-    assert not any(o.startswith(("sandbox_mode", "approval_policy")) for o in ov)
-    # never disable our own server, never emit plugin-provided mcp servers we did not see
-    assert "mcp_servers.hailer.enabled=false" not in ov
-    assert not any("cua_repl" in o for o in ov)
-
-
-def test_overrides_for_chat_provider_point_codex_at_the_bridge(tmp_path):
-    cfg = make_config(tmp_path, providers={"internal": CHAT_PROVIDER})
-    ov = build_config_overrides(cfg, USER_CODEX_CONFIG, {"internal": "http://127.0.0.1:4242/internal"})
-    assert 'model_providers.internal.wire_api="responses"' in ov
-    assert 'model_providers.internal.base_url="http://127.0.0.1:4242/internal"' in ov
-    # credentials and headers stay on the provider so Codex attaches them and the bridge forwards them
-    assert 'model_providers.internal.env_key="INTERNAL_MODEL_API_KEY"' in ov
-    assert 'model_providers.internal.http_headers={X-Team = "risk"}' in ov
-    assert "llm.example.internal" not in " ".join(ov)
-
-
-def test_chat_upstreams_carry_the_stream_flag_but_codex_never_sees_it(tmp_path):
-    quiet = ProviderConfig(id="quiet", base_url="https://quiet.example/v1/", wire_api="chat", env_key="Q", stream=False)
-    cfg = make_config(tmp_path, providers={"internal": CHAT_PROVIDER, "quiet": quiet})
-    upstreams = chat_completion_upstreams(cfg)
-    assert upstreams["internal"].base_url == "https://llm.example.internal/v1" and upstreams["internal"].stream is True
-    assert upstreams["quiet"].base_url == "https://quiet.example/v1" and upstreams["quiet"].stream is False
-    ov = build_config_overrides(cfg, USER_CODEX_CONFIG, {"internal": "http://127.0.0.1:1/internal", "quiet": "http://127.0.0.1:1/quiet"})
-    assert not any(".stream=" in o for o in ov)  # a bridge setting, not a Codex model_providers key
-
-
-def test_agent_starts_and_stops_the_bridge_for_chat_providers(tmp_path, monkeypatch):
-    monkeypatch.setenv("INTERNAL_MODEL_API_KEY", "k")
-    ag, created = make_agent(tmp_path, providers={"internal": CHAT_PROVIDER})
-    assert ag.bridge is None
-    ag.start()
-    assert ag.bridge is not None and ag.bridge.port
-    bridge_url = ag.bridge.urls["internal"]
-    (fake,) = created
-    assert f'model_providers.internal.base_url="{bridge_url}"' in fake.cfg.config_overrides
-    assert 'model_providers.internal.wire_api="responses"' in fake.cfg.config_overrides
-    assert 'wire_api="chat"' not in " ".join(fake.cfg.config_overrides)
-    assert ag.overrides == fake.cfg.config_overrides  # derived on demand, never a stale copy
-    ag.close()
-    assert ag.bridge is None
-
-
-def test_bridge_start_failure_is_a_provider_error(tmp_path, monkeypatch):
-    def refuse(self):
-        raise OSError(13, "Permission denied")
-
-    monkeypatch.setattr(agent_mod.ChatBridge, "start", refuse)
-    ag, _ = make_agent(tmp_path, providers={"internal": CHAT_PROVIDER})
-    with pytest.raises(ProviderError) as info:
-        ag.start()
-    assert "Chat Completions bridge" in str(info.value)
-    assert "Permission denied" in info.value.hint and "internal" in info.value.hint
-    assert ag.bridge is None
-
-
-def test_child_env_exempts_the_bridge_from_the_proxy(tmp_path):
-    cfg = make_config(tmp_path, providers={"internal": CHAT_PROVIDER})
-    env = build_child_env(cfg, "k", environ={"HTTPS_PROXY": "http://proxy.corp:3128", "NO_PROXY": ".corp, localhost"})
-    assert env["NO_PROXY"] == ".corp,localhost,127.0.0.1"
-    assert env["no_proxy"] == ".corp,localhost,127.0.0.1"
-    env = build_child_env(cfg, "k", environ={})
-    assert env["NO_PROXY"] == "127.0.0.1,localhost"
-    # responses-only configs leave the proxy variables alone
-    assert "NO_PROXY" not in build_child_env(make_config(tmp_path), "k", environ={"HTTPS_PROXY": "http://p:1"})
-
-
-def test_map_exception_uses_the_live_provider_after_a_model_switch(tmp_path):
-    cfg = make_config(
-        tmp_path,
-        model=ModelConfig(name="gpt-5.5", provider="openai"),
-        providers={"internal": CHAT_PROVIDER},
+def call(name: str, args: dict[str, Any], call_id: str = "call_1", *, text: str = "", tokens: tuple[int, int] = (10, 5)) -> AIMessage:
+    return AIMessage(
+        content=text,
+        tool_calls=[{"name": name, "args": args, "id": call_id}],
+        usage_metadata={"input_tokens": tokens[0], "output_tokens": tokens[1], "total_tokens": sum(tokens)},
     )
-    mapped = map_exception(RuntimeError("404 Not Found"), cfg, provider="internal")
-    assert "https://llm.example.internal/v1/chat/completions" in mapped.hint
-    mapped = map_exception(RuntimeError("404 Not Found"), cfg)
-    assert "https://api.openai.com/v1/responses" in mapped.hint
 
 
-def test_map_bridge_unsupported_endpoint_has_its_own_hint(tmp_path):
-    cfg = make_config(tmp_path, providers={"internal": CHAT_PROVIDER})
-    mapped = map_exception(RuntimeError("404: /responses/compact is not available through the Chat Completions bridge"), cfg)
-    assert isinstance(mapped, ProviderError) and "bridge" in str(mapped)
-    assert "Only POST /responses is translated" in mapped.hint
+def say(text: str, tokens: tuple[int, int] | None = (20, 7)) -> AIMessage:
+    usage = {"input_tokens": tokens[0], "output_tokens": tokens[1], "total_tokens": sum(tokens)} if tokens else None
+    return AIMessage(content=text, usage_metadata=usage)
 
 
-def test_map_bridge_dns_failure_is_a_connection_error(tmp_path):
-    cfg = make_config(tmp_path, providers={"internal": CHAT_PROVIDER})
-    text = "could not reach https://llm.exmaple.internal/v1/chat/completions: dns error ([Errno -2] Name or service not known)"
-    mapped = map_exception(RuntimeError(text), cfg)
-    assert isinstance(mapped, ProviderError) and "Could not reach the model endpoint" in str(mapped)
+class Harness:
+    """An agent wired to a ScriptedModel and two toy tools; records what the factory was asked for."""
+
+    def __init__(self, tmp_path: Path, script: list[Any], *, env: dict[str, str] | None = None, tool_delay: float = 0.0, **cfg: Any):
+        self.config = make_config(tmp_path, **cfg)
+        self.model = ScriptedModel(script=list(script))
+        self.factory_calls: list[tuple[str, str, str | None]] = []
+        self.tool_log: list[str] = []
+        self.tool_delay = tool_delay
+        harness = self
+
+        @tool
+        def echo(text: str) -> str:
+            """Return the text."""
+            harness.tool_log.append(f"echo:{text}")
+            return f"echo: {text}"
+
+        @tool
+        async def slow(seconds: float) -> str:
+            """Wait, then answer."""
+            harness.tool_log.append("slow:start")
+            await asyncio.sleep(seconds)
+            harness.tool_log.append("slow:done")
+            return "slow done"
+
+        self.tools = [echo, slow]
+        self.bundle = ContextBundle(context_text="PRA101 is the counterparty credit risk return.")
+        self.agent = self.new_agent(env=env)
+
+    def _factory(self, provider: ProviderConfig, model: str, key: str | None) -> Any:
+        self.factory_calls.append((provider.id, model, key))
+        return self.model
+
+    def new_agent(self, *, env: dict[str, str] | None = None) -> HailerAgent:
+        return HailerAgent(
+            self.config, self.bundle, model_factory=self._factory, tools=self.tools, env=KEY_ENV if env is None else env
+        )
 
 
-def test_agent_has_no_bridge_for_responses_providers(tmp_path, monkeypatch):
-    monkeypatch.setenv("INTERNAL_MODEL_API_KEY", "k")
-    ag, _ = make_agent(tmp_path)
-    ag.start()
-    assert ag.bridge is None
-    ag.close()
+@pytest.fixture
+def harness(tmp_path):
+    made: list[Harness] = []
+
+    def make(script: list[Any], **kw: Any) -> Harness:
+        h = Harness(tmp_path, script, **kw)
+        made.append(h)
+        return h
+
+    yield make
+    for h in made:
+        h.agent.close()
 
 
-def test_overrides_openai_default_has_no_provider_table(tmp_path):
-    cfg = make_config(tmp_path, model=ModelConfig(name="gpt-5.5", provider="openai", reasoning_effort=None), providers={})
-    ov = build_config_overrides(cfg, {})
-    assert ov[:2] == ('model="gpt-5.5"', 'model_provider="openai"')
-    assert not any(o.startswith("model_providers.") for o in ov)
-    assert not any(o.startswith("model_reasoning_effort") for o in ov)
-    assert not any(o.startswith("plugins.") for o in ov)
+def roles(messages: list[Any]) -> list[str]:
+    return [type(m).__name__.replace("Message", "").lower() for m in messages]
 
 
-def test_overrides_include_all_declared_custom_providers(tmp_path):
+# --------------------------------------------------------------------------- #
+# Providers and the chat model
+# --------------------------------------------------------------------------- #
+
+
+def test_provider_by_id_defaults_openai_and_rejects_undeclared(tmp_path):
     cfg = make_config(tmp_path)
-    providers = dict(cfg.providers)
-    providers["azure"] = ProviderConfig(id="azure", base_url="https://az.example/v1", env_key="AZURE_KEY", query_params={"api-version": "2025-04-01"})
-    cfg = make_config(tmp_path, providers=providers)
-    ov = build_config_overrides(cfg, {})
-    assert 'model_providers.azure.base_url="https://az.example/v1"' in ov
-    assert 'model_providers.azure.query_params={api-version = "2025-04-01"}' in ov
-
-
-def test_network_overrides_only_when_shell_network_allowed(tmp_path):
-    web = WebConfig(allowed_domains=("docs.pola.rs", "**.bankofengland.co.uk"), allow_shell_network=True)
-    cfg = make_config(tmp_path, web=web)
-    ov = build_config_overrides(cfg, {})
-    assert "features.network_proxy.enabled=true" in ov
-    assert "network.enabled=true" in ov
-    assert 'network.mode="limited"' in ov
-    assert "sandbox_workspace_write.network_access=true" in ov
-    domains = next(o for o in ov if o.startswith("features.network_proxy.domains="))
-    assert '"docs.pola.rs" = "allow"' in domains
-    assert '"**.bankofengland.co.uk" = "allow"' in domains
-    # "localhost" is a bare TOML key so it is rendered unquoted; "127.0.0.1" must be quoted.
-    assert '"127.0.0.1" = "allow"' in domains and 'localhost = "allow"' in domains
-    assert next(o for o in ov if o.startswith("network.domains=")).split("=", 1)[1] == domains.split("=", 1)[1]
-
-    cfg2 = make_config(tmp_path, web=WebConfig(allowed_domains=("docs.pola.rs",), allow_shell_network=False))
-    assert not any(o.startswith(("network.", "features.network_proxy")) for o in build_config_overrides(cfg2, {}))
-
-
-def test_overrides_undeclared_provider_is_config_error(tmp_path):
-    cfg = make_config(tmp_path, model=ModelConfig(name="x", provider="ghost"))
+    assert provider_by_id(cfg).id == "internal"
+    builtin = provider_by_id(cfg, "openai")
+    assert builtin.is_builtin_openai and builtin.env_key == "OPENAI_API_KEY" and builtin.wire_api == "responses"
     with pytest.raises(ConfigError) as err:
-        build_config_overrides(cfg, {})
-    assert "ghost" in str(err.value) and "hailer.toml" in err.value.hint
+        provider_by_id(cfg, "azure")
+    assert "[model_providers.azure]" in err.value.hint
 
 
-# --------------------------------------------------------------------------- #
-# Child env
-# --------------------------------------------------------------------------- #
+def test_request_headers_adds_env_headers_only_when_the_variable_is_set():
+    provider = ProviderConfig(
+        id="p", base_url="https://x/v1", http_headers={"X-Team": "risk"}, env_http_headers={"X-Client-Id": "CLIENT_ID", "X-Trace": "TRACE_ID"}
+    )
+    assert request_headers(provider, {"CLIENT_ID": "abc", "TRACE_ID": ""}) == {"X-Team": "risk", "X-Client-Id": "abc"}
 
 
-def test_child_env_contains_key_under_env_key_only(tmp_path):
-    cfg = make_config(tmp_path, codex_home=tmp_path / "codex-home")
-    env = build_child_env(cfg, "sekrit", {"AZURE_KEY": "other"})
-    assert env["INTERNAL_MODEL_API_KEY"] == "sekrit"
-    assert env["AZURE_KEY"] == "other"
-    assert env["HAILER_WORKSPACE"] == str(cfg.workspace)
-    assert env["HAILER_CONFIG"] == str(cfg.config_path)
-    assert env["CODEX_HOME"] == str(tmp_path / "codex-home")
-    assert set(env) == {"INTERNAL_MODEL_API_KEY", "AZURE_KEY", "HAILER_WORKSPACE", "HAILER_CONFIG", "CODEX_HOME"}
+def test_build_model_for_a_chat_completions_endpoint():
+    provider = ProviderConfig(
+        id="internal",
+        base_url="https://llm.example.internal/v1/",
+        wire_api="chat",
+        env_key="K",
+        stream_options=False,
+        http_headers={"X-Team": "risk"},
+        env_http_headers={"X-Client-Id": "CLIENT_ID"},
+        query_params={"api-version": "2025-04-01-preview"},
+    )
+    model = build_model(provider, "corp-gpt", "sk-secret-value-123456", reasoning_effort="low", environ={"CLIENT_ID": "abc"})
+    assert model.model_name == "corp-gpt"
+    assert model.openai_api_base == "https://llm.example.internal/v1"
+    assert model.use_responses_api is False
+    assert model.stream_usage is False  # stream_options = false: the field is never sent
+    assert model.disable_streaming is False
+    assert dict(model.default_headers) == {"X-Team": "risk", "X-Client-Id": "abc"}
+    assert dict(model.default_query) == {"api-version": "2025-04-01-preview"}
+    assert model.reasoning_effort == "low"
+    assert "sk-secret-value-123456" not in repr(model)
 
 
-def test_child_env_without_key(tmp_path):
-    cfg = make_config(tmp_path, config_path=None)
-    env = build_child_env(cfg, None)
-    assert env == {"HAILER_WORKSPACE": str(cfg.workspace)}
+def test_build_model_stream_false_and_no_reasoning_effort():
+    provider = ProviderConfig(id="internal", base_url="https://x/v1", wire_api="chat", env_key="K", stream=False)
+    model = build_model(provider, "corp-gpt", "k", environ={})
+    assert model.disable_streaming is True
+    assert model.stream_usage is False
+    assert model.reasoning_effort is None
+    assert model.default_headers is None and model.default_query is None
+
+
+def test_build_model_for_the_builtin_openai_provider_is_explicit_about_url_and_api():
+    model = build_model(ProviderConfig(id="openai", env_key="OPENAI_API_KEY"), "gpt-5.5", "k", environ={"LANGSMITH_GATEWAY": "true"})
+    assert model.openai_api_base == OPENAI_BASE_URL  # not the LangSmith gateway
+    assert model.use_responses_api is True
+    assert model.stream_usage is True
+
+
+def test_build_model_never_lets_the_model_name_pick_the_wire_api():
+    provider = ProviderConfig(id="internal", base_url="https://x/v1", wire_api="chat", env_key="K")
+    model = build_model(provider, "gpt-5-codex", "k", environ={})  # langchain-openai would route this name to /responses
+    assert model.use_responses_api is False
+    assert model._use_responses_api({}) is False
+
+
+def test_tracing_is_switched_off_unless_opted_in():
+    env = {"LANGSMITH_TRACING": "true", "LANGCHAIN_TRACING_V2": "true"}
+    assert disable_tracing_unless_opted_in(env) is False
+    assert env["LANGSMITH_TRACING"] == "false" and env["LANGCHAIN_TRACING_V2"] == "false"
+    opted = {"LANGSMITH_TRACING": "true", "HAILER_TRACING": "1"}
+    assert disable_tracing_unless_opted_in(opted) is True
+    assert opted["LANGSMITH_TRACING"] == "true"
 
 
 # --------------------------------------------------------------------------- #
@@ -496,15 +299,7 @@ def test_system_prompt_names_the_notebooks_folder_not_the_notebook(tmp_path):
     text = system_prompt(cfg, ContextBundle())
     assert f"- Notebooks folder: {cfg.notebooks_root}" in text
     assert "- Notebook:" not in text
-    assert str(cfg.notebook) not in text  # the active notebook changes mid-thread; it must not be baked in
-
-
-def test_system_prompt_is_stable_across_notebook_switches(tmp_path):
-    ws = tmp_path / "ws"
-    before = make_config(tmp_path, notebook=ws / "notebooks" / "analysis.py", notebooks_dir=ws / "notebooks")
-    after = make_config(tmp_path, notebook=ws / "notebooks" / "q2_churn.py", notebooks_dir=ws / "notebooks")
-    bundle = ContextBundle(context_text="PRA101 is the counterparty credit risk return.")
-    assert system_prompt(before, bundle) == system_prompt(after, bundle)
+    assert str(cfg.notebook) not in text  # the active notebook changes mid-conversation; it must not be baked in
 
 
 def test_system_prompt_folder_falls_back_to_the_notebook_parent(tmp_path):
@@ -512,475 +307,19 @@ def test_system_prompt_folder_falls_back_to_the_notebook_parent(tmp_path):
     assert f"- Notebooks folder: {cfg.notebook.parent}" in system_prompt(cfg, ContextBundle())
 
 
-def test_packaged_prompt_covers_the_notebook_tools():
+def test_packaged_prompt_covers_the_tools_the_agent_has():
     text = agent_mod._base_prompt_text()
     assert text != agent_mod._FALLBACK_SYSTEM_PROMPT, "prompts/system.md must be packaged and non-empty"
-    for name in ("notebook_list", "notebook_create", "notebook_open", "notebook_close"):
+    from hailer.tools import TOOL_NAMES
+
+    for name in TOOL_NAMES:
         assert f"`{name}(" in text, name
     assert "## Notebooks" in text
     assert "[Hailer]" in text and "not the user's words" in text
     assert "active notebook" in text
+    assert "no shell" in text  # the prompt must not promise tools the agent does not have
     # the starter globals are still documented, but scoped to starter-template notebooks
     assert "period_files" in text and "starter template" in text
-
-
-# --------------------------------------------------------------------------- #
-# Agent lifecycle
-# --------------------------------------------------------------------------- #
-
-
-def make_agent(tmp_path, *, events=None, resume_fails=False, env=None, account="chatgpt", **cfg_overrides):
-    cfg = make_config(tmp_path, **cfg_overrides)
-    created: list[FakeCodex] = []
-
-    def factory(codex_cfg):
-        codex = FakeCodex(codex_cfg, events or scripted_events(), resume_fails=resume_fails, account=account)
-        created.append(codex)
-        return codex
-
-    ag = HailerAgent(
-        cfg,
-        ContextBundle(),
-        codex_factory=factory,
-        user_codex_config=USER_CODEX_CONFIG,
-        env=env if env is not None else {"INTERNAL_MODEL_API_KEY": "sekrit"},
-    )
-    return ag, created
-
-
-def test_start_uses_thread_start_with_expected_kwargs(tmp_path):
-    ag, created = make_agent(tmp_path)
-    tid = ag.start()
-    assert tid == "thread-1" and ag.thread_id == "thread-1"
-    codex = created[0]
-    assert codex.cfg.cwd == str(ag.config.workspace)
-    assert codex.cfg.config_overrides == ag.overrides
-    assert codex.cfg.env["INTERNAL_MODEL_API_KEY"] == "sekrit"
-    # A custom provider cannot serve Codex's reviewer model, so the thread is started through
-    # the raw client with approval policy on-request and reviewer "user" (verified live).
-    assert codex.start_calls == []
-    params = codex._client.start_params[0]
-    assert params.model == "internal-analyst" and params.model_provider == "internal"
-    assert params.sandbox.value == "workspace-write"
-    assert params.approval_policy.root.value == "on-request"
-    assert params.approvals_reviewer.value == "user"
-    assert params.cwd == str(ag.config.workspace)
-    assert "Hailer" in params.base_instructions
-    assert ag.key_source == "env"
-    assert not hasattr(ag, "_key")
-
-
-def test_start_resumes_then_falls_back(tmp_path):
-    ag, created = make_agent(tmp_path)
-    assert ag.start(resume_thread_id="old-thread") == "old-thread"
-    thread_id, params = created[0]._client.resume_params[0]
-    assert thread_id == "old-thread" and params.thread_id == "old-thread"
-    assert params.approvals_reviewer.value == "user" and params.approval_policy.root.value == "on-request"
-    assert created[0]._client.start_params == [] and created[0].start_calls == []
-
-    ag2, created2 = make_agent(tmp_path, resume_fails=True)
-    assert ag2.start(resume_thread_id="old-thread") == "thread-1"
-    assert created2[0]._client.resume_params and created2[0]._client.start_params
-
-
-def test_uses_codex_reviewer_only_for_builtin_openai_on_a_chatgpt_account():
-    builtin = ProviderConfig(id="openai", env_key="OPENAI_API_KEY", requires_openai_auth=True)
-    assert agent_mod.uses_codex_reviewer(builtin, "missing", "chatgpt") is True
-    assert agent_mod.uses_codex_reviewer(builtin, "env", "chatgpt") is True  # the signed-in account wins
-    assert agent_mod.uses_codex_reviewer(builtin, "missing", "apiKey") is False  # codex login --api-key
-    assert agent_mod.uses_codex_reviewer(builtin, "missing", "amazonBedrock") is False
-    assert agent_mod.uses_codex_reviewer(builtin, "missing", "none") is False  # signed out
-    # lookup failed: the key source decides
-    assert agent_mod.uses_codex_reviewer(builtin, "missing", None) is True
-    assert agent_mod.uses_codex_reviewer(builtin, "env", None) is False
-    assert agent_mod.uses_codex_reviewer(builtin, "keyring", None) is False
-    assert agent_mod.uses_codex_reviewer(CHAT_PROVIDER, "env", "chatgpt") is False
-    assert agent_mod.uses_codex_reviewer(CHAT_PROVIDER, "missing", None) is False
-    declared_openai = ProviderConfig(id="openai", base_url="https://gw.example/v1", env_key="OPENAI_API_KEY")
-    assert agent_mod.uses_codex_reviewer(declared_openai, "missing", "chatgpt") is False  # a base_url makes it a gateway
-
-
-def test_codex_account_type_reads_every_sdk_shape():
-    from openai_codex.generated.v2_all import GetAccountResponse
-
-    class Codex:
-        def __init__(self, response):
-            self.response = response
-
-        def account(self):
-            if isinstance(self.response, Exception):
-                raise self.response
-            return self.response
-
-    chatgpt = GetAccountResponse.model_validate(
-        {"account": {"type": "chatgpt", "email": "a@b.c", "planType": "plus"}, "requiresOpenaiAuth": False}
-    )
-    api_key = GetAccountResponse.model_validate({"account": {"type": "apiKey"}, "requiresOpenaiAuth": False})
-    signed_out = GetAccountResponse.model_validate({"account": None, "requiresOpenaiAuth": True})
-    assert agent_mod.codex_account_type(Codex(chatgpt)) == "chatgpt"
-    assert agent_mod.codex_account_type(Codex(api_key)) == "apiKey"
-    assert agent_mod.codex_account_type(Codex(signed_out)) == "none"
-    assert agent_mod.codex_account_type(Codex(RuntimeError("no app-server"))) is None
-    assert agent_mod.codex_account_type(FakeCodex(None, account="apiKey")) == "apiKey"  # the test double's shape
-    assert agent_mod.codex_account_type(FakeCodex(None, account=None)) == "none"
-
-
-HAILER_TOOL_CALL = {
-    "serverName": "hailer",
-    "_meta": {"codex_approval_kind": "mcp_tool_call"},
-    "message": 'Allow the hailer MCP server to run tool "marimo_status"?',
-}
-
-
-def test_approval_handler_accepts_only_hailer_mcp_tool_calls():
-    from openai_codex.client import CodexClient
-
-    sdk_default = CodexClient()._default_approval_handler  # constructing a client does not start Codex
-    seen: list[tuple[str, Any]] = []
-
-    def default(method, params):
-        seen.append((method, params))
-        return sdk_default(method, params)
-
-    handle = agent_mod.approval_handler(default)
-    assert handle("mcpServer/elicitation/request", HAILER_TOOL_CALL) == {"action": "accept", "content": {}}
-    persistable = dict(HAILER_TOOL_CALL, _meta={"codex_approval_kind": "mcp_tool_call", "persist": ["session", "always"]})
-    assert handle("mcpServer/elicitation/request", persistable) == {
-        "action": "accept",
-        "content": {},
-        "_meta": {"persist": "session"},  # one request per tool per thread, never "always"
-    }
-    always_only = dict(HAILER_TOOL_CALL, _meta={"codex_approval_kind": "mcp_tool_call", "persist": ["always"]})
-    assert handle("mcpServer/elicitation/request", always_only) == {"action": "accept", "content": {}}
-    assert seen == []
-    other_server = dict(HAILER_TOOL_CALL, serverName="cua_repl")
-    other_kind = dict(HAILER_TOOL_CALL, _meta={"codex_approval_kind": "mcp_elicitation"})
-    assert handle("mcpServer/elicitation/request", other_server) == {}
-    assert handle("mcpServer/elicitation/request", other_kind) == {}
-    assert handle("mcpServer/elicitation/request", None) == {}
-    assert handle("mcpServer/elicitation/request", {"serverName": "hailer"}) == {}  # no _meta: not a tool call
-    assert handle("item/commandExecution/requestApproval", {"itemId": "c1"}) == {"decision": "accept"}
-    assert handle("item/fileChange/requestApproval", {"itemId": "f1"}) == {"decision": "accept"}
-    assert handle("some/unknown/request", {}) == {}
-    assert [m for m, _ in seen] == [
-        "mcpServer/elicitation/request",
-        "mcpServer/elicitation/request",
-        "mcpServer/elicitation/request",
-        "mcpServer/elicitation/request",
-        "item/commandExecution/requestApproval",
-        "item/fileChange/requestApproval",
-        "some/unknown/request",
-    ]
-
-
-def test_agent_installs_the_approval_handler_on_the_client_it_uses(tmp_path):
-    ag, created = make_agent(tmp_path)
-    ag._ensure_codex()
-    handler = created[0]._client._approval_handler
-    assert handler("mcpServer/elicitation/request", HAILER_TOOL_CALL) == {"action": "accept", "content": {}}
-    assert handler("mcpServer/elicitation/request", dict(HAILER_TOOL_CALL, serverName="other")) == {}
-    assert handler("item/commandExecution/requestApproval", {}) == {"decision": "accept"}
-    ag._ensure_codex()  # idempotent: the runtime, and its handler, are created once
-    assert created[0]._client._approval_handler is handler and len(created) == 1
-
-
-def test_runtime_without_an_approval_handler_is_an_agent_error(tmp_path):
-    class BareCodex:
-        def __init__(self, cfg):
-            self._client = SimpleNamespace()  # no _approval_handler
-
-        def close(self):
-            pass
-
-    cfg = make_config(tmp_path)
-    ag = HailerAgent(cfg, ContextBundle(), codex_factory=BareCodex, user_codex_config={}, env={"INTERNAL_MODEL_API_KEY": "k"})
-    with pytest.raises(AgentError) as err:
-        ag.start()
-    assert "approval handler" in str(err.value) and "openai-codex==0.154.0" in err.value.hint
-    assert ag._codex is None
-
-
-def test_real_sdk_thread_wraps_the_raw_client():
-    from openai_codex.api import Thread
-
-    client = object()
-    thread = REAL_SDK_THREAD(client, "t")
-    assert isinstance(thread, Thread) and thread._client is client and thread.id == "t"
-
-
-def test_reviewer_free_thread_params_carry_the_wrapper_kwargs():
-    from openai_codex import ApprovalMode, Sandbox
-
-    kwargs = {
-        "sandbox": Sandbox.workspace_write,
-        "approval_mode": ApprovalMode.auto_review,  # ignored: the params say on-request + user
-        "base_instructions": "Be brief.",
-        "cwd": "C:\\ws",
-        "model": "m",
-        "model_provider": "internal",
-    }
-    start = agent_mod.reviewer_free_thread_params(kwargs)
-    wire = start.model_dump(by_alias=True, exclude_none=True, mode="json")
-    assert wire["approvalPolicy"] == "on-request" and wire["approvalsReviewer"] == "user"
-    assert wire["sandbox"] == "workspace-write" and wire["model"] == "m" and wire["modelProvider"] == "internal"
-    assert wire["baseInstructions"] == "Be brief." and wire["cwd"] == "C:\\ws"
-    assert "config" not in wire
-    resume = agent_mod.reviewer_free_thread_params(kwargs, "old-thread")
-    wire = resume.model_dump(by_alias=True, exclude_none=True, mode="json")
-    assert wire["threadId"] == "old-thread" and wire["approvalsReviewer"] == "user" and wire["approvalPolicy"] == "on-request"
-
-
-def test_reviewer_free_thread_params_forward_every_kwarg_and_reject_unknown_ones():
-    kwargs = {"model": "m", "developer_instructions": "Prefer Polars."}
-    for resume_id in (None, "old-thread"):
-        wire = agent_mod.reviewer_free_thread_params(kwargs, resume_id).model_dump(by_alias=True, exclude_none=True, mode="json")
-        assert wire["developerInstructions"] == "Prefer Polars." and wire["model"] == "m"
-    start = agent_mod.reviewer_free_thread_params({"model": "m", "ephemeral": True}).model_dump(by_alias=True, exclude_none=True, mode="json")
-    assert start["ephemeral"] is True
-    with pytest.raises(TypeError, match="ephemeral"):  # start-only in the SDK as well
-        agent_mod.reviewer_free_thread_params({"model": "m", "ephemeral": True}, "old-thread")
-    with pytest.raises(TypeError, match="not_a_param"):
-        agent_mod.reviewer_free_thread_params({"model": "m", "not_a_param": 1})
-    with pytest.raises(TypeError, match="ThreadResumeParams"):
-        agent_mod.reviewer_free_thread_params({"model": "m", "not_a_param": 1}, "old-thread")
-
-
-OPENAI_MODEL = ModelConfig(name="gpt-5.5", provider="openai")
-
-
-def test_builtin_openai_on_a_chatgpt_account_keeps_codex_reviewer(tmp_path):
-    ag, created = make_agent(tmp_path, env={}, account="chatgpt", model=OPENAI_MODEL)
-    assert ag.key_sources["openai"] == "missing" and ag.codex_reviewer is None
-    ag.start()
-    codex = created[0]
-    assert codex.account_calls == 1 and ag.codex_reviewer is True
-    assert codex.start_calls[0]["approval_mode"].value == "auto_review"
-    assert codex._client.start_params == []
-
-
-@pytest.mark.parametrize("account", ["apiKey", "amazonBedrock", None])
-def test_builtin_openai_on_any_other_account_starts_without_reviewer(tmp_path, account):
-    # codex login --api-key (or the desktop app in API-key mode) leaves Hailer's key source "missing",
-    # so the account reported by the runtime, not the key, must decide.
-    ag, created = make_agent(tmp_path, env={}, account=account, model=OPENAI_MODEL)
-    ag.start()
-    codex = created[0]
-    assert ag.codex_reviewer is False and codex.start_calls == []
-    assert codex._client.start_params[0].approvals_reviewer.value == "user"
-    assert codex._client.start_params[0].model_provider == "openai"
-
-
-def test_builtin_openai_with_env_key_and_no_account_starts_without_reviewer(tmp_path):
-    ag, created = make_agent(tmp_path, env={"OPENAI_API_KEY": "sk-x"}, account=None, model=OPENAI_MODEL)
-    assert ag.key_sources["openai"] == "env"
-    ag.start()
-    assert ag.codex_reviewer is False and created[0].start_calls == []
-    assert created[0]._client.start_params[0].approvals_reviewer.value == "user"
-
-
-def test_account_lookup_failure_falls_back_to_the_key_source(tmp_path):
-    ag, created = make_agent(tmp_path, env={}, account="raise", model=OPENAI_MODEL)
-    ag.start()  # no key: Codex will use whatever login it has, so keep the reviewer
-    assert ag.codex_reviewer is True and created[0].start_calls[0]["approval_mode"].value == "auto_review"
-
-    ag2, created2 = make_agent(tmp_path, env={"OPENAI_API_KEY": "sk-x"}, account="raise", model=OPENAI_MODEL)
-    ag2.start()
-    assert ag2.codex_reviewer is False and created2[0]._client.start_params[0].approvals_reviewer.value == "user"
-
-
-def test_custom_provider_never_asks_for_the_account(tmp_path):
-    ag, created = make_agent(tmp_path, account="chatgpt")
-    ag.start()
-    assert created[0].account_calls == 0 and ag.codex_reviewer is False
-
-
-def test_builtin_openai_key_source_is_known_before_a_provider_switch(tmp_path):
-    ag, created = make_agent(tmp_path, env={"INTERNAL_MODEL_API_KEY": "sekrit", "OPENAI_API_KEY": "sk-x"}, account="raise")
-    assert ag.key_sources == {"internal": "env", "openai": "env"}
-    ag.start()
-    assert created[0]._client.start_params[0].model_provider == "internal"
-    ag.set_model("gpt-5.5", provider="openai")  # account unknown: the API key means no reviewer
-    assert created[0].start_calls == []
-    assert created[0]._client.start_params[-1].model_provider == "openai"
-    assert created[0]._client.start_params[-1].approvals_reviewer.value == "user"
-
-
-def test_missing_raw_client_is_an_agent_error_naming_the_sdk_pin(tmp_path):
-    ag, created = make_agent(tmp_path)
-    ag._ensure_codex()
-    del created[0]._client
-    with pytest.raises(AgentError) as err:
-        ag.start()
-    assert "raw client" in str(err.value) and "openai-codex==0.154.0" in err.value.hint
-
-
-def test_resume_does_not_swallow_config_errors_from_the_thread_settings(tmp_path, monkeypatch, caplog):
-    ag, created = make_agent(tmp_path)
-
-    def broken_prompt(config, bundle):
-        raise ConfigError("bad prompt", hint="fix it")
-
-    monkeypatch.setattr(agent_mod, "system_prompt", broken_prompt)
-    with caplog.at_level("WARNING", logger="hailer"), pytest.raises(ConfigError, match="bad prompt"):
-        ag.start(resume_thread_id="old-thread")
-    assert "could not resume" not in caplog.text
-    assert created[0]._client.resume_params == [] and created[0]._client.start_params == []
-
-
-def test_provider_switch_recomputes_the_reviewer_choice(tmp_path):
-    ag, created = make_agent(tmp_path, account="chatgpt")  # internal key from env, ChatGPT account signed in
-    ag.start()
-    assert created[0]._client.start_params[-1].model_provider == "internal" and ag.codex_reviewer is False
-    ag.set_model("gpt-5.5", provider="openai")  # ChatGPT account: Codex's reviewer is available
-    assert created[0].start_calls[-1]["model_provider"] == "openai" and ag.codex_reviewer is True
-    assert created[0].start_calls[-1]["approval_mode"].value == "auto_review"
-    ag.set_model("internal-analyst", provider="internal")
-    assert created[0]._client.start_params[-1].model_provider == "internal" and ag.codex_reviewer is False
-    assert created[0]._client.start_params[-1].approvals_reviewer.value == "user"
-
-
-def test_missing_key_for_custom_provider_is_credentials_error(tmp_path):
-    ag, created = make_agent(tmp_path, env={})
-    assert ag.key_source == "missing"
-    with pytest.raises(CredentialsError) as err:
-        ag.start()
-    assert "INTERNAL_MODEL_API_KEY" in str(err.value)
-    assert "hailer login internal" in err.value.hint
-    assert created == []  # runtime never launched
-
-
-def test_missing_key_for_openai_is_not_fatal(tmp_path):
-    ag, created = make_agent(
-        tmp_path, env={}, model=ModelConfig(name="gpt-5.5", provider="openai"), providers={}
-    )
-    assert ag.start() == "thread-1"
-    assert "OPENAI_API_KEY" not in created[0].cfg.env if created[0].cfg.env else True
-
-
-def test_run_turn_translates_events_and_collects_summary(tmp_path):
-    ag, created = make_agent(tmp_path)
-    ag.start()
-    events: list[AgentEvent] = []
-    summary = ag.run_turn("what's driving the increase?", on_event=events.append)
-
-    kinds = [(e.kind, e.text) for e in events]
-    assert ("command", "dir data") in kinds
-    assert ("command_output", "25-01 pra101.parquet\n") in kinds
-    assert ("tool_call", "hailer.marimo_execute") in kinds
-    tool_event = next(e for e in events if e.kind == "tool_call")
-    assert "print(1)" in tool_event.detail["arguments"]
-    assert ("reasoning", "thinking") in kinds
-    assert [e.text for e in events if e.kind == "message_delta"] == ["RWA rose ", "5.6%."]
-
-    assert summary.final_response == "RWA rose 5.6%."
-    assert summary.thread_id == "thread-1" and summary.turn_id == "turn-1"
-    assert summary.commands == ["dir data"]
-    assert summary.tool_calls == ["hailer.marimo_execute"]
-    assert (summary.input_tokens, summary.output_tokens) == (1200, 80)
-    assert summary.duration_ms == 321 and summary.status == "completed"
-
-    thread = created[0]
-    thread_obj = ag._thread
-    assert thread_obj.turn_calls[0][0] == "what's driving the increase?"
-    assert thread_obj.turn_calls[0][1]["model"] == "internal-analyst"
-
-
-def test_run_turn_with_skill_input(tmp_path):
-    ag, _ = make_agent(tmp_path)
-    ag.start()
-    skill = SkillInfo(name="pra101-recon", description="d", path=tmp_path / "skills" / "pra101-recon")
-    ag.run_turn("reconcile", skill=skill)
-    turn_input = ag._thread.turn_calls[0][0]
-    assert isinstance(turn_input, list) and len(turn_input) == 2
-    assert turn_input[0].name == "pra101-recon" and turn_input[0].path.endswith("SKILL.md")
-    assert turn_input[1].text == "reconcile"
-
-
-NOTICE = "[Hailer] The active notebook is now notebooks/q2_churn.py (reopened, 7 cells). Call notebook_cells before editing."
-
-
-def test_run_turn_with_preamble_sends_notice_then_message(tmp_path):
-    ag, _ = make_agent(tmp_path)
-    ag.start()
-    ag.run_turn("continue with the churn table", preamble=NOTICE)
-    turn_input = ag._thread.turn_calls[0][0]
-    assert isinstance(turn_input, list) and len(turn_input) == 2
-    assert turn_input[0].text == NOTICE
-    assert turn_input[1].text == "continue with the churn table"
-
-
-def test_run_turn_with_skill_and_preamble_orders_skill_notice_message(tmp_path):
-    ag, _ = make_agent(tmp_path)
-    ag.start()
-    skill = SkillInfo(name="pra101-recon", description="d", path=tmp_path / "skills" / "pra101-recon")
-    ag.run_turn("reconcile", skill=skill, preamble=NOTICE)
-    turn_input = ag._thread.turn_calls[0][0]
-    assert len(turn_input) == 3
-    assert turn_input[0].name == "pra101-recon" and turn_input[0].path.endswith("SKILL.md")
-    assert turn_input[1].text == NOTICE
-    assert turn_input[2].text == "reconcile"
-
-
-@pytest.mark.parametrize("preamble", [None, "", "   \n"])
-def test_run_turn_without_preamble_keeps_plain_string_input(tmp_path, preamble):
-    ag, _ = make_agent(tmp_path)
-    ag.start()
-    ag.run_turn("hello", preamble=preamble)
-    assert ag._thread.turn_calls[0][0] == "hello"
-
-
-def test_final_response_falls_back_to_deltas_when_no_final_item(tmp_path):
-    events = [
-        N("item/agentMessage/delta", delta="partial ", item_id="a"),
-        N("item/agentMessage/delta", delta="answer", item_id="a"),
-        turn_completed(),
-    ]
-    ag, _ = make_agent(tmp_path, events=events)
-    ag.start()
-    assert ag.run_turn("hi").final_response == "partial answer"
-
-
-def test_interrupt_calls_handle(tmp_path):
-    full = scripted_events()
-    events = full[:3] + [turn_completed(status="interrupted")]  # started, command, output, done
-    ag, _ = make_agent(tmp_path, events=events)
-    ag.start()
-    seen: list[str] = []
-
-    def on_event(ev: AgentEvent) -> None:
-        seen.append(ev.kind)
-        if ev.kind == "command":
-            ag.interrupt()
-
-    summary = ag.run_turn("go", on_event=on_event)
-    assert ag._thread.last_handle.interrupted is True
-    assert "command_output" not in seen  # skipped after the interrupt
-    assert summary.status == "interrupted"
-    assert ag._handle is None
-    ag.interrupt()  # no active turn: must be a no-op
-
-
-def test_new_thread_and_set_model(tmp_path):
-    ag, created = make_agent(tmp_path)
-    ag.start()
-    assert ag.new_thread() == "thread-2"
-    assert ag.set_model("internal-fast") is False  # same provider: no new thread
-    ag.run_turn("x")
-    assert ag._thread.turn_calls[0][1]["model"] == "internal-fast"
-    # provider switch starts a fresh thread automatically
-    assert ag.set_model("gpt-5.5", provider="openai") is True  # it started the thread itself
-    assert ag.thread_id == "thread-3"
-    assert created[0].start_calls[-1]["model_provider"] == "openai"
-    with pytest.raises(ConfigError):
-        ag.set_model("x", provider="ghost")
-
-
-def test_close_is_idempotent(tmp_path):
-    ag, created = make_agent(tmp_path)
-    ag.start()
-    ag.close()
-    ag.close()
-    assert created[0].closed and ag.thread_id == "thread-1" and not ag.started
 
 
 # --------------------------------------------------------------------------- #
@@ -988,461 +327,464 @@ def test_close_is_idempotent(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
-def test_map_transport_config_error(tmp_path):
+class _Response:
+    def __init__(self, status: int) -> None:
+        self.status_code = status
+        self.request = object()
+        self.headers: dict[str, str] = {}
+
+
+def status_error(status: int, body: Any, message: str = "request failed") -> openai.APIStatusError:
+    return openai.APIStatusError(message, response=_Response(status), body=body)  # type: ignore[arg-type]
+
+
+def test_map_401_is_a_credentials_error_with_the_login_hint(tmp_path):
+    err = map_exception(status_error(401, {"message": "Invalid API key"}), make_config(tmp_path))
+    assert isinstance(err, CredentialsError)
+    assert "provider 'internal'" in str(err)
+    assert "hailer login internal" in err.hint and "INTERNAL_MODEL_API_KEY" in err.hint
+
+
+def test_map_unknown_model_names_the_model_in_use_and_quotes_the_endpoint(tmp_path):
+    body = {"detail": [{"type": "string_pattern_mismatch", "loc": ["body", "model"], "msg": "String should match pattern '^corp-'"}]}
+    err = map_exception(status_error(422, body), make_config(tmp_path), model="gpt-5.5")
+    assert isinstance(err, ProviderError)
+    assert str(err) == "Unknown model 'gpt-5.5' for provider 'internal'."
+    assert "[model].name" in err.hint and "String should match pattern" in err.hint
+
+
+def test_map_openai_model_not_found_404(tmp_path):
+    body = {"message": "The model `gpt-9` does not exist", "type": "invalid_request_error", "param": None, "code": "model_not_found"}
+    err = map_exception(status_error(404, body), make_config(tmp_path), model="gpt-9", provider="openai")
+    assert str(err) == "Unknown model 'gpt-9' for provider 'openai'."
+
+
+def test_map_404_points_at_the_other_wire_api(tmp_path):
+    err = map_exception(status_error(404, {"detail": "Not Found"}), make_config(tmp_path))
+    assert isinstance(err, ProviderError)
+    assert "did not accept the request" in str(err)
+    assert "POST https://llm.example.internal/v1/chat/completions" in err.hint
+    assert 'wire_api = "responses"' in err.hint and "Not Found" in err.hint
+    responses = make_config(tmp_path, providers={"internal": ProviderConfig(id="internal", base_url="https://x/v1", env_key="K")})
+    hint = map_exception(status_error(404, {"detail": "Not Found"}), responses).hint
+    assert "POST https://x/v1/responses" in hint and 'wire_api = "chat"' in hint
+
+
+def test_map_rejected_request_names_the_switches_still_on(tmp_path):
+    body = {"detail": [{"type": "extra_forbidden", "loc": ["body", "stream_options"], "msg": "Extra inputs are not permitted"}]}
+    err = map_exception(status_error(422, body), make_config(tmp_path))
+    assert isinstance(err, ProviderError) and "rejected the request (HTTP 422)" in str(err)
+    assert "stream = false or stream_options = false" in err.hint
+    assert "reasoning_effort" in err.hint and "Extra inputs are not permitted" in err.hint
+    off = ProviderConfig(id="internal", base_url="https://x/v1", wire_api="chat", env_key="K", stream=False, stream_options=False)
+    hint = map_exception(status_error(400, {"message": "bad field"}), make_config(tmp_path, providers={"internal": off})).hint
+    assert "stream = false" not in hint.split("The endpoint said")[0].replace("stream = false, one JSON reply", "")
+
+
+def test_map_403_429_and_5xx(tmp_path):
     cfg = make_config(tmp_path)
-    exc = TransportClosedError(
-        "Codex process closed stdout. stderr_tail=Error: error loading default config after config error: "
-        "invalid transport in `mcp_servers.cua_repl`"
-    )
-    mapped = map_exception(exc, cfg)
-    assert isinstance(mapped, ConfigError) and "config.toml" in mapped.hint
+    assert "refused access (HTTP 403)" in str(map_exception(status_error(403, {"message": "forbidden"}), cfg))
+    busy = map_exception(status_error(429, {"message": "slow down"}), cfg)
+    assert "unavailable (HTTP 429)" in str(busy) and "slow down" in busy.hint
+    assert "unavailable (HTTP 503)" in str(map_exception(status_error(503, None, "upstream down"), cfg))
 
 
-def test_map_transport_other_is_agent_error(tmp_path):
-    mapped = map_exception(TransportClosedError("Codex process closed stdout. stderr_tail=panic"), make_config(tmp_path))
-    assert isinstance(mapped, AgentError)
+def test_map_context_overflow_suggests_new_or_earlier_summaries(tmp_path):
+    body = {"message": "This model's maximum context length is 128000 tokens", "code": "context_length_exceeded"}
+    err = map_exception(status_error(400, body), make_config(tmp_path))
+    assert "context window" in str(err) and "/new" in err.hint and "summarize_after_tokens" in err.hint
 
 
-def test_map_401_is_credentials_error(tmp_path):
-    mapped = map_exception(RuntimeError("HTTP 401 Unauthorized"), make_config(tmp_path))
-    assert isinstance(mapped, CredentialsError) and "hailer login internal" in mapped.hint
-
-
-def test_map_connection_refused_is_provider_error(tmp_path):
-    mapped = map_exception(RuntimeError("error sending request: connection refused"), make_config(tmp_path))
-    assert isinstance(mapped, ProviderError) and "llm.example.internal" in str(mapped)
-
-
-def test_map_404_mentions_responses_api(tmp_path):
-    mapped = map_exception(RuntimeError("404 Not Found"), make_config(tmp_path))
-    assert isinstance(mapped, ProviderError) and "Responses API" in mapped.hint
-    assert "https://llm.example.internal/v1/responses" in mapped.hint
-    assert 'wire_api = "chat"' in mapped.hint
-    assert "{base_url}" not in mapped.hint
-
-
-def test_map_404_for_chat_provider_names_chat_completions(tmp_path):
-    cfg = make_config(tmp_path, providers={"internal": CHAT_PROVIDER})
-    mapped = map_exception(RuntimeError("404 Not Found"), cfg)
-    assert isinstance(mapped, ProviderError)
-    assert "https://llm.example.internal/v1/chat/completions" in mapped.hint
-    assert "/responses," not in mapped.hint
-    assert "set stream = false" in mapped.hint  # the usual reason a gateway rejects the bridge's request
-
-
-def test_map_404_for_non_streaming_chat_provider_does_not_suggest_stream_false(tmp_path):
-    from dataclasses import replace
-
-    cfg = make_config(tmp_path, providers={"internal": replace(CHAT_PROVIDER, stream=False)})
-    mapped = map_exception(RuntimeError("404 Not Found"), cfg)
-    assert isinstance(mapped, ProviderError)
-    assert "stream = false" in mapped.hint and "set stream = false" not in mapped.hint
-    assert "one JSON reply" in mapped.hint
-
-
-def test_failed_turn_is_mapped(tmp_path):
-    events = [turn_completed(status="failed", error_message="401 unauthorized")]
-    ag, _ = make_agent(tmp_path, events=events)
-    ag.start()
-    with pytest.raises(CredentialsError):
-        ag.run_turn("hi")
-    assert ag._handle is None
-
-
-def test_turn_without_completion_is_agent_error(tmp_path):
-    ag, _ = make_agent(tmp_path, events=[N("item/agentMessage/delta", delta="x", item_id="a")])
-    ag.start()
-    with pytest.raises(AgentError):
-        ag.run_turn("hi")
-
-
-def test_factory_failure_is_mapped(tmp_path):
+def test_map_connection_and_timeout_errors(tmp_path):
     cfg = make_config(tmp_path)
+    unreachable = map_exception(openai.APIConnectionError(request=object()), cfg)  # type: ignore[arg-type]
+    assert isinstance(unreachable, ProviderError)
+    assert str(unreachable) == "Could not reach the model endpoint at https://llm.example.internal/v1."
+    assert "hailer doctor" in unreachable.hint
+    timeout = map_exception(openai.APITimeoutError(request=object()), cfg)  # type: ignore[arg-type]
+    assert "did not answer in time" in str(timeout)
 
-    def factory(_cfg):
-        raise TransportClosedError("Codex process closed stdout. stderr_tail=error loading default config after config error: bad")
 
-    ag = HailerAgent(cfg, ContextBundle(), codex_factory=factory, user_codex_config={}, env={"INTERNAL_MODEL_API_KEY": "k"})
+def test_map_masks_keys_the_endpoint_echoes_back(tmp_path):
+    err = map_exception(status_error(400, {"message": "bad header Authorization: Bearer sk-abcdef0123456789abcdef"}), make_config(tmp_path))
+    assert "sk-abcdef0123456789abcdef" not in err.hint
+
+
+def test_map_generic_failures_and_hailer_errors_pass_through(tmp_path):
+    cfg = make_config(tmp_path)
+    err = map_exception(RuntimeError("boom"), cfg)
+    assert isinstance(err, AgentError) and "RuntimeError: boom" in err.hint
+    original = CredentialsError("no key", hint="login")
+    assert map_exception(original, cfg) is original
+
+
+# --------------------------------------------------------------------------- #
+# Agent lifecycle
+# --------------------------------------------------------------------------- #
+
+
+def test_undeclared_provider_fails_at_construction(tmp_path):
+    cfg = make_config(tmp_path, model=ModelConfig(name="x", provider="azure"))
     with pytest.raises(ConfigError):
-        ag.start()
+        HailerAgent(cfg, ContextBundle(), env=KEY_ENV)
+
+
+def test_start_creates_the_store_and_a_thread(harness):
+    h = harness([])
+    assert not h.agent.started
+    thread_id = h.agent.start()
+    assert thread_id and h.agent.thread_id == thread_id and h.agent.started
+    assert (h.config.workspace / ".hailer" / "threads.sqlite").is_file()
+    assert h.factory_calls == [("internal", "internal-analyst", KEY_ENV["INTERNAL_MODEL_API_KEY"])]
+    assert h.agent.key_source == "env"
+
+
+def test_missing_key_is_a_credentials_error_for_every_provider(tmp_path, harness):
+    h = harness([], env={})
+    assert h.agent.key_source == "missing"
+    with pytest.raises(CredentialsError) as err:
+        h.agent.start()
+    assert "INTERNAL_MODEL_API_KEY is not set" in str(err.value) and "hailer login internal" in err.value.hint
+    builtin = harness([], env={}, model=ModelConfig(name="gpt-5.5", provider="openai", summarize_after_tokens=0))
+    with pytest.raises(CredentialsError) as err:
+        builtin.agent.start()
+    assert "OPENAI_API_KEY is not set" in str(err.value) and "hailer login openai" in err.value.hint
+
+
+def test_key_from_the_credential_store_is_used(harness, monkeypatch):
+    monkeypatch.setattr(agent_mod._secrets, "_keyring_get", lambda username: "stored-key" if username == "internal:INTERNAL_MODEL_API_KEY" else None)
+    h = harness([], env={})
+    h.agent.start()
+    assert h.agent.key_source == "keyring"
+    assert h.factory_calls[-1] == ("internal", "internal-analyst", "stored-key")
+
+
+def test_a_conversation_resumes_after_a_restart_and_an_unknown_id_starts_fresh(harness):
+    h = harness([say("first answer"), say("second answer")])
+    thread_id = h.agent.start()
+    h.agent.run_turn("first question")
+    h.agent.close()
+
+    again = h.new_agent()
+    try:
+        assert again.start(resume_thread_id=thread_id) == thread_id
+        again.run_turn("second question")
+        assert roles(h.model.seen[-1]) == ["system", "human", "ai", "human"]
+        fresh = again.start(resume_thread_id="no-such-thread")
+        assert fresh != "no-such-thread" and again.thread_id == fresh
+    finally:
+        again.close()
+
+
+def test_new_thread_forgets_the_previous_conversation(harness):
+    h = harness([say("one"), say("two")])
+    first = h.agent.start()
+    h.agent.run_turn("hello")
+    second = h.agent.new_thread()
+    assert second != first
+    h.agent.run_turn("hello again")
+    assert roles(h.model.seen[-1]) == ["system", "human"]  # nothing carried over
+    h.agent.close()
+    other = h.new_agent()
+    try:
+        assert other.start(resume_thread_id=first) != first  # the old thread was deleted, not just left behind
+    finally:
+        other.close()
+
+
+def test_set_model_rebuilds_the_model_and_rejects_undeclared_providers(harness):
+    providers = {"internal": CHAT_PROVIDER, "azure": ProviderConfig(id="azure", base_url="https://az/v1", env_key="AZURE_KEY")}
+    h = harness([say("ok")], env={**KEY_ENV, "AZURE_KEY": "az-key"}, providers=providers)
+    h.agent.start()
+    h.agent.set_model("gpt-x", "azure")
+    assert (h.agent.model, h.agent.provider_id) == ("gpt-x", "azure")
+    h.agent.run_turn("hello")
+    assert h.factory_calls[-1] == ("azure", "gpt-x", "az-key")
+    with pytest.raises(ConfigError):
+        h.agent.set_model("y", "nope")
+    assert h.agent.provider_id == "azure"
+
+
+def test_close_is_idempotent_and_the_agent_can_start_again(harness):
+    h = harness([say("ok")])
+    h.agent.close()  # never started
+    h.agent.start()
+    h.agent.close()
+    h.agent.close()
+    assert not h.agent.started
+    h.agent.start()
+    assert h.agent.run_turn("hello").final_response == "ok"
 
 
 # --------------------------------------------------------------------------- #
-# Fix-wave additions: secrets in env only, Ctrl+C, set_model, error classification
+# Turns
 # --------------------------------------------------------------------------- #
 
 
-def test_child_env_carries_marimo_token_but_overrides_never_do(tmp_path):
-    cfg = make_config(tmp_path, marimo_token="marimo-secret-token")
-    env = build_child_env(cfg, "sekrit")
-    assert env["HAILER_MARIMO_TOKEN"] == "marimo-secret-token"
-    ov = build_config_overrides(cfg, USER_CODEX_CONFIG)
-    assert not any("marimo-secret-token" in o or "HAILER_MARIMO_TOKEN" in o for o in ov)
-    assert not any("sekrit" in o for o in ov)
+def test_run_turn_runs_tools_reports_events_and_sums_usage(harness):
+    h = harness([call("echo", {"text": "hi"}, text="Let me check."), say("All done.")])
+    events: list[AgentEvent] = []
+    summary = h.agent.run_turn("please echo hi", on_event=events.append)
+
+    assert summary.final_response == "All done."
+    assert h.model.bound == ["echo", "slow"]  # the model is offered exactly the agent's tools
+    assert summary.tool_calls == ["echo"] and h.tool_log == ["echo:hi"]
+    assert (summary.input_tokens, summary.output_tokens) == (30, 12)  # both model calls of the turn
+    assert summary.thread_id == h.agent.thread_id and summary.status == "completed" and summary.duration_ms >= 0
+    tool_events = [e for e in events if e.kind == "tool_call"]
+    assert [(e.text, e.detail["arguments"]) for e in tool_events] == [("echo", "{'text': 'hi'}")]
+    assert any(e.kind == "message_delta" for e in events)
+
+    first, second = h.model.seen
+    assert isinstance(first[0], SystemMessage) and "PRA101 is the counterparty" in first[0].content
+    assert roles(first) == ["system", "human"] and first[1].content == "please echo hi"
+    assert roles(second) == ["system", "human", "ai", "tool"] and second[-1].content == "echo: hi"
 
 
-def test_keyboard_interrupt_during_turn_interrupts_and_reraises(tmp_path):
-    full = scripted_events()
-    events = full[:3] + [turn_completed(status="interrupted")]
-    ag, _ = make_agent(tmp_path, events=events)
-    ag.start()
-    seen: list[str] = []
-
-    def on_event(ev: AgentEvent) -> None:
-        seen.append(ev.kind)
-        if ev.kind == "command":
-            raise KeyboardInterrupt
-
-    with pytest.raises(KeyboardInterrupt):
-        ag.run_turn("go", on_event=on_event)
-    assert ag._thread.last_handle.interrupted is True  # interrupted on the LOCAL handle
-    assert ag._handle is None
-    assert "command_output" not in seen  # nothing surfaced after the interrupt
-    ag.interrupt()  # idempotent when nothing is running
-
-    # the agent is usable again afterwards
-    ag._thread.events = scripted_events()
-    summary = ag.run_turn("again")
-    assert summary.status == "completed" and summary.final_response == "RWA rose 5.6%."
+def test_usage_is_none_when_the_endpoint_reports_none(harness):
+    h = harness([say("ok", tokens=None)])
+    summary = h.agent.run_turn("hello")
+    assert summary.input_tokens is None and summary.output_tokens is None
 
 
-def test_stream_errors_from_the_pump_thread_are_mapped(tmp_path):
-    class BoomHandle:
-        def stream(self):
-            raise RuntimeError("error sending request: connection refused")
-            yield  # pragma: no cover
+def test_preamble_and_skill_go_above_the_users_text_in_one_message(harness, tmp_path):
+    h = harness([say("ok")])
+    skill_dir = h.config.skills_dir / "pra101-recon"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\nname: pra101-recon\ndescription: Reconcile\n---\nCompare months pairwise.\n", encoding="utf-8")
+    skill = SkillInfo(name="pra101-recon", description="Reconcile", path=skill_dir)
 
-        def interrupt(self) -> None:
-            pass
-
-    ag, _ = make_agent(tmp_path)
-    ag.start()
-    ag._thread.turn = lambda *a, **k: BoomHandle()  # type: ignore[assignment]
-    with pytest.raises(ProviderError):
-        ag.run_turn("hi")
-    assert ag._handle is None
-
-
-def test_map_unknown_model_is_not_the_proxy_hint(tmp_path):
-    exc = RuntimeError("The model `gpt-9` does not exist or you do not have access to it.")
-    mapped = map_exception(exc, make_config(tmp_path), model="gpt-9")
-    assert isinstance(mapped, ProviderError)
-    assert "Unknown model 'gpt-9'" in str(mapped) and "internal" in str(mapped)
-    assert "Responses API" not in mapped.hint
+    h.agent.run_turn("reconcile march", skill=skill, preamble="[Hailer] The active notebook is now notebooks/q2.py.")
+    assert roles(h.model.seen[0]) == ["system", "human"]  # one user message, not three
+    content = h.model.seen[0][1].content
+    assert content.startswith("[Hailer] The user attached the skill 'pra101-recon'")
+    assert "Compare months pairwise." in content
+    assert content.index("Compare months pairwise.") < content.index("[Hailer] The active notebook is now") < content.index("reconcile march")
+    assert content.endswith("reconcile march")
 
 
-def test_map_generic_not_found_is_agent_error(tmp_path):
-    mapped = map_exception(RuntimeError("thread not found"), make_config(tmp_path))
-    assert isinstance(mapped, AgentError)
+def test_blank_preamble_is_ignored(harness):
+    h = harness([say("ok")])
+    h.agent.run_turn("hello", preamble="   ")
+    assert h.model.seen[0][1].content == "hello"
 
 
-def test_map_tool_timeout_is_not_an_endpoint_failure(tmp_path):
-    mapped = map_exception(RuntimeError("MCP tool call marimo_execute timed out after 600s"), make_config(tmp_path))
-    assert isinstance(mapped, AgentError) and "tool call timed out" in str(mapped).lower()
-    mapped = map_exception(RuntimeError("request timed out while connecting"), make_config(tmp_path))
-    assert isinstance(mapped, ProviderError) and "Could not reach" in str(mapped)
+def test_reloaded_context_applies_to_the_next_turn_of_the_same_conversation(harness):
+    h = harness([say("one"), say("two")])
+    h.agent.run_turn("first")
+    h.agent.bundle = ContextBundle(context_text="New rule: report in GBP millions.")
+    h.agent.run_turn("second")
+    assert "PRA101 is the counterparty" in h.model.seen[0][0].content
+    assert "New rule: report in GBP millions." in h.model.seen[1][0].content
+    assert roles(h.model.seen[1]) == ["system", "human", "ai", "human"]  # same conversation
 
 
-def test_failed_turn_with_unknown_model_uses_live_model_name(tmp_path):
-    events = [turn_completed(status="failed", error_message="model `internal-fast` not found")]
-    ag, _ = make_agent(tmp_path, events=events)
-    ag.start()
-    ag.set_model("internal-fast")
+def test_a_failed_turn_is_mapped_and_its_message_is_kept_for_the_retry(harness):
+    body = {"detail": [{"loc": ["body", "stream"], "msg": "streaming is not supported"}]}
+    h = harness([status_error(422, body), say("recovered")])
     with pytest.raises(ProviderError) as err:
-        ag.run_turn("hi")
-    assert "internal-fast" in str(err.value)
+        h.agent.run_turn("what changed in March?")
+    assert "rejected the request (HTTP 422)" in str(err.value) and "streaming is not supported" in err.value.hint
+
+    summary = h.agent.run_turn("try again")
+    assert summary.final_response == "recovered"
+    retry = h.model.seen[-1]
+    assert roles(retry) == ["system", "human"]  # merged: strict chat templates refuse two user messages in a row
+    assert retry[1].content == "what changed in March?\n\ntry again"
+
+
+def test_summarisation_runs_on_the_configured_model_and_stays_out_of_the_reply(harness):
+    def reply(messages: list[Any]) -> AIMessage:
+        if any("Messages to summarize" in str(getattr(m, "content", "")) for m in messages):
+            return say("SUMMARY OF EARLIER TURNS")
+        return say("answer " + "x" * 400)
+
+    h = harness([reply] * 60, model=ModelConfig(name="internal-analyst", provider="internal", summarize_after_tokens=300))
+    events: list[AgentEvent] = []
+    for i in range(14):
+        summary = h.agent.run_turn(f"question {i} " + "y" * 200, on_event=events.append)
+        assert summary.final_response.startswith("answer ")
+    summary_calls = [seen for seen in h.model.seen if any("Messages to summarize" in str(getattr(m, "content", "")) for m in seen)]
+    assert summary_calls, "the conversation passed the threshold, so older turns must have been summarised"
+    assert all("SUMMARY OF EARLIER TURNS" not in e.text for e in events if e.kind == "message_delta")
+    assert any("SUMMARY OF EARLIER TURNS" in str(m.content) for m in h.model.seen[-1])  # the model now works from the summary
+    assert len(h.model.seen[-1]) < 2 * 14  # and no longer receives every turn
 
 
 # --------------------------------------------------------------------------- #
-# Endpoint errors quote the gateway (chat bridge URL is not evidence)
+# Ctrl+C
 # --------------------------------------------------------------------------- #
 
 
-_GATEWAY_422 = (
-    'unexpected status 422 Unprocessable Entity: {"detail": [{"type": "string_pattern_mismatch", '
-    '"loc": ["body", "model"], "msg": "String should match pattern \'^(my-model)$\'", "input": "codex-auto-review"}]}'
-    ", url: http://127.0.0.1:54321/internal/responses"
-)
+def interrupt_after(seconds: float) -> threading.Timer:
+    timer = threading.Timer(seconds, _thread.interrupt_main)  # what Ctrl+C does: SIGINT for the main thread
+    timer.daemon = True
+    timer.start()
+    return timer
 
 
-def test_map_422_quotes_the_gateway_and_skips_the_protocol_hint(tmp_path):
-    cfg = make_config(tmp_path, providers={"internal": CHAT_PROVIDER})
-    mapped = map_exception(RuntimeError(_GATEWAY_422), cfg)
-    assert isinstance(mapped, ProviderError) and "rejected the request" in str(mapped)
-    assert "The endpoint said:" in mapped.hint and "String should match pattern" in mapped.hint
-    assert "Responses API" not in mapped.hint and 'wire_api = "responses"' not in mapped.hint
-    assert "127.0.0.1" not in mapped.hint  # the bridge's loopback URL says nothing about the gateway
-    assert "https://llm.example.internal/v1/chat/completions" in mapped.hint
-    assert "\n" in mapped.hint and mapped.hint.splitlines()[-1].startswith("The endpoint said:")
+def test_ctrl_c_during_a_model_call_cancels_the_turn_at_once(harness):
+    async def never(_messages: list[Any]) -> AIMessage:
+        await asyncio.sleep(30)
+        return say("too late")
+
+    h = harness([lambda messages: never(messages), say("after the interrupt")])
+    h.agent.start()
+    timer = interrupt_after(0.5)
+    started = time.monotonic()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            h.agent.run_turn("a slow question")
+    finally:
+        timer.cancel()
+    assert time.monotonic() - started < 5
+
+    summary = h.agent.run_turn("and now?")
+    assert summary.final_response == "after the interrupt"
+    assert roles(h.model.seen[-1]) == ["system", "human"]
+    assert h.model.seen[-1][1].content == "a slow question\n\nand now?"
 
 
-def test_map_unsupported_parameter_body_is_quoted_not_reinterpreted(tmp_path):
-    body = (
-        '{"error": {"message": "Unsupported parameter: \'reasoning_effort\' is not supported with this model.", '
-        '"type": "invalid_request_error", "param": null, "code": null}}'
-    )
-    cfg = make_config(tmp_path, providers={"internal": CHAT_PROVIDER})
-    mapped = map_exception(RuntimeError(body), cfg)
-    assert isinstance(mapped, ProviderError) and "rejected the request" in str(mapped)
-    assert "Unsupported parameter: 'reasoning_effort'" in mapped.hint
-    assert 'reasoning_effort = ""' in mapped.hint
-    assert "Responses API" not in mapped.hint and "set stream = false in its" not in mapped.hint
+def test_ctrl_c_during_a_tool_leaves_a_valid_conversation(harness):
+    h = harness([call("slow", {"seconds": 30}, "call_slow"), say("carried on")])
+    h.agent.start()
+    timer = interrupt_after(0.7)
+    started = time.monotonic()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            h.agent.run_turn("run the slow thing")
+    finally:
+        timer.cancel()
+    assert time.monotonic() - started < 5
+    assert h.tool_log == ["slow:start"]
+
+    summary = h.agent.run_turn("what happened?")
+    assert summary.final_response == "carried on"
+    sent = h.model.seen[-1]
+    assert roles(sent) == ["system", "human", "ai", "tool", "human"]  # the dangling call got a result
+    assert isinstance(sent[3], ToolMessage) and sent[3].tool_call_id == "call_slow" and sent[3].content == INTERRUPTED_TOOL_RESULT
+    assert isinstance(sent[4], HumanMessage) and sent[4].content == "what happened?"
 
 
-def test_map_404_keeps_the_protocol_hint_and_quotes_a_real_url(tmp_path):
-    text = "unexpected status 404 Not Found: 404 page not found, url: https://llm.example.internal/v1/responses"
-    mapped = map_exception(RuntimeError(text), make_config(tmp_path))
-    assert isinstance(mapped, ProviderError) and "did not accept the request" in str(mapped)
-    assert "Responses API" in mapped.hint and 'wire_api = "chat"' in mapped.hint
-    # a real endpoint URL (not the loopback bridge) stays in the quoted reply
-    assert "The endpoint said: unexpected status 404 Not Found: 404 page not found, url: https://llm.example.internal/v1/responses" in mapped.hint
+# --------------------------------------------------------------------------- #
+# On the wire: a strict Chat-Completions-only gateway (real ChatOpenAI, loopback only)
+# --------------------------------------------------------------------------- #
+
+GATEWAY_ENV = {"CORP_KEY": "sk-spike", "CLIENT_ID": "hailer-spike"}
 
 
-def test_map_404_through_the_bridge_drops_the_loopback_url(tmp_path):
-    cfg = make_config(tmp_path, providers={"internal": CHAT_PROVIDER})
-    text = "unexpected status 404 Not Found: no route, url: http://127.0.0.1:5/internal/responses"
-    mapped = map_exception(RuntimeError(text), cfg)
-    assert "did not accept the request" in str(mapped)
-    assert "/chat/completions" in mapped.hint and "127.0.0.1" not in mapped.hint
-    assert mapped.hint.endswith("The endpoint said: unexpected status 404 Not Found: no route")
-
-
-def test_map_endpoint_reply_is_redacted_and_trimmed(tmp_path):
-    text = "unexpected status 400 Bad Request: Authorization: Bearer sk-live-abcdefgh1234 rejected\n" + "x " * 600
-    mapped = map_exception(RuntimeError(text), make_config(tmp_path))
-    said = mapped.hint.splitlines()[-1]
-    assert said.startswith("The endpoint said: ") and "sk-live-abcdefgh1234" not in said and "<redacted>" in said
-    assert "\n" not in said and len(said) <= len("The endpoint said: ") + 500
-
-
-def test_map_5xx_and_429_are_unavailable_not_rejected(tmp_path):
-    for status in (503, 429):
-        mapped = map_exception(RuntimeError(f"unexpected status {status} Whatever: try later"), make_config(tmp_path))
-        assert isinstance(mapped, ProviderError) and f"unavailable (HTTP {status})" in str(mapped)
-        assert "The endpoint said:" in mapped.hint
-
-
-def test_map_generic_text_mentioning_responses_is_not_a_protocol_error(tmp_path):
-    # "responses" used to be a signal on its own; the bridge URL always contains it.
-    mapped = map_exception(RuntimeError("stream ended before any responses arrived"), make_config(tmp_path))
-    assert isinstance(mapped, AgentError)
-
-
-def test_turn_failure_folds_in_additional_details(tmp_path):
-    error = SimpleNamespace(message="Turn failed", additional_details=_GATEWAY_422)
-    events = [
-        N("turn/started", turn=SimpleNamespace(id="turn-1")),
-        N("turn/completed", turn=SimpleNamespace(id="turn-1", status="failed", error=error, duration_ms=1)),
-    ]
-    ag, _ = make_agent(tmp_path, events=events, providers={"internal": CHAT_PROVIDER})
-    ag.start()
-    with pytest.raises(ProviderError) as info:
-        ag.run_turn("hi")
-    assert "String should match pattern" in info.value.hint
-
-
-def test_error_notification_previews_the_turn_error_message(tmp_path):
-    error = SimpleNamespace(message=_GATEWAY_422, additional_details=None, codex_error_info=None)
-    events = [
-        N("turn/started", turn=SimpleNamespace(id="turn-1")),
-        N("error", error=error, thread_id="t", turn_id="turn-1", will_retry=False),
-        turn_completed("failed", error_message=_GATEWAY_422),
-    ]
-    ag, _ = make_agent(tmp_path, events=events, providers={"internal": CHAT_PROVIDER})
-    ag.start()
-    seen: list[AgentEvent] = []
-    with pytest.raises(ProviderError):
-        ag.run_turn("hi", on_event=seen.append)
-    statuses = [e.text for e in seen if e.kind == "status"]
-    assert statuses and statuses[0].startswith("unexpected status 422 Unprocessable Entity")
-    assert "TurnError(" not in statuses[0] and "namespace(" not in statuses[0]
-
-
-# ---- review follow-ups: local errors, unknown-model naming, provider-specific hints ---------
-
-
-def test_map_local_validation_error_is_not_blamed_on_the_endpoint(tmp_path):
-    text = "1 validation error for ThreadStartParams\napproval_policy\n  Input should be 'untrusted', 'on-request' or 'never' [type=enum]"
-    mapped = map_exception(RuntimeError(text), make_config(tmp_path))
-    assert isinstance(mapped, AgentError) and "validation error for ThreadStartParams" in mapped.hint
-    assert "The endpoint" not in str(mapped)
-
-
-def test_map_local_unsupported_operation_is_not_blamed_on_the_endpoint(tmp_path):
-    mapped = map_exception(RuntimeError("unsupported operation: thread/fork"), make_config(tmp_path))
-    assert isinstance(mapped, AgentError) and "unsupported operation: thread/fork" in mapped.hint
-
-
-def test_map_unknown_model_names_the_model_the_endpoint_rejected(tmp_path):
-    body = (
-        '{"error": {"message": "The model \'codex-auto-review\' does not exist", '
-        '"type": "invalid_request_error", "param": "model", "code": "model_not_found"}}'
-    )
-    mapped = map_exception(RuntimeError(body), make_config(tmp_path))
-    assert isinstance(mapped, ProviderError)
-    assert "Unknown model 'codex-auto-review'" in str(mapped) and "internal-analyst" not in str(mapped)
-    assert "not the configured 'internal-analyst'" in mapped.hint and "codex-auto-review" in mapped.hint
-    assert mapped.hint.splitlines()[-1].startswith("The endpoint said: ")
-
-
-def test_map_unknown_model_marker_without_a_quoted_name_uses_the_configured_one(tmp_path):
-    body = '{"error": {"message": "model not found", "code": "model_not_found"}}'
-    mapped = map_exception(RuntimeError(body), make_config(tmp_path), model="gpt-9")
-    assert "Unknown model 'gpt-9'" in str(mapped) and "not the configured" not in mapped.hint
-
-
-def test_map_tool_registry_not_found_is_not_an_unknown_model(tmp_path):
-    mapped = map_exception(RuntimeError("Tool exec_command not found in model tool registry"), make_config(tmp_path))
-    assert isinstance(mapped, AgentError) and "Unknown model" not in str(mapped)
-
-
-def test_map_rejected_hint_matches_the_provider_kind(tmp_path):
-    text = 'unexpected status 400 Bad Request: {"error": {"message": "nope"}}'
-    responses_provider = map_exception(RuntimeError(text), make_config(tmp_path))
-    assert "rejected the request" in str(responses_provider)
-    assert "stream = false" not in responses_provider.hint and "[model_providers]" in responses_provider.hint
-    assert "https://llm.example.internal/v1/responses" in responses_provider.hint
-
-    builtin = make_config(tmp_path, model=ModelConfig(name="gpt-5.5", provider="openai"), providers={})
-    openai_builtin = map_exception(RuntimeError(text), builtin)
-    assert "rejected the request" in str(openai_builtin)
-    assert "[model_providers]" not in openai_builtin.hint and "stream = false" not in openai_builtin.hint
-    assert "https://api.openai.com/v1/responses" in openai_builtin.hint and "reasoning_effort" in openai_builtin.hint
-
-    chat = map_exception(RuntimeError(text), make_config(tmp_path, providers={"internal": CHAT_PROVIDER}))
-    assert "stream = false" in chat.hint and "/chat/completions" in chat.hint
-
-
-def test_map_endpoint_quote_masks_bare_api_keys(tmp_path):
-    text = 'unexpected status 400 Bad Request: {"error": {"message": "key sk-abcdefghijklmnopqrstuvwxyz123456 is not valid here"}}'
-    mapped = map_exception(RuntimeError(text), make_config(tmp_path))
-    assert "sk-abcdefghijklmnopqrstuvwxyz123456" not in mapped.hint and "<redacted>" in mapped.hint
-
-
-def test_map_retry_exhaustion_is_unavailable(tmp_path):
-    mapped = map_exception(RuntimeError("exceeded retry limit, last status: 502 Bad Gateway"), make_config(tmp_path))
-    assert isinstance(mapped, ProviderError) and "unavailable (HTTP 502)" in str(mapped)
-
-
-def test_map_403_gets_the_access_hint(tmp_path):
-    text = 'unexpected status 403 Forbidden: {"error": {"message": "model not allowed for this key"}}, url: http://127.0.0.1:7/internal/responses'
-    mapped = map_exception(RuntimeError(text), make_config(tmp_path, providers={"internal": CHAT_PROVIDER}))
-    assert isinstance(mapped, ProviderError) and "refused access (HTTP 403)" in str(mapped)
-    assert "access policy" in mapped.hint and "model not allowed" in mapped.hint and "127.0.0.1" not in mapped.hint
-    # a local "forbidden" without gateway markers is not an endpoint error
-    local = map_exception(RuntimeError("forbidden by sandbox policy"), make_config(tmp_path))
-    assert isinstance(local, AgentError)
-
-
-def test_error_notification_marks_retries(tmp_path):
-    error = SimpleNamespace(message="unexpected status 503 Service Unavailable: busy", additional_details=None)
-    events = [
-        N("turn/started", turn=SimpleNamespace(id="turn-1")),
-        N("error", error=error, thread_id="t", turn_id="turn-1", will_retry=True),
-        turn_completed("failed", error_message="exceeded retry limit, last status: 503 Service Unavailable"),
-    ]
-    ag, _ = make_agent(tmp_path, events=events)
-    ag.start()
-    seen: list[AgentEvent] = []
-    with pytest.raises(ProviderError) as info:
-        ag.run_turn("hi", on_event=seen.append)
-    assert "unavailable (HTTP 503)" in str(info.value)
-    statuses = [e.text for e in seen if e.kind == "status"]
-    assert statuses and statuses[0].startswith("retrying: unexpected status 503")
-
-
-def test_chat_upstreams_carry_the_bridge_options_but_codex_never_sees_them(tmp_path):
-    strict = ProviderConfig(
-        id="strict",
-        base_url="https://strict.example/v1",
+def gateway_config(tmp_path: Path, gateway: FakeGateway, *, model: str = "corp-gpt", effort: str | None = None, **provider: Any) -> HailerConfig:
+    settings: dict[str, Any] = dict(
+        id="corp",
+        base_url=gateway.base_url,
         wire_api="chat",
-        env_key="S",
-        merge_messages=False,
+        env_key="CORP_KEY",
         stream_options=False,
-        parallel_tool_calls=False,
+        env_http_headers={"X-Client-Id": "CLIENT_ID"},
+        query_params={"api-version": "2025-04-01-preview"},
     )
-    cfg = make_config(tmp_path, providers={"internal": CHAT_PROVIDER, "strict": strict})
-    upstreams = chat_completion_upstreams(cfg)
-    lenient, hard = upstreams["internal"], upstreams["strict"]
-    assert (lenient.merge_messages, lenient.stream_options, lenient.parallel_tool_calls) == (True, True, True)
-    assert (hard.merge_messages, hard.stream_options, hard.parallel_tool_calls) == (False, False, False)
-    ov = build_config_overrides(cfg, USER_CODEX_CONFIG, {"internal": "http://127.0.0.1:1/internal", "strict": "http://127.0.0.1:1/strict"})
-    assert not any(key in o for o in ov for key in (".merge_messages=", ".stream_options=", ".parallel_tool_calls="))
-
-
-# ---- integration follow-ups: stream = false example, connection branch quoting ---------------
-
-
-def test_map_rejected_hint_does_not_suggest_stream_false_when_already_off(tmp_path):
-    unstreamed = ProviderConfig(
-        id="internal",
-        name="Internal",
-        base_url="https://llm.example.internal/v1",
-        wire_api="chat",
-        stream=False,
-        env_key="INTERNAL_MODEL_API_KEY",
+    settings.update(provider)
+    return make_config(
+        tmp_path,
+        model=ModelConfig(name=model, provider="corp", reasoning_effort=effort, summarize_after_tokens=0),
+        providers={"corp": ProviderConfig(**settings)},
     )
-    mapped = map_exception(RuntimeError(_GATEWAY_422), make_config(tmp_path, providers={"internal": unstreamed}))
-    assert "rejected the request" in str(mapped)
-    assert ", stream = false)" in mapped.hint  # the sent-description still says streaming is off
-    assert "(stream = false" not in mapped.hint  # already off: not offered again
-    assert "other chat switches in its [model_providers] table in hailer.toml (stream_options = false, parallel_tool_calls = false or merge_messages = false)" in mapped.hint
-    streaming = map_exception(RuntimeError(_GATEWAY_422), make_config(tmp_path, providers={"internal": CHAT_PROVIDER}))
-    assert "chat switches in its [model_providers] table in hailer.toml (stream = false, stream_options = false, parallel_tool_calls = false or merge_messages = false)" in streaming.hint
 
 
-def test_map_connection_branch_quotes_gateway_text_but_not_plain_reasons(tmp_path):
-    cfg = make_config(tmp_path, providers={"internal": CHAT_PROVIDER})
-    mid_stream = map_exception(
-        RuntimeError("upstream stream from https://llm.example.internal/v1/chat/completions failed: timed out"), cfg
-    )
-    assert "Could not reach" in str(mid_stream)
-    assert (
-        "The endpoint said: upstream stream from https://llm.example.internal/v1/chat/completions failed: timed out"
-        in mid_stream.hint
-    )
-    gateway_504 = map_exception(
-        RuntimeError(
-            'unexpected status 504 Gateway Timeout: {"error": {"message": "upstream timed out after 60s"}}'
-            ", url: http://127.0.0.1:7/internal/responses"
-        ),
-        cfg,
-    )
-    assert "Could not reach" in str(gateway_504)
-    assert "upstream timed out after 60s" in gateway_504.hint and "127.0.0.1" not in gateway_504.hint
-    plain = map_exception(RuntimeError("error sending request: connection refused"), cfg)
-    assert "Could not reach" in str(plain) and "The endpoint said" not in plain.hint
-    dns = map_exception(RuntimeError("could not reach https://llm.example.internal/v1/chat/completions: dns error (x)"), cfg)
-    assert "The endpoint said" not in dns.hint
+@pytest.fixture
+def wire(tmp_path, monkeypatch):
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
+    agents: list[HailerAgent] = []
+
+    @tool
+    def marimo_status() -> str:
+        """Report whether marimo is running and which notebook is active."""
+        return "marimo running; active notebook notebooks/analysis.py"
+
+    @tool
+    def marimo_execute(code: str) -> str:
+        """Run Python in the active notebook's kernel and return stdout."""
+        return "2"
+
+    def make(gateway: FakeGateway, *, env: dict[str, str] | None = None, **kw: Any) -> HailerAgent:
+        agent = HailerAgent(
+            gateway_config(tmp_path, gateway, **kw), ContextBundle(), tools=[marimo_status, marimo_execute], env=GATEWAY_ENV if env is None else env
+        )
+        agents.append(agent)
+        return agent
+
+    yield make
+    for agent in agents:
+        agent.close()
 
 
-def test_map_rejected_hint_names_the_chat_switches_still_on(tmp_path):
-    partly = ProviderConfig(
-        id="internal",
-        name="Internal",
-        base_url="https://llm.example.internal/v1",
-        wire_api="chat",
-        env_key="INTERNAL_MODEL_API_KEY",
-        stream_options=False,
-        merge_messages=False,
-    )
-    mapped = map_exception(RuntimeError(_GATEWAY_422), make_config(tmp_path, providers={"internal": partly}))
-    assert "other chat switches in its [model_providers] table in hailer.toml (stream = false or parallel_tool_calls = false)" in mapped.hint
-    assert "stream_options = false" not in mapped.hint and "merge_messages = false" not in mapped.hint
-    all_off = ProviderConfig(
-        id="internal",
-        name="Internal",
-        base_url="https://llm.example.internal/v1",
-        wire_api="chat",
-        env_key="INTERNAL_MODEL_API_KEY",
-        stream=False,
-        stream_options=False,
-        parallel_tool_calls=False,
-        merge_messages=False,
-    )
-    mapped = map_exception(RuntimeError(_GATEWAY_422), make_config(tmp_path, providers={"internal": all_off}))
-    assert "(every chat switch is already off)" in mapped.hint
-    assert not any(f"{name} = false" in mapped.hint for name in ("stream_options", "parallel_tool_calls", "merge_messages"))
-    responses = map_exception(RuntimeError(_GATEWAY_422), make_config(tmp_path))  # the default provider speaks the Responses API
-    assert "rejected the request" in str(responses)
-    assert not any(name in responses.hint for name in ("stream_options", "parallel_tool_calls", "merge_messages", "chat switches"))
+def test_wire_streaming_turn_sends_only_what_a_strict_gateway_accepts(wire):
+    with FakeGateway() as gateway:
+        events: list[AgentEvent] = []
+        summary = wire(gateway).run_turn("what is the status?", on_event=events.append)
+
+    assert summary.tool_calls == ["marimo_status"]
+    assert summary.final_response.startswith("Tool said: marimo running")
+    assert (summary.input_tokens, summary.output_tokens) == (22, 14)
+    assert sum(1 for e in events if e.kind == "message_delta") > 3
+    assert {r["path"] for r in gateway.requests} == {"/v1/chat/completions"}
+    bodies = [r["body"] for r in gateway.requests]
+    assert len(bodies) == 2  # one tool turn = two requests; nothing on the side
+    assert all(sorted(b) == ["messages", "model", "stream", "tools"] for b in bodies)  # no stream_options, no parallel_tool_calls
+    assert {b["model"] for b in bodies} == {"corp-gpt"}
+    assert [m["role"] for m in bodies[0]["messages"]] == ["system", "user"]
+    assert [t["function"]["name"] for t in bodies[0]["tools"]] == ["marimo_status", "marimo_execute"]
+    first = gateway.requests[0]
+    headers = {name.lower(): value for name, value in first["headers"].items()}
+    assert headers["x-client-id"] == "hailer-spike" and headers["authorization"] == "Bearer sk-spike"
+    assert first["query"] == {"api-version": ["2025-04-01-preview"]}
+
+
+def test_wire_stream_false_never_asks_for_a_stream(wire):
+    with FakeGateway(allow_stream=False) as gateway:
+        events: list[AgentEvent] = []
+        summary = wire(gateway, stream=False).run_turn("please run it", on_event=events.append)
+    assert summary.final_response == "Tool said: 2" and summary.tool_calls == ["marimo_execute"]
+    assert [r["body"].get("stream") for r in gateway.requests] == [False, False]
+    assert (summary.input_tokens, summary.output_tokens) == (22, 14)
+    assert [e.text for e in events if e.kind == "tool_call"] == ["marimo_execute"]
+
+
+def test_wire_reasoning_effort_is_sent_only_when_configured(wire):
+    with FakeGateway() as gateway:
+        wire(gateway).run_turn("hello")
+        assert "reasoning_effort" not in gateway.requests[-1]["body"]
+        wire(gateway, effort="low").run_turn("hello")
+        assert gateway.requests[-1]["body"]["reasoning_effort"] == "low"
+
+
+def test_wire_errors_become_actionable_messages(wire):
+    with FakeGateway() as gateway:
+        with pytest.raises(ProviderError) as unknown_model:
+            wire(gateway, model="gpt-5.5").run_turn("hello")
+        assert str(unknown_model.value) == "Unknown model 'gpt-5.5' for provider 'corp'."
+        assert "String should match pattern" in unknown_model.value.hint
+
+        with pytest.raises(CredentialsError) as bad_key:
+            wire(gateway, env={**GATEWAY_ENV, "CORP_KEY": "sk-wrong"}).run_turn("hello")
+        assert "hailer login corp" in bad_key.value.hint
+
+        with pytest.raises(ProviderError) as rejected:
+            wire(gateway, stream_options=True).run_turn("hello")
+        assert "rejected the request (HTTP 422)" in str(rejected.value)
+        assert "stream_options = false" in rejected.value.hint and "Extra inputs are not permitted" in rejected.value.hint
+
+        with pytest.raises(ProviderError) as wrong_api:
+            wire(gateway, wire_api="responses").run_turn("hello")
+        assert 'wire_api = "chat"' in wrong_api.value.hint
+        assert len(gateway.requests) == 4  # one request per failed turn: a 4xx reply is not retried
+
+
+def test_wire_unreachable_endpoint(wire, tmp_path):
+    class Closed:
+        base_url = "http://127.0.0.1:9/v1"
+
+    with pytest.raises(ProviderError) as err:
+        wire(Closed()).run_turn("hello")  # type: ignore[arg-type]
+    assert "Could not reach the model endpoint at http://127.0.0.1:9/v1" in str(err.value)

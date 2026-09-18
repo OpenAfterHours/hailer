@@ -5,16 +5,13 @@ description = "Hailer: a conversational CLI for local data analysis, with a live
 readme = "README.md"
 requires-python = ">=3.12"
 authors = [{ name = "OpenAfterHours" }]
-keywords = ["marimo", "codex", "polars", "duckdb", "data-analysis", "cli"]
+keywords = ["marimo", "langchain", "polars", "duckdb", "data-analysis", "cli"]
 dependencies = [
-    # Codex Python SDK (bundles the codex app-server binary). Pinned: Hailer relies on
-    # config override keys and app-server behaviour verified against this version.
-    "openai-codex==0.154.0",
     # Pinned: Hailer drives the private marimo._code_mode API and /api/kernel/execute.
     "marimo==0.24.2",
-    # Hailer's own stdio MCP server exposed to the agent.
-    "mcp>=2.0,<3",
-    # The agent loop (create_agent), the OpenAI-compatible chat model and the conversation store.
+    # The agent loop (create_agent), the OpenAI-compatible chat model and the conversation
+    # store (SQLite). Hailer passes base_url and use_responses_api explicitly and owns the HTTP
+    # client; see hailer.agent.build_model before raising the upper bounds.
     "langchain>=1.4,<2",
     "langchain-openai>=1.6,<2",
     "langgraph-checkpoint-sqlite>=3.1,<4",

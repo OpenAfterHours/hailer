@@ -5,8 +5,7 @@ Order of precedence for a provider's key:
 1. the environment variable named in ``ProviderConfig.env_key`` (automation, CI);
 2. the OS credential store via ``keyring`` (Windows Credential Manager on Windows),
    stored by ``hailer login <provider>``;
-3. nothing — the caller decides whether that is fatal (a bare ``openai`` provider may
-   still work through an existing Codex ChatGPT login).
+3. nothing — the agent cannot start without a key and says how to store one.
 
 The key value is only ever returned to the caller; it is never logged.
 """
