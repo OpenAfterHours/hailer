@@ -14,6 +14,10 @@ dependencies = [
     "marimo==0.24.2",
     # Hailer's own stdio MCP server exposed to the agent.
     "mcp>=2.0,<3",
+    # The agent loop (create_agent), the OpenAI-compatible chat model and the conversation store.
+    "langchain>=1.4,<2",
+    "langchain-openai>=1.6,<2",
+    "langgraph-checkpoint-sqlite>=3.1,<4",
     "polars>=1.44",
     "duckdb>=1.5",
     "typer>=0.27",
@@ -24,7 +28,6 @@ dependencies = [
 
 [project.scripts]
 hailer = "hailer.cli:main"
-hailer-mcp = "hailer.mcp_server:main"
 
 [project.urls]
 Repository = "https://github.com/openafterhours/hailer"

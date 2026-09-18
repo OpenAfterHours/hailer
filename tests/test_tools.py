@@ -1,21 +1,19 @@
-"""Tests for hailer.mcp_server: tool behaviour with a fake marimo client, MCP registration,
-and a real stdio round-trip in a subprocess (offline)."""
+"""Tests for hailer.tools: tool behaviour with a fake marimo client and the LangChain
+registration the agent uses (offline)."""
 
 from __future__ import annotations
 
 import asyncio
 import os
-import sys
+import threading
 from pathlib import Path
 
 import pytest
 
 from hailer import notebooks
 from hailer.errors import MarimoUnavailableError, NoSessionError
-from hailer.mcp_server import HailerTools, build_server
 from hailer.models import ExecResult, HailerConfig, MarimoServer, MarimoSession, WebConfig
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
+from hailer.tools import TOOL_NAMES, HailerTools, hailer_tools
 
 NOTEBOOK_SOURCE = 'import marimo\n\n__generated_with = "0.24.2"\napp = marimo.App()\n\n\n@app.cell\ndef _():\n    return\n\n\nif __name__ == "__main__":\n    app.run()\n'
 
@@ -472,102 +470,100 @@ def test_skill_and_page_tools(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# MCP registration (in-process)
+# LangChain registration
 # --------------------------------------------------------------------------- #
 
 
-def test_build_server_registers_eleven_tools(tmp_path):
-    server = build_server(make_config(tmp_path), client_factory=failing_factory)
-    tools = asyncio.run(server.list_tools())
-    assert [t.name for t in tools] == [
-        "marimo_execute",
-        "marimo_status",
-        "notebook_cells",
-        "notebook_list",
-        "notebook_create",
-        "notebook_open",
-        "notebook_close",
-        "list_periods",
-        "load_skill",
-        "read_skill_file",
-        "fetch_page",
-    ]
-    assert all(t.description for t in tools)
+def test_hailer_tools_registers_eleven_tools_with_descriptions_and_schemas(tmp_path):
+    tools = hailer_tools(make_config(tmp_path), client_factory=failing_factory)
+    assert [t.name for t in tools] == list(TOOL_NAMES)
+    assert len(tools) == 11
+    assert all(t.description and len(t.description) > 40 for t in tools)
     by_name = {t.name: t for t in tools}
-    assert by_name["marimo_execute"].input_schema["required"] == ["code"]
-    assert by_name["notebook_create"].input_schema["required"] == ["name"]
-    assert by_name["notebook_open"].input_schema["required"] == ["notebook"]
-    assert "required" not in by_name["notebook_close"].input_schema or by_name["notebook_close"].input_schema["required"] == []
-    assert "ACTIVE notebook" in server.instructions or "active notebook" in server.instructions.lower()
+    schema = {name: t.tool_call_schema.model_json_schema() for name, t in by_name.items()}
+    assert schema["marimo_execute"]["required"] == ["code"]
+    assert schema["notebook_create"]["required"] == ["name"]
+    assert schema["notebook_open"]["required"] == ["notebook"]
+    assert schema["read_skill_file"]["required"] == ["name", "path"]
+    assert not schema["notebook_close"].get("required")
+    assert not schema["marimo_status"].get("required")
+    # the description is the method's docstring, the text the model reads
+    assert "scratchpad" in by_name["marimo_execute"].description
+    assert "ACTIVE" in by_name["marimo_status"].description
+    assert "allowed-domains" in by_name["fetch_page"].description
 
 
-def test_call_tool_in_process_via_client(ws):
-    from mcp import Client
+def test_every_tool_name_is_a_documented_method():
+    for name in TOOL_NAMES:
+        assert (getattr(HailerTools, name).__doc__ or "").strip(), name
 
+
+def test_tools_invoke_in_process(ws):
     config, analysis, other = ws
     client = FakeClient(open_paths={analysis}, result=ExecResult(success=True, stdout="ok"))
     opener = Opener(client)
-    server = build_server(config, client_factory=factory_for(client), open_url=opener, session_wait_sec=0)
+    tools = {t.name: t for t in hailer_tools(config, client_factory=factory_for(client), open_url=opener, session_wait_sec=0)}
 
-    async def go():
-        async with Client(server) as c:
-            r = await c.call_tool("marimo_execute", {"code": "print('ok')"})
-            assert r.content[0].text == "ok"
-            r = await c.call_tool("notebook_list", {})
-            assert "notebooks/analysis.py" in r.content[0].text and "[active]" in r.content[0].text
-            r = await c.call_tool("notebook_create", {"name": "via mcp"})
-            assert r.content[0].text.startswith("Created notebooks/via_mcp.py")
-            r = await c.call_tool("notebook_open", {"notebook": "other"})
-            assert r.content[0].text.startswith("notebooks/other.py is now the active notebook.")
-            r = await c.call_tool("fetch_page", {"url": "https://example.com"})
-            assert r.content[0].text.startswith("ERROR:")
+    assert tools["marimo_execute"].invoke({"code": "print('ok')"}) == "ok"
+    text = tools["notebook_list"].invoke({})
+    assert "notebooks/analysis.py" in text and "[active]" in text
+    assert tools["notebook_create"].invoke({"name": "via tool"}).startswith("Created notebooks/via_tool.py")
+    assert tools["notebook_open"].invoke({"notebook": "other"}).startswith("notebooks/other.py is now the active notebook.")
+    assert tools["fetch_page"].invoke({"url": "https://example.com"}).startswith("ERROR:")
 
-    asyncio.run(go())
     assert len(opener.urls) == 2  # create + open (other had no session)
     assert notebooks.load_active_notebook(config) == other
 
 
-# --------------------------------------------------------------------------- #
-# Real stdio server in a subprocess (offline)
-# --------------------------------------------------------------------------- #
+def test_async_path_runs_the_tool_on_a_daemon_thread(ws):
+    """The agent awaits tools; a blocking kernel call must never be joined at shutdown."""
+    config, analysis, _other = ws
+    seen: dict[str, object] = {}
 
+    class RecordingClient(FakeClient):
+        def execute(self, code, notebook=None, **kw):
+            thread = threading.current_thread()
+            seen.update(name=thread.name, daemon=thread.daemon, main=thread is threading.main_thread())
+            return super().execute(code, notebook=notebook, **kw)
 
-def test_stdio_server_roundtrip(tmp_path):
-    pytest.importorskip("hailer.config")  # written by another owner; skip until it lands
-    from mcp import Client
-    from mcp.client.stdio import StdioServerParameters
-
-    (tmp_path / "hailer.toml").write_text(
-        '[hailer]\nnotebook = "notebooks/analysis.py"\ndata_dir = "data"\n\n[web]\nallowed_domains = ["docs.pola.rs"]\n',
-        encoding="utf-8",
-    )
-    (tmp_path / "data").mkdir()
-    write_notebook(tmp_path / "notebooks" / "analysis.py")
-    env = {
-        "HAILER_WORKSPACE": str(tmp_path),
-        "HAILER_CONFIG": str(tmp_path / "hailer.toml"),
-        "HAILER_LOG_LEVEL": "WARNING",
-        "PYTHONIOENCODING": "utf-8",
-        "PYTHONPATH": str(REPO_ROOT / "src"),
-    }
-    params = StdioServerParameters(command=sys.executable, args=["-m", "hailer.mcp_server"], env=env, cwd=str(tmp_path))
+    client = RecordingClient(open_paths={analysis}, result=ExecResult(success=True, stdout="42"))
+    tools = {t.name: t for t in hailer_tools(config, client_factory=factory_for(client))}
 
     async def go():
-        async with Client(params) as c:
-            tools = await asyncio.wait_for(c.list_tools(), 30)
-            names = [t.name for t in tools.tools] if hasattr(tools, "tools") else [t.name for t in tools]
-            assert "marimo_execute" in names and "fetch_page" in names
-            assert {"notebook_list", "notebook_create", "notebook_open", "notebook_close"} <= set(names)
-            r = await asyncio.wait_for(c.call_tool("fetch_page", {"url": "https://example.com/x"}), 30)
-            assert r.content[0].text.startswith("ERROR: Web access to 'example.com' is not allowed")
-            assert "docs.pola.rs" in r.content[0].text
-            r = await asyncio.wait_for(c.call_tool("list_periods", {}), 30)
-            assert "No period files found" in r.content[0].text
-            # a pure file-system tool works over stdio without marimo (no browser is involved)
-            r = await asyncio.wait_for(c.call_tool("notebook_list", {}), 30)
-            assert "notebooks/analysis.py" in r.content[0].text and "[active]" in r.content[0].text
+        assert await tools["marimo_execute"].ainvoke({"code": "print(42)"}) == "42"
+        assert (await tools["fetch_page"].ainvoke({"url": "https://example.com"})).startswith("ERROR:")
 
     asyncio.run(go())
+    assert seen == {"name": "hailer-tool-marimo_execute", "daemon": True, "main": False}
+
+
+def test_cancelling_a_turn_does_not_wait_for_a_blocked_tool(ws):
+    config, analysis, _other = ws
+    release = threading.Event()
+    finished = threading.Event()
+
+    class BlockingClient(FakeClient):
+        def execute(self, code, notebook=None, **kw):
+            release.wait(10)
+            finished.set()
+            return super().execute(code, notebook=notebook, **kw)
+
+    client = BlockingClient(open_paths={analysis}, result=ExecResult(success=True, stdout="late"))
+    tools = {t.name: t for t in hailer_tools(config, client_factory=factory_for(client))}
+
+    async def go():
+        task = asyncio.ensure_future(tools["marimo_execute"].ainvoke({"code": "slow()"}))
+        await asyncio.sleep(0.1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    try:
+        asyncio.run(go())  # returns at once: closing the loop does not join the tool thread
+        assert not finished.is_set()
+    finally:
+        release.set()
+    assert finished.wait(5)  # the abandoned call still ends on its own; its result is dropped
 
 
 # --------------------------------------------------------------------------- #

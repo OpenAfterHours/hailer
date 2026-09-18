@@ -1,25 +1,26 @@
-"""Hailer's MCP server: the agent's only bridge to the live marimo kernel and the web.
+"""Hailer's tools: the agent's only bridge to the live marimo kernel and the web.
 
-Codex launches this as a stdio MCP server (``python -m hailer.mcp_server``) with
-``HAILER_CONFIG`` / ``HAILER_WORKSPACE`` in its environment. stdout is the
-transport, so this module never prints; diagnostics go to stderr via logging.
+The tools run inside the Hailer process. :class:`HailerTools` holds the implementations
+(plain methods, unit-testable); :func:`hailer_tools` hands them to the agent as LangChain
+tools. A method's docstring is the description the model sees.
 
 Every tool returns plain text. Hailer errors become ``ERROR: <message>\\n<hint>``
-text so the model can act on them; nothing is raised across the protocol.
+text so the model can act on them; nothing is raised into the agent loop.
 
 The *active notebook* (the one every kernel tool acts on) lives in
-``<workspace>/.hailer/notebook.json`` and is re-read on every call: this process
-outlives many turns, and both the model (``notebook_create`` / ``notebook_open``)
-and the CLI (``/notebook`` commands) may switch it.
+``<workspace>/.hailer/notebook.json`` and is re-read on every call: both the model
+(``notebook_create`` / ``notebook_open``) and the CLI (``/notebook`` commands) may switch it.
 """
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import datetime as _dt
+import inspect
 import logging
 import os
-import sys
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -29,16 +30,21 @@ from .errors import HailerError, MarimoUnavailableError, NoSessionError
 from .models import ExecResult, HailerConfig, MarimoServer, MarimoSession
 from .web import truncate_text
 
-log = logging.getLogger("hailer.mcp")
+log = logging.getLogger("hailer.tools")
 
-SERVER_NAME = "hailer"
-SERVER_INSTRUCTIONS = (
-    "Hailer tools. A live marimo notebook is the visual workspace: use marimo_execute to run "
-    "Python in its kernel (scratchpad semantics; persist notebook changes through "
-    "marimo._code_mode). Every kernel tool acts on the ACTIVE notebook, which marimo_status "
-    "names; notebook_create and notebook_open switch it for all later calls. Keep outputs "
-    "compact: inspect schemas, samples and aggregates, never print whole datasets. fetch_page "
-    "only reaches allow-listed domains."
+#: The tools the agent gets, in the order they are offered to the model.
+TOOL_NAMES = (
+    "marimo_execute",
+    "marimo_status",
+    "notebook_cells",
+    "notebook_list",
+    "notebook_create",
+    "notebook_open",
+    "notebook_close",
+    "list_periods",
+    "load_skill",
+    "read_skill_file",
+    "fetch_page",
 )
 
 #: How long notebook_create / notebook_open wait for the browser tab to give the kernel a session.
@@ -88,17 +94,6 @@ def _error_text(err: HailerError) -> str:
     return text
 
 
-def _config_from_env() -> HailerConfig:
-    from .config import load_config  # lazy: keeps import-time coupling low
-
-    workspace = os.environ.get("HAILER_WORKSPACE")
-    config_path = os.environ.get("HAILER_CONFIG")
-    return load_config(
-        workspace=Path(workspace) if workspace else None,
-        config_path=Path(config_path) if config_path else None,
-    )
-
-
 def _list_cells_code() -> str:
     try:
         from .marimo_client import LIST_CELLS_CODE  # type: ignore[attr-defined]
@@ -109,7 +104,7 @@ def _list_cells_code() -> str:
 
 
 def _default_open_url(url: str) -> bool:
-    """Open ``url`` in the user's browser without touching stdout (the MCP transport).
+    """Open ``url`` in the user's browser without touching the terminal the chat runs in.
 
     ``hailer.browser.open_url`` uses ``os.startfile`` on Windows (so a ``BROWSER`` variable
     pointing at a non-GUI command cannot turn it into a silent no-op) and spawns the POSIX
@@ -186,7 +181,10 @@ class _SessionOutcome:
 
 
 class HailerTools:
-    """The tool implementations, independent of the MCP transport (unit-testable)."""
+    """The tool implementations, independent of the agent framework (unit-testable).
+
+    The docstring of each public tool method is the description the model is given.
+    """
 
     def __init__(
         self,
@@ -237,7 +235,7 @@ class HailerTools:
             return self._truncate(fn())
         except HailerError as err:
             return self._truncate(_error_text(err))
-        except Exception as exc:  # noqa: BLE001 - never let an exception cross the protocol
+        except Exception as exc:  # noqa: BLE001 - never let an exception reach the agent loop
             log.exception("tool failed")
             return self._truncate(f"ERROR: unexpected {type(exc).__name__}: {exc}")
 
@@ -332,6 +330,16 @@ class HailerTools:
     # -- kernel tools -------------------------------------------------------- #
 
     def marimo_execute(self, code: str) -> str:
+        """Run Python in the active notebook's kernel and return stdout, the result and stderr.
+
+        The code runs in the kernel's scratchpad: notebook variables are readable by name, but
+        new top-level assignments are discarded afterwards. To add or change notebook cells,
+        use `import marimo._code_mode as cm` and `async with cm.get_context() as ctx:` with
+        ctx.create_cell(...)/ctx.edit_cell(...)/ctx.run_cell(...) (top-level `async with` is
+        allowed). Keep printed output small: schemas, head(), aggregates. Never print whole
+        datasets.
+        """
+
         def go() -> str:
             config = self._active_config()
             client, _ = self._client_factory()
@@ -342,6 +350,11 @@ class HailerTools:
         return self._run(go)
 
     def marimo_status(self) -> str:
+        """Report whether marimo is running, which notebook is ACTIVE (the one every kernel tool
+        acts on) and whether it has a kernel session (one exists only while the notebook is
+        open in a browser), plus every open session. If the active notebook has no session,
+        the reply contains the URL the user must open."""
+
         def go() -> str:
             config = self._active_config()
             active_name = self._display(config, config.notebook)
@@ -386,6 +399,10 @@ class HailerTools:
         return self._run(go)
 
     def notebook_cells(self, pattern: str = "") -> str:
+        """List the active notebook's cells: id, name, status, error count and first code line.
+        Optional case-insensitive substring filter. Use it before editing to find the cell
+        that owns a variable and to avoid creating duplicate cells."""
+
         def go() -> str:
             config = self._active_config()
             client, _ = self._client_factory()
@@ -404,6 +421,10 @@ class HailerTools:
     # -- notebook lifecycle tools ------------------------------------------- #
 
     def notebook_list(self) -> str:
+        """List the notebooks in the notebooks folder with modified time and size; [active]
+        marks the one tools act on and [open] the ones with a kernel session. Call it before
+        creating a notebook (to avoid duplicates) and when the user refers to an existing one."""
+
         def go() -> str:
             config = self._active_config()
             folder = self._display(config, config.notebooks_root)
@@ -433,6 +454,11 @@ class HailerTools:
         return self._run(go)
 
     def notebook_create(self, name: str, template: str = "starter") -> str:
+        """Create a new notebook in the notebooks folder from a human name (saved as
+        <slug>.py), make it the active notebook, open it in the browser and wait for its
+        kernel session. template: 'starter' (imports, data helpers, welcome cell; the usual
+        choice) or 'empty'. Only when the user asks for a new or separate notebook."""
+
         def go() -> str:
             kind = (template or "starter").strip().lower()
             if kind not in notebooks.TEMPLATE_KINDS:
@@ -458,6 +484,10 @@ class HailerTools:
         return self._run(go)
 
     def notebook_open(self, notebook: str) -> str:
+        """Open an existing notebook by name, filename or path and make it the active
+        notebook for every later tool call. Opens the browser only when it has no kernel
+        session yet. Returns its cells so you can continue where the notebook left off."""
+
         def go() -> str:
             config = self._active_config()
             path = notebooks.resolve_notebook(config, notebook)
@@ -479,6 +509,10 @@ class HailerTools:
         return self._run(go)
 
     def notebook_close(self, notebook: str = "") -> str:
+        """Close a notebook's kernel session (default: the active notebook) to free its
+        memory. The notebook stays active until another one is opened; nothing can run in it
+        until it is reopened with notebook_open."""
+
         def go() -> str:
             config = self._active_config()
             path = notebooks.resolve_notebook(config, notebook) if (notebook or "").strip() else config.notebook
@@ -508,6 +542,10 @@ class HailerTools:
     # -- data, skills, web ------------------------------------------------- #
 
     def list_periods(self, name: str = "") -> str:
+        """Describe the monthly data files in the data directory (files named like
+        '25-01 pra101.parquet'): periods available, common columns and columns that only
+        appear in some months. Optional dataset name filter, e.g. 'pra101'."""
+
         def go() -> str:
             from . import periods  # lazy
 
@@ -526,143 +564,92 @@ class HailerTools:
         return self._run(go)
 
     def load_skill(self, name: str) -> str:
+        """Load a project skill (its SKILL.md instructions and the list of bundled files) by
+        name. Use when the task matches a skill listed in your instructions."""
         from .context import read_skill
 
         return self._run(lambda: read_skill(self.config, name))
 
     def read_skill_file(self, name: str, path: str) -> str:
+        """Read a file bundled with a skill, by skill name and path relative to the skill
+        folder (for example 'reference/checks.md')."""
         from .context import read_skill_file
 
         return self._run(lambda: read_skill_file(self.config, name, path))
 
     def fetch_page(self, url: str) -> str:
+        """Fetch a web page as readable text. Only hosts in the project's allowed-domains list
+        can be fetched; a denied request says which domains are allowed. Fetched text is
+        sent to the model like any other tool result."""
         from .web import fetch_page
 
         return self._run(lambda: fetch_page(url, self.config))
 
 
-def build_server(
+# --------------------------------------------------------------------------- #
+# LangChain registration
+# --------------------------------------------------------------------------- #
+
+
+def _in_daemon_thread(fn: Callable[..., str]) -> Callable[..., Any]:
+    """An async twin of a blocking tool that runs it on a daemon thread.
+
+    Kernel calls can block for minutes. LangChain would otherwise run them on the event loop's
+    default executor, whose threads are joined when the loop closes and again at interpreter
+    exit, so quitting after Ctrl+C waited for the abandoned call (measured: 7 s for a call with
+    7 s left). A daemon thread lets the cancelled turn and the process end at once; the call
+    itself finishes (or times out) in the background and its result is dropped.
+    """
+
+    async def run(**kwargs: Any) -> str:
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[str] = loop.create_future()
+
+        def deliver(result: str | None, error: BaseException | None) -> None:
+            if future.done():  # the turn was cancelled meanwhile
+                return
+            if error is not None:
+                future.set_exception(error)
+            else:
+                future.set_result(result or "")
+
+        def work() -> None:
+            try:
+                outcome: tuple[str | None, BaseException | None] = (fn(**kwargs), None)
+            except BaseException as exc:  # noqa: BLE001 - handed to the awaiting turn
+                outcome = (None, exc)
+            try:
+                loop.call_soon_threadsafe(deliver, *outcome)
+            except RuntimeError:  # the loop is closed: Hailer is shutting down
+                pass
+
+        threading.Thread(target=work, name=f"hailer-tool-{fn.__name__}", daemon=True).start()
+        return await future
+
+    return run
+
+
+def hailer_tools(
     config: HailerConfig,
     *,
     client_factory: ClientFactory | None = None,
     open_url: UrlOpener | None = None,
     session_wait_sec: float = DEFAULT_SESSION_WAIT_SEC,
-):
-    """Create the MCP server with Hailer's tools registered. Returns an ``mcp.server.MCPServer``."""
-    from mcp.server import MCPServer
+) -> list[Any]:
+    """Hailer's tools as LangChain tools (``TOOL_NAMES`` order), bound to ``config``."""
+    from langchain_core.tools import StructuredTool  # lazy: keeps `hailer --help` and friends fast
 
-    tools = HailerTools(config, client_factory, open_url=open_url, session_wait_sec=session_wait_sec)
-    server = MCPServer(SERVER_NAME, instructions=SERVER_INSTRUCTIONS, log_level="WARNING")
+    impl = HailerTools(config, client_factory, open_url=open_url, session_wait_sec=session_wait_sec)
+    out: list[Any] = []
+    for name in TOOL_NAMES:
+        method = getattr(impl, name)
+        out.append(
+            StructuredTool.from_function(
+                func=method,
+                coroutine=_in_daemon_thread(method),
+                name=name,
+                description=inspect.getdoc(method) or name,
+            )
+        )
+    return out
 
-    @server.tool(name="marimo_execute")
-    def marimo_execute(code: str) -> str:
-        """Run Python in the active notebook's kernel and return stdout, the result and stderr.
-
-        The code runs in the kernel's scratchpad: notebook variables are readable by name, but
-        new top-level assignments are discarded afterwards. To add or change notebook cells,
-        use `import marimo._code_mode as cm` and `async with cm.get_context() as ctx:` with
-        ctx.create_cell(...)/ctx.edit_cell(...)/ctx.run_cell(...) (top-level `async with` is
-        allowed). Keep printed output small: schemas, head(), aggregates. Never print whole
-        datasets.
-        """
-        return tools.marimo_execute(code)
-
-    @server.tool(name="marimo_status")
-    def marimo_status() -> str:
-        """Report whether marimo is running, which notebook is ACTIVE (the one every kernel tool
-        acts on) and whether it has a kernel session (one exists only while the notebook is
-        open in a browser), plus every open session. If the active notebook has no session,
-        the reply contains the URL the user must open."""
-        return tools.marimo_status()
-
-    @server.tool(name="notebook_cells")
-    def notebook_cells(pattern: str = "") -> str:
-        """List the active notebook's cells: id, name, status, error count and first code line.
-        Optional case-insensitive substring filter. Use it before editing to find the cell
-        that owns a variable and to avoid creating duplicate cells."""
-        return tools.notebook_cells(pattern)
-
-    @server.tool(name="notebook_list")
-    def notebook_list() -> str:
-        """List the notebooks in the notebooks folder with modified time and size; [active]
-        marks the one tools act on and [open] the ones with a kernel session. Call it before
-        creating a notebook (to avoid duplicates) and when the user refers to an existing one."""
-        return tools.notebook_list()
-
-    @server.tool(name="notebook_create")
-    def notebook_create(name: str, template: str = "starter") -> str:
-        """Create a new notebook in the notebooks folder from a human name (saved as
-        <slug>.py), make it the active notebook, open it in the browser and wait for its
-        kernel session. template: 'starter' (imports, data helpers, welcome cell; the usual
-        choice) or 'empty'. Only when the user asks for a new or separate notebook."""
-        return tools.notebook_create(name, template)
-
-    @server.tool(name="notebook_open")
-    def notebook_open(notebook: str) -> str:
-        """Open an existing notebook by name, filename or path and make it the active
-        notebook for every later tool call. Opens the browser only when it has no kernel
-        session yet. Returns its cells so you can continue where the notebook left off."""
-        return tools.notebook_open(notebook)
-
-    @server.tool(name="notebook_close")
-    def notebook_close(notebook: str = "") -> str:
-        """Close a notebook's kernel session (default: the active notebook) to free its
-        memory. The notebook stays active until another one is opened; nothing can run in it
-        until it is reopened with notebook_open."""
-        return tools.notebook_close(notebook)
-
-    @server.tool(name="list_periods")
-    def list_periods(name: str = "") -> str:
-        """Describe the monthly data files in the data directory (files named like
-        '25-01 pra101.parquet'): periods available, common columns and columns that only
-        appear in some months. Optional dataset name filter, e.g. 'pra101'."""
-        return tools.list_periods(name)
-
-    @server.tool(name="load_skill")
-    def load_skill(name: str) -> str:
-        """Load a project skill (its SKILL.md instructions and the list of bundled files) by
-        name. Use when the task matches a skill listed in your instructions."""
-        return tools.load_skill(name)
-
-    @server.tool(name="read_skill_file")
-    def read_skill_file(name: str, path: str) -> str:
-        """Read a file bundled with a skill, by skill name and path relative to the skill
-        folder (for example 'reference/checks.md')."""
-        return tools.read_skill_file(name, path)
-
-    @server.tool(name="fetch_page")
-    def fetch_page(url: str) -> str:
-        """Fetch a web page as readable text. Only hosts in the project's allowed-domains list
-        can be fetched; a denied request says which domains are allowed. Fetched text is
-        sent to the model like any other tool result."""
-        return tools.fetch_page(url)
-
-    server.hailer_tools = tools  # type: ignore[attr-defined]  # handy for tests
-    return server
-
-
-def _setup_logging() -> None:
-    level_name = os.environ.get("HAILER_LOG_LEVEL", "WARNING").upper()
-    level = getattr(logging, level_name, logging.WARNING)
-    handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
-    root = logging.getLogger()
-    root.handlers[:] = [handler]
-    root.setLevel(level)
-
-
-def main() -> None:
-    """Console entry point (``hailer-mcp``). Speaks MCP over stdio."""
-    _setup_logging()
-    try:
-        config = _config_from_env()
-    except HailerError as err:
-        sys.stderr.write(f"hailer-mcp: {err}\n{err.hint}\n")
-        sys.exit(2)
-    log.debug("hailer-mcp starting; workspace=%s notebook=%s", config.workspace, config.notebook)
-    server = build_server(config)
-    server.run(transport="stdio")
-
-
-if __name__ == "__main__":
-    main()
