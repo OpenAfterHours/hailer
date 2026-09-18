@@ -798,10 +798,11 @@ def test_spawn_marimo_uses_background_flags_and_log(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli.subprocess, "Popen", Popen)
     log = tmp_path / ".hailer" / "marimo.log"
+    log.parent.mkdir()  # _start_marimo creates it (with its .gitignore) before spawning
     cli._spawn_marimo(["python", "-m", "marimo"], tmp_path, log)
     cmd, kwargs = calls[0]
     assert cmd == ["python", "-m", "marimo"] and kwargs["cwd"] == str(tmp_path)
-    assert log.parent.is_dir(), "log directory created"
+    assert log.is_file(), "the child logs there"
     assert kwargs["stderr"] == cli.subprocess.STDOUT and kwargs["stdin"] == cli.subprocess.DEVNULL
     expected = getattr(cli.subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if cli.os.name == "nt" else 0
     assert kwargs["creationflags"] == expected, "own process group on Windows so Ctrl+C in the chat is not delivered to marimo"

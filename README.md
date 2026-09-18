@@ -509,7 +509,9 @@ third party. Set `HAILER_TRACING=1` if you do want the tracing variables in your
 
 **On disk:** the conversation (your messages, the agent's replies, tool calls and their truncated results)
 is stored unencrypted in `.hailer/threads.sqlite` inside the workspace until `/new` or `hailer --new`
-replaces it. `.hailer/` is in the repository's `.gitignore`.
+replaces it. `.hailer/` holds only this local state (the conversation, `session.json`, `notebook.json`,
+`marimo.log`) and carries its own `.gitignore` containing `*`, so git ignores the folder in any repository
+without an entry in yours; Hailer never edits your `.gitignore`.
 
 ## Troubleshooting
 

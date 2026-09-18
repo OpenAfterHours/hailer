@@ -10,8 +10,8 @@ from dataclasses import asdict
 from pathlib import Path
 
 from hailer.models import Command, SessionState
+from hailer.statedir import ensure_state_dir, state_dir
 
-SESSION_DIRNAME = ".hailer"
 SESSION_FILENAME = "session.json"
 
 # name -> one-line description (order is the order shown by /help)
@@ -60,7 +60,7 @@ def help_text() -> str:
 
 
 def session_path(workspace: Path) -> Path:
-    return Path(workspace) / SESSION_DIRNAME / SESSION_FILENAME
+    return state_dir(workspace) / SESSION_FILENAME
 
 
 def _read_raw(workspace: Path) -> dict:
@@ -89,8 +89,7 @@ def load_session(workspace: Path) -> SessionState:
 
 def save_session(workspace: Path, state: SessionState) -> None:
     """Persist ``state``."""
-    path = session_path(workspace)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path = ensure_state_dir(workspace) / SESSION_FILENAME
     payload = asdict(state)
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")

@@ -424,6 +424,16 @@ def test_map_generic_failures_and_hailer_errors_pass_through(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
+def test_start_keeps_an_existing_gitignore_in_hailer(harness):
+    h = harness([])
+    folder = h.config.workspace / ".hailer"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / ".gitignore").write_text("# mine\n", encoding="utf-8")
+    h.agent.start()
+    assert (folder / "threads.sqlite").is_file()
+    assert (folder / ".gitignore").read_text(encoding="utf-8") == "# mine\n"
+
+
 def test_undeclared_provider_fails_at_construction(tmp_path):
     cfg = make_config(tmp_path, model=ModelConfig(name="x", provider="azure"))
     with pytest.raises(ConfigError):
@@ -436,6 +446,8 @@ def test_start_creates_the_store_and_a_thread(harness):
     thread_id = h.agent.start()
     assert thread_id and h.agent.thread_id == thread_id and h.agent.started
     assert (h.config.workspace / ".hailer" / "threads.sqlite").is_file()
+    ignore = (h.config.workspace / ".hailer" / ".gitignore").read_text(encoding="utf-8")
+    assert "*" in ignore.splitlines(), ".hailer/ ignores itself"
     assert h.factory_calls == [("internal", "internal-analyst", KEY_ENV["INTERNAL_MODEL_API_KEY"])]
     assert h.agent.key_source == "env"
 

@@ -219,7 +219,7 @@ def load_active_notebook(config: HailerConfig) -> Path
     # ONLY the state file (never the environment; see the ground rule): its "active" entry when it resolves inside
     # notebooks_root and exists; otherwise (missing/corrupt file, deleted or foreign path) config.notebook.
 def save_active_notebook(config: HailerConfig, notebook: Path) -> None
-    # atomic (tmp + replace); stores the workspace-relative posix path; "recent" most-recent-first, unique, max 10; creates .hailer/
+    # atomic (tmp + replace); stores the workspace-relative posix path; "recent" most-recent-first, unique, max 10; creates .hailer/ via statedir.ensure_state_dir
 def load_recent(config: HailerConfig) -> list[Path]         # existing notebooks only, absolute, most recent first
 def notebook_display_name(config: HailerConfig, path: Path) -> str   # workspace-relative posix ("notebooks/q2_churn.py"), absolute posix when outside
 def is_marimo_notebook(path: Path) -> bool                 # marimo's rule: .py whose first 1 MB contains "import marimo" and "marimo.App"; errors → False
@@ -430,10 +430,21 @@ class HailerAgent:
   `hailer status`, never at `hailer doctor`, which does not call the model endpoint); anything else →
   `AgentError("The agent run failed.")` with the redacted `Type: message` as hint.
 
+## `statedir.py`
+
+```python
+STATE_DIRNAME = ".hailer"; GITIGNORE_NAME = ".gitignore"; GITIGNORE_TEXT   # a comment line, then "*"
+def state_dir(workspace: Path) -> Path          # <workspace>/.hailer (path only)
+def ensure_state_dir(workspace: Path) -> Path   # mkdir -p, then write .hailer/.gitignore unless one exists (never overwritten; a failed write is ignored)
+```
+The only place `.hailer/` is created: `session.save_session`, `notebooks.save_active_notebook`,
+`HailerAgent` (the default `threads.sqlite`) and the CLI's marimo log all go through `ensure_state_dir`, so the
+folder ignores itself in any git repository. The user's own `.gitignore` is never touched.
+
 ## `session.py`  (owner: wave 2 / E)
 
 ```python
-SESSION_DIRNAME = ".hailer"; SESSION_FILENAME = "session.json"
+SESSION_FILENAME = "session.json"   # in statedir.state_dir(workspace)
 COMMANDS: dict[str, str]     # name -> one-line help, for /help
 EXIT_COMMANDS = ("exit", "quit")
 def parse_command(line: str) -> Command | None      # "/model gpt-5.5" -> Command("model", "gpt-5.5"); "/exit" ; non-slash -> None; unknown slash -> Command(name, args) (CLI reports unknown)

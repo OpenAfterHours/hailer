@@ -38,7 +38,7 @@ from hailer.models import (
     SkillInfo,
     TurnSummary,
 )
-from hailer.session import SESSION_DIRNAME
+from hailer.statedir import ensure_state_dir, state_dir
 
 log = get_logger("hailer.agent")
 
@@ -414,7 +414,7 @@ class HailerAgent:
         self._environ: Mapping[str, str] = env if env is not None else os.environ
         self._model_factory = model_factory
         self._tools = tools
-        self._threads_path = threads_path or (Path(config.workspace) / SESSION_DIRNAME / THREADS_FILENAME)
+        self._threads_path = threads_path or (state_dir(config.workspace) / THREADS_FILENAME)
         self._model = config.model.name
         self._provider_id = config.model.provider
         self.thread_id: str | None = None
@@ -501,7 +501,10 @@ class HailerAgent:
         if self._saver is None:
             import aiosqlite
 
-            self._threads_path.parent.mkdir(parents=True, exist_ok=True)
+            if self._threads_path.parent == state_dir(self.config.workspace):
+                ensure_state_dir(self.config.workspace)
+            else:
+                self._threads_path.parent.mkdir(parents=True, exist_ok=True)
             self._conn = await aiosqlite.connect(str(self._threads_path))
             self._saver = AsyncSqliteSaver(self._conn)
         if self._tools is None:

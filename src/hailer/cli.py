@@ -61,6 +61,7 @@ from hailer.session import (
     parse_command,
     save_session,
 )
+from hailer.statedir import ensure_state_dir
 
 app = typer.Typer(
     add_completion=False,
@@ -251,13 +252,12 @@ def _registry_remove(url: str) -> bool:
 
 
 def _spawn_marimo(cmd: list[str], cwd: Path, log_path: Path) -> subprocess.Popen:
-    """Start marimo as a background child of this process, logging to ``log_path``.
+    """Start marimo as a background child of this process, logging to ``log_path`` (its folder must exist).
 
     No new console window: the chat runs in this terminal and marimo is stopped when it
     ends. On Windows the child gets its own process group so Ctrl+C in the chat is not
     delivered to marimo.
     """
-    log_path.parent.mkdir(parents=True, exist_ok=True)
     log = open(log_path, "ab")  # noqa: SIM115 - handed to the child; closed with it
     flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
     try:
@@ -1225,8 +1225,8 @@ def _start_marimo(console: Console, config: HailerConfig, port: int) -> tuple[Ma
         console.print(f"Port {port} is busy; using {chosen}.", markup=False)
     url = f"http://127.0.0.1:{chosen}"
     cmd = _marimo_server_command(config, chosen)
-    log_path = config.workspace / ".hailer" / MARIMO_LOG_NAME
     try:
+        log_path = ensure_state_dir(config.workspace) / MARIMO_LOG_NAME
         proc = _spawn_marimo(cmd, config.workspace, log_path)
     except OSError as err:
         console.print(f"Could not start marimo: {err}", style="red", markup=False)
