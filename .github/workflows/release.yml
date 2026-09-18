@@ -1,14 +1,25 @@
-# Publish a release to PyPI.
+# Publish a release: the kernel image to GHCR, then the package to PyPI.
 #
 # Triggered by the vX.Y.Z tag that `uv run python -m scripts.release` pushes after the
-# tests pass locally. Runs the test suite again on every supported platform
-# (test.yml) and builds the sdist and wheel; only if both succeed does it publish
-# through the "pypi" environment using PyPI trusted publishing (OIDC, no API token
-# to store) and then create the GitHub release with the distributions attached.
+# tests pass locally. Runs the test suite again (test.yml: every supported platform,
+# plus the Docker kernel job) and builds the sdist and wheel. Then it builds the docker
+# runtime's kernel image for linux/amd64 and linux/arm64 with scripts/build_kernel_image.py
+# and pushes it as ghcr.io/openafterhours/hailer-kernel:X.Y.Z. Only if all of that
+# succeeds does it publish through the "pypi" environment using PyPI trusted publishing
+# (OIDC, no API token to store) and then create the GitHub release with the
+# distributions attached, so no released Hailer points at a missing image.
 #
 # PyPI's trusted publisher for this project is configured as:
 #   owner OpenAfterHours, repository hailer, workflow release.yml, environment pypi.
 # Renaming this file or the environment breaks publishing.
+#
+# The image job pushes with the workflow's GITHUB_TOKEN (packages: write). GHCR creates
+# the hailer-kernel package as private on the first push: make it public once, in the
+# organisation's package settings (github.com/orgs/OpenAfterHours/packages, hailer-kernel,
+# Package settings, Change visibility), or `uvx hailer kernel pull` and the first docker
+# start fail for everyone outside the organisation. If a hailer-kernel package was ever
+# pushed by hand, also give this repository the Write role under "Manage Actions access"
+# on the same page, or the push is refused.
 
 name: Release
 
@@ -59,9 +70,57 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  image:
+    name: Publish the kernel image
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push ghcr.io/openafterhours/hailer-kernel
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.1.0 # setup-uv publishes no floating major tag
+        with:
+          python-version: "3.12"
+
+      - name: Install the project
+        run: uv sync --locked
+
+      - name: Check that the image's version label will match the tag
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          # build checked pyproject.toml against the tag; the image's label comes from hailer.__version__.
+          installed="$(uv run --locked python -c 'import hailer; print(hailer.__version__)')"
+          if [ "v${VERSION}" != "${GITHUB_REF_NAME}" ] || [ "${installed}" != "${VERSION}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME}, pyproject.toml ${VERSION} and hailer.__version__ ${installed} must agree"
+            exit 1
+          fi
+
+      - uses: docker/setup-qemu-action@v4.4.0 # emulation for the linux/arm64 build on an amd64 runner
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v4.4.1
+
+      - uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push ghcr.io/openafterhours/hailer-kernel for linux/amd64 and linux/arm64
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: >-
+          uv run --locked python -m scripts.build_kernel_image --push
+          --platform linux/amd64,linux/arm64
+          --tag "ghcr.io/openafterhours/hailer-kernel:${VERSION}"
+
   publish:
     name: Publish to PyPI
-    needs: [test, build]
+    needs: [test, build, image]
     runs-on: ubuntu-latest
     environment:
       name: pypi

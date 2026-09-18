@@ -1,8 +1,15 @@
 # Run the test suite.
 #
 # Runs on pushes to main and on pull requests, and is called by release.yml so a
-# release cannot be published to PyPI unless the suite passes on every platform
-# here. The suite is offline (no API key, marimo server, model endpoint or network).
+# release cannot be published unless every job here passes:
+#
+# - test: the unit suite on every platform. It is offline (no API key, marimo server,
+#   model endpoint, network or Docker). The repository ruleset requires these four
+#   checks by name, "pytest (<os>, Python <version>)"; renaming them blocks merges.
+# - docker: builds the kernel image from this checkout (scripts/build_kernel_image.py)
+#   and runs tests/test_docker_integration.py against real containers and headless
+#   Chrome. Linux only: GitHub's Windows runners only run Windows containers. It is not
+#   a required check, but release.yml waits for it like the rest.
 
 name: Tests
 
@@ -37,3 +44,34 @@ jobs:
 
       - name: Run the tests
         run: uv run --locked pytest
+
+  docker:
+    name: Docker kernel (ubuntu-latest, Python 3.12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.1.0 # setup-uv publishes no floating major tag
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install the project and the dev dependencies
+        run: uv sync --locked
+
+      - name: Build the kernel image from this checkout
+        run: uv run --locked python -m scripts.build_kernel_image --load --platform linux/amd64
+
+      - name: Run the Docker integration test
+        env:
+          HAILER_DOCKER_TESTS: strict # fail, not skip, when Docker, the image or Chrome is missing
+        run: uv run --locked pytest tests/test_docker_integration.py -rs --basetemp "$RUNNER_TEMP/pytest"
+
+      - name: Keep headless Chrome's screenshot of the notebook when the test fails
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: docker-kernel-notebook
+          path: ${{ runner.temp }}/pytest/**/notebook.png
+          if-no-files-found: ignore
