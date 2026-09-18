@@ -481,9 +481,12 @@ setup logging → local checks (config, notebook, credentials) → marimo (reuse
 `start(forget_thread_id=<that thread>)` so the stored conversation is deleted; a different id coming back from
 a resume means the thread was gone, the CLI says so and resets the counters. Credentials: a `"missing"` key is
 a fatal preflight failure for every provider, the built-in `openai` included; `status` and `/status` show
-`<env_key> from env|keyring` or `<env_key> missing (run: uvx hailer login <id>)`. REPL: `You > ` prompt;
-Ctrl+C during a turn cancels it (the agent re-raises `KeyboardInterrupt`, the CLI prints `Interrupted.`);
-Ctrl+C or EOF at the prompt exits; slash commands `/help /status /new /exit /quit /model /notebook /clear
+`<env_key> from env|keyring` or `<env_key> missing (run: uvx hailer login <id>)`. REPL: `You > ` prompt read by
+`_LineReader` (from `_make_line_reader(console)`): prompt_toolkit `PromptSession` when stdin and stdout are
+terminals (bracketed paste on while waiting, off before `read()` returns; in-memory history; no mouse, no
+alternate screen; CPR off on VT100 outputs), else Rich's plain `Console.input`. A pasted block is one message
+with its newlines. Ctrl+C during a turn cancels it (the agent re-raises `KeyboardInterrupt`, the CLI prints
+`Interrupted.`); Ctrl+C, Ctrl+D on an empty line, EOF, or Ctrl+Z then Enter at the prompt exits; slash commands `/help /status /new /exit /quit /model /notebook /clear
 /context /skill /prompt /reload`. `/new` and `/model` share `_new_thread` (`agent.new_thread()`, counters
 reset, session saved): `/model <name>` or `/model <provider>:<name>` refuses an undeclared provider, else
 calls `agent.set_model(name, provider)` and starts exactly one new thread. `/reload` re-reads `.config/hailer`

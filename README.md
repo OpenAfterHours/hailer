@@ -392,7 +392,13 @@ credentials, customer names and row-level data out of it.
 | `/prompt <name> [args]` | Send a saved prompt from `.config/hailer/prompts`. |
 | `/reload` | Re-read `.config/hailer`; applies from your next message. |
 | `/clear` | Clear the screen. |
-| `/exit`, `/quit` | Exit Hailer (Ctrl+C at the prompt, or Ctrl+Z then Enter, also exit). |
+| `/exit`, `/quit` | Exit Hailer (Ctrl+C at the prompt, Ctrl+D on an empty line, or Ctrl+Z then Enter, also exit). |
+
+At the `You > ` prompt, pasting a block of several lines sends it as one message, newlines included:
+Hailer turns on the terminal's bracketed paste while it waits for you and turns it off before the agent
+starts. Enter sends; Up and Down recall your earlier messages from this session (they are not saved to disk).
+The prompt does not capture the mouse or switch to an alternate screen, so scrolling and selecting text work
+as usual. When the input is not a terminal (a pipe or a script), Hailer reads plain lines instead.
 
 Ctrl+C while the agent is working cancels that turn, including the request to the model endpoint, and
 returns to the prompt. The conversation carries on: your interrupted message is kept and sent together with

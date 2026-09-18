@@ -565,6 +565,73 @@ def _print_checks(console: Console, checks: list[Check], *, only_failures: bool 
 # --------------------------------------------------------------------------- #
 
 
+CTRL_Z = "\x1a"  # Ctrl+Z then Enter: end of input on Windows, as in Python's own REPL
+
+
+def _stdio_is_terminal() -> bool:
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, ValueError):  # replaced or closed streams
+        return False
+
+
+class _LineReader:
+    """Reads one message at the ``You > `` prompt.
+
+    In a terminal it is a prompt_toolkit prompt. While it waits, bracketed paste is on
+    (``ESC[?2004h``), so a pasted block arrives as one message with its newlines, and it is off
+    again (``ESC[?2004l``) before the prompt returns, so before the turn runs. Up/Down recall this
+    session's messages (in memory only). No mouse capture and no alternate screen, so the
+    terminal's own scrollback and selection keep working. Without a terminal (a pipe, the tests)
+    it is Rich's plain ``Console.input``, as before.
+
+    Ctrl+C at the prompt raises ``KeyboardInterrupt``; Ctrl+D on an empty line, or Ctrl+Z then
+    Enter, raises ``EOFError``. ``pt_input`` / ``pt_output`` replace the terminal (tests).
+    """
+
+    def __init__(self, console: Console, *, interactive: bool | None = None, pt_input: Any = None, pt_output: Any = None) -> None:
+        self.console = console
+        self.interactive = _stdio_is_terminal() if interactive is None else interactive
+        self._pt_input = pt_input
+        self._pt_output = pt_output
+        self._session: Any = None
+
+    def read(self) -> str:
+        if self.interactive:
+            line = self._prompt_session().prompt()
+        else:
+            line = self.console.input(f"[bold cyan]{PROMPT}[/bold cyan]")
+        if line.lstrip().startswith(CTRL_Z):
+            raise EOFError
+        return line
+
+    def _prompt_session(self) -> Any:
+        if self._session is None:
+            from prompt_toolkit import PromptSession
+            from prompt_toolkit.formatted_text import FormattedText
+            from prompt_toolkit.history import InMemoryHistory
+            from prompt_toolkit.output import create_output
+            from prompt_toolkit.output.vt100 import Vt100_Output
+
+            output = self._pt_output or create_output()
+            if isinstance(output, Vt100_Output):
+                # No completion menu needs the cursor row, and a terminal that never answers the
+                # ESC[6n request would get a "does not support CPR" warning printed into it.
+                output.enable_cpr = False
+            self._session = PromptSession(
+                FormattedText([("bold ansicyan", PROMPT)]),
+                history=InMemoryHistory(),
+                mouse_support=False,
+                input=self._pt_input,
+                output=output,
+            )
+        return self._session
+
+
+def _make_line_reader(console: Console) -> _LineReader:
+    return _LineReader(console)
+
+
 @dataclass
 class _TurnDisplay:
     """Drives the progress line for one turn and prints the final answer exactly once.
@@ -626,6 +693,7 @@ class ChatLoop:
         self.state: SessionState = load_session(config.workspace)
         self.bundle: ContextBundle = ContextBundle()
         self.agent: Any = None
+        self.reader = _make_line_reader(console)
         # One-line notice sent with the next user message after a /notebook switch (the model
         # learns about switches it made itself from its own tool results).
         self._pending_preamble: str | None = None
@@ -665,14 +733,13 @@ class ChatLoop:
     # -- REPL -------------------------------------------------------------- #
 
     def run(self) -> None:
+        # The plain prompt leaves the cursor after "You > "; prompt_toolkit has ended the line already.
+        bye = "Bye." if self.reader.interactive else "\nBye."
         while True:
             try:
-                line = self.console.input(f"[bold cyan]{PROMPT}[/bold cyan]")
-            except EOFError:
-                self.console.print("\nBye.")
-                return
-            except KeyboardInterrupt:
-                self.console.print("\nBye.")
+                line = self.reader.read()
+            except (EOFError, KeyboardInterrupt):
+                self.console.print(bye)
                 return
             text = line.strip()
             if not text:

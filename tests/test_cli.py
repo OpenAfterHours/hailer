@@ -6,6 +6,9 @@ import io
 import json
 import socket
 import sys
+import threading
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import quote
@@ -1537,3 +1540,138 @@ def test_pinned_url_that_is_up_is_used_even_when_it_serves_another_folder(harnes
     assert result.exit_code == 0, result.output
     assert f"Using the running marimo at {pinned.url}." in result.output
     assert nb.spawned == []
+
+
+# --------------------------------------------------------------------------- #
+# The prompt: prompt_toolkit in a terminal, bracketed paste, plain input otherwise
+# --------------------------------------------------------------------------- #
+
+PASTE_ON, PASTE_OFF = "\x1b[?2004h", "\x1b[?2004l"
+
+
+@contextmanager
+def terminal():
+    """A prompt_toolkit reader on a pipe (what the keyboard or the host types) and a VT100 screen
+    that records every byte written, escape sequences included."""
+    from prompt_toolkit.data_structures import Size
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output.vt100 import Vt100_Output
+
+    with create_pipe_input() as keys:
+        screen = io.StringIO()
+        output = Vt100_Output(screen, lambda: Size(rows=24, columns=100), term="xterm-256color")
+        console = Console(file=io.StringIO(), force_terminal=False, color_system=None)
+        yield cli._LineReader(console, interactive=True, pt_input=keys, pt_output=output), keys, screen
+
+
+def last_paste_mode(screen: io.StringIO) -> str | None:
+    text = screen.getvalue()
+    on, off = text.rfind(PASTE_ON), text.rfind(PASTE_OFF)
+    if on < 0 and off < 0:
+        return None
+    return "on" if on > off else "off"
+
+
+def test_prompt_bracketed_paste_is_one_submission_with_its_newlines():
+    with terminal() as (reader, keys, _screen):
+        keys.send_text("\x1b[200~first line\r\nsecond line\nthird\x1b[201~\r")
+        assert reader.read() == "first line\nsecond line\nthird"
+        keys.send_text("next\r")
+        assert reader.read() == "next", "the paste produced exactly one submission"
+
+
+def test_prompt_turns_bracketed_paste_on_while_waiting_and_off_before_returning():
+    with terminal() as (reader, keys, screen):
+        result: list[str] = []
+        thread = threading.Thread(target=lambda: result.append(reader.read()), daemon=True)
+        thread.start()
+        deadline = time.monotonic() + 10
+        while "You > " not in screen.getvalue() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert "You > " in screen.getvalue(), "the prompt is drawn"
+        assert last_paste_mode(screen) == "on", "waiting at the prompt: DECSET 2004 is on"
+        keys.send_text("hello\r")
+        thread.join(10)
+        assert result == ["hello"]
+        assert last_paste_mode(screen) == "off", "DECRST 2004 is written before read() returns"
+        out = screen.getvalue()
+        assert "\x1b[?1049h" not in out, "no alternate screen"
+        assert "\x1b[?1000h" not in out and "\x1b[?1003h" not in out, "no mouse capture"
+        assert "\x1b[6n" not in out, "no cursor position request"
+
+
+def test_prompt_ctrl_c_ctrl_d_and_ctrl_z_enter():
+    with terminal() as (reader, keys, _screen):
+        keys.send_text("\x03")
+        with pytest.raises(KeyboardInterrupt):
+            reader.read()
+        keys.send_text("\x04")
+        with pytest.raises(EOFError):
+            reader.read()
+        keys.send_text("\x1a\r")  # Ctrl+Z then Enter: end of input on Windows
+        with pytest.raises(EOFError):
+            reader.read()
+
+
+def type_at_prompt(reader, keys, screen, text: str) -> str:
+    """read() with ``text`` typed once the prompt is on screen, as a person would type it."""
+    shown = screen.getvalue().count("You > ")
+    result: list[str] = []
+    thread = threading.Thread(target=lambda: result.append(reader.read()), daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while screen.getvalue().count("You > ") <= shown and time.monotonic() < deadline:
+        time.sleep(0.02)
+    time.sleep(0.1)  # history loads in the background when the prompt starts
+    keys.send_text(text)
+    thread.join(10)
+    return result[0]
+
+
+def test_prompt_up_arrow_recalls_earlier_messages():
+    with terminal() as (reader, keys, screen):
+        assert type_at_prompt(reader, keys, screen, "first\r") == "first"
+        assert type_at_prompt(reader, keys, screen, "second\r") == "second"
+        assert type_at_prompt(reader, keys, screen, "\x1b[A\x1b[A\r") == "first"  # Up, Up, Enter
+
+
+def test_prompt_falls_back_to_plain_input_without_a_terminal(monkeypatch):
+    monkeypatch.setattr(cli, "_stdio_is_terminal", lambda: False)
+    monkeypatch.setattr(Console, "input", lambda self, prompt="", **kw: "typed")
+    reader = cli._LineReader(Console(file=io.StringIO()))
+    assert reader.interactive is False
+    assert reader.read() == "typed"
+    assert reader._session is None, "prompt_toolkit is never started on a pipe"
+
+
+def test_chat_with_the_prompt_sends_a_pasted_block_as_one_turn(harness, monkeypatch):
+    with terminal() as (reader, keys, screen):
+        monkeypatch.setattr(cli, "_make_line_reader", lambda console: reader)
+        modes_at_turn: list[str | None] = []
+        harness.agent.on_turn = lambda: modes_at_turn.append(last_paste_mode(screen))
+        keys.send_text("\x1b[200~sum revenue\nby region\x1b[201~\r/exit\r")
+        result = chat(input_text="")
+    assert result.exit_code == 0, result.output
+    assert harness.agent.turns == [("sum revenue\nby region", None)]
+    assert modes_at_turn == ["off"], "bracketed paste is off while the turn runs"
+    assert "Bye." in result.output
+
+
+def test_chat_with_the_prompt_ctrl_c_in_a_turn_cancels_only_that_turn(harness, monkeypatch):
+    with terminal() as (reader, keys, _screen):
+        monkeypatch.setattr(cli, "_make_line_reader", lambda console: reader)
+        harness.agent.fail_with = KeyboardInterrupt()  # the agent cancels the turn and re-raises
+        keys.send_text("long question\r/exit\r")
+        result = chat(input_text="")
+    assert result.exit_code == 0, result.output
+    assert "Interrupted." in result.output and "Bye." in result.output
+
+
+def test_chat_with_the_prompt_ctrl_c_at_the_prompt_exits(harness, monkeypatch):
+    with terminal() as (reader, keys, _screen):
+        monkeypatch.setattr(cli, "_make_line_reader", lambda console: reader)
+        keys.send_text("\x03")
+        result = chat(input_text="")
+    assert result.exit_code == 0, result.output
+    assert "Bye." in result.output and harness.agent.turns == []
+    assert harness.agent.closed
