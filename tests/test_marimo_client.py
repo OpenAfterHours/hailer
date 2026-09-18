@@ -6,11 +6,11 @@ import json
 import os
 import socket
 import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote
 
 import pytest
+from fake_marimo import running
 
 from hailer import marimo_client as mc
 from hailer.errors import MarimoExecutionError, MarimoUnavailableError, NoSessionError
@@ -21,119 +21,10 @@ from hailer.models import HailerConfig, MarimoServer, MarimoSession
 # --------------------------------------------------------------------------- #
 
 
-def _sse(events: list[tuple[str, dict]], newline: str = "\n") -> bytes:
-    return "".join(f"event: {name}{newline}data: {json.dumps(data)}{newline}{newline}" for name, data in events).encode()
-
-
-class _Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def log_message(self, *args):  # noqa: D401 - silence
-        pass
-
-    def _send(self, code: int, body: bytes, ctype: str = "application/json") -> None:
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _authorised(self) -> bool:
-        srv = self.server
-        if not srv.token:
-            return True
-        return self.headers.get("Authorization") == f"Bearer {srv.token}"
-
-    def do_GET(self):
-        if self.path == "/health":
-            self._send(200, b'{"status":"healthy"}')
-        elif self.path == "/":
-            self.server.page_hits += 1
-            if self.server.mode == "no_token_tag":
-                self._send(200, b"<html><body>not marimo</body></html>", "text/html")
-                return
-            html = f'<html><head><marimo-server-token data-token="{self.server.server_token}"></marimo-server-token></head></html>'
-            self._send(200, html.encode(), "text/html")
-        elif self.path == "/api/sessions":
-            if not self._authorised():
-                self._send(401, b'{"detail":"unauthorised"}')
-                return
-            if self.server.mode == "sessions_500":
-                self._send(500, b'{"detail":"kernel manager exploded"}')
-                return
-            self._send(200, json.dumps(self.server.sessions).encode())
-        else:
-            self._send(404, b"")
-
-    def do_POST(self):
-        n = int(self.headers.get("Content-Length") or 0)
-        body = self.rfile.read(n) if n else b""
-        self.server.requests.append({"path": self.path, "headers": dict(self.headers.items()), "body": json.loads(body or b"{}")})
-        if not self._authorised():
-            self._send(401, b'{"detail":"unauthorised"}')
-            return
-        if self.path == "/api/home/shutdown_session":
-            # every POST except /api/kernel/execute needs the skew-protection token
-            if self.headers.get("Marimo-Server-Token") != self.server.server_token or self.server.mode == "stale_token":
-                self._send(401, b'{"error":"Invalid server token"}')
-                return
-            sid = self.server.requests[-1]["body"].get("sessionId")
-            if sid not in self.server.sessions:
-                self._send(500, b'{"detail":"Session not found"}')
-                return
-            del self.server.sessions[sid]
-            self._send(200, b'{"files":[]}')
-            return
-        if self.path != "/api/kernel/execute":
-            self._send(404, b"")
-            return
-        mode = self.server.mode
-        if mode == "json_error":
-            self._send(400, b'{"detail":"Session not found: stale"}')
-            return
-        if mode == "plain_json_200":
-            self._send(200, b'{"detail":"not a stream"}')
-            return
-        newline = "\r\n" if mode == "crlf" else "\n"
-        events: list[tuple[str, dict]]
-        if mode in ("success", "crlf"):
-            events = [("stdout", {"data": "hello "}), ("stdout", {"data": "world\n"}), ("done", {"success": True, "output": {"mimetype": "text/plain", "data": "42"}})]
-        elif mode == "stderr":
-            events = [("stderr", {"data": "Traceback: boom\n"}), ("done", {"success": False, "output": {"mimetype": "text/plain", "data": ""}})]
-        elif mode == "nodone":
-            events = [("stdout", {"data": "partial"})]
-        else:
-            raise AssertionError(mode)
-        self._send(200, _sse(events, newline), "text/event-stream")
-
-
-class FakeMarimo(ThreadingHTTPServer):
-    daemon_threads = True
-
-    def __init__(self):
-        super().__init__(("127.0.0.1", 0), _Handler)
-        self.sessions: dict[str, dict] = {}
-        self.mode = "success"
-        self.token: str | None = None
-        self.server_token = "skew-token-123"
-        self.page_hits = 0
-        self.requests: list[dict] = []
-
-    @property
-    def url(self) -> str:
-        return f"http://127.0.0.1:{self.server_address[1]}"
-
-
 @pytest.fixture
 def fake():
-    srv = FakeMarimo()
-    thread = threading.Thread(target=srv.serve_forever, daemon=True)
-    thread.start()
-    try:
+    with running() as srv:
         yield srv
-    finally:
-        srv.shutdown()
-        srv.server_close()
 
 
 def _free_port() -> int:
@@ -415,13 +306,91 @@ def test_find_server_prefers_config(fake, tmp_path):
     assert server == MarimoServer(url="http://localhost:9999", source="config")
 
 
-def test_find_server_single_registry_entry(fake, tmp_path):
+def _register(reg: Path, *servers) -> None:
+    """Registry entries for ``servers`` the way marimo writes them (``<host>_<port>.json``)."""
+    for srv in servers:
+        port = srv.server_address[1]
+        _write_entry(reg, f"127.0.0.1_{port}.json", server_id=f"127.0.0.1:{port}", pid=1, host="127.0.0.1", port=port, base_url="", started_at="", version="0.24.2")
+
+
+def test_find_server_pinned_url_is_returned_even_when_down(tmp_path):
+    cfg = _config(tmp_path, marimo_url=f"http://127.0.0.1:{_free_port()}")
+    assert mc.find_server(cfg, registry=tmp_path / "servers").url == cfg.marimo_url
+
+
+def test_find_server_ignores_a_lone_server_for_another_workspace(fake, tmp_path):
+    """One live server, started on another worktree's notebooks folder: not ours, even though it is the only one."""
     reg = tmp_path / "servers"
-    port = fake.server_address[1]
-    _write_entry(reg, "a.json", server_id="a", pid=1, host="127.0.0.1", port=port, base_url="", started_at="", version="")
-    assert mc.find_server(_config(tmp_path), registry=reg).url == fake.url
-    _write_entry(reg, "b.json", server_id="b", pid=1, host="127.0.0.1", port=port, base_url="", started_at="", version="")
-    assert mc.find_server(_config(tmp_path), registry=reg) is None  # ambiguous
+    ws = tmp_path / "wt-a"
+    other = tmp_path / "wt-b"
+    fake.root = str(other / "notebooks")
+    fake.sessions = {"s1": {"filename": "analysis.py", "path": str(other / "notebooks" / "analysis.py")}}
+    _register(reg, fake)
+    assert mc.find_server(_config(ws, notebook=ws / "notebooks" / "analysis.py"), registry=reg) is None
+
+
+def test_find_server_picks_the_server_started_on_this_workspace(fake, tmp_path):
+    """Two live servers, no tab open on either: the one whose root is our notebooks folder wins."""
+    reg = tmp_path / "servers"
+    ws = tmp_path / "wt-a"
+    fake.root = str(tmp_path / "wt-b" / "notebooks")
+    with running() as ours:
+        ours.root = str(ws / "notebooks")
+        _register(reg, fake, ours)
+        found = mc.find_server(_config(ws, notebook=ws / "notebooks" / "analysis.py"), registry=reg)
+        assert found is not None and found.url == ours.url and found.source == "registry"
+
+
+def test_find_server_picks_the_server_hosting_a_notebook_of_this_workspace(fake, tmp_path):
+    """A server started elsewhere (single-file mode: no root) that hosts one of our notebooks is ours."""
+    reg = tmp_path / "servers"
+    ws = tmp_path / "wt-a"
+    fake.root = str(tmp_path / "wt-b" / "notebooks")
+    with running() as ours:
+        ours.sessions = {"s2": {"filename": "other.py", "path": str(ws / "notebooks" / "sub" / "other.py")}}
+        _register(reg, fake, ours)
+        found = mc.find_server(_config(ws, notebook=ws / "notebooks" / "analysis.py"), registry=reg)
+        assert found is not None and found.url == ours.url
+        assert ours.page_hits == 0, "a session inside the notebooks folder is proof enough; no root lookup"
+
+
+def test_find_server_prefers_the_server_hosting_the_active_notebook(fake, tmp_path):
+    reg = tmp_path / "servers"
+    ws = tmp_path
+    fake.root = str(ws / "notebooks")  # ours, but the active notebook is open on the other one
+    with running() as active:
+        active.sessions = {"s1": {"filename": "analysis.py", "path": str(ws / "notebooks" / "analysis.py")}}
+        _register(reg, fake, active)
+        assert mc.find_server(_config(ws), registry=reg).url == active.url
+
+
+def test_find_server_does_not_claim_a_server_on_a_parent_folder(fake, tmp_path):
+    """A server on the main checkout does not belong to a worktree nested inside it."""
+    reg = tmp_path / "servers"
+    main = tmp_path / "repo"
+    worktree = main / ".claude" / "worktrees" / "wt"
+    fake.root = str(main)
+    _register(reg, fake)
+    assert mc.find_server(_config(worktree, notebook=worktree / "notebooks" / "analysis.py"), registry=reg) is None
+    fake.root = str(main / "notebooks")
+    assert mc.find_server(_config(worktree, notebook=worktree / "notebooks" / "analysis.py"), registry=reg) is None
+
+
+def test_root_reads_workspace_files_with_the_server_token(fake, tmp_path):
+    fake.root = str(tmp_path / "notebooks")
+    assert mc.MarimoClient(fake.url).root() == str(tmp_path / "notebooks")
+    request = fake.requests[-1]
+    assert request["path"] == "/api/home/workspace_files"
+    assert request["headers"].get("Marimo-Server-Token") == fake.server_token
+    fake.root = None
+    assert mc.MarimoClient(fake.url).root() is None, "a single-file server has no folder"
+
+
+def test_workspace_affinity_is_none_for_something_that_is_not_marimo(fake, tmp_path):
+    fake.mode = "no_token_tag"  # answers /health and /api/sessions, but no server token and no workspace_files
+    assert mc.workspace_affinity(mc.MarimoClient(fake.url), _config(tmp_path)) == mc.AFFINITY_NONE
+    fake.mode = "sessions_500"
+    assert mc.workspace_affinity(mc.MarimoClient(fake.url), _config(tmp_path)) == mc.AFFINITY_NONE
 
 
 # --------------------------------------------------------------------------- #
@@ -591,9 +560,9 @@ def test_marimo_server_command_foreground_lets_marimo_open_the_browser(tmp_path)
 
 def test_launch_hint_offers_one_command_route_first():
     hint = mc.launch_hint()
-    assert hint.index("uvx hailer notebook\n") < hint.index("uvx hailer notebook --foreground")
-    assert hint.rstrip().endswith("uvx hailer")
-    assert "Or run marimo on its own in another terminal:" in hint and "Then run Hailer again:" in hint
+    assert hint.index("uvx hailer        (or: uvx hailer notebook)") < hint.index("uvx hailer notebook --foreground")
+    assert "starts marimo for this workspace" in hint, "bare hailer starts its own server"
+    assert "Or run marimo on its own in another terminal:" in hint
     assert "uv run" not in hint
 
 

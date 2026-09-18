@@ -93,8 +93,10 @@ The notebook lists them when it opens, and you can start asking straight away.
 in the background (log in `.hailer/marimo.log`), opens the active notebook's URL so the kernel gets a
 session, then runs the chat in the same terminal. One server hosts every notebook in the folder, and
 marimo's own home page (the server URL without `?file=`) lists them all. When you leave the chat (`/exit`,
-Ctrl+Z Enter, or Ctrl+C at the prompt) it stops the marimo server it started. If a marimo server is already
-running with a notebook from the folder open, it is reused and left running.
+Ctrl+Z Enter, or Ctrl+C at the prompt) it stops the marimo server it started. If this workspace's marimo
+server is already running (started on this notebooks folder, or with one of its notebooks open), it is
+reused and left running. A server for another folder, such as another git worktree of the same repository,
+is never used, so several workspaces can each run their own.
 
 The notebook opens in marimo's **app view**: you see the results, tables and charts the agent produces,
 not the code behind them (the URL carries `view-as=present`). To see or edit the code, press `Ctrl+.`
@@ -106,12 +108,15 @@ instead of opening it), `--keep-marimo` (leave the server running after the chat
 marimo attached to this terminal, no chat; it opens marimo's home page unless `--no-browser` is given),
 `--new` (start a fresh conversation).
 
-Chat only, when marimo is already running (started by `uvx hailer notebook --keep-marimo`, or by
-`uvx hailer notebook --foreground` in another terminal, with the notebook open in a browser):
+Bare `uvx hailer` does the same as `uvx hailer notebook` with its defaults: it reuses this workspace's
+marimo server or starts one, opens the notebook, chats, and stops only a server it started.
 
 ```bash
 uvx hailer
 ```
+
+A pinned server (`[hailer].marimo_url` in `hailer.toml`, or `HAILER_MARIMO_URL`) is used as is, whichever
+folder it serves. If it does not answer, Hailer says so and exits; it never starts a server in its place.
 
 ```text
 +--------------------- Hailer ----------------------+
@@ -508,12 +513,15 @@ replaces it. `.hailer/` is in the repository's `.gitignore`.
 
 ## Troubleshooting
 
-`uvx hailer doctor` runs the five startup checks (config, notebook, credentials, marimo, session) and,
-when a session exists, confirms that marimo's code-mode API is available in the kernel.
+`uvx hailer doctor` runs five checks (config, notebook, credentials, marimo, session) and, when a session
+exists, confirms that marimo's code-mode API is available in the kernel. With several marimo servers
+running it checks the one serving this workspace; having none is only a warning, because `uvx hailer`
+starts one.
 
 | Message | Meaning and fix |
 |---|---|
-| `Marimo is not running.` then `Start everything in one go: uvx hailer notebook`, `Or run marimo on its own in another terminal: uvx hailer notebook --foreground`, `Then run Hailer again: uvx hailer` | No server answered at the configured or discovered URL. `uvx hailer notebook` starts one on the notebooks folder and runs the chat in the same terminal; `--foreground` runs only marimo, with Hailer's own Python environment, so the notebook can import Polars, DuckDB and `hailer.periods`. Servers started with `--no-token` register themselves so Hailer finds them; otherwise set `marimo_url` in `hailer.toml`. |
+| `No marimo server is running for this workspace.` (from `doctor` or `exec`; `status` says `none for this workspace`) | No running server serves this workspace's notebooks folder; servers for other folders are ignored. `uvx hailer` (or `uvx hailer notebook`) starts one and runs the chat in the same terminal; `uvx hailer notebook --foreground` runs only marimo, with Hailer's own Python environment, so the notebook can import Polars, DuckDB and `hailer.periods`. Servers started with `--no-token` register themselves so Hailer finds them; otherwise set `marimo_url` in `hailer.toml`. |
+| `Marimo is not running at <url>.` with a hint about `[hailer].marimo_url` | The URL pinned by `marimo_url` or `HAILER_MARIMO_URL` does not answer. Start marimo there, or remove the setting so Hailer starts its own server for this workspace. |
 | `Marimo exited early (code N)` or `Marimo did not answer on http://127.0.0.1:2718 within 60 s`, followed by `Log: .hailer\marimo.log` and its last lines | `hailer notebook` could not start marimo. The log tail usually names the cause (port in use by something else, a syntax error in the notebook, marimo not installed in the environment). |
 | `the notebook is not open in a browser` followed by `Open http://... in your browser.` | The server is up but has no kernel session. Open the URL; Hailer opens it for you once at startup. The URL ends in `&view-as=present` (app view); `Ctrl+.` in the notebook shows the code. |
 | `not found: <path>` for the notebook | The configured notebook (`[hailer].notebook`, or `HAILER_NOTEBOOK`) does not exist. `uvx hailer init` creates it from the starter template (your `hailer.toml` is kept), or fix the path; a deleted *active* notebook is not the cause, because Hailer already falls back to the configured one when the remembered notebook is gone. New notebooks are created from the chat with `/notebook new <name>`. |

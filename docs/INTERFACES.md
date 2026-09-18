@@ -166,7 +166,8 @@ held at WARNING unless `--verbose`.
 CM_HELP_CODE = "import marimo._code_mode as cm; help(cm)"
 SERVER_TOKEN_HEADER = "Marimo-Server-Token"
 def discover_servers() -> list[MarimoServer]         # registry files; drop entries whose /health does not answer
-def find_server(config: HailerConfig) -> MarimoServer | None   # config.marimo_url first, then registry (single live server, else None)
+def find_server(config: HailerConfig) -> MarimoServer | None   # config.marimo_url (a pin: returned as is, up or not); else the live registry server with the highest workspace_affinity > 0 (never a server for another folder, even when it is the only one)
+def workspace_affinity(client: MarimoClient, config: HailerConfig) -> int   # AFFINITY_ACTIVE (2): a session for the active notebook; AFFINITY_WORKSPACE (1): a session for a notebook under notebooks_root, or root() == notebooks_root (a parent folder does not count); AFFINITY_NONE (0) otherwise or on any error
 class MarimoClient:
     def __init__(self, base_url: str, token: str | None = None, *, timeout: float = 10.0,
                  notebook: Path | None = None, workspace: Path | None = None) -> None
@@ -179,6 +180,7 @@ class MarimoClient:
                 timeout: float = 600.0) -> ExecResult   # SSE parse; missing `done` → MarimoExecutionError
     def notebook_url(self, notebook: Path | None = None) -> str
     def server_token(self) -> str                       # data-token of <marimo-server-token> in GET /; cached per instance; MarimoUnavailableError if absent
+    def root(self) -> str | None                        # POST /api/home/workspace_files + Marimo-Server-Token → "root": the folder marimo was started on (absolute, symlinks not resolved); None for a single-file server
     def shutdown_session(self, session_id: str) -> None # POST /api/home/shutdown_session {"sessionId": id} + Marimo-Server-Token; 401 → MarimoUnavailableError ("server restarted; retry"), token dropped so the next call refetches it
 def match_session(sessions: Sequence[MarimoSession], notebook: Path, workspace: Path | None = None) -> MarimoSession | None
     # the session whose path (or filename when marimo reports no path) is the same file as notebook, compared as
@@ -192,7 +194,7 @@ def marimo_server_command(notebooks_dir: Path, workspace: Path, port: int, *, he
     # [sys.executable,"-m","marimo","edit",<folder>,"--no-token",("--headless"),"--port",N,"--skip-update-check"]; used by
     # `hailer notebook` (background, headless) and `--foreground` (headless only with --no-browser). Hailer's own
     # interpreter, never `uv run`: works under uvx without a project .venv.
-def launch_hint() -> str   # "Start everything in one go: uvx hailer notebook", then launch_command() for another terminal, then "uvx hailer"
+def launch_hint() -> str   # "uvx hailer (or: uvx hailer notebook)" starts marimo for this workspace, then launch_command() for another terminal
 def wait_for_health(url: str, timeout: float = 60.0, *, interval: float = 0.5, should_stop=None) -> bool
 def wait_for_session(client: MarimoClient, notebook: Path | None, timeout: float = 90.0, *, interval: float = 0.5) -> MarimoSession | None
 ```
@@ -446,21 +448,24 @@ stored: the system prompt is sent with every turn, so `/reload` applies from the
 
 ## `cli.py`  (owner: wave 2 / E)
 
-Typer app; `def main() -> None` is the console entry. Commands: default (no subcommand) → chat; `notebook`
-(start marimo on `config.notebooks_root` in the background: `mkdir` it first, `marimo_server_command`, log in
-`.hailer/marimo.log`; or reuse a live server; open the active notebook; chat; stop marimo on exit unless
-`--keep-marimo`; `--foreground` runs `marimo_server_command(..., headless=--no-browser)` attached, without the
-chat; `_reusable_server` accepts the configured
-URL or a live server that has a session for the active notebook or for any notebook under the folder); `exec`
+Typer app; `def main() -> None` is the console entry. Commands: default (no subcommand) and `notebook` both run
+`_run_session` (bare `hailer` with the defaults: port 2718, browser, stop on exit): local checks; reuse this
+workspace's server or start marimo on `config.notebooks_root` in the background (`mkdir` it first,
+`marimo_server_command`, log in `.hailer/marimo.log`); pin the chat to it (`marimo_url`); open the active
+notebook and wait for its session; chat; stop the marimo it started on exit unless `--keep-marimo`.
+`_reusable_server` returns a pinned URL as is (down → error exit, never a server started in its place) or the
+server `find_server` found if it answers and `workspace_affinity` > 0. `notebook --foreground` runs
+`marimo_server_command(..., headless=--no-browser)` attached, without the chat. `exec`
 (`-c CODE` | `-` stdin | file; prints result; exit 1 on failure); `status`; `doctor` (the preflight checks and a
-code-mode probe; it never calls the model endpoint); `login <provider>`; `logout <provider>`; `init` (write
+code-mode probe; it never calls the model endpoint; no server for this workspace is a warning, a pinned URL that
+is down a failure); `login <provider>`; `logout <provider>`; `init` (write
 default config + `.config/hailer` skeleton, then load that config and create the configured notebook with
 `notebooks.ensure_notebook` and the notebooks and data folders when missing; nothing but `hailer.toml` is ever
 overwritten, and only with `--force`; an unloadable `hailer.toml` skips the notebook step). Global options `--verbose/-v`, `--config`, `--workspace`, `--new`
 (do not resume), `--version`. Startup: `_load_config` (load config, then `config.notebook` := the active
 notebook from the state file, or, when `HAILER_NOTEBOOK` is set, that notebook written to the state file) →
-setup logging → Rich panel (`Notebook:` active, `Notebooks:` folder) → preflight (config, notebook,
-credentials, marimo server, session) → agent start → REPL. Agent start (`ChatLoop.start`):
+setup logging → local checks (config, notebook, credentials) → marimo (reuse or start, see above) → Rich panel
+(`Notebook:` active, `Notebooks:` folder) → agent start → REPL. Agent start (`ChatLoop.start`):
 `HailerAgent(config, bundle)`, then `start(resume_thread_id=<thread in session.json>)`, or with `--new`
 `start(forget_thread_id=<that thread>)` so the stored conversation is deleted; a different id coming back from
 a resume means the thread was gone, the CLI says so and resets the counters. Credentials: a `"missing"` key is
