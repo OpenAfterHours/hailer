@@ -163,6 +163,22 @@ Added a channel comparison below the category chart.
 Hailer resumes your previous conversation on the next start; use `uvx hailer --new` or `/new` for a fresh
 thread. `uvx hailer doctor` runs the same startup checks and prints fixes.
 
+## Running inside abeam
+
+[abeam](https://github.com/OpenAfterHours/abeam) runs coding-agent CLIs in a terminal pane beside git status,
+a file viewer and a shell. It starts `hailer` from your `PATH`, so install Hailer as a tool first:
+
+```bash
+uv tool install hailer
+abeam +hailer
+```
+
+abeam forwards every argument, so `abeam +hailer notebook --no-browser` or `abeam +hailer --new` behave as
+they do in a terminal. abeam starts Hailer in a git worktree; commit `hailer.toml` (and your notebooks) so
+each worktree is a workspace of its own, since Hailer uses the nearest folder holding `hailer.toml` or
+`pyproject.toml`. Each workspace then gets its own marimo server, `.hailer/` stays out of the git pane, and a
+pasted block of several lines arrives as one message.
+
 ## Working with several notebooks
 
 One analysis, one notebook: the agent can create a fresh notebook or go back to an earlier one, and you
@@ -534,7 +550,7 @@ starts one.
 | `the notebook is not open in a browser` followed by `Open http://... in your browser.` | The server is up but has no kernel session. Open the URL; Hailer opens it for you once at startup. The URL ends in `&view-as=present` (app view); `Ctrl+.` in the notebook shows the code. |
 | `not found: <path>` for the notebook | The configured notebook (`[hailer].notebook`, or `HAILER_NOTEBOOK`) does not exist. `uvx hailer init` creates it from the starter template (your `hailer.toml` is kept), or fix the path; a deleted *active* notebook is not the cause, because Hailer already falls back to the configured one when the remembered notebook is gone. New notebooks are created from the chat with `/notebook new <name>`. |
 | `No notebook named '...' in notebooks.` or `... is outside the notebooks folder.` | `/notebook open` (or the agent's `notebook_open`) only opens marimo notebooks inside `[hailer].notebooks_dir`; the hint lists the available names. Move the file into the folder or point `notebooks_dir` at it. |
-| `INTERNAL_MODEL_API_KEY is not set (required by provider 'internal')`, or the same for `OPENAI_API_KEY` and provider `'openai'` | Every provider needs a key. Run `uvx hailer login <provider>` or set the variable in this terminal. Releases up to 0.2 could use a ChatGPT login for the `openai` provider; that is gone, so create an API key. |
+| `INTERNAL_MODEL_API_KEY is not set (required by provider 'internal')`, or the same for `OPENAI_API_KEY` and provider `'openai'` | Every provider needs a key. Run `uvx hailer login <provider>` or set the variable in this terminal. Releases up to 0.2.2 could use a ChatGPT login for the `openai` provider; that is gone, so create an API key. |
 | `The model endpoint rejected the API key for provider '...'` | The endpoint returned 401. Re-run `hailer login <provider>`. |
 | `Unknown model '...' for provider '...'` | The endpoint does not know `[model].name` (or the name given to `/model`). Its reply is quoted after `The endpoint said:`. |
 | `Could not reach the model endpoint at <base_url>` | Check `base_url`, VPN or proxy (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`), and that the endpoint is running. |
@@ -543,8 +559,8 @@ starts one.
 | `The endpoint at <base_url> refused access (HTTP 403).` | The key was accepted but is not allowed for this model, route or organisation. Check the endpoint's access policy and the provider's `http_headers` / `env_http_headers`. |
 | `The endpoint at <base_url> is unavailable (HTTP 429)` (or 5xx) | Rate limit or an outage on the endpoint's side. Retry in a moment. |
 | `The conversation no longer fits the model's context window.` | Start again with `/new`, and lower `[model].summarize_after_tokens` so older turns are summarised before the model's limit is reached. |
-| `Warning: unknown key [model_providers.x].merge_messages ... is ignored` (also `parallel_tool_calls`, `requires_openai_auth`, `[hailer].codex_home`, `[web].allow_shell_network`) | Settings from releases up to 0.2 that no longer mean anything. The file still loads; delete the keys to silence the warning. |
-| `Previous conversation could not be resumed; started a new one.` after upgrading from 0.2 | Conversations from before 0.3 were stored elsewhere and do not carry over. |
+| `Warning: unknown key [model_providers.x].merge_messages ... is ignored` (also `parallel_tool_calls`, `requires_openai_auth`, `[hailer].codex_home`, `[web].allow_shell_network`) | Settings from releases up to 0.2.2 that no longer mean anything. The file still loads; delete the keys to silence the warning. |
+| `Previous conversation could not be resumed; started a new one.` after upgrading from 0.2.2 or earlier | Conversations from before 0.2.3 (the Codex releases) were stored elsewhere and do not carry over. |
 | A tool result starting with `ERROR:` inside the conversation | The agent hit a marimo or allowlist problem; the text contains the fix (for example the URL to open). |
 | marimo answers 401 or 403 and the hint mentions `HAILER_MARIMO_TOKEN` | The server was started with a token. Export it as `HAILER_MARIMO_TOKEN` (kept in memory only), or restart marimo with `--no-token`. |
 
