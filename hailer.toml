@@ -1,7 +1,7 @@
 # Hailer project configuration.
 # Relative paths are resolved against the workspace (the folder containing this file).
 # Secrets never go in this file: API keys come from the OS credential store
-# (`uv run hailer login <provider>`) or an environment variable named by `env_key`.
+# (`uvx hailer login <provider>`) or an environment variable named by `env_key`.
 
 [hailer]
 notebook = "notebooks/analysis.py"   # default notebook; the chat can create and open others
@@ -17,7 +17,7 @@ data_dir = "data"                    # where the monthly parquet files live
 
 [model]
 name = "gpt-5.5"
-provider = "openai"                  # "openai" = api.openai.com with OPENAI_API_KEY (`uv run hailer login openai`)
+provider = "openai"                  # "openai" = api.openai.com with OPENAI_API_KEY (`uvx hailer login openai`)
 # reasoning_effort = "medium"        # minimal | low | medium | high | xhigh; "" sends no reasoning
 #                                      effort at all (for endpoints that reject the field)
 # summarize_after_tokens = 100000    # summarise older turns past this size; lower it for small

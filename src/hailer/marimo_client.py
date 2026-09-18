@@ -33,7 +33,6 @@ from urllib.parse import quote, urlsplit
 from hailer.errors import MarimoExecutionError, MarimoUnavailableError, NoSessionError
 from hailer.models import ExecResult, HailerConfig, MarimoServer, MarimoSession
 
-DEFAULT_LAUNCH_DIR = "notebooks"
 SERVER_TOKEN_HEADER = "Marimo-Server-Token"
 _HEALTH_TIMEOUT = 1.0
 _SERVER_TOKEN_RE = re.compile(r"<marimo-server-token[^>]*\bdata-token=[\"']([^\"']+)[\"']", re.IGNORECASE)
@@ -56,56 +55,47 @@ def _relative_to_workspace(notebook: Path, workspace: Path | None) -> str:
     return str(nb)
 
 
-def launch_command(notebooks_dir: Path | None, workspace: Path | None = None, *, port: int | None = None) -> list[str]:
-    """The exact command a user should run to start marimo on the notebooks folder.
+def launch_command(*, port: int | None = None) -> list[str]:
+    """The command a person runs to start marimo in a terminal of its own (no chat).
 
-    The server is started on the *folder* so that every notebook in it (existing or created
-    later) can be opened on the same server.
+    ``hailer notebook --foreground`` starts marimo on the notebooks folder with Hailer's own
+    interpreter (see :func:`marimo_server_command`), so it works under ``uvx`` without a project
+    virtual environment. A bare ``marimo edit`` would need marimo, Polars, DuckDB and Hailer
+    installed wherever it runs; ``uvx --from hailer marimo`` works, but uv then suggests
+    ``uvx --from marimo marimo``, which gives an environment without Hailer.
     """
-    rel = _relative_to_workspace(notebooks_dir, workspace) if notebooks_dir is not None else DEFAULT_LAUNCH_DIR
-    cmd = ["uv", "run", "marimo", "edit", rel, "--no-token"]
+    cmd = ["uvx", "hailer", "notebook", "--foreground"]
     if port is not None:
         cmd += ["--port", str(port)]
     return cmd
 
 
-def notebook_launch_command(config: HailerConfig, *, port: int | None = None) -> list[str]:
-    return launch_command(config.notebooks_root, config.workspace, port=port)
+def marimo_server_command(notebooks_dir: Path, workspace: Path, port: int, *, headless: bool = True) -> list[str]:
+    """Argument list ``hailer notebook`` uses to start marimo on the notebooks folder.
 
-
-def marimo_server_command(notebooks_dir: Path, workspace: Path, port: int) -> list[str]:
-    """Argument list ``hailer notebook`` uses to start marimo as its own background child.
-
-    Runs marimo through the current interpreter (the uv-managed venv that also runs Hailer)
-    rather than through ``uv run``: on Windows terminating a ``uv`` wrapper would not stop the
-    marimo process it spawned, and Hailer must be able to stop what it started. Marimo is
-    started on the notebooks folder, never on a single file.
+    Runs marimo through the current interpreter (the environment that runs Hailer: the ``uvx``
+    tool environment or a project venv) rather than through ``uv run``: that needs no project
+    ``.venv``, and on Windows terminating a ``uv`` wrapper would not stop the marimo process it
+    spawned, while Hailer must be able to stop what it started. Marimo is started on the
+    notebooks folder, never on a single file. ``headless=False`` (``--foreground``) lets marimo
+    open its home page in the browser.
     """
     rel = _relative_to_workspace(notebooks_dir, workspace)
-    return [
-        sys.executable,
-        "-m",
-        "marimo",
-        "edit",
-        rel,
-        "--no-token",
-        "--headless",
-        "--port",
-        str(port),
-        "--skip-update-check",
-    ]
+    cmd = [sys.executable, "-m", "marimo", "edit", rel, "--no-token"]
+    if headless:
+        cmd.append("--headless")
+    return cmd + ["--port", str(port), "--skip-update-check"]
 
 
-def launch_hint(notebooks_dir: Path | None, workspace: Path | None = None) -> str:
+def launch_hint() -> str:
     """The fix printed under "Marimo is not running." — the one-command route first."""
-    cmd = _format_command(launch_command(notebooks_dir, workspace))
     return (
         "Start everything in one go:\n\n"
-        "    uv run hailer notebook\n\n"
-        "Or start it yourself with:\n\n"
-        f"    {cmd}\n\n"
+        "    uvx hailer notebook\n\n"
+        "Or run marimo on its own in another terminal:\n\n"
+        f"    {_format_command(launch_command())}\n\n"
         "Then run Hailer again:\n\n"
-        "    uv run hailer"
+        "    uvx hailer"
     )
 
 
@@ -387,14 +377,12 @@ class MarimoClient:
         timeout: float = 10.0,
         notebook: Path | None = None,
         workspace: Path | None = None,
-        notebooks_dir: Path | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.timeout = timeout
         self.notebook = notebook
         self.workspace = workspace
-        self.notebooks_dir = notebooks_dir
         self._server_token: str | None = None
 
     # -- low level ---------------------------------------------------------- #
@@ -407,16 +395,10 @@ class MarimoClient:
             headers.update(extra)
         return headers
 
-    def _launch_dir(self) -> Path | None:
-        """The folder the launch hints name: ``notebooks_dir``, else the notebook's own folder."""
-        if self.notebooks_dir is not None:
-            return self.notebooks_dir
-        return Path(self.notebook).parent if self.notebook is not None else None
-
     def _unavailable(self, reason: str) -> MarimoUnavailableError:
         return MarimoUnavailableError(
             f"Marimo is not running at {self.base_url} ({reason}).",
-            hint=launch_hint(self._launch_dir(), self.workspace),
+            hint=launch_hint(),
         )
 
     def _auth_error(self, status: int) -> MarimoUnavailableError:
@@ -462,7 +444,7 @@ class MarimoClient:
                 f"Marimo at {self.base_url} answered HTTP {err.code} to /api/sessions" + (f": {detail}" if detail else "."),
                 hint=(
                     "Check the marimo server log for errors (0.24.x is expected), or restart it with:\n\n"
-                    f"    {_format_command(launch_command(self._launch_dir(), self.workspace))}"
+                    f"    {_format_command(launch_command())}"
                 ),
             ) from err
         if not isinstance(payload, dict):
@@ -715,7 +697,6 @@ def build_create_cell_code(code: str, *, name: str | None = None, hide_code: boo
 
 __all__ = [
     "CM_HELP_CODE",
-    "DEFAULT_LAUNCH_DIR",
     "LIST_CELLS_CODE",
     "NOTEBOOK_GLOBALS_CODE",
     "SERVER_TOKEN_HEADER",
@@ -728,7 +709,6 @@ __all__ = [
     "marimo_server_command",
     "match_session",
     "notebook_file_key",
-    "notebook_launch_command",
     "open_notebook_url",
     "registry_dir",
     "wait_for_health",

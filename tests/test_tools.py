@@ -120,7 +120,7 @@ def factory_for(client: FakeClient, url: str = "http://127.0.0.1:2718", version:
 
 
 def failing_factory():
-    raise MarimoUnavailableError("marimo is not running", "Start it with:\n    uv run marimo edit notebooks --no-token")
+    raise MarimoUnavailableError("marimo is not running", "Start it with:\n    uvx hailer notebook --foreground")
 
 
 class Opener:
@@ -180,7 +180,7 @@ def test_marimo_execute_errors_become_text(tmp_path):
     tools = HailerTools(make_config(tmp_path), failing_factory)
     text = tools.marimo_execute("1")
     assert text.startswith("ERROR: marimo is not running")
-    assert "uv run marimo edit" in text
+    assert "uvx hailer notebook --foreground" in text
 
     client = FakeClient(raise_on_execute=NoSessionError("Notebook not open", "Open http://127.0.0.1:2718/?file=notebooks/analysis.py"))
     tools = HailerTools(make_config(tmp_path), factory_for(client))
@@ -225,7 +225,7 @@ def test_kernel_tools_use_the_active_notebook_from_the_state_file(ws):
 def test_marimo_status_variants(tmp_path):
     tools = HailerTools(make_config(tmp_path), failing_factory)
     text = tools.marimo_status()
-    assert text.startswith("marimo: not running") and "uv run marimo edit" in text
+    assert text.startswith("marimo: not running") and "uvx hailer notebook --foreground" in text
     assert "active notebook: notebooks/analysis.py" in text
 
     tools = HailerTools(make_config(tmp_path), factory_for(FakeClient(has_session=True)))
@@ -604,7 +604,6 @@ def test_default_client_uses_active_notebook_folder_and_workspace(ws, monkeypatc
     client, server = HailerTools(cfg)._default_client()
     assert isinstance(client, CapturingClient) and server.url == "http://127.0.0.1:2718"
     assert captured["notebook"] == cfg.notebook and captured["workspace"] == cfg.workspace
-    assert captured["notebooks_dir"] == cfg.notebooks_root
     assert captured["token"] == "tok"
 
     notebooks.save_active_notebook(cfg, other)
@@ -627,7 +626,7 @@ class DownClient:
     def _down(self):
         return MarimoUnavailableError(
             "Marimo is not running at http://127.0.0.1:2718 (connection refused).",
-            hint="Start everything in one go:\n\n    uv run hailer notebook",
+            hint="Start everything in one go:\n\n    uvx hailer notebook",
         )
 
     def health(self):
@@ -655,7 +654,7 @@ def test_notebook_create_with_marimo_configured_but_down(ws):
     assert created.is_file()
     assert notebooks.load_active_notebook(config) == created.resolve()
     assert text.startswith("Created notebooks/q2_churn.py from the starter template; it is now the active notebook.")
-    assert "marimo is not running" in text and "connection refused" in text and "uv run hailer notebook" in text
+    assert "marimo is not running" in text and "connection refused" in text and "uvx hailer notebook" in text
     assert not text.startswith("ERROR"), "a create that succeeded must not read as a failure"
     assert opener.urls == []
 
@@ -677,7 +676,7 @@ def test_marimo_status_with_marimo_configured_but_down(ws):
     text = HailerTools(config, factory_for(DownClient())).marimo_status()
     assert text.startswith("marimo: not running")
     assert "active notebook: notebooks/other.py" in text
-    assert "connection refused" in text and "uv run hailer notebook" in text
+    assert "connection refused" in text and "uvx hailer notebook" in text
 
 
 def test_notebook_close_and_list_with_marimo_configured_but_down(ws):
@@ -692,7 +691,7 @@ def test_notebook_close_and_list_with_marimo_configured_but_down(ws):
     assert any("notebooks/analysis.py" in ln for ln in entries) and any("notebooks/other.py" in ln for ln in entries)
     assert "marimo is not reachable" in text and not any("[open]" in ln for ln in entries)
     # The list also carries the error and the launch hint, like the other tools when marimo is down.
-    assert "connection refused" in text and "uv run hailer notebook" in text
+    assert "connection refused" in text and "uvx hailer notebook" in text
 
 
 def test_session_wait_that_loses_marimo_is_reported_not_raised(ws):

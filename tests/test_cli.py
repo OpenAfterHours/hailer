@@ -34,7 +34,12 @@ from hailer.session import save_session, session_path
 
 runner = CliRunner()
 SERVER = MarimoServer(url="http://127.0.0.1:2718", server_id="127.0.0.1:2718", version="0.24.2", source="config")
-LAUNCH = ["uv", "run", "marimo", "edit", "notebooks", "--no-token"]
+LAUNCH = ["uvx", "hailer", "notebook", "--foreground"]
+
+
+def server_command(port, headless=True):
+    """What the nb fixture's _marimo_server_command returns (the real one runs sys.executable -m marimo)."""
+    return [sys.executable, "-m", "marimo", "edit", "notebooks", "--no-token", *(["--headless"] if headless else []), "--port", str(port), "--skip-update-check"]
 NOTEBOOK_SOURCE = "import marimo\n\napp = marimo.App()\n\n\n@app.cell\ndef _():\n    return\n"
 INTERNAL = ProviderConfig(
     id="internal",
@@ -255,7 +260,7 @@ def harness(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "_find_server", lambda config: h.server)
     monkeypatch.setattr(cli, "_make_client", make_client)
     monkeypatch.setattr(cli, "_wait_for_session", wait_session)
-    monkeypatch.setattr(cli, "_launch_command", lambda config, port=None: LAUNCH + (["--port", str(port)] if port else []))
+    monkeypatch.setattr(cli, "_launch_command", lambda: LAUNCH)
     monkeypatch.setattr(cli, "_cm_help_code", lambda: "import marimo._code_mode as cm; help(cm)")
     monkeypatch.setattr(cli, "_resolve_key", lambda provider: h.key_source)
     monkeypatch.setattr(cli, "_store_key", lambda provider, value: h.stored.append((provider.id, value)))
@@ -355,7 +360,7 @@ def test_notebook_and_context_commands(harness):
     (harness.config.workspace / "ctx.md").write_text("hello", encoding="utf-8")
     result = chat(input_text="/notebook\n/context\n/exit\n")
     out = result.output
-    assert "Launch:" in out and "--no-token" in out
+    assert "Launch:    uvx hailer notebook --foreground" in out
     assert harness.url in out
     assert "ctx.md" in out and "(5 bytes)" in out
     assert "recon: Reconcile months" in out
@@ -408,7 +413,7 @@ def test_resume_fallback_message(harness):
 
 
 def test_hailer_error_in_turn_keeps_loop(harness):
-    harness.agent.fail_with = CredentialsError("Endpoint rejected the API key (401).", hint="Run: uv run hailer login openai")
+    harness.agent.fail_with = CredentialsError("Endpoint rejected the API key (401).", hint="Run: uvx hailer login openai")
     result = chat(input_text="hello\n/exit\n")
     assert result.exit_code == 0
     assert "rejected the API key" in result.output
@@ -454,7 +459,7 @@ def test_missing_key_for_custom_provider_is_fatal(harness):
     result = chat()
     assert result.exit_code == 1
     assert "INTERNAL_MODEL_API_KEY is not set" in result.output
-    assert "uv run hailer login internal" in result.output
+    assert "uvx hailer login internal" in result.output
 
 
 def test_missing_openai_key_is_fatal_too(harness):
@@ -463,7 +468,7 @@ def test_missing_openai_key_is_fatal_too(harness):
     result = chat()
     assert result.exit_code == 1
     assert "OPENAI_API_KEY is not set" in result.output
-    assert "uv run hailer login openai" in result.output
+    assert "uvx hailer login openai" in result.output
     assert harness.agent.turns == []
 
 
@@ -472,9 +477,9 @@ def test_marimo_down_is_fatal_with_launch_hint(harness):
     result = chat()
     assert result.exit_code == 1
     assert "Marimo is not running." in result.output
-    assert "uv run marimo edit notebooks --no-token" in result.output, "the folder, so every notebook opens on one server"
+    assert "uvx hailer notebook --foreground" in result.output, "marimo on its own, with Hailer's interpreter"
     assert "Then run Hailer again" in result.output
-    assert "uv run hailer" in result.output
+    assert "uv run" not in result.output, "no project .venv is needed"
 
 
 def test_no_session_is_warning_and_opens_browser(harness):
@@ -527,7 +532,7 @@ def test_exec_without_code_and_marimo_down(harness):
     harness.server = None
     result = runner.invoke(cli.app, ["exec", "-c", "1"], catch_exceptions=False)
     assert result.exit_code == 1
-    assert "--no-token" in result.output
+    assert "uvx hailer notebook --foreground" in result.output
 
 
 def test_doctor_table_and_code_mode_probe(harness):
@@ -633,7 +638,7 @@ def nb(harness, monkeypatch):
     monkeypatch.setattr(cli, "_spawn_marimo", spawn)
     monkeypatch.setattr(cli, "_run_foreground", lambda cmd, cwd: (h.foreground.append((cmd, cwd)) or 0))
     monkeypatch.setattr(cli, "_find_free_port", lambda preferred: h.free_port if h.free_port is not None else preferred)
-    monkeypatch.setattr(cli, "_marimo_server_command", lambda config, port: [sys.executable, "-m", "marimo", "edit", "notebooks", "--no-token", "--headless", "--port", str(port), "--skip-update-check"])
+    monkeypatch.setattr(cli, "_marimo_server_command", lambda config, port, headless=True: server_command(port, headless))
     monkeypatch.setattr(cli, "_wait_for_health", wait_health)
     monkeypatch.setattr(cli, "_wait_for_session", wait_session)
     monkeypatch.setattr(cli, "_registry_remove", lambda url: (h.removed.append(url) or True))
@@ -745,14 +750,21 @@ def test_notebook_fatal_local_check_exits_before_starting_marimo(harness, nb):
     result = notebook_cmd()
     assert result.exit_code == 1
     assert "notebook: not found" in result.output
+    assert "Run uvx hailer init to create it" in result.output
     assert nb.spawned == []
 
 
 def test_notebook_foreground_runs_marimo_attached_without_chat(harness, nb):
     result = notebook_cmd(["--foreground", "--port", "2718"])
     assert result.exit_code == 0, result.output
-    assert nb.foreground == [(LAUNCH + ["--port", "2718"], harness.config.workspace)]
+    assert nb.foreground == [(server_command(2718, headless=False), harness.config.workspace)], "Hailer's interpreter, not uv run"
     assert nb.spawned == [] and harness.agent.started == []
+
+
+def test_notebook_foreground_no_browser_runs_headless(harness, nb):
+    result = notebook_cmd(["--foreground", "--no-browser", "--port", "2720"])
+    assert result.exit_code == 0, result.output
+    assert nb.foreground == [(server_command(2720, headless=True), harness.config.workspace)]
 
 
 def test_notebook_new_flag_starts_fresh_thread(harness, nb):
@@ -806,24 +818,93 @@ def test_marimo_not_running_hint_offers_one_command_route(harness):
     assert result.exit_code == 1
     assert "Marimo is not running." in result.output
     assert "Start everything in one go:" in result.output
-    assert "uv run hailer notebook" in result.output
-    assert "Or start it yourself with:" in result.output
-    assert "--no-token" in result.output
+    assert "uvx hailer notebook" in result.output
+    assert "Or run marimo on its own in another terminal:" in result.output
+    assert "uvx hailer notebook --foreground" in result.output
     assert "Then run Hailer again:" in result.output
+
+
+def init_cmd(ws: Path, *args: str):
+    return runner.invoke(cli.app, ["--workspace", str(ws), "init", *args], catch_exceptions=False)
 
 
 def test_init_writes_config_and_skeleton(harness, tmp_path, monkeypatch):
     ws = tmp_path / "fresh"
     ws.mkdir()
     monkeypatch.setattr(cli, "_example_config_dir", lambda: None)
-    result = runner.invoke(cli.app, ["--workspace", str(ws), "init"], catch_exceptions=False)
+    result = init_cmd(ws)
     assert result.exit_code == 0, result.output
     assert (ws / "hailer.toml").exists()
     for sub in ("context", "skills", "prompts"):
         assert (ws / ".config" / "hailer" / sub / "README.md").exists()
     assert "Next steps" in result.output
-    result = runner.invoke(cli.app, ["--workspace", str(ws), "init"], catch_exceptions=False)
+    result = init_cmd(ws)
     assert "already exists" in result.output
+
+
+def test_init_creates_the_notebook_and_data_folder_so_notebook_can_start(harness, tmp_path, monkeypatch):
+    """Regression: `hailer init` in an empty folder, then `hailer notebook`, failed with "Notebook not found"."""
+    from hailer.config import load_config, validate
+
+    ws = tmp_path / "fresh"
+    ws.mkdir()
+    monkeypatch.setattr(cli, "_example_config_dir", lambda: None)
+    result = init_cmd(ws)
+    assert result.exit_code == 0, result.output
+    notebook = ws / "notebooks" / "analysis.py"
+    assert notebooks.is_marimo_notebook(notebook)
+    assert "# Hailer workspace" in notebook.read_text(encoding="utf-8")
+    assert (ws / "data").is_dir()
+    assert "Created notebooks/analysis.py (starter notebook), data/" in result.output
+    assert validate(load_config(workspace=ws)) == [], "the checks `hailer notebook` runs first now pass"
+    assert "uvx hailer login openai" in result.output and "uvx hailer notebook" in result.output
+    assert "uv run" not in result.output, "no project .venv is needed"
+
+
+def test_init_again_keeps_the_notebook_and_fills_in_what_is_missing(harness, tmp_path, monkeypatch):
+    ws = tmp_path / "fresh"
+    ws.mkdir()
+    monkeypatch.setattr(cli, "_example_config_dir", lambda: None)
+    init_cmd(ws)
+    notebook = ws / "notebooks" / "analysis.py"
+    notebook.write_text(NOTEBOOK_SOURCE, encoding="utf-8")
+    (ws / "data").rmdir()
+    result = init_cmd(ws, "--force")
+    assert result.exit_code == 0, result.output
+    assert notebook.read_text(encoding="utf-8") == NOTEBOOK_SOURCE, "--force only replaces hailer.toml"
+    assert "Created data/" in result.output and (ws / "data").is_dir()
+    result = init_cmd(ws)
+    assert "notebooks/analysis.py already exists." in result.output
+
+
+def test_init_uses_the_notebook_and_data_dir_from_an_existing_config(harness, tmp_path, monkeypatch):
+    ws = tmp_path / "custom"
+    ws.mkdir()
+    (ws / "hailer.toml").write_text(
+        '[hailer]\nnotebook = "work/q2.py"\ndata_dir = "inputs"\n\n[model]\nname = "m"\nprovider = "internal"\n\n'
+        '[model_providers.internal]\nbase_url = "https://llm.example.internal/v1"\nenv_key = "INTERNAL_MODEL_API_KEY"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "_example_config_dir", lambda: None)
+    result = init_cmd(ws)
+    assert result.exit_code == 0, result.output
+    assert "already exists" in result.output, "the existing hailer.toml is kept"
+    assert notebooks.is_marimo_notebook(ws / "work" / "q2.py")
+    assert (ws / "inputs").is_dir() and not (ws / "notebooks").exists() and not (ws / "data").exists()
+    assert "uvx hailer login internal" in result.output
+    assert "inputs/" in result.output
+
+
+def test_init_with_a_broken_config_skips_the_notebook(harness, tmp_path, monkeypatch):
+    ws = tmp_path / "broken"
+    ws.mkdir()
+    (ws / "hailer.toml").write_text("[hailer\nnotebook = ", encoding="utf-8")
+    monkeypatch.setattr(cli, "_example_config_dir", lambda: None)
+    result = init_cmd(ws)
+    assert result.exit_code == 0, result.output
+    assert "Skipped the notebook and data folder" in result.output
+    assert not (ws / "notebooks").exists()
+    assert "uvx hailer login <provider>" in result.output
 
 
 def test_version_flag():
@@ -890,7 +971,7 @@ def test_ctrl_c_at_prompt_exits_cleanly(harness, monkeypatch):
 
 
 def test_verbose_prints_traceback_for_hailer_error(harness):
-    harness.agent.fail_with = CredentialsError("Endpoint rejected the API key (401).", hint="Run: uv run hailer login openai")
+    harness.agent.fail_with = CredentialsError("Endpoint rejected the API key (401).", hint="Run: uvx hailer login openai")
     result = chat(args=["--verbose"], input_text="hello\n/exit\n")
     assert "rejected the API key" in result.output
     assert "Traceback" in result.output
@@ -920,7 +1001,7 @@ def test_login_openai_then_status_reports_keyring(harness, monkeypatch):
     monkeypatch.setattr(cli, "_store_key", lambda provider, value: stored.__setitem__(provider.id, value))
     monkeypatch.setattr(cli, "_resolve_key", lambda provider: ("v", "keyring") if provider.id in stored else (None, "missing"))
     result = runner.invoke(cli.app, ["status"], catch_exceptions=False)
-    assert "Credentials: OPENAI_API_KEY missing (run: uv run hailer login openai)" in result.output
+    assert "Credentials: OPENAI_API_KEY missing (run: uvx hailer login openai)" in result.output
     result = runner.invoke(cli.app, ["login", "openai"], input="sk-test\n", catch_exceptions=False)
     assert result.exit_code == 0, result.output
     assert stored == {"openai": "sk-test"}
@@ -1201,8 +1282,9 @@ def test_notebook_command_creates_folder_and_reports_missing_notebook_in_foregro
     assert result.exit_code == 0, result.output
     assert harness.config.notebooks_root.is_dir()
     assert "Notebook not found:" in result.output and "/notebook new" in result.output
+    assert "uvx hailer init" in result.output
     assert "marimo will create it" not in result.output
-    assert nb.foreground == [(LAUNCH + ["--port", "2718"], harness.config.workspace)]
+    assert nb.foreground == [(server_command(2718, headless=False), harness.config.workspace)]
 
 
 def test_notebook_command_reuses_server_hosting_another_notebook(harness, nb):
