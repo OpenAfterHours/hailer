@@ -624,6 +624,76 @@ def test_default_client_uses_active_notebook_folder_and_workspace(ws, monkeypatc
     notebooks.save_active_notebook(cfg, other)
     HailerTools(cfg)._default_client()
     assert captured["notebook"] == other
+    assert captured["paths"] is None
+
+
+def test_default_client_uses_the_token_and_paths_of_the_server_hailer_started(ws, monkeypatch):
+    from hailer import marimo_client as mc
+    from hailer.kernel import docker_paths
+
+    config, analysis, other = ws
+    captured: dict = {}
+
+    class CapturingClient:
+        def __init__(self, base_url, token=None, **kw):
+            captured.update(base_url=base_url, token=token, **kw)
+
+    paths = docker_paths(config)
+    started = MarimoServer(url="http://127.0.0.1:2731", source="kernel", token="kernel-token", runtime="docker", paths=paths)
+    monkeypatch.setattr(mc, "find_server", lambda config: started)
+    monkeypatch.setattr(mc, "MarimoClient", CapturingClient)
+    HailerTools(make_config(config.workspace, notebooks_dir=config.notebooks_root, marimo_token="user-token"))._default_client()
+    assert captured["token"] == "kernel-token", "the server's own token wins over HAILER_MARIMO_TOKEN"
+    assert captured["paths"] is paths
+    assert captured.get("token_in_links", False) is False, "hints from this client reach the model"
+
+
+# --------------------------------------------------------------------------- #
+# The server token never reaches the model
+# --------------------------------------------------------------------------- #
+
+SECRET = "kernel-token-never-for-the-model"
+
+
+def signed_factory(client: FakeClient, **server_kw):
+    def factory():
+        return client, MarimoServer(url="http://127.0.0.1:2718", source="kernel", token=SECRET, **server_kw)
+
+    return factory
+
+
+def test_tool_results_carry_token_free_urls_and_the_browser_gets_the_signed_one(ws):
+    config, analysis, other = ws
+    client = FakeClient(open_paths={analysis})
+    opener = Opener(client, grant_session=False)
+    tools = HailerTools(config, signed_factory(client), open_url=opener, session_wait_sec=0)
+    texts = [tools.notebook_create("draft"), tools.notebook_open("other"), tools.marimo_status()]
+    opener_fails = HailerTools(config, signed_factory(client), open_url=Opener(client, succeed=False), session_wait_sec=0)
+    texts.append(opener_fails.notebook_open("other"))
+    for text in texts:
+        assert SECRET not in text and "access_token" not in text, text
+    assert all("/notebook in the chat" in text for text in texts), "the user can get the signed-in link there"
+    assert "http://127.0.0.1:2718/?file=" in texts[0] and "http://127.0.0.1:2718/?file=" in texts[3]
+    assert opener.urls and all(url.endswith(f"&access_token={SECRET}") for url in opener.urls)
+
+
+def test_no_session_errors_point_at_the_notebook_command(ws):
+    config, analysis, other = ws
+    client = FakeClient(raise_on_execute=NoSessionError("The notebook is not open in a browser.", "Open http://127.0.0.1:2718/?file=x in your browser."))
+    text = HailerTools(config, signed_factory(client)).marimo_execute("1")
+    assert text.startswith("ERROR: The notebook is not open") and "/notebook in the chat" in text and SECRET not in text
+
+
+def test_tools_send_kernel_paths_for_a_docker_kernel(ws):
+    from hailer.kernel import docker_paths
+
+    config, analysis, other = ws
+    client = FakeClient(open_paths={analysis})
+    opener = Opener(client, grant_session=False)
+    tools = HailerTools(config, signed_factory(client, runtime="docker", paths=docker_paths(config)), open_url=opener, session_wait_sec=0)
+    text = tools.notebook_open("other")
+    assert opener.urls == [f"http://127.0.0.1:2718/?file=/work/notebooks/other.py&view-as=present&access_token={SECRET}"]
+    assert "?file=/work/notebooks/other.py&view-as=present" in text and SECRET not in text
 
 
 # --------------------------------------------------------------------------- #

@@ -18,13 +18,12 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
 import sys
 import traceback
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import typer
 from rich.console import Console
@@ -143,20 +142,60 @@ def _find_server(config: HailerConfig) -> MarimoServer | None:
 
 
 def _make_client(server: MarimoServer, config: HailerConfig) -> Any:
+    """A client for ``server``: its token (else ``HAILER_MARIMO_TOKEN``) and its path map.
+
+    Links in its error hints carry the token: the CLI prints them for the user and never sends
+    them to the model (the agent's tools build their own clients, without it).
+    """
     from hailer.marimo_client import MarimoClient
 
     return MarimoClient(
         server.url,
-        config.marimo_token,
+        server.token or config.marimo_token,
         notebook=config.notebook,
         workspace=config.workspace,
+        paths=server.paths,
+        token_in_links=True,
     )
 
 
+def _signed_in(server: MarimoServer, config: HailerConfig) -> MarimoServer:
+    """``server`` with the token a browser needs: its own, else ``HAILER_MARIMO_TOKEN``."""
+    if server.token or not config.marimo_token:
+        return server
+    return replace(server, token=config.marimo_token)
+
+
 def _notebook_url(server: MarimoServer, config: HailerConfig) -> str:
+    """The active notebook's URL for the user (printed or opened here, never sent to the model)."""
     from hailer.marimo_client import open_notebook_url
 
-    return open_notebook_url(server, config.notebook, config.workspace)
+    return open_notebook_url(_signed_in(server, config), config.notebook, config.workspace)
+
+
+def _home_url(server: MarimoServer, config: HailerConfig) -> str:
+    from hailer.marimo_client import home_url
+
+    return home_url(_signed_in(server, config))
+
+
+def _runtime_for(config: HailerConfig) -> Any:
+    """The kernel runtime ``[kernel] runtime`` asks for (``KernelRuntimeError`` when it cannot be used)."""
+    from hailer.kernel import runtime_for
+
+    return runtime_for(config)
+
+
+def _attach_runtime(config: HailerConfig, server: MarimoServer | None) -> HailerConfig:
+    from hailer.kernel import attach_runtime
+
+    return attach_runtime(config, server)
+
+
+def _kernel_line(config: HailerConfig) -> str:
+    from hailer.kernel import describe_runtime
+
+    return describe_runtime(config.kernel)
 
 
 def _launch_command() -> list[str]:
@@ -219,101 +258,16 @@ def _open_browser(url: str) -> None:
     open_url(url)
 
 
-def _marimo_server_command(config: HailerConfig, port: int, *, headless: bool = True) -> list[str]:
-    from hailer.marimo_client import marimo_server_command
-
-    return marimo_server_command(config.notebooks_root, config.workspace, port, headless=headless)
-
-
 def _find_free_port(preferred: int) -> int:
     from hailer.marimo_client import find_free_port
 
     return find_free_port(preferred)
 
 
-def _wait_for_health(url: str, timeout: float, should_stop: Callable[[], bool] | None = None) -> bool:
-    from hailer.marimo_client import wait_for_health
-
-    return wait_for_health(url, timeout, should_stop=should_stop)
-
-
 def _wait_for_session(client: Any, notebook: Path, timeout: float) -> MarimoSession | None:
     from hailer.marimo_client import wait_for_session
 
     return wait_for_session(client, notebook, timeout)
-
-
-def _registry_remove(url: str) -> bool:
-    from hailer.marimo_client import remove_registry_entry
-
-    return remove_registry_entry(url)
-
-
-def _spawn_marimo(cmd: list[str], cwd: Path, log_path: Path) -> subprocess.Popen:
-    """Start marimo as a background child of this process, logging to ``log_path``.
-
-    No new console window: the chat runs in this terminal and marimo is stopped when it
-    ends. On Windows the child gets its own process group so Ctrl+C in the chat is not
-    delivered to marimo.
-    """
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    log = open(log_path, "ab")  # noqa: SIM115 - handed to the child; closed with it
-    flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
-    try:
-        return subprocess.Popen(
-            cmd,
-            cwd=str(cwd),
-            stdin=subprocess.DEVNULL,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            creationflags=flags,
-        )
-    finally:
-        log.close()
-
-
-def _run_foreground(cmd: list[str], cwd: Path) -> int:
-    """Run marimo attached to this terminal (no chat); returns its exit code."""
-    return subprocess.run(cmd, cwd=str(cwd), check=False).returncode
-
-
-def _kill_tree(pid: int) -> None:
-    """Windows: kill a process and everything it spawned (marimo runs kernels as children)."""
-    if os.name == "nt":
-        subprocess.run(
-            ["taskkill", "/PID", str(pid), "/T", "/F"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-
-
-def _stop_process(proc: Any, timeout: float = 5.0) -> None:
-    """terminate → wait up to ``timeout`` → kill; never raises."""
-    try:
-        if proc.poll() is not None:
-            return
-        if os.name == "nt":
-            _kill_tree(proc.pid)
-        proc.terminate()
-        try:
-            proc.wait(timeout=timeout)
-        except Exception:  # noqa: BLE001 - subprocess.TimeoutExpired or a fake
-            proc.kill()
-            try:
-                proc.wait(timeout=timeout)
-            except Exception:  # noqa: BLE001
-                pass
-    except Exception:  # noqa: BLE001 - best effort on the way out
-        pass
-
-
-def _log_tail(path: Path, lines: int = 15) -> list[str]:
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return []
-    return text.splitlines()[-lines:]
 
 
 def _write_default_config(path: Path) -> None:
@@ -423,6 +377,7 @@ def _startup_panel(console: Console, config: HailerConfig) -> None:
             f"Notebook:   {_relative(config.notebook, config.workspace)}",
             f"Notebooks:  {_relative(config.notebooks_root, config.workspace)}",
             f"Workspace:  {config.workspace}",
+            f"Kernel:     {_kernel_line(config)}",
             f"Web access: {_web_line(config)}",
         ]
     )
@@ -455,10 +410,26 @@ def _marimo_state(config: HailerConfig) -> tuple[MarimoServer | None, MarimoSess
         return server, None, err
 
 
+def _discovered_server(config: HailerConfig) -> MarimoServer | None:
+    try:
+        return _find_server(config)
+    except HailerError:
+        return None
+
+
 def _launch_hint() -> str:
     from hailer.marimo_client import launch_hint
 
     return launch_hint()
+
+
+def kernel_checks(config: HailerConfig) -> list[Check]:
+    """The kernel runtime's rows (``hailer doctor``, ``hailer notebook``); a runtime that cannot be
+    used is one failed ``kernel`` row."""
+    try:
+        return list(_runtime_for(config).check())
+    except HailerError as err:
+        return [Check("kernel", False, str(err), hint=err.hint)]
 
 
 def preflight(config: HailerConfig) -> list[Check]:
@@ -803,6 +774,7 @@ class ChatLoop:
             ("Turns", str(self.state.turns)),
             ("Tokens", f"{self.state.input_tokens} in / {self.state.output_tokens} out"),
             ("Marimo", marimo),
+            ("Kernel", _kernel_line(self.config)),
             ("Notebook", _relative(self.config.notebook, self.config.workspace)),
             ("Notebooks", _relative(self.config.notebooks_root, self.config.workspace)),
             ("Web access", _web_line(self.config)),
@@ -1116,9 +1088,12 @@ def run_chat(opts: CliOptions) -> None:
         _print_error(console, err, verbose=opts.verbose)
         raise typer.Exit(code=1)
     _setup_logging(config, opts)
+    requested = config
+    # A docker kernel Hailer started for this workspace makes this session docker (see attach_runtime).
+    config = _attach_runtime(config, _discovered_server(config))
     _startup_panel(console, config)
 
-    checks = preflight(config)
+    checks = preflight(requested)  # the settings as written; the attached kernel is checked by marimo_checks
     _print_checks(console, checks, only_failures=True)
     if any(not c.ok and c.fatal for c in checks):
         raise typer.Exit(code=1)
@@ -1195,8 +1170,6 @@ def _main(
         run_chat(ctx.obj)
 
 
-MARIMO_LOG_NAME = "marimo.log"
-HEALTH_TIMEOUT_SEC = 60.0
 SESSION_TIMEOUT_SEC = 90.0
 SWITCH_SESSION_TIMEOUT_SEC = 30.0  # how long /notebook new|open waits for the browser tab
 NOTEBOOK_USAGE = "Usage: /notebook [list | new <name> [--empty] | open <name> | close [name]]"
@@ -1216,13 +1189,12 @@ def _has_session_under(client: Any, root: Path) -> bool:
 
 
 def _reusable_server(config: HailerConfig) -> tuple[MarimoServer, MarimoSession | None] | None:
-    """A running server Hailer may attach to: the configured URL, or a live server that already has
-    a kernel session for the active notebook or for another notebook in the notebooks folder (one
-    server hosts them all). Anything else gets a fresh server on its own port."""
-    try:
-        server = _find_server(config)
-    except HailerError:
-        return None
+    """A running server Hailer may attach to. In order: the one Hailer started for this workspace
+    (``.hailer/kernel.json``, verified with its token; any runtime ``find_server`` allows), the
+    configured URL, or (local runtime) a live registry server that already has a kernel session for
+    the active notebook or for another notebook in the notebooks folder (one server hosts them all).
+    Anything else gets a fresh server on its own port."""
+    server = _discovered_server(config)
     if server is None:
         return None
     client = _make_client(server, config)
@@ -1232,40 +1204,58 @@ def _reusable_server(config: HailerConfig) -> tuple[MarimoServer, MarimoSession 
         session = client.resolve_session(config.notebook)
         return server, session
     except NoSessionError:
-        if config.marimo_url or _has_session_under(client, config.notebooks_root):
+        if server.source == "kernel" or config.marimo_url or _has_session_under(client, config.notebooks_root):
             return server, None
         return None
     except HailerError:
         return None
 
 
-def _start_marimo(console: Console, config: HailerConfig, port: int) -> tuple[MarimoServer, Any, Path]:
-    """Start marimo in the background and wait until ``/health`` answers."""
+def _free_port_url(console: Console, port: int) -> tuple[int, str]:
     chosen = _find_free_port(port)
     if chosen != port:
         console.print(f"Port {port} is busy; using {chosen}.", markup=False)
-    url = f"http://127.0.0.1:{chosen}"
-    cmd = _marimo_server_command(config, chosen)
-    log_path = config.workspace / ".hailer" / MARIMO_LOG_NAME
+    return chosen, f"http://127.0.0.1:{chosen}"
+
+
+def _start_kernel(console: Console, runtime: Any, port: int, *, verbose: bool) -> Any:
+    """Start marimo through ``runtime`` and wait until ``/health`` answers; exit 1 when it does not."""
+    chosen, url = _free_port_url(console, port)
     try:
-        proc = _spawn_marimo(cmd, config.workspace, log_path)
-    except OSError as err:
-        console.print(f"Could not start marimo: {err}", style="red", markup=False)
+        with console.status(f"Starting marimo on {url} ..."):
+            running = runtime.start(chosen)
+    except HailerError as err:  # the runtime has cleaned up; the hint carries the log tail
+        _print_error(console, err, verbose=verbose)
         raise typer.Exit(code=1)
-    with console.status(f"Starting marimo on {url} ..."):
-        healthy = _wait_for_health(url, HEALTH_TIMEOUT_SEC, lambda: proc.poll() is not None)
-    if not healthy:
-        if proc.poll() is not None:
-            console.print(f"Marimo exited early (code {proc.returncode}).", style="red", markup=False)
+    console.print(f"Marimo is running at {running.server.url}  (log: {running.log_hint})", markup=False)
+    return running
+
+
+def _run_foreground(console: Console, config: HailerConfig, runtime: Any, port: int, *, open_browser: bool, verbose: bool) -> int:
+    """``hailer notebook --foreground``: marimo in this terminal, no chat, until it exits or Ctrl+C.
+
+    It is recorded in ``.hailer/kernel.json`` like any server Hailer starts, so ``uvx hailer`` in
+    another terminal attaches to it.
+    """
+    chosen, url = _free_port_url(console, port)
+    console.print(f"Starting marimo on {url} (Ctrl+C stops it) ...", markup=False)
+    try:
+        running = runtime.start(chosen, foreground=True)
+    except HailerError as err:
+        _print_error(console, err, verbose=verbose)
+        return 1
+    try:
+        console.print(f"Kernel:     {runtime.describe()}", markup=False)
+        console.print(f"Marimo is running at {running.server.url}. Chat with it from another terminal: uvx hailer", markup=False)
+        home = _home_url(running.server, config)
+        if open_browser:
+            console.print(f"Opening {home} in your browser...", markup=False)
+            _open_browser(home)
         else:
-            console.print(f"Marimo did not answer on {url} within {int(HEALTH_TIMEOUT_SEC)} s.", style="red", markup=False)
-            _stop_process(proc)
-        console.print(f"Log: {log_path}", markup=False)
-        for line in _log_tail(log_path):
-            console.print(f"    {line}", markup=False)
-        raise typer.Exit(code=1)
-    console.print(f"Marimo is running at {url}  (log: {log_path})", markup=False)
-    return MarimoServer(url=url, server_id=f"127.0.0.1:{chosen}", pid=getattr(proc, "pid", None), source="config"), proc, log_path
+            console.print(f"Open {home} in your browser.", markup=False)
+        return running.wait()
+    finally:
+        running.stop()
 
 
 def _wait_for_notebook(console: Console, config: HailerConfig, server: MarimoServer, *, open_browser: bool) -> None:
@@ -1323,26 +1313,30 @@ def notebook(
                     "it, create another in the chat with /notebook new <name>, or fix [hailer].notebook in hailer.toml.",
                 )
             )
-        # Hailer's own interpreter, like the background server: `uv run marimo` would need a project .venv.
-        cmd = _marimo_server_command(config, port, headless=no_browser)
-        console.print("Launching: " + " ".join(cmd), markup=False)
-        raise typer.Exit(code=_run_foreground(cmd, config.workspace))
+        checks = kernel_checks(config)
+        _print_checks(console, checks, only_failures=True)
+        if any(not c.ok and c.fatal for c in checks):
+            raise typer.Exit(code=1)
+        runtime = _runtime_for(config)
+        raise typer.Exit(code=_run_foreground(console, config, runtime, port, open_browser=not no_browser, verbose=opts.verbose))
 
-    checks = local_checks(config)
+    checks = local_checks(config) + kernel_checks(config)
     _print_checks(console, checks, only_failures=True)
     if any(not c.ok and c.fatal for c in checks):
         raise typer.Exit(code=1)
     config.notebooks_root.mkdir(parents=True, exist_ok=True)  # marimo edit refuses a missing folder
 
-    proc: Any = None
-    log_path: Path | None = None
+    running: Any = None
     reusable = _reusable_server(config)
     if reusable is not None:
         server, _session = reusable
         console.print(f"Using the running marimo at {server.url}.", markup=False)
+        config = _attach_runtime(config, server)
     else:
-        server, proc, log_path = _start_marimo(console, config, port)
-    # Pin the chat to this server so registry discovery cannot pick another one.
+        running = _start_kernel(console, _runtime_for(config), port, verbose=opts.verbose)
+        server = running.server
+    # Pin the chat to this server so registry discovery cannot pick another one; find_server gives it
+    # its token and path map back from .hailer/kernel.json.
     config = replace(config, marimo_url=server.url)
 
     try:
@@ -1351,15 +1345,15 @@ def notebook(
         _startup_panel(console, config)
         _run_chat_loop(console, config, opts)
     finally:
-        if proc is not None:
+        if running is not None:
             if keep_marimo:
                 console.print(
-                    f"Marimo is still running at {server.url} (stop it by closing its process; log: {log_path}).",
+                    f"Marimo is still running at {server.url} ({running.stop_hint}; log: {running.log_hint}). "
+                    "uvx hailer in this workspace attaches to it.",
                     markup=False,
                 )
             else:
-                _stop_process(proc)
-                _registry_remove(server.url)
+                running.stop()
                 console.print("Stopped marimo.", markup=False)
 
 
@@ -1411,6 +1405,8 @@ def status(ctx: typer.Context) -> None:
     opts = _opts(ctx)
     console = console_factory()
     config = _config_or_exit(console, opts)
+    server, session, err = _marimo_state(config)
+    config = _attach_runtime(config, server)
     _startup_panel(console, config)
     try:
         provider = config.provider
@@ -1421,7 +1417,6 @@ def status(ctx: typer.Context) -> None:
             console.print(f"Credentials: {provider.env_key or 'API key'} from {source}", markup=False)
     except KeyError:
         console.print(f"Credentials: provider {config.model.provider!r} is not declared", markup=False)
-    server, session, err = _marimo_state(config)
     if server is None:
         console.print("Marimo:      not running", markup=False)
     elif session is None:
@@ -1432,8 +1427,8 @@ def status(ctx: typer.Context) -> None:
         console.print(f"Marimo:      {server.url} (session {session.session_id})", markup=False)
     try:
         bundle = _load_context(config)
-    except HailerError as err:
-        _print_error(console, err, verbose=opts.verbose)
+    except HailerError as context_err:
+        _print_error(console, context_err, verbose=opts.verbose)
         return
     console.print(
         f"Context:     {len(bundle.context_files)} file(s), {len(bundle.skills)} skill(s), {len(bundle.prompts)} prompt(s)",
@@ -1453,7 +1448,7 @@ def doctor(ctx: typer.Context) -> None:
     opts = _opts(ctx)
     console = console_factory()
     config = _config_or_exit(console, opts)
-    checks = preflight(config)
+    checks = local_checks(config) + kernel_checks(config) + marimo_checks(config)
     table = Table(title="Hailer doctor", show_lines=False)
     table.add_column("Check")
     table.add_column("Result")

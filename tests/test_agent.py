@@ -303,6 +303,17 @@ def test_system_prompt_names_the_notebooks_folder_not_the_notebook(tmp_path):
     assert str(cfg.notebook) not in text  # the active notebook changes mid-conversation; it must not be baked in
 
 
+def test_system_prompt_never_carries_a_marimo_token(tmp_path):
+    """The prompt goes to the model endpoint: the pinned URL is there, the server's token is not."""
+    from hailer.kernel import KernelState, write_kernel_state
+
+    cfg = make_config(tmp_path, marimo_url="http://127.0.0.1:2718", marimo_token="user-marimo-token-123")
+    write_kernel_state(cfg.workspace, KernelState(runtime="local", url="http://127.0.0.1:2718", port=2718, token="kernel-token-456"))
+    text = system_prompt(cfg, ContextBundle())
+    assert "http://127.0.0.1:2718" in text
+    assert "user-marimo-token-123" not in text and "kernel-token-456" not in text and "access_token" not in text
+
+
 def test_system_prompt_folder_falls_back_to_the_notebook_parent(tmp_path):
     cfg = make_config(tmp_path)  # hand-built config: notebooks_dir is None
     assert f"- Notebooks folder: {cfg.notebook.parent}" in system_prompt(cfg, ContextBundle())

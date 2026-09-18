@@ -10,6 +10,10 @@ text so the model can act on them; nothing is raised into the agent loop.
 The *active notebook* (the one every kernel tool acts on) lives in
 ``<workspace>/.hailer/notebook.json`` and is re-read on every call: both the model
 (``notebook_create`` / ``notebook_open``) and the CLI (``/notebook`` commands) may switch it.
+
+Tool results go to the model endpoint, so they never carry the marimo server's token: URLs in
+them are token-free (the user gets a signed-in link from ``/notebook`` in the chat), while the
+browser Hailer opens itself gets the signed-in URL.
 """
 
 from __future__ import annotations
@@ -49,6 +53,10 @@ TOOL_NAMES = (
 
 #: How long notebook_create / notebook_open wait for the browser tab to give the kernel a session.
 DEFAULT_SESSION_WAIT_SEC = 30.0
+#: Added wherever a tool asks the model to have the user open a URL: the URL in a tool result has
+#: no token, so for a server Hailer started the browser would ask for one; /notebook prints the
+#: signed-in link.
+NOTEBOOK_LINK_TIP = "The user can also run /notebook in the chat to get the link."
 
 # Fallback used only if hailer.marimo_client does not export LIST_CELLS_CODE.
 _FALLBACK_LIST_CELLS_CODE = '''
@@ -91,6 +99,8 @@ def _error_text(err: HailerError) -> str:
     text = f"ERROR: {err}"
     if err.hint:
         text += f"\n{err.hint}"
+    if isinstance(err, NoSessionError):  # its hint names a URL the user must open
+        text += f"\n{NOTEBOOK_LINK_TIP}"
     return text
 
 
@@ -174,7 +184,7 @@ class _SessionOutcome:
 
     client: Any = None
     session: MarimoSession | None = None
-    url: str | None = None
+    url: str | None = None  # token-free: this one is shown to the model
     reused: bool = False  # a session already existed; no browser was opened
     opened: bool = False  # the browser was asked to open the URL
     marimo_error: HailerError | None = None  # marimo unreachable (or answered with an error)
@@ -220,9 +230,10 @@ class HailerTools:
             )
         client = mc.MarimoClient(
             server.url,
-            token=config.marimo_token,
+            token=server.token or config.marimo_token,
             notebook=config.notebook,
             workspace=config.workspace,
+            paths=server.paths,
         )
         return client, server
 
@@ -238,11 +249,14 @@ class HailerTools:
             log.exception("tool failed")
             return self._truncate(f"ERROR: unexpected {type(exc).__name__}: {exc}")
 
-    def _open_url(self, server: MarimoServer, notebook: Path) -> str:
+    def _open_url(self, server: MarimoServer, notebook: Path, *, with_token: bool = False) -> str:
+        """The notebook's URL: token-free for the model (the default), signed in for the browser."""
         try:
             from . import marimo_client as mc
 
-            return mc.open_notebook_url(server, notebook)
+            if with_token and not server.token and self.config.marimo_token:
+                server = dataclasses.replace(server, token=self.config.marimo_token)
+            return mc.open_notebook_url(server, notebook, with_token=with_token)
         except Exception:  # noqa: BLE001 - best effort
             return server.url
 
@@ -279,6 +293,7 @@ class HailerTools:
             return outcome
         outcome.client = client
         outcome.url = self._open_url(server, notebook)
+        browser_url = self._open_url(server, notebook, with_token=True)
         # With a configured marimo_url the server is not health-checked up front, so "marimo is
         # down" first shows up here. The notebook was already created/switched by then; report it
         # as a session outcome rather than letting the error replace the whole reply.
@@ -292,7 +307,7 @@ class HailerTools:
             outcome.marimo_error = err
             return outcome
         try:
-            outcome.opened = bool(self.open_url(outcome.url))
+            outcome.opened = bool(self.open_url(browser_url))
         except Exception as exc:  # noqa: BLE001 - the URL is reported instead
             log.debug("browser opener failed: %s: %s", type(exc).__name__, exc)
             outcome.opened = False
@@ -319,11 +334,11 @@ class HailerTools:
         if outcome.opened:
             return [
                 f"Opened {outcome.url} in the browser, but no kernel session appeared within {self.session_wait_sec:.0f} s. "
-                "Ask the user to check that tab (or open the URL), then call marimo_status before running code."
+                f"Ask the user to check that tab (or open the URL), then call marimo_status before running code. {NOTEBOOK_LINK_TIP}"
             ]
         return [
             f"Could not open a browser from here. Ask the user to open {outcome.url}; "
-            "the kernel gets a session once the tab loads. Call marimo_status before running code."
+            f"the kernel gets a session once the tab loads. Call marimo_status before running code. {NOTEBOOK_LINK_TIP}"
         ]
 
     # -- kernel tools -------------------------------------------------------- #
@@ -375,7 +390,7 @@ class HailerTools:
             else:
                 lines.append(
                     f"active notebook: {active_name} has NO session. "
-                    f"Ask the user to open {self._open_url(server, config.notebook)} in a browser."
+                    f"Ask the user to open {self._open_url(server, config.notebook)} in a browser. {NOTEBOOK_LINK_TIP}"
                 )
             if sessions:
                 lines.append("sessions:")

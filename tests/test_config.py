@@ -16,7 +16,7 @@ from hailer.config import (
     write_default_config,
 )
 from hailer.errors import ConfigError
-from hailer.models import HailerConfig
+from hailer.models import HailerConfig, KernelConfig
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -503,6 +503,121 @@ def test_validate_unknown_keys_are_warnings(tmp_path: Path) -> None:
     assert "unknown section [other]" in joined
     assert "secret-looking key" in joined
     assert "sk-abcdefghijklmnop" not in joined
+
+
+# --------------------------------------------------------------------------- #
+# [kernel]
+# --------------------------------------------------------------------------- #
+
+
+def test_kernel_defaults_to_local(tmp_path: Path) -> None:
+    cfg = load_config(workspace=_make_workspace(tmp_path), env={})
+    assert cfg.kernel == KernelConfig(runtime="local", image=None, memory="4g", cpus=2.0, network=False)
+
+
+def test_kernel_section_is_parsed(tmp_path: Path) -> None:
+    ws = _make_workspace(
+        tmp_path,
+        '[kernel]\nruntime = "Docker"\nimage = "registry.example/hailer-kernel:dev"\nmemory = "8G"\ncpus = 1.5\nnetwork = true\n',
+    )
+    cfg = load_config(workspace=ws, env={})
+    assert cfg.kernel == KernelConfig(runtime="docker", image="registry.example/hailer-kernel:dev", memory="8g", cpus=1.5, network=True)
+    assert _errors(validate(cfg)) == []
+    (tmp_path / "ints").mkdir()
+    cfg2 = load_config(workspace=_make_workspace(tmp_path / "ints", '[kernel]\ncpus = 4\nimage = ""\n'), env={})
+    assert cfg2.kernel.cpus == 4.0 and cfg2.kernel.image is None, "an empty image means the default one"
+
+
+def test_kernel_env_overrides_the_file(tmp_path: Path) -> None:
+    ws = _make_workspace(tmp_path, '[kernel]\nruntime = "docker"\nimage = "from-file"\n')
+    cfg = load_config(workspace=ws, env={"HAILER_KERNEL": "local", "HAILER_KERNEL_IMAGE": "from-env"})
+    assert (cfg.kernel.runtime, cfg.kernel.image) == ("local", "from-env")
+    assert load_config(workspace=ws, env={}).kernel.runtime == "docker"
+
+
+@pytest.mark.parametrize(
+    ("text", "fragment"),
+    [
+        ('[kernel]\ncpus = "2"\n', "[kernel].cpus"),
+        ("[kernel]\ncpus = true\n", "[kernel].cpus"),
+        ("[kernel]\nmemory = 4\n", "[kernel].memory"),
+        ('[kernel]\nnetwork = "no"\n', "[kernel].network"),
+        ("[kernel]\nruntime = 1\n", "[kernel].runtime"),
+        ('kernel = "docker"\n', "[kernel]"),
+    ],
+)
+def test_kernel_wrong_types_raise_config_error(tmp_path: Path, text: str, fragment: str) -> None:
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(workspace=_make_workspace(tmp_path, text), env={})
+    assert fragment in str(excinfo.value) and excinfo.value.hint
+
+
+@pytest.mark.parametrize(
+    ("text", "env", "fragment"),
+    [
+        ('[kernel]\nruntime = "podman"\n', {}, "[kernel].runtime 'podman'"),
+        ("", {"HAILER_KERNEL": "vm"}, "[kernel].runtime 'vm'"),
+        ('[kernel]\nmemory = "lots"\n', {}, "[kernel].memory 'lots'"),
+        ('[kernel]\nmemory = "4tb"\n', {}, "[kernel].memory"),
+        ('[kernel]\nmemory = "0g"\n', {}, "[kernel].memory"),
+        ("[kernel]\ncpus = 0\n", {}, "[kernel].cpus"),
+        ("[kernel]\ncpus = -1.5\n", {}, "[kernel].cpus"),
+    ],
+)
+def test_kernel_bad_values_are_fatal(tmp_path: Path, text: str, env: dict, fragment: str) -> None:
+    errors = _errors(validate(load_config(workspace=_make_workspace(tmp_path, text), env=env)))
+    assert len(errors) == 1 and fragment in errors[0], errors
+
+
+def test_docker_refuses_marimo_url(tmp_path: Path) -> None:
+    ws = _make_workspace(tmp_path, '[hailer]\nmarimo_url = "http://127.0.0.1:2718"\n[kernel]\nruntime = "docker"\n')
+    errors = _errors(validate(load_config(workspace=ws, env={})))
+    assert len(errors) == 1 and "marimo_url" in errors[0] and "its own container" in errors[0]
+    assert _errors(validate(load_config(workspace=ws, env={"HAILER_KERNEL": "local"}))) == [], "fine for local"
+    (tmp_path / "env").mkdir()
+    plain = _make_workspace(tmp_path / "env", '[kernel]\nruntime = "docker"\n')
+    errors = _errors(validate(load_config(workspace=plain, env={"HAILER_MARIMO_URL": "http://127.0.0.1:2718"})))
+    assert len(errors) == 1 and "HAILER_MARIMO_URL" in errors[0]
+
+
+@pytest.mark.parametrize("data_dir", ["notebooks", "notebooks/data", "NOTEBOOKS/Data"])
+def test_docker_refuses_data_inside_the_notebooks_folder(tmp_path: Path, data_dir: str) -> None:
+    if data_dir != data_dir.lower() and not Path(str(tmp_path).upper()).exists():
+        pytest.skip("case-insensitive file system only")
+    ws = _make_workspace(tmp_path, f'[hailer]\ndata_dir = "{data_dir}"\n[kernel]\nruntime = "docker"\n')
+    (ws / "notebooks" / "data").mkdir(exist_ok=True)
+    errors = _errors(validate(load_config(workspace=ws, env={})))
+    assert len(errors) == 1 and "[hailer].data_dir" in errors[0] and "writable" in errors[0]
+    assert _errors(validate(load_config(workspace=ws, env={"HAILER_KERNEL": "local"}))) == [], "local mounts nothing"
+
+
+def test_docker_allows_notebooks_inside_the_data_folder(tmp_path: Path) -> None:
+    ws = _make_workspace(tmp_path, notebook=False)
+    _write(ws / "data" / "notebooks" / "analysis.py", "import marimo\n")
+    _write(
+        ws / "hailer.toml",
+        '[hailer]\nnotebook = "data/notebooks/analysis.py"\ndata_dir = "data"\n[kernel]\nruntime = "docker"\n',
+    )
+    assert _errors(validate(load_config(workspace=ws, env={}))) == []
+
+
+def test_kernel_unknown_keys_are_warnings(tmp_path: Path) -> None:
+    ws = _make_workspace(tmp_path, '[kernel]\nruntime = "local"\nmounts = ["x"]\n')
+    problems = validate(load_config(workspace=ws, env={}))
+    assert _errors(problems) == []
+    assert any(p.startswith("Warning:") and "[kernel].mounts" in p for p in problems)
+    assert not any("unknown section [kernel]" in p for p in problems)
+
+
+def test_template_documents_the_kernel_section_commented_out() -> None:
+    assert "# [kernel]\n# runtime = \"local\"" in DEFAULT_CONFIG_TEMPLATE
+    assert "HAILER_KERNEL" in DEFAULT_CONFIG_TEMPLATE
+    for key in ("image", "memory", "cpus", "network"):
+        assert f"\n# {key} " in DEFAULT_CONFIG_TEMPLATE
+    uncommented = DEFAULT_CONFIG_TEMPLATE.replace("# [kernel]", "[kernel]").replace('# runtime = "local"', 'runtime = "docker"')
+    import tomllib
+
+    assert tomllib.loads(uncommented)["kernel"] == {"runtime": "docker"}, "`init --kernel docker` can switch it on in place"
 
 
 # --------------------------------------------------------------------------- #

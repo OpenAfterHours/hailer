@@ -14,6 +14,11 @@ existing notebook gets its own kernel session when a browser opens ``?file=<abso
 A kernel *session* only exists while the notebook is open in a browser. Durable notebook
 changes are made from the scratchpad through ``marimo._code_mode``; the snippet constants at
 the bottom of this module are the canonical patterns.
+
+Servers Hailer starts carry a random token (``Authorization: Bearer <token>`` for the API,
+``&access_token=<token>`` in a browser URL). A kernel in a container knows files by other paths;
+:class:`MarimoClient` translates them with a :class:`~hailer.kernel.PathMap` at the HTTP boundary.
+``hailer.kernel`` imports this module, so this one reaches back into it only lazily.
 """
 
 from __future__ import annotations
@@ -28,10 +33,14 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import quote, urlsplit
 
-from hailer.errors import MarimoExecutionError, MarimoUnavailableError, NoSessionError
-from hailer.models import ExecResult, HailerConfig, MarimoServer, MarimoSession
+from hailer.errors import MarimoExecutionError, MarimoUnavailableError, NoSessionError, NotebookPathError
+from hailer.models import KERNEL_RUNTIME_LOCAL, ExecResult, HailerConfig, MarimoServer, MarimoSession
+
+if TYPE_CHECKING:  # pragma: no cover - annotations only; hailer.kernel imports this module
+    from hailer.kernel import PathMap
 
 SERVER_TOKEN_HEADER = "Marimo-Server-Token"
 _HEALTH_TIMEOUT = 1.0
@@ -77,11 +86,15 @@ def marimo_server_command(notebooks_dir: Path, workspace: Path, port: int, *, he
     tool environment or a project venv) rather than through ``uv run``: that needs no project
     ``.venv``, and on Windows terminating a ``uv`` wrapper would not stop the marimo process it
     spawned, while Hailer must be able to stop what it started. Marimo is started on the
-    notebooks folder, never on a single file. ``headless=False`` (``--foreground``) lets marimo
-    open its home page in the browser.
+    notebooks folder, never on a single file. ``headless=False`` lets marimo open its home page
+    in the browser.
+
+    The server requires a token, read from stdin (``--token-password-file -``) so it never
+    appears on a command line: the caller writes it to the child's stdin and closes it. Without
+    a token any local program could POST code to ``/api/kernel/execute``.
     """
     rel = _relative_to_workspace(notebooks_dir, workspace)
-    cmd = [sys.executable, "-m", "marimo", "edit", rel, "--no-token"]
+    cmd = [sys.executable, "-m", "marimo", "edit", rel, "--token-password-file", "-"]
     if headless:
         cmd.append("--headless")
     return cmd + ["--port", str(port), "--skip-update-check"]
@@ -122,19 +135,52 @@ def notebook_file_key(notebook: Path) -> str:
     return Path(absolute).as_posix()
 
 
-def open_notebook_url(server: MarimoServer, notebook: Path, workspace: Path | None = None, *, view: str = "app") -> str:
+def open_notebook_url(
+    server: MarimoServer,
+    notebook: Path,
+    workspace: Path | None = None,
+    *,
+    view: str = "app",
+    paths: PathMap | None = None,
+    with_token: bool = True,
+) -> str:
     """URL the user should open so the kernel gets a session.
 
     ``view="app"`` (default) opens the notebook in app view so the chat user sees results, not code:
     ``http://127.0.0.1:2718/?file=C:/work/notebooks/analysis.py&view-as=present``. ``view="edit"``
     opens the plain editor (no ``view-as`` parameter). ``workspace`` is accepted for
     compatibility; the key is always the absolute path (see :func:`notebook_file_key`).
+
+    ``paths`` (default: ``server.paths``) turns the key into the path the kernel knows the file by
+    (``/work/notebooks/...`` in a container). When the server has a token the URL ends with
+    ``&access_token=<token>``, which signs the browser in; ``with_token=False`` leaves it out, for
+    text that goes to the model endpoint. ``NotebookPathError`` when the kernel cannot see the file.
     """
     del workspace  # the file key no longer depends on the workspace
     if view not in ("app", "edit"):
         raise ValueError(f"view must be 'app' or 'edit', not {view!r}")
-    url = f"{server.url.rstrip('/')}/?file={quote(notebook_file_key(notebook), safe='/:')}"
-    return f"{url}&{APP_VIEW_PARAM}" if view == "app" else url
+    mapping = paths if paths is not None else server.paths
+    try:
+        key = mapping.to_kernel(notebook) if mapping is not None else notebook_file_key(notebook)
+    except ValueError as err:
+        raise NotebookPathError(
+            f"{notebook_file_key(notebook)} is outside the folders the kernel can see.",
+            hint="Keep notebooks in the notebooks folder ([hailer].notebooks_dir).",
+        ) from err
+    url = f"{server.url.rstrip('/')}/?file={quote(key, safe='/:')}"
+    if view == "app":
+        url += f"&{APP_VIEW_PARAM}"
+    if with_token and server.token:
+        url += f"&access_token={quote(server.token, safe='')}"
+    return url
+
+
+def home_url(server: MarimoServer, *, with_token: bool = True) -> str:
+    """marimo's home page (the notebooks folder), signed in with the server's token when it has one."""
+    url = f"{server.url.rstrip('/')}/"
+    if with_token and server.token:
+        url += f"?access_token={quote(server.token, safe='')}"
+    return url
 
 
 def _format_command(cmd: Sequence[str]) -> str:
@@ -204,7 +250,11 @@ def wait_for_session(
 
 
 def registry_entry_path(url: str, registry: Path | None = None) -> Path:
-    """The registry file marimo writes for a ``--no-token`` server at ``url`` (``<host>_<port>.json``)."""
+    """The registry file marimo writes for a ``--no-token`` server at ``url`` (``<host>_<port>.json``).
+
+    Servers with a token (every server Hailer starts) are never registered; Hailer finds those
+    through ``.hailer/kernel.json`` instead.
+    """
     parts = urlsplit(url if "://" in url else f"http://{url}")
     host = parts.hostname or "127.0.0.1"
     port = parts.port or 80
@@ -265,6 +315,38 @@ def _health_ok(url: str, timeout: float = _HEALTH_TIMEOUT) -> bool:
         return False
 
 
+def _sessions_status(url: str, token: str | None, timeout: float) -> int | None:
+    """HTTP status of ``GET /api/sessions`` (with ``token`` as a bearer token); ``None`` when unreachable."""
+    headers = {"User-Agent": "hailer"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(f"{url.rstrip('/')}/api/sessions", method="GET", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - local http only
+            resp.read(1)
+            return resp.status
+    except urllib.error.HTTPError as err:
+        return err.code
+    except (urllib.error.URLError, socket.timeout, TimeoutError, OSError, ValueError):
+        return None
+
+
+def answers_with_token(url: str, token: str | None, timeout: float = _HEALTH_TIMEOUT) -> bool:
+    """True when the server at ``url`` is up and is the one that holds ``token``.
+
+    It must answer ``/health``, refuse ``/api/sessions`` without the token and accept it with
+    ``Authorization: Bearer <token>``. A server started with ``--no-token`` accepts anything and
+    therefore never passes, so a record in ``.hailer/kernel.json`` only ever leads to the server it
+    describes, even when another one now listens on that port. Without a token only ``/health``
+    is checked.
+    """
+    if not _health_ok(url, timeout):
+        return False
+    if not token:
+        return True
+    return _sessions_status(url, None, timeout) in (401, 403) and _sessions_status(url, token, timeout) == 200
+
+
 def discover_servers(registry: Path | None = None) -> list[MarimoServer]:
     """Live servers from the local registry; entries that do not answer ``/health`` are skipped."""
     directory = registry if registry is not None else registry_dir()
@@ -294,10 +376,38 @@ def discover_servers(registry: Path | None = None) -> list[MarimoServer]:
     return found
 
 
+def _attach_allowed(requested: str, runtime: str) -> bool:
+    """Fail closed: a docker request never gets a local server; a local one may get either (a docker
+    kernel is strictly more isolated)."""
+    return requested == KERNEL_RUNTIME_LOCAL or runtime == requested
+
+
 def find_server(config: HailerConfig, registry: Path | None = None) -> MarimoServer | None:
-    """Configured URL first; otherwise the single live registry server; otherwise ``None``."""
+    """The marimo server Hailer should talk to, or ``None``.
+
+    1. ``[hailer].marimo_url``, for the local runtime. When it is the server recorded in
+       ``.hailer/kernel.json``, that record's token, runtime and path map apply (``hailer notebook``
+       pins the server it started or reused this way). Not health-checked, as before.
+    2. ``.hailer/kernel.json``: the server Hailer started for this workspace, when it answers with
+       its token (:func:`answers_with_token`).
+    3. marimo's registry of ``--no-token`` servers: the single live one. Local runtime only.
+
+    Fails closed: when ``config.kernel.runtime`` is ``docker`` no local server is returned (not
+    from ``marimo_url``, the registry, or a ``kernel.json`` that says local).
+    """
+    from hailer.kernel import read_kernel_state  # lazy: hailer.kernel imports this module
+
+    requested = config.kernel.runtime
+    state = read_kernel_state(config.workspace)
     if config.marimo_url:
-        return MarimoServer(url=config.marimo_url.rstrip("/"), source="config")
+        url = config.marimo_url.rstrip("/")
+        if state is not None and state.url.lower() == url.lower():
+            return state.server() if _attach_allowed(requested, state.runtime) else None
+        return MarimoServer(url=url, source="config") if requested == KERNEL_RUNTIME_LOCAL else None
+    if state is not None and _attach_allowed(requested, state.runtime) and answers_with_token(state.url, state.token):
+        return state.server()
+    if requested != KERNEL_RUNTIME_LOCAL:
+        return None
     live = discover_servers(registry)
     if len(live) == 1:
         return live[0]
@@ -367,7 +477,16 @@ def _iter_sse(raw_lines: Iterator[bytes]) -> Iterator[tuple[str, str]]:
 
 
 class MarimoClient:
-    """HTTP client for one marimo server."""
+    """HTTP client for one marimo server.
+
+    ``token`` is sent as ``Authorization: Bearer <token>``. ``paths`` translates between host and
+    kernel paths at exactly two places: the ``?file=`` key of :meth:`notebook_url` and the session
+    paths :meth:`sessions` returns (a kernel path outside every mount is left as it is, so it never
+    matches a host notebook). Callers work in host paths only.
+
+    The notebook links in error hints leave the token out unless ``token_in_links`` is set: the
+    agent's tools pass those hints to the model endpoint, while the CLI prints them for the user.
+    """
 
     def __init__(
         self,
@@ -377,12 +496,16 @@ class MarimoClient:
         timeout: float = 10.0,
         notebook: Path | None = None,
         workspace: Path | None = None,
+        paths: PathMap | None = None,
+        token_in_links: bool = False,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.timeout = timeout
         self.notebook = notebook
         self.workspace = workspace
+        self.paths = paths
+        self.token_in_links = token_in_links
         self._server_token: str | None = None
 
     # -- low level ---------------------------------------------------------- #
@@ -405,8 +528,10 @@ class MarimoClient:
         return MarimoUnavailableError(
             f"Marimo at {self.base_url} rejected the request (HTTP {status}).",
             hint=(
-                "The server was started with an auth token. Either restart it with --no-token "
-                "or set HAILER_MARIMO_TOKEN to the token shown when marimo started."
+                "The server was started with an auth token. If Hailer started it (uvx hailer notebook), "
+                "run Hailer in the same workspace so it can read the token from .hailer/kernel.json. "
+                "For a server you started yourself, restart it with --no-token or set "
+                "HAILER_MARIMO_TOKEN to the token shown when marimo started."
             ),
         )
 
@@ -452,8 +577,21 @@ class MarimoClient:
         out: list[MarimoSession] = []
         for sid, info in payload.items():
             info = info if isinstance(info, dict) else {}
-            out.append(MarimoSession(session_id=str(sid), filename=info.get("filename"), path=info.get("path")))
+            out.append(
+                MarimoSession(
+                    session_id=str(sid),
+                    filename=self._host_path(info.get("filename")),
+                    path=self._host_path(info.get("path")),
+                )
+            )
         return out
+
+    def _host_path(self, value: object) -> object:
+        """A path the kernel reported, as the host knows it (unchanged when it maps to nothing)."""
+        if self.paths is None or self.paths.identity or not isinstance(value, str):
+            return value
+        host = self.paths.to_host(value)
+        return host if host is not None else value
 
     def server_token(self) -> str:
         """The server's skew-protection token, read once from the page and cached.
@@ -511,10 +649,15 @@ class MarimoClient:
             ) from err
 
     def notebook_url(self, notebook: Path | None = None) -> str:
+        """The URL that opens ``notebook`` (token only with ``token_in_links``; see the class docstring)."""
         nb = notebook or self.notebook
+        server = MarimoServer(url=self.base_url, token=self.token if self.token_in_links else None)
         if nb is None:
-            return f"{self.base_url}/"
-        return open_notebook_url(MarimoServer(url=self.base_url), nb, self.workspace or Path.cwd())
+            return home_url(server)
+        try:
+            return open_notebook_url(server, nb, self.workspace or Path.cwd(), paths=self.paths)
+        except NotebookPathError:
+            return home_url(server)
 
     def resolve_session(self, notebook: Path | None) -> MarimoSession:
         """Pick the session for ``notebook`` (or the only session when ``notebook`` is None)."""
@@ -701,9 +844,11 @@ __all__ = [
     "NOTEBOOK_GLOBALS_CODE",
     "SERVER_TOKEN_HEADER",
     "MarimoClient",
+    "answers_with_token",
     "build_create_cell_code",
     "discover_servers",
     "find_server",
+    "home_url",
     "launch_command",
     "launch_hint",
     "marimo_server_command",

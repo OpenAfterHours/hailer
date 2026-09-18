@@ -1,14 +1,18 @@
 """Typed internal models shared across Hailer modules.
 
 Keep this module dependency-free (standard library only) so every other module
-can import it without side effects.
+can import it without side effects. :class:`~hailer.kernel.PathMap` is only named in
+annotations here (a ``TYPE_CHECKING`` import): ``hailer.kernel`` imports this module.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:  # pragma: no cover - annotations only; hailer.kernel imports this module
+    from hailer.kernel import PathMap
 
 
 # --------------------------------------------------------------------------- #
@@ -53,13 +57,21 @@ class PeriodFile:
 
 @dataclass(frozen=True)
 class MarimoServer:
-    """A running marimo server discovered from the local registry or config."""
+    """A running marimo server: one Hailer started (``.hailer/kernel.json``), the configured URL,
+    or one found in marimo's registry."""
 
     url: str  # base URL without trailing slash, e.g. http://127.0.0.1:2718
     server_id: str = ""
     pid: int | None = None
     version: str = ""
-    source: Literal["config", "registry", "env"] = "config"
+    source: Literal["config", "registry", "env", "kernel"] = "config"
+    #: The auth token of a server Hailer started; ``None`` for servers started with ``--no-token``.
+    #: Kept out of ``repr`` so it never lands in a log line or a test failure.
+    token: str | None = field(default=None, repr=False)
+    #: Where the kernel runs: "local" (Hailer's own Python) or "docker".
+    runtime: str = "local"
+    #: Host <-> kernel paths; ``None`` means identity (the kernel sees the host's paths).
+    paths: PathMap | None = None
 
 
 @dataclass(frozen=True)
@@ -152,6 +164,33 @@ class WebConfig:
     max_page_bytes: int = 200_000
 
 
+#: Where the notebook kernel runs: in Hailer's own Python, as the user (the default), or in a
+#: Docker container that sees only the notebooks folder and, read-only, the data folder.
+KERNEL_RUNTIME_LOCAL = "local"
+KERNEL_RUNTIME_DOCKER = "docker"
+VALID_KERNEL_RUNTIMES = (KERNEL_RUNTIME_LOCAL, KERNEL_RUNTIME_DOCKER)
+#: The published kernel image; the tag is the Hailer version (see ``KernelConfig.effective_image``).
+KERNEL_IMAGE_REPOSITORY = "ghcr.io/openafterhours/hailer-kernel"
+
+
+@dataclass(frozen=True)
+class KernelConfig:
+    """The ``[kernel]`` table: where notebook code runs. Only ``runtime`` matters for ``local``."""
+
+    runtime: str = KERNEL_RUNTIME_LOCAL  # one of VALID_KERNEL_RUNTIMES (validate() reports others)
+    image: str | None = None  # None: the image for this Hailer version
+    memory: str = "4g"  # docker --memory format: <number>[b|k|m|g]
+    cpus: float = 2.0
+    network: bool = False  # docker only: True puts the kernel on the default bridge network
+
+    @property
+    def effective_image(self) -> str:
+        """``image``, else ``ghcr.io/openafterhours/hailer-kernel:<hailer version>``."""
+        from hailer import __version__  # the package root: plain constant, no side effects
+
+        return self.image or f"{KERNEL_IMAGE_REPOSITORY}:{__version__}"
+
+
 @dataclass(frozen=True)
 class HailerConfig:
     """Fully resolved configuration (file + environment overrides). Paths are absolute."""
@@ -165,6 +204,7 @@ class HailerConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     providers: dict[str, ProviderConfig] = field(default_factory=dict)
     web: WebConfig = field(default_factory=WebConfig)
+    kernel: KernelConfig = field(default_factory=KernelConfig)
     marimo_url: str | None = None
     marimo_token: str | None = None  # value is read from env only, never from file
     log_level: str = "WARNING"

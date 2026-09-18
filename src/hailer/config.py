@@ -26,9 +26,12 @@ from typing import Any
 
 from hailer.errors import ConfigError
 from hailer.models import (
+    KERNEL_RUNTIME_DOCKER,
+    VALID_KERNEL_RUNTIMES,
     VALID_WIRE_APIS,
     WIRE_API_RESPONSES,
     HailerConfig,
+    KernelConfig,
     ModelConfig,
     ProviderConfig,
     WebConfig,
@@ -47,7 +50,7 @@ VALID_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 
 # Known keys per section; anything else is reported by validate() as a warning.
-_KNOWN_TOP = {"hailer", "model", "model_providers", "web"}
+_KNOWN_TOP = {"hailer", "model", "model_providers", "web", "kernel"}
 _KNOWN_HAILER = {
     "notebook",
     "notebooks_dir",
@@ -73,6 +76,10 @@ _KNOWN_PROVIDER = {
     "query_params",
 }
 _KNOWN_WEB = {"allowed_domains", "max_page_bytes"}
+_KNOWN_KERNEL = {"runtime", "image", "memory", "cpus", "network"}
+
+# docker --memory: a number with an optional b/k/m/g unit ("4g", "512m", "1.5g").
+_MEMORY_RE = re.compile(r"^(\d+(?:\.\d+)?)[bkmg]?$", re.IGNORECASE)
 
 # A domain rule: optional "*." (subdomains only) or "**." (apex + subdomains)
 # prefix, then DNS labels. "localhost" and IPv4 literals are also accepted.
@@ -130,6 +137,18 @@ provider = "openai"                  # "openai" = api.openai.com with OPENAI_API
 # [web]
 # allowed_domains = ["docs.pola.rs", "duckdb.org", "**.marimo.io"]
 # max_page_bytes = 200000
+
+# Where notebook code runs. "local" (the default): marimo runs in Hailer's own Python, as you,
+# with your files and network (not isolated). "docker": marimo runs in a container that sees only
+# the notebooks folder and, read-only, the data folder, with no network; it needs Docker Desktop
+# or Docker Engine. HAILER_KERNEL overrides runtime for one run.
+#
+# [kernel]
+# runtime = "local"                  # "local" or "docker"
+# image   = ""                       # docker: default ghcr.io/openafterhours/hailer-kernel:<hailer version>
+# memory  = "4g"                     # docker: container memory limit
+# cpus    = 2                        # docker: container CPU limit
+# network = false                    # docker: true lets notebook code reach the internet
 """
 
 
@@ -242,6 +261,16 @@ def _int(table: Mapping[str, Any], key: str, section: str, path: Path | None, de
     return value
 
 
+def _number(table: Mapping[str, Any], key: str, section: str, path: Path | None, default: float) -> float:
+    value = table.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(
+            f"[{section}].{key} in {path} must be a number, not {type(value).__name__}.",
+            hint=f"Write a plain number without quotes, e.g. {key} = {default:g}.",
+        )
+    return float(value)
+
+
 def _bool(table: Mapping[str, Any], key: str, section: str, path: Path | None, default: bool) -> bool:
     value = table.get(key, default)
     if not isinstance(value, bool):
@@ -315,6 +344,7 @@ def load_config(
     model_tbl = _section(data, "model", path)
     providers_tbl = _section(data, "model_providers", path)
     web_tbl = _section(data, "web", path)
+    kernel_tbl = _section(data, "kernel", path)
 
     notebook = env.get("HAILER_NOTEBOOK") or _str(hailer_tbl, "notebook", "hailer", path, DEFAULT_NOTEBOOK)
     notebooks_dir = env.get("HAILER_NOTEBOOKS_DIR") or _str(hailer_tbl, "notebooks_dir", "hailer", path)
@@ -360,6 +390,17 @@ def load_config(
         max_page_bytes=_int(web_tbl, "max_page_bytes", "web", path, WebConfig().max_page_bytes),
     )
 
+    kernel_defaults = KernelConfig()
+    runtime = env.get("HAILER_KERNEL") or _str(kernel_tbl, "runtime", "kernel", path, kernel_defaults.runtime)
+    image = env.get("HAILER_KERNEL_IMAGE") or _str(kernel_tbl, "image", "kernel", path)
+    kernel = KernelConfig(
+        runtime=(runtime or "").strip().lower() or kernel_defaults.runtime,  # validate() reports unknown values
+        image=(image or "").strip() or None,
+        memory=(_str(kernel_tbl, "memory", "kernel", path, kernel_defaults.memory) or "").strip().lower(),
+        cpus=_number(kernel_tbl, "cpus", "kernel", path, kernel_defaults.cpus),
+        network=_bool(kernel_tbl, "network", "kernel", path, kernel_defaults.network),
+    )
+
     resolved_notebook = _resolve(ws, notebook or DEFAULT_NOTEBOOK)
     return HailerConfig(
         workspace=ws,
@@ -377,6 +418,7 @@ def load_config(
         ),
         providers=providers,
         web=web,
+        kernel=kernel,
         marimo_url=marimo_url,
         marimo_token=(env.get("HAILER_MARIMO_TOKEN") or None),
         log_level=log_level,
@@ -440,7 +482,66 @@ def _unknown_key_warnings(path: Path) -> list[str]:
     web_tbl = data.get("web") or {}
     if isinstance(web_tbl, dict):
         check(web_tbl, _KNOWN_WEB, "web")
+    kernel_tbl = data.get("kernel") or {}
+    if isinstance(kernel_tbl, dict):
+        check(kernel_tbl, _KNOWN_KERNEL, "kernel")
     return warnings
+
+
+def _inside_or_equal(path: Path, root: Path) -> bool:
+    """True when ``path`` is ``root`` or below it: compared resolved, and by file identity for the
+    folders that exist (case-insensitive file systems, links)."""
+    try:
+        path, root = Path(path).resolve(), Path(root).resolve()
+    except OSError:
+        return False
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        pass
+    if not root.is_dir():
+        return False
+    for candidate in (path, *path.parents):
+        try:
+            if candidate.is_dir() and os.path.samefile(candidate, root):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _kernel_problems(config: HailerConfig) -> list[str]:
+    kernel = config.kernel
+    problems: list[str] = []
+    if kernel.runtime not in VALID_KERNEL_RUNTIMES:
+        problems.append(
+            f'Invalid [kernel].runtime {kernel.runtime!r} (or HAILER_KERNEL); use "local" (notebook code runs '
+            'in Hailer\'s own Python, as you) or "docker" (it runs in an isolated container).'
+        )
+    memory = _MEMORY_RE.match(kernel.memory)
+    if memory is None or float(memory.group(1)) <= 0:
+        problems.append(
+            f'Invalid [kernel].memory {kernel.memory!r}; write a size such as "4g" or "512m" '
+            "(a number with an optional b, k, m or g unit)."
+        )
+    if not kernel.cpus > 0:
+        problems.append(f"Invalid [kernel].cpus {kernel.cpus:g}; use a number above 0, e.g. cpus = 2.")
+    if kernel.runtime != KERNEL_RUNTIME_DOCKER:
+        return problems
+    if config.marimo_url:
+        problems.append(
+            '[hailer].marimo_url (or HAILER_MARIMO_URL) cannot be used with [kernel] runtime = "docker": '
+            "Hailer starts and finds its own container. Remove marimo_url, or set runtime = \"local\" to use "
+            "that server."
+        )
+    if _inside_or_equal(config.data_dir, config.notebooks_root):
+        problems.append(
+            f"[hailer].data_dir ({config.data_dir}) is inside the notebooks folder ({config.notebooks_root}). "
+            'With [kernel] runtime = "docker" the notebooks folder is writable from notebook code, so the data '
+            "would be too. Keep the data in its own folder (the default is data/ next to notebooks/)."
+        )
+    return problems
 
 
 def validate(config: HailerConfig) -> list[str]:
@@ -542,6 +643,8 @@ def validate(config: HailerConfig) -> list[str]:
         problems.append("[hailer].max_tool_output_chars must be a positive integer.")
     if config.max_context_bytes <= 0:
         problems.append("[hailer].max_context_bytes must be a positive integer.")
+
+    problems.extend(_kernel_problems(config))
 
     if config.config_path is not None and config.config_path.is_file():
         problems.extend(_unknown_key_warnings(config.config_path))
