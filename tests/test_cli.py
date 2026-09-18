@@ -1452,10 +1452,33 @@ def test_session_matching_is_by_path_not_filename(harness):
 
 LOCAL_LINE = "local (runs as you; not isolated)"
 DOCKER_SERVER = MarimoServer(url="http://127.0.0.1:2731", server_id="127.0.0.1:2731", source="kernel", token=TOKEN, runtime="docker")
+IMAGE = f"ghcr.io/openafterhours/hailer-kernel:{__version__}"
 
 
 def docker_config(config: HailerConfig) -> HailerConfig:
     return replace(config, kernel=KernelConfig(runtime="docker"))
+
+
+@pytest.fixture
+def docker(harness, monkeypatch):
+    """The real DockerRuntime (and ``hailer kernel ...``) driving a scripted docker CLI: nothing runs.
+    Local configs still get whatever runtime was set up before (list ``nb`` first to fake it)."""
+    from hailer.kernel import DockerRuntime
+    from test_kernel import FakeDocker
+
+    fake = FakeDocker()
+    local_runtime_for = cli._runtime_for
+
+    def runtime_for(config):
+        if config.kernel.runtime != "docker":
+            return local_runtime_for(config)
+        return DockerRuntime(
+            config, runner=fake, token_factory=lambda: TOKEN, health=lambda url, timeout, should_stop=None: True, user=lambda: None
+        )
+
+    monkeypatch.setattr(cli, "_runtime_for", runtime_for)
+    monkeypatch.setattr(cli, "_docker_runner", lambda: fake)
+    return fake
 
 
 def test_kernel_line_in_the_startup_panel_status_and_slash_status(harness):
@@ -1473,24 +1496,27 @@ def test_doctor_has_a_kernel_row(harness):
     assert any("kernel" in line and "OK" in line and "local (runs as you" in line for line in result.output.splitlines())
 
 
-def test_doctor_reports_a_runtime_it_cannot_use(harness):
+def test_doctor_reports_a_runtime_it_cannot_use(harness, docker):
     harness.config = docker_config(harness.config)
+    docker.installed = False
     result = runner.invoke(cli.app, ["doctor"], catch_exceptions=False)
     assert result.exit_code == 1
-    assert any("kernel" in line and "FAIL" in line for line in result.output.splitlines())
-    assert "implemented" in result.output
+    assert any("docker" in line and "FAIL" in line and "Docker is not installed." in line for line in result.output.splitlines())
+    assert 'runtime = "local"' in result.output
 
 
-def test_notebook_with_docker_requested_never_starts_a_local_server(harness, nb, monkeypatch):
-    from hailer.kernel import runtime_for
-
+def test_notebook_with_docker_requested_never_starts_a_local_server(harness, nb, docker):
     harness.config = docker_config(harness.config)
-    monkeypatch.setattr(cli, "_runtime_for", runtime_for)  # the real one: docker is not in this build
-    for args in ([], ["--foreground"]):
-        result = notebook_cmd(args)
-        assert result.exit_code == 1
-        assert "not implemented in this build" in result.output and 'runtime = "local"' in result.output
+    for fake_state in ({"installed": False}, {"engine": None}):
+        for name, value in fake_state.items():
+            setattr(docker, name, value)
+        for args in ([], ["--foreground"]):
+            result = notebook_cmd(args)
+            assert result.exit_code == 1
+            assert "Docker is not installed." in result.output or "Docker is not running." in result.output
+        docker.installed, docker.engine = True, "29.4.3 linux"
     assert nb.spawned == [] and nb.foreground == [] and harness.agent.started == []
+    assert not docker.commands("run") and not docker.commands("create")
 
 
 def test_chat_attached_to_a_docker_kernel_runs_as_docker(harness, monkeypatch):
@@ -1574,3 +1600,235 @@ def test_exec_in_another_terminal_attaches_through_kernel_json(tmp_path, monkeyp
     assert "hello world" in result.output and "42" in result.output
     execute = [r for r in srv.requests if r["path"] == "/api/kernel/execute"][-1]
     assert execute["headers"]["Authorization"] == f"Bearer {TOKEN}" and execute["headers"]["Marimo-Session-Id"] == "s1"
+
+
+# --------------------------------------------------------------------------- #
+# The docker runtime from the CLI: --kernel, the image before the spinner, kernel pull/build/stop
+# --------------------------------------------------------------------------- #
+
+
+def test_notebook_kernel_docker_runs_the_chat_against_a_container(harness, nb, docker, monkeypatch):
+    from hailer.kernel import docker_names, kernel_state_path
+
+    names = docker_names(harness.config.workspace)
+    agent_configs: list = []
+    recorded: list = []
+    monkeypatch.setattr(cli, "_make_agent", lambda config, bundle: (agent_configs.append(config) or harness.agent))
+    harness.agent.on_turn = lambda: recorded.append(json.loads(kernel_state_path(harness.config.workspace).read_text()))
+    harness.client = FakeClient(session=None)  # nobody has the tab open yet
+    result = notebook_cmd(["--kernel", "docker", "--port", "2731"], input_text="hi\n/exit\n")
+    assert result.exit_code == 0, result.output
+    assert nb.spawned == [] and nb.foreground == [], "no local server"
+    assert docker.commands("run")[0][:8] == ["run", "-d", "--pull", "never", "--name", names.kernel, "--network", names.network]
+    assert docker.commands("create")[0][4:7] == [names.forwarder, "-p", "127.0.0.1:2731:2718"]
+    assert f"Marimo is running at http://127.0.0.1:2731  (log: docker logs {names.kernel})" in result.output
+    assert harness.opened == [f"http://127.0.0.1:2731/?file=/work/notebooks/analysis.py&view-as=present&access_token={TOKEN}"]
+    assert f"Kernel:     docker (hailer-kernel {__version__}; no network; data read-only)" in result.output
+    assert agent_configs[0].kernel.runtime == "docker" and agent_configs[0].marimo_url == "http://127.0.0.1:2731"
+    assert recorded and recorded[0]["runtime"] == "docker" and recorded[0]["containers"] == [names.kernel, names.forwarder]
+    assert docker.calls[-2:] == [["rm", "-f", names.kernel, names.forwarder], ["network", "rm", names.network]]
+    assert "Stopped marimo." in result.output and not kernel_state_path(harness.config.workspace).exists()
+
+
+def test_notebook_keep_marimo_in_docker_mode_says_how_to_stop_it(harness, nb, docker):
+    from hailer.kernel import docker_names
+
+    result = notebook_cmd(["--kernel", "docker", "--keep-marimo"])
+    assert result.exit_code == 0, result.output
+    assert "stop it with uvx hailer kernel stop" in result.output
+    assert f"log: docker logs {docker_names(harness.config.workspace).kernel}" in result.output
+    assert not docker.commands("rm"), "left running"
+
+
+def test_notebook_downloads_a_missing_image_before_the_spinner(harness, nb, docker, monkeypatch):
+    """docker's progress bars and a spinner line would fight over the terminal."""
+    events: list[str] = []
+
+    class RecordingConsole(Console):
+        def status(self, *args, **kwargs):
+            events.append("spinner")
+            return super().status(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "console_factory", lambda: RecordingConsole(force_terminal=False, width=120, highlight=False, soft_wrap=True, color_system=None))
+    docker.image_version = None
+    docker.stream_hook = lambda args: events.append(args[0])
+    result = notebook_cmd(["--kernel", "docker"])
+    assert result.exit_code == 0, result.output
+    assert events[0] == "pull" and events[1] == "spinner", events
+    assert f"Downloading the kernel image {IMAGE} (first use; this can take a few minutes) ..." in result.output
+
+
+def test_notebook_kernel_flag_beats_the_file_and_rejects_other_values(harness, nb, docker):
+    harness.config = docker_config(harness.config)
+    result = notebook_cmd(["--kernel", "LOCAL"])
+    assert result.exit_code == 0, result.output
+    assert len(nb.spawned) == 1 and not docker.commands("run"), "--kernel local ran a local server"
+    result = notebook_cmd(["--kernel", "podman"])
+    assert result.exit_code == 2 and '--kernel must be "local" or "docker"' in result.output
+
+
+def test_notebook_docker_refuses_to_orphan_a_live_local_server(harness, nb, docker):
+    import threading
+
+    from hailer.kernel import KernelState, read_kernel_state, write_kernel_state
+    from test_marimo_client import FakeMarimo
+
+    srv = FakeMarimo()
+    srv.token = TOKEN
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        write_kernel_state(harness.config.workspace, KernelState(runtime="local", url=srv.url, port=srv.server_address[1], token=TOKEN, pid=1))
+        result = notebook_cmd(["--kernel", "docker"])
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert result.exit_code == 1
+    assert f"A local marimo server Hailer started for this workspace is still running at {srv.url}." in result.output
+    assert "uvx hailer kernel stop" in result.output
+    assert not docker.commands("run") and read_kernel_state(harness.config.workspace).runtime == "local"
+
+
+def test_notebook_foreground_in_docker_mode_follows_the_log_and_removes_the_containers(harness, nb, docker):
+    from hailer.kernel import docker_names, kernel_state_path
+
+    names = docker_names(harness.config.workspace)
+
+    def ctrl_c(args):
+        if args[:2] == ["logs", "-f"]:
+            raise KeyboardInterrupt
+
+    docker.stream_hook = ctrl_c
+    result = notebook_cmd(["--kernel", "docker", "--foreground", "--no-browser", "--port", "2731"])
+    assert result.exit_code == 0, result.output
+    assert "Starting marimo in Docker on http://127.0.0.1:2731 (Ctrl+C stops it) ..." in result.output
+    assert f"Kernel:     docker (hailer-kernel {__version__}; no network; data read-only)" in result.output
+    assert f"Open http://127.0.0.1:2731/?access_token={TOKEN} in your browser." in result.output
+    assert docker.streams == [["logs", "-f", "--tail", "0", names.kernel]]
+    assert docker.calls[-2:] == [["rm", "-f", names.kernel, names.forwarder], ["network", "rm", names.network]]
+    assert not kernel_state_path(harness.config.workspace).exists() and nb.foreground == []
+
+
+def test_doctor_in_docker_mode_has_docker_image_and_data_rows_and_probes_the_helpers(harness, docker):
+    harness.config = docker_config(harness.config)
+    harness.client = FakeClient(exec_result=ExecResult(True, stdout="Help on module ... get_context ..."))
+    result = runner.invoke(cli.app, ["doctor"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    for name, text in (("kernel", "docker (hailer-kernel"), ("docker", "Docker 29.4.3 (Linux engine)"), ("image", IMAGE), ("data", "/work/data")):
+        assert any(f" {name} " in line and "OK" in line for line in lines), name
+        assert text in result.output, text
+    assert "ok    notebook helpers: hailer.periods imports in the kernel" in result.output
+    assert any("import hailer.periods" in code for code in harness.client.codes)
+
+
+def test_doctor_warns_when_the_kernel_cannot_import_the_helpers(harness):
+    class Client(FakeClient):
+        def execute(self, code, **kwargs):
+            if "hailer.periods" in code:
+                return ExecResult(False, stderr="Traceback ...\nModuleNotFoundError: No module named 'hailer'\n")
+            return super().execute(code, **kwargs)
+
+    harness.client = Client(exec_result=ExecResult(True, stdout="get_context"))
+    result = runner.invoke(cli.app, ["doctor"], catch_exceptions=False)
+    assert "warn  notebook helpers: hailer.periods did not import in the kernel (ModuleNotFoundError: No module named 'hailer')" in result.output
+
+
+def test_kernel_pull(harness, docker):
+    result = runner.invoke(cli.app, ["kernel", "pull"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    assert docker.streams == [["pull", IMAGE]], "pulled even though a copy is here: it may be stale"
+    assert f"Downloading {IMAGE} ..." in result.output and f"{IMAGE} is ready (Hailer {__version__})." in result.output
+    docker.pull_code = 1
+    result = runner.invoke(cli.app, ["kernel", "pull"], catch_exceptions=False)
+    assert result.exit_code == 1 and "Could not download the kernel image" in result.output and "uvx hailer kernel build" in result.output
+    docker.installed = False
+    result = runner.invoke(cli.app, ["kernel", "pull"], catch_exceptions=False)
+    assert result.exit_code == 1 and "Docker is not installed." in result.output
+
+
+def test_kernel_build(harness, docker):
+    from hailer.kernel_image import build_args
+
+    result = runner.invoke(cli.app, ["kernel", "build"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    build = docker.streams[0]
+    assert build[:3] == ["build", "--tag", IMAGE]
+    assert build[3:-1] == [part for name, value in build_args().items() for part in ("--build-arg", f"{name}={value}")]
+    assert f"Building {IMAGE} for Hailer {__version__} (marimo 0.24.2, Polars " in result.output and f"Built {IMAGE}." in result.output
+    result = runner.invoke(cli.app, ["kernel", "build", "--tag", "hailer-kernel:dev"], catch_exceptions=False)
+    assert docker.streams[-1][:3] == ["build", "--tag", "hailer-kernel:dev"]
+    assert 'set image = "hailer-kernel:dev" under [kernel] in hailer.toml' in result.output
+    docker.build_code = 1
+    result = runner.invoke(cli.app, ["kernel", "build"], catch_exceptions=False)
+    assert result.exit_code == 1 and "docker build failed (exit code 1)." in result.output
+    docker.engine = None
+    streams = len(docker.streams)
+    result = runner.invoke(cli.app, ["kernel", "build"], catch_exceptions=False)
+    assert result.exit_code == 1 and "Docker is not running." in result.output and len(docker.streams) == streams
+
+
+def test_kernel_stop(harness, docker):
+    from hailer.kernel import KernelState, docker_names, read_kernel_state, write_kernel_state
+
+    result = runner.invoke(cli.app, ["kernel", "stop"], catch_exceptions=False)
+    assert result.exit_code == 0 and "No kernel is running for this workspace." in result.output
+    names = docker_names(harness.config.workspace)
+    write_kernel_state(
+        harness.config.workspace,
+        KernelState(runtime="docker", url="http://127.0.0.1:2731", port=2731, token=TOKEN, containers=(names.kernel, names.forwarder), network=names.network),
+    )
+    result = runner.invoke(cli.app, ["kernel", "stop"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    assert f"Stopped the docker kernel at http://127.0.0.1:2731 (removed {names.kernel}, {names.forwarder}, {names.network})." in result.output
+    assert read_kernel_state(harness.config.workspace) is None
+    help_text = runner.invoke(cli.app, ["kernel", "--help"], catch_exceptions=False).output
+    assert all(command in help_text for command in ("pull", "build", "stop"))
+
+
+def test_init_kernel_docker_switches_the_section_on(harness, tmp_path, monkeypatch):
+    from hailer.config import load_config, validate
+
+    monkeypatch.delenv("HAILER_KERNEL", raising=False)
+    monkeypatch.setattr(cli, "_example_config_dir", lambda: None)
+    monkeypatch.setattr(cli, "_docker_on_path", lambda: False)
+    ws = tmp_path / "fresh"
+    ws.mkdir()
+    result = init_cmd(ws, "--kernel", "docker")
+    assert result.exit_code == 0, result.output
+    assert '[kernel]\nruntime = "docker"' in (ws / "hailer.toml").read_text(encoding="utf-8")
+    config = load_config(workspace=ws, env={})
+    assert config.kernel.runtime == "docker" and validate(config) == []
+    assert f'Wrote {ws / "hailer.toml"} ([kernel] runtime = "docker")' in result.output
+    assert "uvx hailer kernel pull" in result.output and "Docker was not found on this machine" in result.output
+    assert "uv run" not in result.output
+
+
+def test_init_mentions_the_docker_kernel_only_when_docker_is_installed(harness, tmp_path, monkeypatch):
+    monkeypatch.delenv("HAILER_KERNEL", raising=False)
+    monkeypatch.setattr(cli, "_example_config_dir", lambda: None)
+    for found in (True, False):
+        ws = tmp_path / f"found-{found}"
+        ws.mkdir()
+        monkeypatch.setattr(cli, "_docker_on_path", lambda found=found: found)
+        result = init_cmd(ws)
+        assert result.exit_code == 0, result.output
+        assert "# [kernel]" in (ws / "hailer.toml").read_text(encoding="utf-8"), "commented out without the flag"
+        assert ('set runtime = "docker" under [kernel]' in result.output) is found
+
+
+def test_init_kernel_flag_with_an_existing_config(harness, tmp_path, monkeypatch):
+    from hailer.config import load_config
+
+    monkeypatch.delenv("HAILER_KERNEL", raising=False)
+    monkeypatch.setattr(cli, "_example_config_dir", lambda: None)
+    monkeypatch.setattr(cli, "_docker_on_path", lambda: True)
+    ws = tmp_path / "fresh"
+    ws.mkdir()
+    init_cmd(ws)
+    result = init_cmd(ws, "--kernel", "docker")
+    assert "already exists" in result.output
+    assert 'hailer.toml was kept, so [kernel] runtime is still "local". To change it, set runtime = "docker" under [kernel]' in result.output
+    result = init_cmd(ws, "--kernel", "docker", "--force")
+    assert result.exit_code == 0 and load_config(workspace=ws, env={}).kernel.runtime == "docker"
+    result = init_cmd(tmp_path / "other", "--kernel", "vm")
+    assert result.exit_code == 2 and not (tmp_path / "other" / "hailer.toml").exists()

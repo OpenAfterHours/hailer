@@ -657,13 +657,27 @@ def validate(config: HailerConfig) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 
-def write_default_config(path: Path, *, overwrite: bool = False) -> None:
-    """Write :data:`DEFAULT_CONFIG_TEMPLATE` to ``path`` (parents created)."""
+_KERNEL_SECTION_OFF = '# [kernel]\n# runtime = "local"'
+
+
+def config_template(kernel: str | None = None) -> str:
+    """:data:`DEFAULT_CONFIG_TEMPLATE`; with ``kernel`` ("local" or "docker") its ``[kernel]`` section
+    is switched on with that runtime (the other keys stay commented out)."""
+    if kernel is None:
+        return DEFAULT_CONFIG_TEMPLATE
+    if kernel not in VALID_KERNEL_RUNTIMES:
+        raise ConfigError(f"Unknown kernel runtime {kernel!r}.", hint='Use "local" or "docker".')
+    return DEFAULT_CONFIG_TEMPLATE.replace(_KERNEL_SECTION_OFF, f'[kernel]\nruntime = "{kernel}"', 1)
+
+
+def write_default_config(path: Path, *, overwrite: bool = False, kernel: str | None = None) -> None:
+    """Write :func:`config_template` (``kernel`` sets ``[kernel] runtime``) to ``path`` (parents created)."""
     path = Path(path)
     if path.exists() and not overwrite:
         raise ConfigError(
             f"Config file already exists: {path}",
             hint="Edit it in place, or pass --force to replace it with the default template.",
         )
+    text = config_template(kernel)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(DEFAULT_CONFIG_TEMPLATE, encoding="utf-8", newline="\n")
+    path.write_text(text, encoding="utf-8", newline="\n")

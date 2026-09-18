@@ -31,7 +31,7 @@ from typing import Any
 
 from . import notebooks
 from .errors import HailerError, MarimoUnavailableError, NoSessionError
-from .models import ExecResult, HailerConfig, MarimoServer, MarimoSession
+from .models import KERNEL_RUNTIME_DOCKER, ExecResult, HailerConfig, MarimoServer, MarimoSession
 from .web import truncate_text
 
 log = logging.getLogger("hailer.tools")
@@ -161,6 +161,16 @@ def _session_label(config: HailerConfig, session: MarimoSession) -> str:
     if Path(raw).is_absolute():
         return notebooks.notebook_display_name(config, Path(raw))
     return raw
+
+
+def _kernel_data_dir(config: HailerConfig) -> str:
+    """The data folder as notebook code reaches it: its mount point in a docker kernel (the host path
+    does not exist there), the host path otherwise. ``list_periods`` runs on the host either way."""
+    if config.kernel.runtime == KERNEL_RUNTIME_DOCKER:
+        from .kernel import KERNEL_DATA_DIR  # lazy: keeps import-time coupling low
+
+        return str(KERNEL_DATA_DIR)
+    return str(config.data_dir)
 
 
 def _fmt_size(size: int) -> str:
@@ -565,14 +575,15 @@ class HailerTools:
             from . import periods  # lazy
 
             data_dir = self.config.data_dir
+            shown = _kernel_data_dir(self.config)
             if not data_dir.is_dir():
-                return f"Data directory does not exist: {data_dir}"
+                return f"Data directory does not exist: {shown}"
             files = periods.scan_period_files(data_dir, name.strip() or None)
             if files:
                 text = periods.describe_periods(files)
             else:
                 text = (
-                    f"No period files found in {data_dir}"
+                    f"No period files found in {shown}"
                     + (f" for '{name.strip()}'" if name.strip() else "")
                     + ". Monthly files are named like '25-01 sales.parquet' (YY-MM then the dataset name)."
                 )

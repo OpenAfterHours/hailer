@@ -12,7 +12,7 @@ import pytest
 
 from hailer import notebooks
 from hailer.errors import MarimoUnavailableError, NoSessionError
-from hailer.models import ExecResult, HailerConfig, MarimoServer, MarimoSession, WebConfig
+from hailer.models import ExecResult, HailerConfig, KernelConfig, MarimoServer, MarimoSession, WebConfig
 from hailer.tools import TOOL_NAMES, HailerTools, hailer_tools
 
 NOTEBOOK_SOURCE = 'import marimo\n\n__generated_with = "0.24.2"\napp = marimo.App()\n\n\n@app.cell\ndef _():\n    return\n\n\nif __name__ == "__main__":\n    app.run()\n'
@@ -450,6 +450,18 @@ def test_list_periods_names_other_data_files(tmp_path):
     text = HailerTools(config, failing_factory).list_periods()
     assert text.startswith("No period files found")
     assert text.splitlines()[-1] == "Other data files (load them directly with Polars or DuckDB): customers.csv, Survey 2024.json"
+
+
+def test_list_periods_names_the_data_folder_as_a_docker_kernel_sees_it(tmp_path):
+    """list_periods runs on the host, but the model writes code for the container."""
+    config = make_config(tmp_path, kernel=KernelConfig(runtime="docker"))
+    tools = HailerTools(config, failing_factory)
+    assert tools.list_periods() == "Data directory does not exist: /work/data"
+    config.data_dir.mkdir()
+    text = tools.list_periods()
+    assert text.startswith("No period files found in /work/data.") and str(config.data_dir) not in text
+    local = HailerTools(make_config(tmp_path), failing_factory).list_periods()
+    assert local.startswith(f"No period files found in {config.data_dir}.")
 
 
 def test_list_periods_with_files(tmp_path):

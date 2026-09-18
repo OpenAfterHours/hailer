@@ -37,6 +37,7 @@ from hailer.models import (
     AgentEvent,
     ContextBundle,
     HailerConfig,
+    KernelConfig,
     ModelConfig,
     ProviderConfig,
     SkillInfo,
@@ -317,6 +318,45 @@ def test_system_prompt_never_carries_a_marimo_token(tmp_path):
 def test_system_prompt_folder_falls_back_to_the_notebook_parent(tmp_path):
     cfg = make_config(tmp_path)  # hand-built config: notebooks_dir is None
     assert f"- Notebooks folder: {cfg.notebook.parent}" in system_prompt(cfg, ContextBundle())
+
+
+def test_system_prompt_for_the_local_kernel_keeps_host_paths_and_the_package_rule(tmp_path):
+    from hailer.kernel import LOCAL_PROMPT_NOTES
+
+    cfg = make_config(tmp_path)
+    text = system_prompt(cfg, ContextBundle())
+    assert f"- Workspace: {cfg.workspace}\n" in text and f"- Data directory: {cfg.data_dir}\n" in text
+    assert LOCAL_PROMPT_NOTES in text and "not isolated" in text
+    assert text.count("ctx.packages.add()") == 1, "the package rule lives in the runtime notes only"
+
+
+def test_system_prompt_for_a_docker_kernel_gives_kernel_paths_and_its_limits(tmp_path):
+    """The model copies paths into code; in a container only the mount points exist."""
+    from hailer.kernel import KernelState, write_kernel_state
+
+    cfg = make_config(
+        tmp_path, kernel=KernelConfig(runtime="docker"), marimo_url="http://127.0.0.1:2731", marimo_token="user-marimo-token-123"
+    )
+    write_kernel_state(cfg.workspace, KernelState(runtime="docker", url="http://127.0.0.1:2731", port=2731, token="kernel-token-456"))
+    text = system_prompt(cfg, ContextBundle())
+    workspace = text[text.index("## Workspace") :]
+    assert workspace.startswith(
+        "## Workspace\n\n"
+        "- Workspace: /work (in the kernel; only the two folders below are mounted)\n"
+        "- Notebooks folder: /work/notebooks (writable; the only place files persist)\n"
+        "- Data directory: /work/data (read-only)\n"
+        "- Marimo URL: http://127.0.0.1:2731\n"
+    )
+    assert "No internet access from notebook code" in workspace and "/tmp is writable but wiped" in workspace
+    assert str(cfg.workspace) not in text and str(cfg.data_dir) not in text, "no host paths"
+    assert "ctx.packages.add()" not in text, "never told to install packages"
+    assert "user-marimo-token-123" not in text and "kernel-token-456" not in text and "access_token" not in text
+
+
+def test_system_prompt_for_a_docker_kernel_with_network(tmp_path):
+    cfg = make_config(tmp_path, kernel=KernelConfig(runtime="docker", network=True))
+    text = system_prompt(cfg, ContextBundle())
+    assert "- Data directory: /work/data (read-only)" in text and "can reach the internet" in text
 
 
 def test_packaged_prompt_covers_the_tools_the_agent_has():

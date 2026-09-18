@@ -9,6 +9,7 @@
 ``uvx hailer login``      store an API key in the OS credential store
 ``uvx hailer logout``     remove it
 ``uvx hailer init``       set up a workspace: hailer.toml, .config/hailer, the starter notebook, data/
+``uvx hailer kernel``     the Docker kernel: ``pull`` or ``build`` its image, ``stop`` this workspace's kernel
 
 Collaborators (config, marimo client, agent, secrets, context) are reached through
 small module-level factory functions so tests can replace them.
@@ -40,6 +41,8 @@ from hailer.errors import (
     NoSessionError,
 )
 from hailer.models import (
+    KERNEL_RUNTIME_DOCKER,
+    VALID_KERNEL_RUNTIMES,
     WIRE_API_CHAT,
     AgentEvent,
     Check,
@@ -184,6 +187,21 @@ def _runtime_for(config: HailerConfig) -> Any:
     from hailer.kernel import runtime_for
 
     return runtime_for(config)
+
+
+def _docker_runner() -> Any:
+    """What ``hailer kernel ...`` runs ``docker`` with (the CLI on PATH)."""
+    from hailer.kernel import SubprocessDockerRunner
+
+    return SubprocessDockerRunner()
+
+
+def _docker_on_path() -> bool:
+    return shutil.which("docker") is not None
+
+
+def _periods_probe_code() -> str:
+    return "import hailer.periods\nprint('hailer.periods imported')"
 
 
 def _attach_runtime(config: HailerConfig, server: MarimoServer | None) -> HailerConfig:
@@ -1211,6 +1229,17 @@ def _reusable_server(config: HailerConfig) -> tuple[MarimoServer, MarimoSession 
         return None
 
 
+def _kernel_choice(console: Console, value: str | None) -> str | None:
+    """A ``--kernel`` value ("local" or "docker"); exit 2 for anything else."""
+    if value is None:
+        return None
+    choice = value.strip().lower()
+    if choice not in VALID_KERNEL_RUNTIMES:
+        console.print(f'--kernel must be "local" or "docker", not {value!r}.', style="red", markup=False)
+        raise typer.Exit(code=2)
+    return choice
+
+
 def _free_port_url(console: Console, port: int) -> tuple[int, str]:
     chosen = _find_free_port(port)
     if chosen != port:
@@ -1218,11 +1247,22 @@ def _free_port_url(console: Console, port: int) -> tuple[int, str]:
     return chosen, f"http://127.0.0.1:{chosen}"
 
 
+def _prepare_runtime(console: Console, runtime: Any) -> None:
+    """The runtime's slow steps with their own progress (docker: downloading the kernel image), before
+    any spinner: a spinner line would fight with docker's progress bars."""
+    runtime.prepare(say=lambda text: console.print(text, markup=False))
+
+
+def _where(runtime: Any) -> str:
+    return " in Docker" if getattr(runtime, "name", "") == KERNEL_RUNTIME_DOCKER else ""
+
+
 def _start_kernel(console: Console, runtime: Any, port: int, *, verbose: bool) -> Any:
     """Start marimo through ``runtime`` and wait until ``/health`` answers; exit 1 when it does not."""
-    chosen, url = _free_port_url(console, port)
     try:
-        with console.status(f"Starting marimo on {url} ..."):
+        _prepare_runtime(console, runtime)
+        chosen, url = _free_port_url(console, port)
+        with console.status(f"Starting marimo{_where(runtime)} on {url} ..."):
             running = runtime.start(chosen)
     except HailerError as err:  # the runtime has cleaned up; the hint carries the log tail
         _print_error(console, err, verbose=verbose)
@@ -1235,10 +1275,16 @@ def _run_foreground(console: Console, config: HailerConfig, runtime: Any, port: 
     """``hailer notebook --foreground``: marimo in this terminal, no chat, until it exits or Ctrl+C.
 
     It is recorded in ``.hailer/kernel.json`` like any server Hailer starts, so ``uvx hailer`` in
-    another terminal attaches to it.
+    another terminal attaches to it. In docker mode the kernel's log is followed here, and Ctrl+C
+    stops and removes the containers.
     """
+    try:
+        _prepare_runtime(console, runtime)
+    except HailerError as err:
+        _print_error(console, err, verbose=verbose)
+        return 1
     chosen, url = _free_port_url(console, port)
-    console.print(f"Starting marimo on {url} (Ctrl+C stops it) ...", markup=False)
+    console.print(f"Starting marimo{_where(runtime)} on {url} (Ctrl+C stops it) ...", markup=False)
     try:
         running = runtime.start(chosen, foreground=True)
     except HailerError as err:
@@ -1294,13 +1340,22 @@ def notebook(
     keep_marimo: bool = typer.Option(False, "--keep-marimo", help="Leave marimo running when the chat ends."),
     foreground: bool = typer.Option(False, "--foreground", help="Run marimo attached to this terminal, without the chat."),
     new: bool = typer.Option(False, "--new", help="Start a new conversation instead of resuming."),
+    kernel: str | None = typer.Option(
+        None,
+        "--kernel",
+        help='Where notebook code runs for this run: "local" (as you) or "docker" (an isolated container). Default: [kernel] runtime.',
+        show_default=False,
+    ),
 ) -> None:
     """Start marimo (or reuse a running one), open the notebook, and chat here; stop marimo on exit."""
     opts = _opts(ctx)
     if new:
         opts.new_thread = True
     console = console_factory()
+    choice = _kernel_choice(console, kernel)
     config = _config_or_exit(console, opts)
+    if choice is not None:  # the flag beats HAILER_KERNEL and the file
+        config = replace(config, kernel=replace(config.kernel, runtime=choice))
 
     if foreground:
         config.notebooks_root.mkdir(parents=True, exist_ok=True)  # marimo edit refuses a missing folder
@@ -1470,10 +1525,111 @@ def doctor(ctx: typer.Context) -> None:
                 console.print("ok    code mode: marimo._code_mode is available in the kernel", markup=False)
             else:
                 console.print("warn  code mode: marimo._code_mode did not respond as expected; check the marimo version (0.24.x expected)", markup=False)
+            result = client.execute(_periods_probe_code(), notebook=config.notebook)
+            if result.success:
+                console.print("ok    notebook helpers: hailer.periods imports in the kernel", markup=False)
+            else:
+                lines = (result.stderr or result.output or "").strip().splitlines()
+                detail = f" ({lines[-1].strip()})" if lines else ""
+                console.print(
+                    f"warn  notebook helpers: hailer.periods did not import in the kernel{detail}; the starter "
+                    "notebook needs it. Docker: uvx hailer kernel pull (or build) gets the right image.",
+                    markup=False,
+                )
         except HailerError as err:
             console.print(f"warn  code mode: {err}", markup=False)
     if any(not c.ok and c.fatal for c in checks):
         raise typer.Exit(code=1)
+
+
+# --------------------------------------------------------------------------- #
+# hailer kernel: the Docker kernel's image and containers
+# --------------------------------------------------------------------------- #
+
+kernel_app = typer.Typer(
+    no_args_is_help=True,
+    help="The Docker kernel: download or build its image, stop this workspace's kernel.",
+)
+app.add_typer(kernel_app, name="kernel")
+
+
+def _docker_runtime(config: HailerConfig) -> Any:
+    from hailer.kernel import DockerRuntime
+
+    return DockerRuntime(config, runner=_docker_runner())
+
+
+@kernel_app.command("pull")
+def kernel_pull(ctx: typer.Context) -> None:
+    """Download the kernel image for this Hailer version ([kernel].image) ahead of the first start."""
+    opts = _opts(ctx)
+    console = console_factory()
+    config = _config_or_exit(console, opts)
+    runtime = _docker_runtime(config)
+    try:
+        version = runtime.pull(say=lambda text: console.print(text, markup=False))
+    except HailerError as err:
+        _print_error(console, err, verbose=opts.verbose)
+        raise typer.Exit(code=1)
+    console.print(f"{runtime.image} is ready (Hailer {version}).", markup=False)
+
+
+@kernel_app.command("build")
+def kernel_build(
+    ctx: typer.Context,
+    tag: str | None = typer.Option(
+        None,
+        "--tag",
+        help="Name and tag for the image (default: [kernel].image, else ghcr.io/openafterhours/hailer-kernel:<version>).",
+        show_default=False,
+    ),
+) -> None:
+    """Build the kernel image on this machine, for machines that cannot download it."""
+    from hailer import kernel_image
+    from hailer.errors import KernelRuntimeError
+
+    opts = _opts(ctx)
+    console = console_factory()
+    config = _config_or_exit(console, opts)
+    runtime = _docker_runtime(config)
+    image = tag or config.kernel.effective_image
+    try:
+        runtime.engine_version()
+        args = kernel_image.build_args()
+        console.print(
+            f"Building {image} for Hailer {args['HAILER_VERSION']} (marimo {args['MARIMO_VERSION']}, "
+            f"Polars {args['POLARS_VERSION']}, DuckDB {args['DUCKDB_VERSION']}) ...",
+            markup=False,
+        )
+        code = kernel_image.build(image, runtime.runner)
+        if code != 0:
+            raise KernelRuntimeError(
+                f"docker build failed (exit code {code}).",
+                hint="docker's output is above. The build downloads the base image from Docker Hub and the Python packages from PyPI.",
+            )
+    except HailerError as err:
+        _print_error(console, err, verbose=opts.verbose)
+        raise typer.Exit(code=1)
+    console.print(f"Built {image}.", markup=False)
+    if image != config.kernel.effective_image:
+        console.print(f'Hailer uses {config.kernel.effective_image}; set image = "{image}" under [kernel] in hailer.toml to use this one.', markup=False)
+
+
+@kernel_app.command("stop")
+def kernel_stop(ctx: typer.Context) -> None:
+    """Stop this workspace's kernel (local or docker) and remove its Docker containers and network."""
+    from hailer.kernel import stop_workspace_kernels
+
+    opts = _opts(ctx)
+    console = console_factory()
+    config = _config_or_exit(console, opts)
+    try:
+        done = stop_workspace_kernels(config, runner=_docker_runner())
+    except HailerError as err:
+        _print_error(console, err, verbose=opts.verbose)
+        raise typer.Exit(code=1)
+    for line in done or ["No kernel is running for this workspace."]:
+        console.print(line, markup=False)
 
 
 def _provider_for(config: HailerConfig, provider_id: str) -> ProviderConfig:
@@ -1585,6 +1741,12 @@ def _init_notebook_and_data(console: Console, workspace: Path, config_path: Path
 def init(
     ctx: typer.Context,
     force: bool = typer.Option(False, "--force", help="Overwrite an existing hailer.toml."),
+    kernel: str | None = typer.Option(
+        None,
+        "--kernel",
+        help='Write [kernel] runtime = "local" or "docker" into hailer.toml (docker: notebook code runs in an isolated container).',
+        show_default=False,
+    ),
 ) -> None:
     """Set up a workspace: hailer.toml, .config/hailer, the starter notebook and the data folder.
 
@@ -1593,6 +1755,7 @@ def init(
     """
     opts = _opts(ctx)
     console = console_factory()
+    choice = _kernel_choice(console, kernel)
     workspace = opts.workspace or Path.cwd()
     workspace = workspace.resolve()
     config_path = workspace / "hailer.toml"
@@ -1601,8 +1764,8 @@ def init(
     else:
         from hailer.config import write_default_config
 
-        write_default_config(config_path, overwrite=force)
-        console.print(f"Wrote {config_path}", markup=False)
+        write_default_config(config_path, overwrite=force, kernel=choice)
+        console.print(f"Wrote {config_path}" + (f' ([kernel] runtime = "{choice}")' if choice else ""), markup=False)
 
     target = workspace / ".config" / "hailer"
     example = _example_config_dir()
@@ -1632,6 +1795,13 @@ def init(
         console.print(f"{target} already set up.", markup=False)
 
     config = _init_notebook_and_data(console, workspace, config_path, verbose=opts.verbose)
+    runtime = config.kernel.runtime if config is not None else (choice or "local")
+    if choice is not None and config is not None and runtime != choice:
+        console.print(
+            f'hailer.toml was kept, so [kernel] runtime is still "{runtime}". To change it, set '
+            f'runtime = "{choice}" under [kernel] in hailer.toml.',
+            markup=False,
+        )
     provider = config.model.provider if config is not None else "<provider>"
     data = notebooks.notebook_display_name(config, config.data_dir) if config is not None else "data"
     console.print(
@@ -1643,6 +1813,27 @@ def init(
         '     then ask, for example: "what is in my data?" or "chart revenue by month"',
         markup=False,
     )
+    for line in _kernel_next_steps(runtime):
+        console.print(line, markup=False)
+
+
+def _kernel_next_steps(runtime: str) -> list[str]:
+    """What ``init`` adds to the next steps about where notebook code runs."""
+    docker_found = _docker_on_path()
+    if runtime == KERNEL_RUNTIME_DOCKER:
+        lines = [
+            "\nNotebook code runs in a Docker container (no network; the data folder is read-only).",
+            "The first uvx hailer notebook downloads the kernel image; uvx hailer kernel pull does it now.",
+        ]
+        if not docker_found:
+            lines.append("Docker was not found on this machine: install Docker Desktop (or Docker Engine) first.")
+        return lines
+    if docker_found:
+        return [
+            '\nOptional: to isolate notebook code in a container, set runtime = "docker" under [kernel] in '
+            "hailer.toml (Docker was found on this machine)."
+        ]
+    return []
 
 
 def main() -> None:

@@ -9,6 +9,7 @@ import pytest
 from hailer.config import (
     CONFIG_FILENAMES,
     DEFAULT_CONFIG_TEMPLATE,
+    config_template,
     find_config_path,
     find_workspace,
     load_config,
@@ -618,6 +619,20 @@ def test_template_documents_the_kernel_section_commented_out() -> None:
     import tomllib
 
     assert tomllib.loads(uncommented)["kernel"] == {"runtime": "docker"}, "`init --kernel docker` can switch it on in place"
+
+
+@pytest.mark.parametrize("runtime", ["docker", "local"])
+def test_write_default_config_can_switch_the_kernel_section_on(tmp_path: Path, runtime: str) -> None:
+    ws = _make_workspace(tmp_path)
+    write_default_config(ws / "hailer.toml", kernel=runtime)
+    text = (ws / "hailer.toml").read_text(encoding="utf-8")
+    assert f'\n[kernel]\nruntime = "{runtime}"' in text and "\n# image " in text, "the other keys stay commented out"
+    config = load_config(workspace=ws, env={})
+    assert config.kernel == KernelConfig(runtime=runtime)
+    assert _errors(validate(config)) == [] and not any("[kernel]" in p for p in validate(config))
+    assert config_template() == DEFAULT_CONFIG_TEMPLATE
+    with pytest.raises(ConfigError):
+        config_template("podman")
 
 
 # --------------------------------------------------------------------------- #
