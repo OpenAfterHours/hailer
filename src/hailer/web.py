@@ -114,7 +114,7 @@ def _deny(host: str, config: HailerConfig, reason: str | None = None) -> WebAcce
     else:
         hint = (
             "No websites are allowed. Add a [web] section to hailer.toml, e.g.\n"
-            '    [web]\n    allowed_domains = ["docs.pola.rs", "**.bankofengland.co.uk"]'
+            '    [web]\n    allowed_domains = ["docs.pola.rs", "**.marimo.io"]'
         )
     return WebAccessDenied(msg, hint)
 

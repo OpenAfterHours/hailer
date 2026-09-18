@@ -92,7 +92,7 @@ DEFAULT_CONFIG_TEMPLATE = """\
 [hailer]
 notebook = "notebooks/analysis.py"   # default notebook; the chat can create and open others
 # notebooks_dir = "notebooks"        # folder for notebooks created or opened from the chat (default: the notebook's folder)
-data_dir = "data"                    # where the monthly parquet files live
+data_dir = "data"                    # the data files to analyse (CSV, Parquet, JSON, ...)
 # marimo_url = "http://127.0.0.1:2718"  # optional; auto-discovered from the marimo registry when omitted
 # context_dir = ".config/hailer/context"  # always-on context (*.md) sent with every session
 # skills_dir  = ".config/hailer/skills"   # on-demand skills (<name>/SKILL.md)
@@ -120,7 +120,7 @@ provider = "openai"                  # "openai" = api.openai.com with OPENAI_API
 # stream_options       = true                             # false omits stream_options (token counts may be lost)
 # env_key              = "INTERNAL_MODEL_API_KEY"   # env var name; value from `hailer login internal` or the shell
 # name                 = "Internal"
-# http_headers         = { "X-Team" = "risk-analytics" }
+# http_headers         = { "X-Team" = "data-analytics" }
 # env_http_headers     = { "X-Client-Id" = "INTERNAL_CLIENT_ID" }
 # query_params         = { "api-version" = "2025-04-01-preview" }
 
@@ -128,7 +128,7 @@ provider = "openai"                  # "openai" = api.openai.com with OPENAI_API
 # no internet access at all. "*.d" = subdomains only, "**.d" = apex + subdomains.
 #
 # [web]
-# allowed_domains = ["docs.pola.rs", "duckdb.org", "**.bankofengland.co.uk"]
+# allowed_domains = ["docs.pola.rs", "duckdb.org", "**.marimo.io"]
 # max_page_bytes = 200000
 """
 
@@ -479,7 +479,7 @@ def validate(config: HailerConfig) -> list[str]:
     if not config.data_dir.is_dir():
         problems.append(
             f"Warning: data directory not found: {config.data_dir}. "
-            "Create it (or set [hailer].data_dir) before loading parquet files."
+            "Create it (or set [hailer].data_dir) and put the files to analyse there."
         )
 
     if config.log_level not in VALID_LOG_LEVELS:

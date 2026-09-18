@@ -66,7 +66,7 @@ app = typer.Typer(
     add_completion=False,
     no_args_is_help=False,
     invoke_without_command=True,
-    help="Hailer: conversational local data analysis with a live marimo notebook.",
+    help="Hailer: chat with your data. Explore, analyse and chart local data files in a live marimo notebook.",
 )
 
 PROMPT = "You > "
@@ -1643,8 +1643,9 @@ def init(
         "\nNext steps:\n"
         "  1. Edit hailer.toml (model, provider, notebook).\n"
         f"  2. Store the API key once:   uvx hailer login {provider}\n"
-        f"  3. Put your parquet files in {data}/ (named like '25-01 pra101.parquet').\n"
-        "  4. Start marimo and chat:     uvx hailer notebook",
+        f"  3. Put the files you want to analyse in {data}/ (CSV, Parquet or JSON, any name).\n"
+        "  4. Start marimo and chat:     uvx hailer notebook\n"
+        '     then ask, for example: "what is in my data?" or "chart revenue by month"',
         markup=False,
     )
 

@@ -39,11 +39,11 @@ class Period:
 
 @dataclass(frozen=True)
 class PeriodFile:
-    """A data file whose period is encoded in its name, e.g. ``25-03 pra101.parquet``."""
+    """A data file whose period is encoded in its name, e.g. ``25-03 sales.parquet``."""
 
     path: Path
     period: Period
-    stem: str  # the dataset name after the period, lower-cased, e.g. "pra101"
+    stem: str  # the dataset name after the period, lower-cased, e.g. "sales"
 
 
 # --------------------------------------------------------------------------- #

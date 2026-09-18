@@ -1,11 +1,11 @@
 [project]
 name = "hailer"
 version = "0.2.4"
-description = "Hailer: a conversational CLI for local data analysis, with a live Marimo notebook as the visual workspace."
+description = "Hailer: chat with your data. A conversational CLI that explores, analyses and charts local data files in a live marimo notebook."
 readme = "README.md"
 requires-python = ">=3.12"
 authors = [{ name = "OpenAfterHours" }]
-keywords = ["marimo", "langchain", "polars", "duckdb", "data-analysis", "cli"]
+keywords = ["marimo", "langchain", "polars", "duckdb", "data-analysis", "data-visualization", "cli"]
 dependencies = [
     # Pinned: Hailer drives the private marimo._code_mode API and /api/kernel/execute.
     "marimo==0.24.2",
