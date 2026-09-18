@@ -154,8 +154,11 @@ What is verified, and what is not:
   query parameter and the custom header. A second run resumed the conversation and sent the earlier turns.
   With `OPENAI_API_KEY` and the built-in provider, `gpt-5.5` over the Responses API called `marimo_status`,
   then `marimo_execute`, and answered `391` for 17 × 23 computed in the kernel (9,223 tokens in, 91 out).
-- Still owed: a physical Ctrl+C in a console (the suite raises SIGINT with `_thread.interrupt_main()`), and
-  a run by one of the users the Codex runtime failed for.
+- Ctrl+C is covered by the suite with a real SIGINT to the main thread on Linux (`signal.pthread_kill`) and
+  `_thread.interrupt_main()` on Windows. The latter does not wake an `epoll` wait on Linux, so it cannot
+  stand in for Ctrl+C there.
+- Still owed: a physical Ctrl+C in a Windows console, and a run by one of the users the Codex runtime
+  failed for.
 
 ### 1b. How a user points Hailer at their own endpoint (user-facing workflow)
 

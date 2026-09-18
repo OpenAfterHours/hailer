@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import _thread
 import asyncio
+import signal
 import threading
 import time
 from pathlib import Path
@@ -642,8 +643,22 @@ def test_summarisation_runs_on_the_configured_model_and_stays_out_of_the_reply(h
 # --------------------------------------------------------------------------- #
 
 
+def _press_ctrl_c() -> None:
+    """What Ctrl+C does: SIGINT for the main thread.
+
+    On POSIX it must be a real signal. ``_thread.interrupt_main()`` only sets CPython's pending-signal
+    flag; it does not interrupt the event loop's ``epoll`` wait, so on Linux the handler ran only when
+    the wait timed out (CI: 30 s late). A real SIGINT, which is what a terminal sends, interrupts the
+    wait at once. Windows has no ``pthread_kill``; there ``interrupt_main()`` is verified to work.
+    """
+    if hasattr(signal, "pthread_kill"):
+        signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)
+    else:
+        _thread.interrupt_main()
+
+
 def interrupt_after(seconds: float) -> threading.Timer:
-    timer = threading.Timer(seconds, _thread.interrupt_main)  # what Ctrl+C does: SIGINT for the main thread
+    timer = threading.Timer(seconds, _press_ctrl_c)
     timer.daemon = True
     timer.start()
     return timer

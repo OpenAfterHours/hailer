@@ -42,8 +42,12 @@ server and a kernel session opened through headless Chrome):
 - The first live run also caught a bug the suite had missed: a LangChain deprecation warning printed into
   the chat (the suite ignores `DeprecationWarning`). Fixed, with a test that fails on any warning in a turn.
 
-Still owed: a physical Ctrl+C in a console. The suite raises SIGINT with `_thread.interrupt_main()`, which
-takes the same path inside CPython, but nobody has pressed the key against the new agent yet.
+Ctrl+C: on Linux (CI and WSL) the suite sends a real SIGINT to the main thread (`signal.pthread_kill`),
+which is what a terminal sends, and the turn is cancelled at once. On Windows it uses
+`_thread.interrupt_main()`. Section 3 below says that call "takes the same CPython path"; that holds on
+Windows only. On Linux it merely sets CPython's pending-signal flag, the event loop's `epoll` wait is not
+interrupted, and the handler ran only when the 30 s wait in the test ended (the first CI run on Ubuntu
+failed this way). Still owed: a physical Ctrl+C in a Windows console against the new agent.
 
 ## 1. Recommendation
 

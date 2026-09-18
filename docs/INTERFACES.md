@@ -97,6 +97,10 @@ without agreement (report a needed change instead).
     tests `isinstance(text, str)` first. The pytest config ignores `DeprecationWarning`, so
     `test_agent.py::test_a_turn_raises_no_warnings_into_the_users_terminal` runs a turn under
     `warnings.simplefilter("error")`.
+  - Simulating Ctrl+C: `_thread.interrupt_main()` works on Windows, but on Linux it only sets CPython's
+    pending-signal flag and does not interrupt the event loop's `epoll` wait, so the handler ran when the
+    wait ended (30 s late in CI). The tests send a real SIGINT to the main thread there
+    (`signal.pthread_kill`), which is what a terminal sends.
 - Verified live on 2026-09-18 (real `hailer` CLI, headless marimo 0.24.2 server, kernel session opened through
   headless Chrome): (a) custom Chat Completions endpoint (the strict fake gateway on a fixed port): the model's
   `marimo_execute("print(1 + 1)")` ran in the real kernel and `2` came back; the gateway saw only `messages`,
@@ -104,8 +108,8 @@ without agreement (report a needed change instead).
   header; (b) a second run resumed the conversation ("Resumed conversation (1 turns so far)") and sent the
   earlier turns; (c) built-in provider with `OPENAI_API_KEY`: `gpt-5.5` over the Responses API called
   `marimo_status`, then `marimo_execute`, and answered 391 for 17 x 23 computed in the kernel (9,223 tokens
-  in, 91 out). Still owed: a physical Ctrl+C in a console (the suite raises SIGINT with
-  `_thread.interrupt_main()`), and a run by one of the users the Codex runtime failed for.
+  in, 91 out). Still owed: a physical Ctrl+C in a Windows console, and a run by one of the users the Codex
+  runtime failed for.
 
 ## `config.py`  (owner: wave 1 / A)
 
@@ -506,7 +510,8 @@ allowlist, project context, skills index and workspace are appended by `agent.sy
   `model_factory=` with `ScriptedModel` (a `BaseChatModel` replaying messages, exceptions or callables) and
   two toy tools: `build_model` kwargs, tracing, system prompt, error mapping, lifecycle (resume after a
   restart, `new_thread`, `set_model`, `close`), turns (events, usage, one user message, `/reload`, failed-turn
-  merge, summarisation) and Ctrl+C via `_thread.interrupt_main()` during a model call and during a tool.
+  merge, summarisation) and Ctrl+C during a model call and during a tool (a real SIGINT to the main thread
+  on POSIX, `_thread.interrupt_main()` on Windows; see "Runtime facts").
   Wire-level tests run the real `ChatOpenAI` against `tests/fake_gateway.py` (`FakeGateway`, a stdlib
   `ThreadingHTTPServer` on 127.0.0.1: only `POST /v1/chat/completions`, 404 elsewhere, 422 for unknown fields
   and model names, required key, `X-Client-Id` header and `api-version` query, optional refusal of `stream:
