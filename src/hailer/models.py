@@ -102,8 +102,8 @@ class ExecResult:
 # --------------------------------------------------------------------------- #
 
 
-#: Protocols a provider endpoint can speak. Codex talks the Responses API natively; for
-#: ``"chat"`` Hailer bridges Codex's Responses calls to Chat Completions (see hailer.wire).
+#: Protocols a provider endpoint can speak: the OpenAI Responses API (``POST /responses``) or
+#: Chat Completions (``POST /chat/completions``). Hailer talks either one directly.
 WIRE_API_RESPONSES = "responses"
 WIRE_API_CHAT = "chat"
 VALID_WIRE_APIS = (WIRE_API_RESPONSES, WIRE_API_CHAT)
@@ -111,24 +111,19 @@ VALID_WIRE_APIS = (WIRE_API_RESPONSES, WIRE_API_CHAT)
 
 @dataclass(frozen=True)
 class ProviderConfig:
-    """A model provider, passed through to Codex as ``model_providers.<id>.*``."""
+    """A model endpoint: the built-in OpenAI one, or a ``[model_providers.<id>]`` table with a ``base_url``."""
 
     id: str
     base_url: str | None = None
     wire_api: str = WIRE_API_RESPONSES  # one of VALID_WIRE_APIS
-    #: Chat Completions only: False sends ``stream: false`` and reads one JSON reply, for
-    #: gateways that reject or cannot deliver server-sent events. Codex always streams the Responses API.
+    #: False sends ``stream: false`` and reads one JSON reply, for endpoints that reject or
+    #: cannot deliver server-sent events.
     stream: bool = True
-    #: Chat Completions only: collapse Codex's consecutive ``system`` messages into one and its
-    #: consecutive ``user`` messages into one, for chat templates that insist on alternating roles.
-    merge_messages: bool = True
-    #: Chat Completions only: False omits ``stream_options`` from streamed requests, for gateways
-    #: that reject the field (token counts are then whatever the final chunk carries).
+    #: False omits ``stream_options`` from streamed requests, for endpoints that reject the
+    #: field (token counts are then whatever the final chunk carries).
     stream_options: bool = True
-    #: Chat Completions only: False omits the ``parallel_tool_calls`` field, for gateways that reject it.
-    parallel_tool_calls: bool = True
+    #: Environment variable (and credential-store entry) that holds the API key.
     env_key: str | None = None
-    requires_openai_auth: bool = False
     name: str | None = None
     http_headers: dict[str, str] = field(default_factory=dict)
     env_http_headers: dict[str, str] = field(default_factory=dict)
@@ -138,17 +133,15 @@ class ProviderConfig:
     def is_builtin_openai(self) -> bool:
         return self.id == "openai" and self.base_url is None
 
-    @property
-    def uses_chat_completions(self) -> bool:
-        """True when Hailer must translate Codex's Responses calls into Chat Completions."""
-        return self.wire_api == WIRE_API_CHAT and not self.is_builtin_openai
-
 
 @dataclass(frozen=True)
 class ModelConfig:
     name: str = "gpt-5.5"
     provider: str = "openai"
     reasoning_effort: str | None = "medium"
+    #: Older turns are summarised once the conversation passes this many tokens; 0 turns it off.
+    #: Lower it for endpoints whose models have a small context window.
+    summarize_after_tokens: int = 100_000
 
 
 @dataclass(frozen=True)
@@ -157,7 +150,6 @@ class WebConfig:
 
     allowed_domains: tuple[str, ...] = ()
     max_page_bytes: int = 200_000
-    allow_shell_network: bool = False
 
 
 @dataclass(frozen=True)
@@ -175,7 +167,6 @@ class HailerConfig:
     web: WebConfig = field(default_factory=WebConfig)
     marimo_url: str | None = None
     marimo_token: str | None = None  # value is read from env only, never from file
-    codex_home: Path | None = None
     log_level: str = "WARNING"
     config_path: Path | None = None
     max_tool_output_chars: int = 12_000
@@ -194,7 +185,7 @@ class HailerConfig:
         if pid in self.providers:
             return self.providers[pid]
         if pid == "openai":
-            return ProviderConfig(id="openai", env_key="OPENAI_API_KEY", requires_openai_auth=True)
+            return ProviderConfig(id="openai", env_key="OPENAI_API_KEY")
         raise KeyError(pid)
 
 
@@ -226,7 +217,7 @@ class ContextBundle:
 # --------------------------------------------------------------------------- #
 
 
-AgentEventKind = Literal["message_delta", "command", "command_output", "tool_call", "reasoning", "status"]
+AgentEventKind = Literal["message_delta", "tool_call", "status"]
 
 
 @dataclass(frozen=True)
@@ -242,9 +233,7 @@ class AgentEvent:
 class TurnSummary:
     final_response: str
     thread_id: str
-    turn_id: str
     duration_ms: int | None = None
-    commands: list[str] = field(default_factory=list)
     tool_calls: list[str] = field(default_factory=list)
     input_tokens: int | None = None
     output_tokens: int | None = None

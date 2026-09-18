@@ -23,7 +23,7 @@ Hailer warns at startup if a file looks like it contains a key or token.
 
 ## skills/
 
-Skills use the Agent Skills format shared by Codex and Claude: a folder with a `SKILL.md`
+Skills use the Agent Skills format that several coding agents share: a folder with a `SKILL.md`
 whose frontmatter has `name` and `description`, plus optional `reference/` and `scripts/`.
 Hailer puts only the name and description in the agent's instructions; the body is loaded
 when the task matches (the agent calls `load_skill`) or when you type `/skill <name>`.

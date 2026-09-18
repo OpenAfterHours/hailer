@@ -70,7 +70,7 @@ INTERNAL = ProviderConfig(
     base_url="https://llm.example.internal/v1",
     env_key="INTERNAL_MODEL_API_KEY",
 )
-OPENAI = ProviderConfig(id="openai", env_key="OPENAI_API_KEY", requires_openai_auth=True)
+OPENAI = ProviderConfig(id="openai", env_key="OPENAI_API_KEY")
 
 
 def test_username_format():
@@ -102,7 +102,7 @@ def test_provider_without_env_key():
 
 
 def test_openai_missing_is_reported_not_raised(memory_keyring):
-    # The CLI decides whether this is fatal (a ChatGPT login may exist).
+    # Resolution only reports; the agent turns a missing key into a CredentialsError with the login hint.
     assert secrets.resolve_provider_key(OPENAI, {}) == (None, "missing")
 
 

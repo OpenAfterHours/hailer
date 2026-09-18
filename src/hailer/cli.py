@@ -17,7 +17,6 @@ small module-level factory functions so tests can replace them.
 from __future__ import annotations
 
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -42,6 +41,7 @@ from hailer.errors import (
     NoSessionError,
 )
 from hailer.models import (
+    WIRE_API_CHAT,
     AgentEvent,
     Check,
     ContextBundle,
@@ -57,10 +57,8 @@ from hailer.session import (
     COMMANDS,
     EXIT_COMMANDS,
     help_text,
-    load_prompt_hash,
     load_session,
     parse_command,
-    prompt_hash,
     save_session,
 )
 
@@ -103,36 +101,6 @@ def _reconfigure_streams() -> None:
             reconfigure(errors="replace")
         except (ValueError, OSError):  # pragma: no cover - closed or exotic streams
             pass
-
-
-_SHELL_WRAPPERS = (
-    # "C:\...\powershell.exe" -NoProfile -Command '<cmd>'   |   pwsh -Command "<cmd>"
-    re.compile(r"""^"?(?:[A-Za-z]:\\|/)?[^"'\s]*?(?:powershell|pwsh)(?:\.exe)?"?(?:\s+-\w+)*\s+-Command\s+(?P<cmd>.+)$""", re.IGNORECASE | re.DOTALL),
-    # cmd.exe /c <cmd>   |   cmd /d /s /c <cmd>
-    re.compile(r"""^"?(?:[A-Za-z]:\\|/)?[^"'\s]*?cmd(?:\.exe)?"?(?:\s+/[dsDS])*\s+/[cC]\s+(?P<cmd>.+)$""", re.DOTALL),
-    # bash -lc <cmd>   |   sh -c <cmd>   |   zsh -lc <cmd>
-    re.compile(r"""^"?(?:[^"'\s]*/)?(?:bash|sh|zsh)"?\s+-l?c\s+(?P<cmd>.+)$""", re.DOTALL),
-)
-
-
-def _display_command(text: str) -> str:
-    """The command as the user would recognise it, without the shell wrapper Codex adds."""
-    shown = text.strip()
-    for pattern in _SHELL_WRAPPERS:
-        match = pattern.match(shown)
-        if match:
-            shown = match.group("cmd").strip()
-            break
-    if len(shown) >= 2 and shown[0] == shown[-1] and shown[0] in ("'", '"'):
-        shown = shown[1:-1]
-    return " ".join(shown.split())
-
-
-def _prompt_hash(config: HailerConfig, bundle: ContextBundle) -> str:
-    """Fingerprint of the system prompt a new thread would start with."""
-    from hailer.agent import system_prompt
-
-    return prompt_hash(system_prompt(config, bundle))
 
 
 def _load_config(opts: CliOptions) -> HailerConfig:
@@ -392,14 +360,15 @@ def _provider_line(config: HailerConfig) -> str:
 
 
 def _describe_provider(provider: ProviderConfig) -> str:
-    """``id (base_url, chat completions)`` for a chat provider (``, no streaming`` when ``stream = false``);
-    ``id (base_url)`` or ``id`` otherwise."""
+    """``id (base_url[, chat completions][, no streaming])`` for a custom endpoint, ``id`` for the built-in one."""
     if not provider.base_url:
         return provider.id
-    if provider.uses_chat_completions:
-        mode = "chat completions" if provider.stream else "chat completions, no streaming"
-        return f"{provider.id} ({provider.base_url}, {mode})"
-    return f"{provider.id} ({provider.base_url})"
+    notes = [provider.base_url]
+    if provider.wire_api == WIRE_API_CHAT:
+        notes.append("chat completions")
+    if not provider.stream:
+        notes.append("no streaming")
+    return f"{provider.id} ({', '.join(notes)})"
 
 
 def _web_line(config: HailerConfig) -> str:
@@ -409,8 +378,7 @@ def _web_line(config: HailerConfig) -> str:
     shown = ", ".join(domains[:4])
     if len(domains) > 4:
         shown += f" (+{len(domains) - 4} more)"
-    shell = " (shell too)" if config.web.allow_shell_network else ""
-    return shown + shell
+    return shown
 
 
 def _relative(path: Path, workspace: Path) -> str:
@@ -564,16 +532,6 @@ def local_checks(config: HailerConfig) -> list[Check]:
         del value
         if source != "missing":
             checks.append(Check("credentials", True, f"{provider.env_key or 'API key'} from {source}", fatal=False))
-        elif provider.is_builtin_openai:
-            checks.append(
-                Check(
-                    "credentials",
-                    False,
-                    "no OPENAI_API_KEY found; Codex will use its existing ChatGPT login if you have one",
-                    hint="If the agent fails to authenticate, run: uv run hailer login openai",
-                    fatal=False,
-                )
-            )
         else:
             checks.append(
                 Check(
@@ -611,9 +569,9 @@ def _print_checks(console: Console, checks: list[Check], *, only_failures: bool 
 class _TurnDisplay:
     """Drives the progress line for one turn and prints the final answer exactly once.
 
-    Agent-message deltas are not streamed: Codex emits interim commentary and the final
-    answer as separate messages, and streaming both printed the answer twice. The spinner
-    shows the latest command or tool instead, and ``finish`` prints ``final_response``.
+    Message deltas are not printed as they arrive: a model can write interim commentary next
+    to its tool calls and then the final answer, and streaming both printed the answer twice.
+    The spinner shows the latest tool instead, and ``finish`` prints ``final_response``.
     """
 
     console: Console
@@ -640,12 +598,11 @@ class _TurnDisplay:
             if self.deltas == 1:
                 self._update("Writing reply...")
             return
-        if event.kind in ("command", "tool_call"):
+        if event.kind == "tool_call":
             width = max(20, self.console.width - 12)
-            text = _display_command(event.text) if event.kind == "command" else event.text.replace("\n", " ")
+            text = event.text.replace("\n", " ")
             self.last_activity = text[: width - 1] + "…" if len(text) > width else text
-            verb = "Running" if event.kind == "command" else "Using"
-            self._update(f"{verb}: {self.last_activity}")
+            self._update(f"Using: {self.last_activity}")
             return
         if event.kind == "status" and event.text:
             self._update(event.text)
@@ -679,34 +636,20 @@ class ChatLoop:
         self.bundle = _load_context(self.config)
         self._print_context_warnings()
         self.agent = _make_agent(self.config, self.bundle)
-        current_hash = self._current_prompt_hash()
-        stored_hash = load_prompt_hash(self.config.workspace)
         resume = None if self.opts.new_thread else self.state.thread_id
-        thread_id = self.agent.start(resume_thread_id=resume)
-        resumed = False
+        forget = self.state.thread_id if self.opts.new_thread else None  # --new: drop the stored conversation
+        thread_id = self.agent.start(resume_thread_id=resume, forget_thread_id=forget)
         if resume and thread_id != resume:
             self.console.print(Text("Previous conversation could not be resumed; started a new one.", style="dim"))
             self.state = SessionState()
         elif resume:
-            resumed = True
             self.console.print(Text(f"Resumed conversation ({self.state.turns} turns so far). /new starts fresh.", style="dim"))
-            if current_hash and stored_hash and stored_hash != current_hash:
-                self.console.print(
-                    Text("Project context or prompt changed since this conversation started; use /new to apply.", style="yellow")
-                )
         elif self.opts.new_thread:
             self.state = SessionState()
         self.state.thread_id = thread_id
         self.state.model = self.state.model or self.config.model.name
         self.state.provider = self.state.provider or self.config.model.provider
-        # A resumed thread keeps the prompt it was started with; a new thread records the current one.
-        save_session(self.config.workspace, self.state, prompt_hash=None if resumed else (current_hash or ""))
-
-    def _current_prompt_hash(self) -> str:
-        try:
-            return _prompt_hash(self.config, self.bundle)
-        except Exception:  # noqa: BLE001 - the fingerprint is a convenience, never fatal
-            return ""
+        save_session(self.config.workspace, self.state)
 
     def close(self) -> None:
         if self.agent is not None:
@@ -759,13 +702,9 @@ class ChatLoop:
         try:
             try:
                 summary: TurnSummary = self.agent.run_turn(text, on_event=display, skill=skill, preamble=preamble)
-            except KeyboardInterrupt:
+            except KeyboardInterrupt:  # the agent has already cancelled the turn
                 self._pending_preamble = None  # the notice went out with the interrupted turn
                 display.stop()
-                try:
-                    self.agent.interrupt()
-                except Exception:  # pragma: no cover - best effort
-                    pass
                 self.console.print("\nInterrupted.")
                 return
             except BaseException:
@@ -836,16 +775,14 @@ class ChatLoop:
         else:
             self.console.print(f"Unknown command /{name}; type /help for commands.", markup=False)
 
-    def _new_thread(self, *, reason: str, thread_id: str | None = None) -> None:
-        """Record a new thread (starting it unless the agent already did) and reset counters."""
-        if thread_id is None:
-            thread_id = self.agent.new_thread()
+    def _new_thread(self, *, reason: str) -> None:
+        """Start a new thread and reset the counters."""
         self.state = SessionState(
-            thread_id=thread_id,
+            thread_id=self.agent.new_thread(),
             model=self.state.model,
             provider=self.state.provider,
         )
-        save_session(self.config.workspace, self.state, prompt_hash=self._current_prompt_hash() or "")
+        save_session(self.config.workspace, self.state)
         self.console.print(reason, markup=False)
 
     def _status(self) -> None:
@@ -862,7 +799,6 @@ class ChatLoop:
             ("Model", f"{self.state.model or self.config.model.name}"),
             ("Provider", self._active_provider_line()),
             ("Credentials", self._credentials_line()),
-            ("Reviewer", {True: "Codex (ChatGPT account)", False: "none (Hailer approves its own tools)"}.get(getattr(self.agent, "codex_reviewer", None), "-")),
             ("Thread", self.state.thread_id or "-"),
             ("Turns", str(self.state.turns)),
             ("Tokens", f"{self.state.input_tokens} in / {self.state.output_tokens} out"),
@@ -880,7 +816,7 @@ class ChatLoop:
         if provider_id in self.config.providers:
             return self.config.providers[provider_id]
         if provider_id == "openai":
-            return ProviderConfig(id="openai", env_key="OPENAI_API_KEY", requires_openai_auth=True)
+            return ProviderConfig(id="openai", env_key="OPENAI_API_KEY")
         return None
 
     def _active_provider_line(self) -> str:
@@ -903,8 +839,6 @@ class ChatLoop:
             except HailerError:
                 source = "missing"
         if source == "missing":
-            if provider.is_builtin_openai:
-                return "Codex login (no OPENAI_API_KEY set)"
             return f"{provider.env_key or 'API key'} missing (run: uv run hailer login {provider.id})"
         return f"{provider.env_key or 'API key'} from {source}"
 
@@ -926,14 +860,11 @@ class ChatLoop:
             known = ", ".join(sorted({"openai", *self.config.providers}))
             self.console.print(f"Unknown provider {provider!r}. Declared providers: {known}.", markup=False)
             return
-        restarted = bool(self.agent.set_model(name, provider))
+        self.agent.set_model(name, provider)
         self.state.model = name
         if provider is not None:
             self.state.provider = provider
-        reason = f"Model set to {name}" + (f" ({provider})" if provider else "") + "; started a new thread."
-        # set_model already started a new thread when the provider changed; do not start a second one.
-        already = getattr(self.agent, "thread_id", None) if restarted else None
-        self._new_thread(reason=reason, thread_id=already if isinstance(already, str) and already else None)
+        self._new_thread(reason=f"Model set to {name}" + (f" ({provider})" if provider else "") + "; started a new thread.")
 
     # -- /notebook --------------------------------------------------------- #
 
@@ -1172,7 +1103,7 @@ class ChatLoop:
             self.agent.bundle = self.bundle
         self.console.print(
             f"Reloaded {len(self.bundle.context_files)} context file(s), {len(self.bundle.skills)} skill(s), "
-            f"{len(self.bundle.prompts)} prompt(s). Applies to the next thread (/new).",
+            f"{len(self.bundle.prompts)} prompt(s). Applies from your next message.",
             markup=False,
         )
 
@@ -1483,9 +1414,7 @@ def status(ctx: typer.Context) -> None:
     try:
         provider = config.provider
         _value, source = _resolve_key(provider)
-        if source == "missing" and provider.is_builtin_openai:
-            console.print("Credentials: Codex login (no OPENAI_API_KEY set)", markup=False)
-        elif source == "missing":
+        if source == "missing":
             console.print(f"Credentials: {provider.env_key or 'API key'} missing (run: uv run hailer login {provider.id})", markup=False)
         else:
             console.print(f"Credentials: {provider.env_key or 'API key'} from {source}", markup=False)
@@ -1555,7 +1484,7 @@ def _provider_for(config: HailerConfig, provider_id: str) -> ProviderConfig:
     if provider_id in config.providers:
         return config.providers[provider_id]
     if provider_id == "openai":
-        return ProviderConfig(id="openai", env_key="OPENAI_API_KEY", requires_openai_auth=True)
+        return ProviderConfig(id="openai", env_key="OPENAI_API_KEY")
     known = ", ".join(sorted({"openai", *config.providers}))
     raise CredentialsError(
         f"Unknown provider {provider_id!r}.",
@@ -1577,7 +1506,7 @@ def login(
         if not prov.env_key:
             raise CredentialsError(
                 f"Provider {provider!r} has no env_key.",
-                hint=f"Set model_providers.{provider}.env_key in hailer.toml to the variable name Codex should read.",
+                hint=f"Set model_providers.{provider}.env_key in hailer.toml to the environment variable that names the key.",
             )
         value = typer.prompt(f"API key for {provider} ({prov.env_key})", hide_input=True)
         if not value.strip():

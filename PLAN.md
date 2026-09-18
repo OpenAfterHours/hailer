@@ -1,23 +1,55 @@
-# Hailer — implementation plan
+# Hailer: implementation plan
+
+## 2026-09-18: the agent moves from the Codex SDK to LangChain
+
+The agent is now `langchain.agents.create_agent` with `langchain_openai.ChatOpenAI`, running inside the Hailer
+process. The OpenAI Codex SDK (`openai-codex`, a bundled native `codex app-server`), the stdio MCP tool server
+(`hailer.mcp_server`) and the loopback bridge that translated Responses-API calls to Chat Completions
+(`hailer.wire`) are removed, and with them the sandbox, the shell tool, approval and reviewer handling and
+every use of `~/.codex`.
+
+Why:
+
+- The SDK ships a 381 MB native runtime (five executables) that has to be launched from a user-writable
+  folder, which application control on managed Windows machines commonly blocks. This is the likely cause of
+  the "does not work for some users" reports, but no report was seen, so it is not confirmed.
+- Codex speaks only the Responses API, which forced the bridge for Chat-Completions-only gateways.
+- Codex sends side requests Hailer never asked for, such as the `codex-auto-review` reviewer model on every
+  command and tool call, which strict gateways reject.
+- The settings Hailer needed were reachable only through private SDK surface, which meant an exact version pin.
+
+Kept: custom endpoints, key storage, all 11 tools, the marimo integration and the slash commands.
+
+What users must do:
+
+- Provide an API key for the built-in `openai` provider as well (`uv run hailer login openai` or
+  `OPENAI_API_KEY`). There is no ChatGPT-login fallback any more.
+- Nothing about an old `hailer.toml`: it still loads. `[hailer].codex_home`, `requires_openai_auth`,
+  `merge_messages`, `parallel_tool_calls` and `[web].allow_shell_network` are reported as unknown keys that are
+  ignored, and `HAILER_CODEX_HOME` is no longer read.
+- Expect a new conversation: earlier conversations do not carry over.
+
+The reasoning and the measurements are in `docs/LANGCHAIN_MIGRATION.md`; the spike behind it is in
+`spikes/langchain/`. The rest of this file describes the new design only.
 
 ## 2026-09-16: notebooks from the chat
 
-Built and verified live. The user (or the agent) can create new notebooks and reopen old ones without leaving
-the conversation:
+Built, and verified live on the agent of that date (the runs have not been repeated on the LangChain agent).
+The user (or the agent) can create new notebooks and reopen old ones without leaving the conversation:
 
 - One marimo server, started on the notebooks **folder** (`marimo edit notebooks --no-token`), hosts every
   notebook; a notebook is opened by URL with an absolute `?file=` key, no restart. Verified on marimo 0.24.2 with
   a websocket probe against both folder and single-file servers before the design was fixed.
-- The **active notebook** lives in `.hailer/notebook.json`, shared by the CLI process and the MCP tool server
-  (which re-reads it on every call). `hailer.notebooks` owns the state file, notebook listing, slugified
-  creation from a starter/empty template and folder-confined path resolution.
-- Four MCP tools (`notebook_list`, `notebook_create`, `notebook_open`, `notebook_close`) and the matching
+- The **active notebook** lives in `.hailer/notebook.json`, shared by the CLI and the agent's tools
+  (`hailer.tools`, which re-read it on every call). `hailer.notebooks` owns the state file, notebook listing,
+  slugified creation from a starter/empty template and folder-confined path resolution.
+- Four tools (`notebook_list`, `notebook_create`, `notebook_open`, `notebook_close`) and the matching
   `/notebook list | new | open | close` slash commands; a `[Hailer] ...` notice rides with the next message after
-  a slash-command switch; the system prompt names the folder, not the notebook, so switches never change the
-  prompt fingerprint.
-- Live verification (throwaway workspace, real Codex turns): "Create a new notebook called e2e beta and add one
+  a slash-command switch; the system prompt names the folder, not the notebook, and the model learns the active
+  notebook from `marimo_status` and those notices.
+- Live verification (throwaway workspace, real model turns): "Create a new notebook called e2e beta and add one
   cell that prints hello" → the model called `notebook_create`, `notebook_cells`, `marimo_execute`, the file
-  `e2e_beta.py` gained a `hello` cell, a browser tab opened from the tool server, and the CLI printed
+  `e2e_beta.py` gained a `hello` cell, a browser tab opened from the tool, and the CLI printed
   `Active notebook is now notebooks/e2e_beta.py.`; "Open the e2e alpha notebook and tell me how many cells it
   has" → `notebook_open` only, reply "I'm now in notebooks/e2e_alpha.py. It has 5 cells." (correct for the
   starter template). `/notebook new`, `/notebook list`, `/notebook close`, `hailer exec` on the active notebook
@@ -25,17 +57,19 @@ the conversation:
 - Review fixes folded in: exact-path session matching (no filename fallback), Windows reserved names and a
   64-character cap in slugs, `os.startfile`-first browser opening (a `BROWSER=true` shell had silently opened
   nothing), the switch notice queued before the browser wait, state re-read after interrupted/failed turns,
-  `HAILER_NOTEBOOK` persisted to the state file so the tool server follows it.
+  `HAILER_NOTEBOOK` persisted to the state file so the tools follow it.
 
-The single-file launch command quoted below (`marimo edit notebooks/analysis.py`) is the 2026-09-15 state;
-since 2026-09-16 Hailer launches the folder.
+## Status
 
-## Status (2026-09-15): built and verified
+All milestones M0 to M7 are implemented in this repository (`https://github.com/OpenAfterHours/hailer`); the
+agent path (M2, M3) was rebuilt on LangChain on 2026-09-18. The offline test suite (`uv run pytest`) needs no
+API key, no marimo and no network beyond loopback. The new agent was verified live on 2026-09-18 with the
+real CLI, a running marimo server and a kernel session (§1a has the details): a custom Chat Completions
+endpoint, resume after a restart, and one `gpt-5.5` turn over the Responses API with a real key. A physical
+Ctrl+C in a console is the one check still owed.
 
-All milestones M0–M7 are implemented in this repository (`https://github.com/OpenAfterHours/hailer`) and the
-offline test suite passes (`uv run pytest`, 283 tests, no API key, no marimo, no network). Verified live on
-Windows 11 against a running `marimo edit notebooks/analysis.py --no-token` server with the notebook open in a
-browser and Codex using the existing ChatGPT login:
+Verified live on 2026-09-15 on Windows 11, against a running marimo server with the notebook open in a
+browser. These longer runs predate the LangChain agent and have not been repeated on it:
 
 - Definition-of-done sequence: "create a dataframe with monthly RWA values and show it in the notebook" →
   "turn that into a chart" → "summarise the biggest movement". Cells were created, then edited in place for
@@ -43,11 +77,11 @@ browser and Codex using the existing ChatGPT login:
 - Realistic sequence: inspect parquet files → identify periods → compare latest two → biggest month-on-month
   movements → break down by exposure class → plot. Eight cells were added, all ran without errors, and the
   agent applied the example project skill's reconciliation checks on its own.
-- Custom endpoints, keyring storage, the domain allowlist and the Windows sandbox behaviour were verified
-  as described in §1a–1c below; the one correction found during the build is recorded in §2 (approval mode).
 
-Investigated 2026-09-15 against the real installed APIs: `openai-codex` 0.154.0, `marimo` 0.24.2,
-`polars` 1.44.2, `duckdb` 1.5.5, `typer` 0.27.2, `rich` 15.0.0, `pytest` 9.1.1, `uv` 0.12.1, Python 3.12/3.13 on Windows 11.
+Investigated against the real installed APIs on Windows 11, Python 3.12/3.13. 2026-09-15: `marimo` 0.24.2,
+`polars` 1.44.2, `duckdb` 1.5.5, `typer` 0.27.2, `rich` 15.0.0, `pytest` 9.1.1, `uv` 0.12.1. 2026-09-18:
+`langchain` 1.4.1, `langchain-core` 1.6.3, `langchain-openai` 1.6.2, `langgraph` 1.2.11,
+`langgraph-checkpoint-sqlite` 3.1.1, `openai` 3.15.0.
 
 ## 1. Findings that change the original spec
 
@@ -55,7 +89,7 @@ Investigated 2026-09-15 against the real installed APIs: `openai-codex` 0.154.0,
    - `marimo pair prompt --url ... --codex` (built into marimo >= 0.21): only *prints a prompt string* telling an agent to use a skill.
    - The GitHub repo `marimo-team/marimo-pair`: an Agent Skill (`SKILL.md`, `scripts/execute-code.sh`, `scripts/discover-servers.sh`, `reference/*.md`). The scripts need **bash + curl + jq**. `jq` is not installed on this machine, so the stock scripts would not run here anyway.
 
-2. **The whole "pair" protocol is three plain HTTP calls.** Hailer will implement it in pure Python (stdlib `urllib`), so nothing in Hailer depends on Git Bash or WSL:
+2. **The whole "pair" protocol is three plain HTTP calls.** Hailer implements it in pure Python (stdlib `urllib`, `marimo_client.py`), so nothing in Hailer depends on Git Bash or WSL:
    - `GET  {url}/health` (no auth) → `{"status": "healthy"}`
    - `GET  {url}/api/sessions` → `{ "<session_id>": {"filename": ..., "path": ...}, ... }`
    - `POST {url}/api/kernel/execute` with header `Marimo-Session-Id: <id>` and body `{"code": "..."}` → Server-Sent Events: `stdout` / `stderr` (`{"data": "..."}`) then `done` (`{"success": bool, "output": {"mimetype": ..., "data": ...}}`).
@@ -74,53 +108,57 @@ Investigated 2026-09-15 against the real installed APIs: `openai-codex` 0.154.0,
 
 4. **A kernel session only exists while the notebook is open in a browser.** Sessions are created by the websocket connector, not by the server starting. `marimo edit --headless` with no browser tab = no session = nothing to execute against. Hailer must detect "server up, no session" and tell the user to open the URL (or open it for them).
 
-5. **The Codex Python SDK works on this machine.** `Codex()` launches the bundled `codex.exe` app-server over stdio in ~2.3 s, reuses the existing ChatGPT login in `~/.codex/auth.json`, and lists models `gpt-5.5`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-6-astra`. Key API surface:
-   - `Codex(CodexConfig(config_overrides=("key=value", ...), cwd=..., env=...))` — overrides are passed as `codex -c key=value`, exactly the config.toml keys.
-   - `codex.thread_start(model=, model_provider=, developer_instructions=, base_instructions=, sandbox=Sandbox.workspace_write, approval_mode=ApprovalMode.deny_all, cwd=, config={...})`, `codex.thread_resume(thread_id)`.
-   - `thread.turn(text)` → `TurnHandle.stream()` yields notifications (`item/agentMessage/delta`, `item/started`, `item/completed`, `item/commandExecution/outputDelta`, `item/mcpToolCall/progress`, `turn/completed`); `handle.interrupt()` for Ctrl+C; `handle.run()` → `TurnResult(final_response, items, usage, status, error)`.
-   - Turn input can include `SkillInput(name, path)` to explicitly invoke a skill by path.
+## 1a. Custom (non-OpenAI) endpoints
 
-6. **The provider config in the spec is already Codex's own format.** `[model_providers.internal] base_url / wire_api="responses" / env_key / requires_openai_auth` is native Codex config, so Hailer does not implement any HTTP provider code. Hailer translates `hailer.toml` into `-c` overrides and Codex talks to the endpoint. Verified that `-c` overrides register MCP servers and that a whole-table override **merges** with the user's config rather than replacing it.
+`hailer.agent.build_model` turns a provider (the built-in `openai` one or a `[model_providers.<id>]` table) into
+one `ChatOpenAI` with an explicit `base_url`. Nothing sits between Hailer and the endpoint. The user's side
+(§1b: declare the provider, `hailer login <id>`, pick `wire_api`) is unchanged.
 
-7. **This machine's `~/.codex/config.toml` belongs to the Codex desktop app.** It enables MCP servers (`cua_repl`, `node_repl`) and many plugins (browser, computer-use, spreadsheets...). Hailer must not inherit those into an analysis session: it reads the user config with `tomllib` and passes `mcp_servers.<name>.enabled=false` / `plugins."<id>".enabled=false` overrides for everything it did not add. `HAILER_CODEX_HOME` gives full isolation (then auth needs `OPENAI_API_KEY` or a one-off `hailer login`).
-
-8. **The SDK cannot register in-process tools.** Its only server-to-client hook is the approval handler, so Hailer's tools must be an **MCP server** (stdio) or shell commands. Decision: MCP (see §2).
-
-9. **Where Codex finds context on its own** (relevant to the `.config` requirement):
-   - Skills: `.agents/skills/` in cwd, each parent up to the repo root, and `~/.agents/skills/` (legacy `.codex/skills` strings also present in the binary).
-   - Instructions: `~/.codex/AGENTS.md` (or `AGENTS.override.md`), then `AGENTS.md` in each directory from repo root down to cwd; combined, 32 KiB cap (`project_doc_max_bytes`).
-
-## 1a. Custom (non-OpenAI) endpoints: verified end to end
-
-Tested on 2026-09-15 by pointing the Codex SDK at a fake local server that implements only `POST /v1/responses`, configured purely through `-c` overrides (what Hailer will generate from `hailer.toml`):
-
-```
-model="internal-analyst-model"
-model_provider="internal"
-model_providers.internal.base_url="http://127.0.0.1:8765/v1"
-model_providers.internal.wire_api="responses"
-model_providers.internal.env_key="INTERNAL_MODEL_API_KEY"
-model_providers.internal.requires_openai_auth=false
-```
-
-Result: the app-server started with **no ChatGPT/OpenAI login** (`account: None, requires_openai_auth: False`), sent `Authorization: Bearer <value of INTERNAL_MODEL_API_KEY>`, and the turn completed with the fake endpoint's text as `final_response`.
+- **`base_url` and `use_responses_api` are always explicit**, `https://api.openai.com/v1` included. Checked
+  against langchain-openai 1.6.2: left unset, a model named `gpt-5-codex` or `gpt-5.5-pro` is routed to
+  `/responses` even on a custom `base_url`, and a stray `LANGSMITH_GATEWAY` environment variable redirects the
+  built-in provider's requests.
+- **The strict-gateway switches are `stream` and `stream_options` only**, for either wire API.
+  `stream = false` → `disable_streaming=True` (sends `stream: false`, reads one JSON reply);
+  `stream_options = false` → `stream_usage=False` (the field is omitted; token counts then arrive only if the
+  gateway sends usage unasked). `parallel_tool_calls` is never sent, and `[model].reasoning_effort = ""` stops
+  sending `reasoning_effort`.
+- **Proxies and the HTTP client.** `http_socket_options=()` keeps httpx's detection of `HTTP(S)_PROXY` and the
+  system proxy. The agent owns its HTTP client (`openai.DefaultAsyncHttpxClient`): langchain-openai's cached
+  client is bound to the first event loop, and a second agent failed with "Event loop is closed".
+- **Errors are typed.** `map_exception` switches on `openai.APIStatusError.status_code`, `APITimeoutError` and
+  `APIConnectionError` instead of parsing text, and quotes the endpoint's words with secrets masked.
 
 What a bespoke endpoint must provide:
 
-- **The Responses API, streaming.** `POST {base_url}/responses` with `stream: true`, replying with SSE events (`response.created`, `response.output_item.added`, `response.output_text.delta`, `response.output_item.done`, `response.completed` with `usage`). The Codex 0.154 binary contains no Chat Completions client at all, and `wire_api` accepts only `"responses"`. **If the internal endpoint only speaks Chat Completions, a translating proxy (for example LiteLLM) must sit in front of it.** This is the single hard requirement.
-- **Tolerate a `GET {base_url}/models?client_version=...` probe** at startup. Returning 404 is fine; Codex carried on.
-- **Accept these request fields**: `model`, `instructions`, `input`, `tools` (type `function`), `tool_choice`, `parallel_tool_calls`, `reasoning` (`{"effort": ..., "summary": "auto"}`), `include` (`["reasoning.encrypted_content"]`), `store: false`, `prompt_cache_key`, `client_metadata`. A gateway that rejects unknown fields must be relaxed for `reasoning`, `include` and `client_metadata`.
-- **Auth is a bearer token from the env var named in `env_key`**; extra static or env-sourced headers are available via `model_providers.<id>.http_headers` / `env_http_headers` if the gateway needs them.
+- **One of the two OpenAI wire APIs**, with function tool calls: `wire_api = "responses"` →
+  `POST {base_url}/responses`, `wire_api = "chat"` → `POST {base_url}/chat/completions`.
+- **Streaming (SSE)**, unless `stream = false`.
+- **Bearer-token auth** with the key named by `env_key`; extra headers and query parameters come from
+  `http_headers`, `env_http_headers` (sent only when the variable is set) and `query_params`.
 
-What Hailer must trim so a strict gateway is not surprised (measured on a "Say hello" turn):
+What is verified, and what is not:
 
-| Configuration | Request size | Tools sent |
-|---|---|---|
-| Defaults (inherits the desktop app's config) | 106.8 KB | 8 functions incl. `request_plugin_install`, `web_search`, `multi_agent_v1` and 6 `mcp__codex_apps__*` namespaces, plus a `<recommended_plugins>` block |
-| `base_instructions` + web search / multi-agent / plugin features off + user plugins disabled | 73.8 KB | still `mcp__node_repl` and `mcp__codex_apps__*` namespaces |
-| + `mcp_servers.node_repl.enabled=false`, `features.apps=false`, `features.codex_apps=false`, `features.connectors=false` | **11.3 KB** | `exec_command`, `write_stdin`, `request_user_input`, `view_image` only |
-
-So `agent.py` will always pass: `base_instructions=<Hailer system prompt>` (replaces Codex's built-in "You are a coding agent" prompt), `web_search="disabled"`, `features.web_search_request=false`, `features.multi_agent=false`, `features.multi_agent_v2=false`, `features.plugins=false`, `features.apps=false`, `features.codex_apps=false`, `features.connectors=false`, `features.image_generation=false`, `plugins."<id>".enabled=false` for every plugin in the user's config, and `mcp_servers.<name>.enabled=false` **only for servers defined in the user's `config.toml`** (disabling a plugin-provided server that way creates an incomplete table and the app-server refuses to start with "invalid transport"). Hailer's own MCP server is then the only namespace tool.
+- The offline test suite drives the real `ChatOpenAI` against a strict Chat-Completions-only fake gateway
+  (`tests/fake_gateway.py`, used by `tests/test_agent.py`; standard library, loopback only). Only
+  `POST /v1/chat/completions` exists, unknown fields (`stream_options`, `parallel_tool_calls`) and unknown
+  model names get a 422, a custom header and an `api-version` query parameter are required, and it can refuse
+  `stream: true`. With `stream_options = false`, a one-tool turn is exactly two requests carrying only
+  `model`, `messages`, `stream` and `tools`, one system and one user message, the configured model on both.
+  `stream = false`, the error hints (one request per 401, 404 or 422, no retry) and an unreachable endpoint
+  are covered the same way.
+- Live, 2026-09-18, real `hailer` CLI on Windows 11 with a headless marimo 0.24.2 server and a kernel
+  session opened through headless Chrome. Against the same fake gateway on a fixed port, the model's
+  `marimo_execute("print(1 + 1)")` ran in the real kernel and `2` came back in the answer; the gateway saw
+  only `messages`, `model`, `stream` and `tools`, the eleven tools as plain functions, the `api-version`
+  query parameter and the custom header. A second run resumed the conversation and sent the earlier turns.
+  With `OPENAI_API_KEY` and the built-in provider, `gpt-5.5` over the Responses API called `marimo_status`,
+  then `marimo_execute`, and answered `391` for 17 × 23 computed in the kernel (9,223 tokens in, 91 out).
+- Ctrl+C is covered by the suite with a real SIGINT to the main thread on Linux (`signal.pthread_kill`) and
+  `_thread.interrupt_main()` on Windows. The latter does not wake an `epoll` wait on Linux, so it cannot
+  stand in for Ctrl+C there.
+- Still owed: a physical Ctrl+C in a Windows console, and a run by one of the users the Codex runtime
+  failed for.
 
 ### 1b. How a user points Hailer at their own endpoint (user-facing workflow)
 
@@ -131,35 +169,39 @@ So `agent.py` will always pass: `base_instructions=<Hailer system prompt>` (repl
    provider = "internal"
 
    [model_providers.internal]
-   base_url             = "https://llm.example.internal/v1"
-   wire_api             = "responses"
-   env_key              = "INTERNAL_MODEL_API_KEY"
-   requires_openai_auth = false
-   # optional, passed straight through to Codex:
+   base_url = "https://llm.example.internal/v1"
+   wire_api = "responses"                  # or "chat" for Chat Completions
+   env_key  = "INTERNAL_MODEL_API_KEY"
+   # optional:
+   # stream           = false              # the endpoint rejects or cannot deliver streaming
+   # stream_options   = false              # the endpoint rejects the stream_options field
    # http_headers     = { "X-Team" = "risk-analytics" }
    # env_http_headers = { "X-Client-Id" = "INTERNAL_CLIENT_ID" }
    # query_params     = { "api-version" = "2025-04-01-preview" }   # Azure-style gateways
    ```
 2. **Store the secret once with `uv run hailer login internal`.** Hailer prompts with hidden input and saves the key in the OS credential store through `keyring` (Windows Credential Manager, verified working on this machine: `WinVaultKeyring` round-trip OK). Nothing is written to `hailer.toml`, shell history, or any Hailer file. `hailer logout internal` removes it.
 
-   How it reaches Codex: Codex only reads provider keys from the env var named in `env_key`, but the SDK's `CodexConfig(env={...})` sets variables for the **Codex child process only**. So at startup Hailer resolves the key and injects it there; it is never exported to the user's shell, never passed on a command line, and never logged (redaction filter). Resolution order per provider: (a) env var already set in the shell (for CI/automation, keeps the original workflow), (b) `keyring` entry `service="hailer", username="<provider>:<env_key>"`, (c) neither → actionable message suggesting `hailer login <provider>`. The same path works for `provider = "openai"` by injecting `OPENAI_API_KEY`, which avoids Codex's plaintext `~/.codex/auth.json` for API-key users; the existing ChatGPT login still works untouched. `hailer doctor` reports where the key came from (`keyring` or `env`), never the value.
+   How it reaches the endpoint: `hailer.secrets.resolve_provider_key` reads the key inside the Hailer process and `build_model` hands it to `ChatOpenAI` as `api_key`. It is never written to a file, exported to the user's shell, passed on a command line or logged (redaction filter). Resolution order per provider: (a) the env var named in `env_key`, when set in the shell (for CI/automation), (b) `keyring` entry `service="hailer", username="<provider>:<env_key>"`, (c) neither → a `CredentialsError` suggesting `hailer login <provider>`. The built-in `openai` provider works the same way with `OPENAI_API_KEY` and has no other login. `hailer doctor` and `/status` report where the key came from (`keyring` or `env`), never the value.
 
    Same-user processes can read Credential Manager entries just as they can read env vars, so this is about not leaving the key in files and history, not about isolating it from the user's own account. `keyring` adds six small pure-Python packages; no bash, no native build.
-3. **Run `uv run hailer doctor`** (also part of normal startup). It reports: config parsed, provider `internal` selected, env var present, `GET {base_url}/models` reachable (404 is acceptable), marimo running, notebook found. Failures print a fix, for example:
+3. **Run `uv run hailer doctor`.** It reports: config valid, notebook found, where the active provider's key comes from, marimo running, notebook open in a browser (the checks normal startup runs too), then whether code mode answers in the kernel. It does not call the model endpoint. Failures print a fix, for example:
    ```
-   INTERNAL_MODEL_API_KEY is not set (required by provider "internal").
-   Set it in this terminal and run Hailer again:
-       set INTERNAL_MODEL_API_KEY=<your key>
+   INTERNAL_MODEL_API_KEY is not set (required by provider 'internal')
+   Store it once with:
+
+       uv run hailer login internal
+
+   or set the INTERNAL_MODEL_API_KEY environment variable in this terminal.
    ```
-4. **Run `uv run hailer`.** The startup panel shows `Model: risk-analyst-v3` and `Provider: internal (https://llm.example.internal/v1)`. Under the hood Hailer launches the Codex app-server with the provider as `-c` overrides for that session only; it never edits `~/.codex/config.toml`, so the user's Codex desktop/CLI setup is untouched.
-5. **Switch when needed.** `/model <name>` changes the model for the next turn; `/model internal:<name>` or `/model openai:gpt-5.5` changes provider too. One-off overrides: `HAILER_MODEL`, `HAILER_MODEL_PROVIDER`. With `provider = "openai"` Hailer instead reuses the existing Codex login or `OPENAI_API_KEY`.
-6. **If the gateway only speaks Chat Completions**, run a translating proxy locally and point `base_url` at it (documented in the README with a LiteLLM example). Hailer detects the symptom (404 or a validation error on `POST /responses`) and prints that advice rather than a stack trace.
+4. **Run `uv run hailer`.** The startup panel shows `Model: risk-analyst-v3` and `Provider: internal (https://llm.example.internal/v1)`, with `chat completions` and `no streaming` noted when set.
+5. **Switch when needed.** `/model <name>` changes the model and starts a new thread; `/model internal:<name>` or `/model openai:gpt-5.5` changes provider too. One-off overrides: `HAILER_MODEL`, `HAILER_MODEL_PROVIDER`.
+6. **If the gateway only speaks Chat Completions**, set `wire_api = "chat"`; no proxy is needed. If it also rejects `stream: true` or the `stream_options` field, set `stream = false` or `stream_options = false`. Hailer turns the symptoms (a 404/405 on the wrong API, a 4xx naming a field) into a hint that names the setting rather than a stack trace.
 
-`hailer status` inside the chat shows the same provider line plus the thread id and token usage, so the user can always confirm which endpoint a session is talking to.
+`/status` inside the chat shows the same provider line plus the key's source, the thread id and token usage, so the user can always confirm which endpoint a session is talking to.
 
-### 1c. Allowed web domains for context (verified enforcement)
+### 1c. Allowed web domains for context
 
-Users can list websites the agent may read for context (regulator pages, internal documentation, library docs). Anything not listed is unreachable, not merely discouraged. Config:
+Users can list websites the agent may read for context (regulator pages, internal documentation, library docs). Anything not listed is refused by the tool, not merely discouraged. Config:
 
 ```toml
 [web]
@@ -168,59 +210,65 @@ allowed_domains = [
   "docs.pola.rs", "duckdb.org",
   "confluence.example.internal",
 ]
-max_page_bytes      = 200000   # cap per fetch before HTML-to-text conversion
-allow_shell_network = false    # also let shell commands reach the same domains (see below)
+max_page_bytes = 200000        # cap per fetch before HTML-to-text conversion
 ```
 
-With no `[web]` section the agent has **no internet access at all**: the default Codex sandbox already blocks outbound connections from shell commands (verified on this machine: `curl https://example.com` fails to connect, while loopback such as marimo is reachable), and Hailer's fetch tool refuses every URL.
+The agent's only web tool is `fetch_page(url)` (`hailer.web`), and the allow-list is its one enforcement point: there is no shell and no network proxy layer. With no `[web]` section it refuses every URL and the system prompt tells the model it has no internet access. The allow-list does not cover code the agent runs in the marimo kernel (§7).
 
-Two enforcement layers, both driven by the same list:
+`fetch_page` checks the host against `allowed_domains` (private and loopback addresses only when listed literally; a bare `*` is rejected at config validation), re-checks on every redirect hop, fetches with stdlib `urllib`, converts HTML to readable text (stdlib `html.parser`), caps the size, and returns the text to the model. A disallowed host returns a one-line refusal that names the allowed domains so the agent can ask the user to extend the list. Covered offline by `tests/test_web.py`.
 
-1. **Hailer's `fetch_page(url)` MCP tool** (primary path). Runs outside the command sandbox, so TLS and DNS behave normally. It checks the host against `allowed_domains` with Codex's wildcard semantics, fetches with stdlib `urllib`, converts HTML to readable text (stdlib `html.parser`), caps the size, and returns the text to the model. A disallowed host returns a one-line refusal that names the allowed domains so the agent can ask the user to extend the list. Codex's proxy deliberately does not filter MCP tools, so this check is Hailer's responsibility.
-2. **Codex's network proxy allowlist for shell commands** (opt-in via `allow_shell_network = true`). Verified working on Windows with the documented schema, passed as `-c` overrides: `features.network_proxy.enabled=true`, `features.network_proxy.domains={"example.com"="allow"}`, `network.enabled=true`, `network.mode="limited"`, `network.domains={...}`, `sandbox_workspace_write.network_access=true`. Result: `http://example.com` returned 200, `https://www.python.org` was blocked with `Network access to "www.python.org" was blocked: domain is not on the allowlist`, and loopback worked only when `127.0.0.1` was listed. Hailer adds `127.0.0.1` and `localhost` automatically so the `hailer exec` shell fallback can still reach marimo. Two Windows-sandbox quirks make this the secondary path: `curl.exe` fails HTTPS inside the sandbox with a schannel credentials error, and the sandbox could not execute a Python interpreter living outside the workspace (`Access is denied` for the uv-managed interpreter under `%APPDATA%`).
+What this means for data leaving the machine: text fetched from an allowed site becomes tool output and is sent to the configured model endpoint like any other tool result. The README security section says so, and the startup panel and `/status` show the active allow-list.
 
-What this means for data leaving the machine: text fetched from an allowed site becomes tool output and is sent to the configured model endpoint like any other tool result. The README security section says so, and `hailer status` shows the active allowlist.
+Later options (not v1): per-domain auth headers from keyring for internal wikis (`[web.auth."confluence.example.internal"] header = "Authorization" keyring = true`), and a `denied_domains` list where a deny wins.
 
-Later options (not v1): per-domain auth headers from keyring for internal wikis (`[web.auth."confluence.example.internal"] header = "Authorization" keyring = true`), and a `denied_domains` list mirroring Codex's deny-wins rule.
+## 2. Architecture
 
-## 2. Architecture (revised)
+One Python process holds the CLI, the agent loop and the tools. marimo is the only other process.
 
 ```
 Terminal  (Typer + Rich)                                   cli.py / session.py
     │  text turns, slash commands
     ▼
-agent.py ── openai-codex SDK ── codex.exe app-server ── model endpoint
-                                     │                  (OpenAI or internal Responses API,
-                                     │ MCP over stdio    configured via -c overrides)
-                                     ▼
-                              hailer-mcp  (mcp_server.py)
-                              tools: marimo_execute, marimo_status,
-                                     notebook_cells, notebook_list,
-                                     notebook_create, notebook_open,
-                                     notebook_close, list_periods,
-                                     load_skill, read_skill_file,
-                                     fetch_page (allowlisted domains only)
-                                     │
-                                     ▼
-                              marimo_client.py  (pure-Python HTTP + SSE)
-                                     │
-                                     ▼
-                  marimo edit notebooks --no-token   (live kernel; the folder since 2026-09-16)
-                       scratchpad  +  marimo._code_mode  →  Polars / DuckDB / charts
-                                     │
-                                     ▼
-                                 Browser UI
+agent.py   HailerAgent: create_agent + ChatOpenAI ── HTTP(S) ── model endpoint
+    │      one asyncio.Runner; conversations in                (OpenAI or a custom base_url,
+    │      .hailer/threads.sqlite                               Responses API or Chat Completions)
+    │  in-process calls (a daemon thread per call)
+    ▼
+tools.py   marimo_execute, marimo_status, notebook_cells, notebook_list,
+    │      notebook_create, notebook_open, notebook_close, list_periods,
+    │      load_skill, read_skill_file, fetch_page (allow-listed domains only)
+    ▼
+marimo_client.py  (pure-Python HTTP + SSE)
+    │
+    ▼
+marimo edit notebooks --no-token   (live kernel; the folder since 2026-09-16)
+    scratchpad  +  marimo._code_mode  →  Polars / DuckDB / charts
+    │
+    ▼
+Browser UI
 ```
 
-Why an MCP server instead of the upstream shell scripts:
+`hailer.tools`: `HailerTools` holds the 11 tools (`TOOL_NAMES`) as plain methods that return text, errors
+included; a method's docstring is the description the model sees. `hailer_tools(config)` wraps them as
+LangChain `StructuredTool`s. The model has these tools and nothing else: no shell, no file tool, no approval step.
+
+Why Hailer's own tools instead of the upstream shell scripts:
 - No bash/curl/jq; works from `cmd.exe`/PowerShell.
 - Typed arguments: multi-line Python arrives intact (cmd.exe has no heredocs; shell quoting was the main Windows failure mode).
 - Hailer controls the result shape: truncation of large outputs with head/tail, session resolution by notebook path on every call, clear error strings the model can act on.
 - Same client is also exposed as `uv run hailer exec -c "..."` for humans and debugging.
 
-Alternative kept as a documented option, not the default: marimo's hidden `marimo edit --mcp code-mode` flag exposes `list_sessions` / `execute_code` over streamable HTTP at `/mcp/server` (needs `marimo[mcp]`). Zero Hailer code, but experimental and it requires the user to remember the flag.
+Not used: marimo's hidden `marimo edit --mcp code-mode` flag exposes `list_sessions` / `execute_code` over streamable HTTP at `/mcp/server` (needs `marimo[mcp]`). It is experimental, it requires the user to remember the flag, and the agent has no MCP client.
 
-Codex session settings: `cwd=<workspace>`, `Sandbox.workspace_write`, `ApprovalMode.auto_review`, `base_instructions` = Hailer system prompt + user context (see §3). **Verified live (2026-09-15):** with `ApprovalMode.deny_all` (approval policy `never`) Codex rejects every MCP tool call with "MCP tool call requires approval, but approval policy is never", regardless of `mcp_servers.<id>.default_tools_approval_mode` or per-tool `approval_mode`; with `auto_review` the same call completes. Hailer therefore uses `auto_review` plus `mcp_servers.hailer.default_tools_approval_mode="auto"`; ordinary commands inside the workspace-write sandbox never prompt, and any escalation request is routed to Codex's automatic reviewer rather than the terminal. The Windows sandbox behaviour of the app-server (`windowsSandbox/setupCompleted` notifications exist; user config has `[windows] sandbox = "elevated"`) is verified in milestone M2.
+Agent design rules and the finding behind each (`docs/LANGCHAIN_MIGRATION.md`; the docstrings in `hailer.agent` and `hailer.tools`):
+
+- **Sync public methods over one `asyncio.Runner`** that lives as long as the agent. LangGraph's synchronous `stream()` blocks in an untimed wait on Windows and Ctrl+C arrived 5 to 9 s late, after the turn had finished; under asyncio it cancels the task and aborts the HTTP request at once.
+- **Blocking tools run on daemon threads.** Each `StructuredTool` has an async path that runs the call on a daemon thread, so Ctrl+C and exit never wait for a kernel call (on the loop's default executor, quitting waited 7 s for a call with 7 s left). The abandoned call finishes in the background and its result is dropped.
+- **Conversations are LangGraph checkpoints** in `<workspace>/.hailer/threads.sqlite` (`AsyncSqliteSaver`); `.hailer/session.json` keeps the thread id and counters. An id the store does not know starts a new thread. `new_thread()` (`/new`, `/model`) deletes the previous thread: Hailer only ever resumes the latest.
+- **`_settle_history` runs before each turn.** A tool call cut short by Ctrl+C gets a result (endpoints answer 400 to a tool call without one), and a new user message is merged into a trailing unanswered one (strict chat templates refuse two user messages in a row).
+- **`SummarizationMiddleware` with an absolute token trigger**: `[model].summarize_after_tokens`, default 100000, 0 = off. The fractional trigger needs a model profile, which no custom deployment name has. The configured model writes the summary, so no request goes out under another model name.
+- **The system prompt is sent on every model call**, so `/reload` applies from the next message of the same conversation.
+- **LangSmith tracing is forced off** at start-up unless `HAILER_TRACING` is set (§7).
 
 ## 3. The `.config` folder: user-supplied context and skills
 
@@ -233,7 +281,7 @@ Layout (project-level, committed alongside the notebook):
     ├── context/                    # ALWAYS-ON context, loaded every session
     │   ├── 00-team.md              #   sorted by filename, concatenated, ~24 KiB cap with a warning
     │   └── pra101-glossary.md      #   e.g. column meanings, exposure-class rules, house style
-    ├── skills/                     # ON-DEMAND skills in the Agent Skills format Codex/Claude use
+    ├── skills/                     # ON-DEMAND skills in the Agent Skills format
     │   └── pra101-reconciliation/
     │       ├── SKILL.md            #   frontmatter: name, description (+ optional allowed-tools)
     │       ├── reference/*.md
@@ -244,12 +292,11 @@ Layout (project-level, committed alongside the notebook):
 
 How each part is wired:
 
-- **`context/*.md`** → `context.py` reads them at startup and after `/reload`, and appends them under a "Project context" heading in `developer_instructions`. `/context` lists what is loaded and its size. Files are sent to the model endpoint every session, so the loader warns if a file looks like it contains a key or token (simple pattern check) and the README says so.
+- **`context/*.md`** → `context.py` reads them at startup and after `/reload`, and `agent.system_prompt` appends them under a "Project context" heading. `/context` lists what is loaded and its size. Files are sent to the model endpoint every session, so the loader warns if a file looks like it contains a key or token (simple pattern check) and the README says so.
 - **`skills/`** → progressive disclosure, Hailer-native so it works on Windows without symlinks:
   1. `context.py` parses each `SKILL.md` frontmatter and puts a compact index (name + description) in the system prompt.
-  2. The MCP server exposes `load_skill(name)` (returns the SKILL.md body and the file list) and `read_skill_file(name, relative_path)`, so the model pulls in a skill only when the task matches.
-  3. `/skill <name> [message]` sends `SkillInput(name, path)` with the turn for explicit invocation. If `SkillInput` turns out not to accept arbitrary paths (unverified), the fallback is to prepend the SKILL.md text to the turn.
-  4. Users who prefer Codex's own discovery can put skills in `.agents/skills/` instead; documented, not managed by Hailer.
+  2. The tools `load_skill(name)` (returns the SKILL.md body and the file list) and `read_skill_file(name, path)` let the model pull in a skill only when the task matches.
+  3. `/skill <name> [message]` invokes a skill explicitly: the SKILL.md text goes above the user's message in the same turn, under a `[Hailer]` notice that the system prompt explains.
 - **`prompts/`** → `/prompt <name>` sends the file contents as the turn (with `{{args}}` substitution). Cheap and useful for repeatable monthly analyses.
 - **`hailer.toml`** (strongly typed via dataclasses + stdlib `tomllib`):
   ```toml
@@ -261,17 +308,17 @@ How each part is wired:
   skills_dir  = ".config/hailer/skills"
 
   [model]
-  name             = "gpt-5.5"
-  provider         = "openai"                # or "internal"
-  reasoning_effort = "medium"
+  name                   = "gpt-5.5"
+  provider               = "openai"          # or "internal"
+  reasoning_effort       = "medium"          # "" sends none
+  summarize_after_tokens = 100000            # 0 = off
 
-  [model_providers.internal]                 # passed through to Codex verbatim
-  base_url             = "https://example.internal/v1"
-  wire_api             = "responses"
-  env_key              = "INTERNAL_MODEL_API_KEY"
-  requires_openai_auth = false
+  [model_providers.internal]                 # see §1b
+  base_url = "https://example.internal/v1"
+  wire_api = "responses"                     # or "chat"
+  env_key  = "INTERNAL_MODEL_API_KEY"
   ```
-  Env overrides: `HAILER_MODEL`, `HAILER_MODEL_PROVIDER`, `HAILER_NOTEBOOK`, `HAILER_DATA_DIR`, `HAILER_MARIMO_URL`, `HAILER_LOG_LEVEL`, `HAILER_CODEX_HOME`, `HAILER_CONFIG`. Hailer never reads the secret itself: preflight only checks that `os.environ` *has* the `env_key` name (or that a Codex login exists for the `openai` provider) and Codex reads the value.
+  Env overrides: `HAILER_MODEL`, `HAILER_MODEL_PROVIDER`, `HAILER_NOTEBOOK`, `HAILER_NOTEBOOKS_DIR`, `HAILER_DATA_DIR`, `HAILER_MARIMO_URL`, `HAILER_LOG_LEVEL`, `HAILER_CONFIG`, `HAILER_WORKSPACE`; `HAILER_MARIMO_TOKEN` and `HAILER_TRACING` exist only as environment variables. No secret goes in the file: the API key comes from the `env_key` variable or the credential store (§1b), and secret-looking or unknown keys are ignored with a warning.
 
 A global `~/.config/hailer/` layer (same structure, loaded before the project one) is a natural v1.1 addition; not in v1.
 
@@ -279,29 +326,39 @@ A global `~/.config/hailer/` layer (same structure, loaded before the project on
 
 ```
 hailer/
-├── pyproject.toml         [project.scripts] hailer = "hailer.cli:app", hailer-mcp = "hailer.mcp_server:main"
+├── pyproject.toml         [project.scripts] hailer = "hailer.cli:main"
 ├── hailer.toml            example project config
-├── README.md, .gitignore, PLAN.md
+├── README.md, .gitignore, PLAN.md, uv.lock
+├── docs/                  INTERFACES.md, LANGCHAIN_MIGRATION.md (the proposal behind the 2026-09-18 change)
+├── spikes/langchain/      the spike behind that proposal (throwaway; not packaged, not collected by pytest)
 ├── .config/hailer/        example context/, skills/, prompts/ with a short README
 ├── notebooks/analysis.py  valid marimo notebook: imports (mo, pl, duckdb), paths, welcome cell
-├── data/.gitkeep          (+ scripts/make_sample_data.py generating "25-01 pra101.parquet" ... for demos/tests)
+├── data/                  .gitkeep, README.md
+├── scripts/               make_sample_data.py ("25-01 pra101.parquet" ... for demos/tests), release.py
 ├── src/hailer/
-│   ├── cli.py             Typer app: chat REPL (default), `notebook`, `exec`, `status`, `doctor`
-│   ├── agent.py           Codex lifecycle: overrides, thread start/resume, streamed turns, interrupt
-│   ├── marimo_client.py   HTTP/SSE client, registry discovery, session resolution, typed errors
-│   ├── mcp_server.py      stdio MCP server (`mcp` package) exposing the tools in §2
+│   ├── cli.py             Typer app: chat REPL (default), `notebook`, `exec`, `status`, `doctor`, `login`, `logout`, `init`
+│   ├── agent.py           build_model (provider → ChatOpenAI), HailerAgent (threads, streamed turns, Ctrl+C),
+│   │                      system prompt, error mapping
+│   ├── tools.py           HailerTools (the 11 tools in §2) and hailer_tools(config) → LangChain tools
+│   ├── marimo_client.py   HTTP/SSE client, registry discovery, session resolution, launch commands
+│   ├── notebooks.py       active-notebook state (.hailer/notebook.json), listing, creation from templates
+│   ├── browser.py         opens a URL in the user's browser (os.startfile first on Windows)
+│   ├── web.py             allow-list matching, fetch_page, HTML to text, truncation
+│   ├── secrets.py         API-key resolution (env var, then keyring); storage for login/logout
 │   ├── config.py          dataclasses + tomllib + env overrides + validation
 │   ├── context.py         context/, skills index, prompts
-│   ├── session.py         slash-command parsing, session state, thread-id persistence (.hailer/session.json)
+│   ├── session.py         slash-command parsing, session state (.hailer/session.json)
 │   ├── periods.py         YY-MM filename parsing, multi-period Polars/DuckDB loaders
-│   ├── models.py          typed internal models (ExecResult, MarimoSession, TurnSummary, ...)
-│   ├── logging.py         logging setup, secret-redaction filter
+│   ├── models.py          typed internal models (ExecResult, MarimoSession, ProviderConfig, TurnSummary, ...)
+│   ├── errors.py          HailerError and its subclasses: a short message plus a hint
+│   ├── log.py             logging setup, secret-redaction filter
 │   └── prompts/system.md  agent system prompt (package data, loaded with importlib.resources)
-└── tests/                 test_config, test_periods, test_session, test_cli, test_marimo_client,
-                           test_context, test_agent_overrides  (all mocked; no key, no server)
+└── tests/                 test_<module>.py for agent, tools, cli, config, session, secrets, marimo_client, notebooks,
+                           browser, web, context, periods, log; test_release  (no key, no marimo, loopback only);
+                           fake_gateway.py is a test helper: the strict Chat-Completions-only gateway of §1a
 ```
 
-Dependencies: `openai-codex`, `marimo` (pinned, `_code_mode` is private), `mcp`, `polars`, `duckdb`, `typer`, `rich`; dev: `pytest`. Standard library for TOML, HTTP, SSE parsing, logging, subprocess.
+Dependencies: `marimo` (pinned `==0.24.2`, `_code_mode` is private), `langchain>=1.4,<2`, `langchain-openai>=1.6,<2`, `langgraph-checkpoint-sqlite>=3.1,<4`, `polars`, `duckdb`, `typer`, `rich`, `keyring`; dev: `pytest`. Standard library for TOML, the marimo HTTP/SSE client, page fetching, logging, subprocess.
 
 ## 5. Data conventions (`periods.py`)
 
@@ -317,7 +374,7 @@ Dependencies: `openai-codex`, `marimo` (pinned, `_code_mode` is private), `mcp`,
 |---|---|---|
 | M0 Scaffold | `pyproject.toml`, `uv sync`, package skeleton, notebook, `.gitignore` | `uv run hailer --help` |
 | M1 Marimo path | `marimo_client.py` + `hailer exec` | With the notebook open in a browser: `uv run hailer exec -c "<cm snippet>"` adds a visible cell |
-| M2 Agent path | `mcp_server.py`, `agent.py` (overrides, disable inherited tools, `developer_instructions`), hard-wired turn | `> create a simple dataframe and display it in Marimo` produces a notebook change |
+| M2 Agent path | `tools.py`, `agent.py` (chat model, tool loop, system prompt), hard-wired turn | `> create a simple dataframe and display it in Marimo` produces a notebook change |
 | M3 Conversation | REPL, `session.py`, streaming progress, Ctrl+C interrupt, EOF exit, thread resume | Three-turn definition-of-done sequence (dataframe → chart → summary) |
 | M4 Config & preflight | `config.py`, `hailer.toml`, env overrides, startup checks with actionable messages, `hailer notebook`, `--verbose` | Each error case in the spec prints a fix, no traceback |
 | M5 Data utilities | `periods.py`, sample-data generator, notebook helpers | The realistic PRA101 sequence works |
@@ -328,20 +385,23 @@ Slash commands: `/help /status /new /exit /quit /model /notebook /clear /context
 
 ## 7. Risks and how the plan handles them
 
-- **Private `marimo._code_mode` API** → pin marimo; all `cm` patterns live in `prompts/system.md` and one helper module; `hailer doctor` runs `help(cm)` to detect drift.
-- **No browser session** → `marimo_status` detects it; CLI opens the URL with `webbrowser` and waits/prompts.
+- **Private `marimo._code_mode` API** → pin marimo; the `cm` patterns live in `prompts/system.md`, the `marimo_execute` description and `marimo_client.py`; `hailer doctor` probes code mode in the live kernel to detect drift.
+- **No browser session** → `marimo_status` detects it; the CLI, `notebook_create` and `notebook_open` open the URL (`hailer.browser`) and wait for the session.
 - **Session id churn on page refresh** → every call resolves the session by notebook path, never caches ids.
-- **Inherited desktop-app MCP servers/plugins** → disabled by name via overrides; `HAILER_CODEX_HOME` for full isolation.
-- **Windows sandbox / approvals in app-server** → verified in M2; `Sandbox.workspace_write` + `deny_all`; documented fallback.
-- **Windows sandbox cannot run interpreters outside the workspace** → observed: `Access is denied` when a shell command invoked the uv-managed Python under `%APPDATA%`, and `python` is not on the sandbox PATH. All Python execution therefore goes through Hailer's MCP server into the marimo kernel (both outside the sandbox); the agent's shell is for light workspace inspection only, and the system prompt says so. M2 checks whether `sandbox_workspace_write.writable_roots` or a workspace-local `.venv` is needed for any shell use of `uv run`.
-- **Tool timeouts on big Polars/DuckDB jobs** → `mcp_servers.hailer.tool_timeout_sec=600`; the client streams SSE so nothing blocks silently.
-- **Large outputs into model context** → tool results capped (head/tail with a "truncated" marker) and the prompt tells the agent to aggregate locally and inspect summaries.
-- **`SkillInput` with arbitrary paths unverified** → text-injection fallback.
-- **What leaves the machine** (README security section): user turns, system prompt + `.config` context, skill bodies when loaded, tool call arguments (code) and truncated results, any file the agent reads via its shell, and any `AGENTS.md` Codex discovers. Raw datasets stay local unless code prints them. Secrets are never placed in prompts; logs redact `Authorization` headers and values of any env var named `*_KEY`/`*_TOKEN`.
+- **LangChain's release pace** → `langchain` and `langchain-openai` are pinned `<2`, `langgraph-checkpoint-sqlite` `<4`; the `build_model` docstring records what to re-check before raising a bound, and the offline fake-gateway tests catch wire regressions on an upgrade.
+- **More Python packages**, several with compiled wheels (`orjson`, `ormsgpack`, `xxhash`, `zstandard`, `tiktoken`, `jiter`, `regex`, `uuid-utils`, `sqlite-vec`) → extension modules of the kind Hailer already shipped (`polars`, `duckdb`, `pydantic-core`); nothing installed is a standalone executable.
+- **`langsmith` is installed transitively** → tracing is forced off unless `HAILER_TRACING` is set, so a `LANGSMITH_TRACING=true` left over from another project cannot send prompts and tool results to a third party; the explicit `base_url` closes the `LANGSMITH_GATEWAY` variant (§1a).
+- **`ChatOpenAI` targets the official OpenAI wire format** → known upstream issues with OpenAI-compatible gateways, none seen in the spike or the tests: tool-call arguments lost when a gateway fragments streamed tool-call chunks unusually (langchain #35514, #35782), where `stream = false` is the workaround; a deployment whose name starts with `o1`, `o3` and so on gets the `developer` role instead of `system`; non-standard `reasoning_content` is ignored.
+- **The checkpoint file grows** → LangGraph writes a checkpoint per step and never prunes. Only the latest thread is kept (`/new` and `/model` delete the previous one); one long conversation still grows until then.
+- **Long Polars/DuckDB jobs** → `marimo_execute` waits up to 600 s and the client streams SSE. Ctrl+C cancels the turn, not the kernel: the next turn tells the model that the call's effect is unknown.
+- **Large outputs into model context** → tool results capped (head/tail with a "truncated" marker), rich HTML/JSON outputs replaced by a placeholder, and the prompt tells the agent to aggregate locally and inspect summaries.
+- **What leaves the machine** (README security section): user turns, system prompt + `.config` context, skill bodies when loaded, tool call arguments (code) and truncated results, and pages fetched from allowed domains, all to the configured endpoint only. Raw datasets stay local unless code prints them. `marimo_execute` runs the model's Python unsandboxed in the user's kernel, so the prompt's safety rules are instructions, not an enforcement boundary. Secrets are never placed in prompts; logs redact `Authorization` headers and values of any env var named `*_KEY`/`*_TOKEN`/`*_SECRET`/`*_PASSWORD`.
 
 ## 8. Assumptions made (say if any should change)
 
 - The user-facing config folder is `.config/hailer/` as requested; `hailer.toml` is also accepted at the project root.
-- The shared `~/.codex` home (existing ChatGPT login) is the default; `gpt-5.5` is the default model for the `openai` provider.
-- Tools are exposed to the agent via Hailer's own MCP server, not the upstream bash scripts.
+- Every provider needs an API key, the built-in `openai` one included; `gpt-5.5` is the default model for the `openai` provider.
+- The endpoint speaks the official OpenAI wire format, Responses API or Chat Completions, with function tool calls.
+- Tools are Hailer's own in-process functions (`hailer.tools`), not the upstream bash scripts and not an MCP server.
+- Hailer resumes only the latest conversation of a workspace.
 - Git Bash / WSL are not required by anything in Hailer.

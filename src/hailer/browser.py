@@ -1,7 +1,7 @@
 """Open a URL in the user's browser without touching this process's stdio.
 
-Used by the CLI and by the MCP server, whose stdout *is* the MCP transport: a launcher that
-inherited it would corrupt the protocol. ``open_url`` never raises and never prints.
+Used by the CLI and by the agent's notebook tools while a turn is running: a launcher that
+inherited the terminal would write into the chat. ``open_url`` never raises and never prints.
 
 On Windows ``os.startfile`` is tried first. ``webbrowser`` honours the ``BROWSER`` environment
 variable, which Git Bash and WSL profiles sometimes set to a non-GUI command such as ``true``;

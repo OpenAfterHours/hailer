@@ -52,7 +52,7 @@ class ProviderError(HailerError):
 
 
 class AgentError(HailerError):
-    """Codex runtime failed to start or a turn failed."""
+    """The agent could not start or a turn failed."""
 
 
 class WebAccessDenied(HailerError):

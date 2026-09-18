@@ -1,4 +1,4 @@
-"""Notebook lifecycle shared by the CLI and the MCP server.
+"""Notebook lifecycle shared by the CLI and the agent's tools.
 
 Which notebook is *active*, which notebooks exist in the notebooks folder, how a user's
 reference ("q2 churn", "q2_churn.py", "notebooks/q2_churn.py") maps to a file, and how a new
@@ -6,9 +6,9 @@ notebook is created from a template. Standard library only; this module never im
 marimo, typer or rich.
 
 The active notebook is persisted in ``<workspace>/.hailer/notebook.json`` next to
-``session.json``. Two processes touch that file: the CLI (between turns, for slash commands)
-and the MCP server (during a turn, for tool calls), so there is only ever one writer at a
-time. Readers re-read it before every use and never cache it.
+``session.json``. Two writers touch that file: the CLI (between turns, for slash commands)
+and the agent's tools (during a turn), so there is only ever one writer at a time. Readers
+re-read it before every use and never cache it.
 """
 
 from __future__ import annotations
@@ -235,10 +235,10 @@ def notebook_display_name(config: HailerConfig, path: Path) -> str:
 def load_active_notebook(config: HailerConfig) -> Path:
     """The notebook the chat is working in: the state file's ``active`` entry, else ``config.notebook``.
 
-    Only the state file is consulted, never the environment: ``HAILER_NOTEBOOK`` is inherited
-    by the Codex child and therefore by the MCP server, so an env-wins rule would make the tool
-    server ignore every switch. The CLI persists such an override at startup with
-    :func:`save_active_notebook` instead, so both processes read the same answer. A missing or
+    Only the state file is consulted, never the environment: ``HAILER_NOTEBOOK`` stays set for
+    the whole session, so an env-wins rule would make the tools ignore every switch. The CLI
+    persists such an override at startup with :func:`save_active_notebook` instead, so the CLI
+    and the tools read the same answer. A missing or
     corrupt file, or an entry that no longer names an existing notebook inside the notebooks
     folder, falls back to the configured notebook.
     """
