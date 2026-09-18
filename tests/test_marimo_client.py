@@ -257,8 +257,8 @@ def test_connection_refused_hint_has_launch_command(tmp_path):
     client = mc.MarimoClient(f"http://127.0.0.1:{_free_port()}", notebook=nb, workspace=tmp_path)
     with pytest.raises(MarimoUnavailableError) as exc:
         client.sessions()
-    assert "uv run marimo edit notebooks --no-token" in exc.value.hint, "the folder, not the file"
-    assert "uv run hailer" in exc.value.hint
+    assert "uvx hailer notebook --foreground" in exc.value.hint
+    assert "uv run" not in exc.value.hint, "no project .venv is needed"
 
 
 # --------------------------------------------------------------------------- #
@@ -472,14 +472,9 @@ def test_client_notebook_url_uses_app_view(fake, tmp_path):
     assert client.notebook_url().endswith(f"?file={quote(mc.notebook_file_key(nb), safe='/:')}&view-as=present")
 
 
-def test_notebook_launch_command_uses_the_folder(tmp_path):
-    cfg = _config(tmp_path)
-    assert cfg.notebooks_root == tmp_path / "notebooks"
-    assert mc.notebook_launch_command(cfg) == ["uv", "run", "marimo", "edit", "notebooks", "--no-token"]
-    assert mc.notebook_launch_command(cfg, port=2718)[-2:] == ["--port", "2718"]
-    custom = _config(tmp_path, notebooks_dir=tmp_path / "nbs" / "deep")
-    assert mc.notebook_launch_command(custom)[4] == "nbs/deep"
-    assert mc.launch_command(None) == ["uv", "run", "marimo", "edit", "notebooks", "--no-token"]
+def test_launch_command_is_hailers_foreground_mode():
+    assert mc.launch_command() == ["uvx", "hailer", "notebook", "--foreground"]
+    assert mc.launch_command(port=2718)[-2:] == ["--port", "2718"]
 
 
 def test_snippets_are_valid_python():
@@ -500,7 +495,7 @@ def test_sessions_server_error_is_actionable(fake, tmp_path):
         client.sessions()
     assert "HTTP 500" in str(info.value)
     assert "kernel manager exploded" in str(info.value)
-    assert "--no-token" in info.value.hint
+    assert "uvx hailer notebook --foreground" in info.value.hint
     # resolve_session (used by preflight) must surface the same actionable error, never a raw HTTPError
     with pytest.raises(MarimoUnavailableError):
         client.resolve_session(tmp_path / "nb.py")
@@ -589,20 +584,21 @@ def test_marimo_server_command_flags(tmp_path):
     assert cmd[cmd.index("--port") + 1] == "2731"
 
 
-def test_launch_hint_offers_one_command_route_first(tmp_path):
-    hint = mc.launch_hint(tmp_path / "notebooks", tmp_path)
-    assert hint.index("uv run hailer notebook") < hint.index("uv run marimo edit notebooks --no-token")
-    assert hint.rstrip().endswith("uv run hailer")
-    assert "Or start it yourself with:" in hint and "Then run Hailer again:" in hint
+def test_marimo_server_command_foreground_lets_marimo_open_the_browser(tmp_path):
+    cmd = mc.marimo_server_command(tmp_path / "nbs", tmp_path, 2718, headless=False)
+    assert cmd == [mc.sys.executable, "-m", "marimo", "edit", "nbs", "--no-token", "--port", "2718", "--skip-update-check"]
+
+
+def test_launch_hint_offers_one_command_route_first():
+    hint = mc.launch_hint()
+    assert hint.index("uvx hailer notebook\n") < hint.index("uvx hailer notebook --foreground")
+    assert hint.rstrip().endswith("uvx hailer")
+    assert "Or run marimo on its own in another terminal:" in hint and "Then run Hailer again:" in hint
+    assert "uv run" not in hint
 
 
 def test_unavailable_error_uses_one_command_hint(tmp_path):
     client = mc.MarimoClient(f"http://127.0.0.1:{_free_port()}", timeout=0.5, notebook=tmp_path / "nbs" / "nb.py", workspace=tmp_path)
     with pytest.raises(MarimoUnavailableError) as info:
         client.sessions()
-    assert "uv run hailer notebook" in info.value.hint
-    assert "uv run marimo edit nbs --no-token" in info.value.hint, "derived from the notebook's folder"
-    explicit = mc.MarimoClient(f"http://127.0.0.1:{_free_port()}", timeout=0.5, notebook=tmp_path / "nbs" / "nb.py", workspace=tmp_path, notebooks_dir=tmp_path / "all")
-    with pytest.raises(MarimoUnavailableError) as info:
-        explicit.sessions()
-    assert "uv run marimo edit all --no-token" in info.value.hint
+    assert info.value.hint == mc.launch_hint()

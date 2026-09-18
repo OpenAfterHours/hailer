@@ -126,7 +126,7 @@ def _(DATA_DIR, WORKSPACE, describe_periods, mo, period_files, pl):
     **Workspace:** `{WORKSPACE}`
     **Data:** `{DATA_DIR}`
 
-    Chat in the terminal (`uv run hailer`); results, tables and charts appear here.
+    Chat in the terminal (`uvx hailer`); results, tables and charts appear here.
     """
     )
     if period_files:
@@ -150,8 +150,8 @@ def _(DATA_DIR, WORKSPACE, describe_periods, mo, period_files, pl):
                 _header,
                 mo.callout(
                     mo.md(
-                        "No period files found. Add files named like `25-01 pra101.parquet` to the data folder, "
-                        "or run `uv run python scripts/make_sample_data.py` for a synthetic example."
+                        "No period files found. Add files named like `25-01 pra101.parquet` (the `YY-MM` "
+                        "period, then the dataset name) to the data folder."
                     ),
                     kind="info",
                 ),
@@ -514,6 +514,24 @@ def create_notebook(config: HailerConfig, name: str, *, kind: TemplateKind = "st
     return target.resolve()
 
 
+def ensure_notebook(path: Path, *, title: str, kind: TemplateKind = "starter") -> bool:
+    """Write ``kind``'s template to ``path`` unless something is already there; True when it wrote.
+
+    ``hailer init`` uses it for the configured notebook so the first ``hailer notebook`` has one to
+    open. Parent folders are created and an existing file is never touched. ``OSError`` when the
+    file cannot be written.
+    """
+    target = Path(path)
+    if target.exists():
+        return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        _write_new_file(target, render_template(kind, title=title))
+    except FileExistsError:  # appeared between the check and the write: leave it alone
+        return False
+    return True
+
+
 def _write_new_file(path: Path, text: str) -> None:
     """Create ``path`` with ``text``; ``FileExistsError`` when it already exists (no overwrite)."""
     with open(path, "x", encoding="utf-8", newline="\n") as handle:
@@ -529,6 +547,7 @@ __all__ = [
     "TEMPLATE_KINDS",
     "NotebookInfo",
     "create_notebook",
+    "ensure_notebook",
     "is_marimo_notebook",
     "list_notebooks",
     "load_active_notebook",

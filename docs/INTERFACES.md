@@ -164,14 +164,13 @@ held at WARNING unless `--verbose`.
 
 ```python
 CM_HELP_CODE = "import marimo._code_mode as cm; help(cm)"
-DEFAULT_LAUNCH_DIR = "notebooks"
 SERVER_TOKEN_HEADER = "Marimo-Server-Token"
 def discover_servers() -> list[MarimoServer]         # registry files; drop entries whose /health does not answer
 def find_server(config: HailerConfig) -> MarimoServer | None   # config.marimo_url first, then registry (single live server, else None)
 class MarimoClient:
     def __init__(self, base_url: str, token: str | None = None, *, timeout: float = 10.0,
-                 notebook: Path | None = None, workspace: Path | None = None, notebooks_dir: Path | None = None) -> None
-                 # notebook: the one resolve_session()/execute() default to; notebooks_dir: named in launch hints (else notebook.parent)
+                 notebook: Path | None = None, workspace: Path | None = None) -> None
+                 # notebook: the one resolve_session()/execute() default to
     def health(self) -> bool
     def sessions(self) -> list[MarimoSession]
     def resolve_session(self, notebook: Path | None) -> MarimoSession   # match_session() below (exact path only); notebook=None → the single session; 0 → NoSessionError with hint to open the notebook URL; no match → NoSessionError listing the open sessions
@@ -188,16 +187,18 @@ def match_session(sessions: Sequence[MarimoSession], notebook: Path, workspace: 
     # matches → the last one listed. Used by resolve_session, the CLI (/notebook list, close) and the test fakes.
 def notebook_file_key(notebook: Path) -> str          # the ?file= key: absolute, normalised, forward slashes, symlinks/junctions NOT resolved (marimo compares the key against the folder it was started on the same way); works on folder and single-file servers
 def open_notebook_url(server: MarimoServer, notebook: Path, workspace: Path | None = None, *, view: str = "app") -> str   # http://127.0.0.1:2718/?file=<quoted absolute posix path>&view-as=present (view="app", default: results only, Ctrl+. toggles the editor); view="edit" omits the parameter; workspace is accepted but unused
-def launch_command(notebooks_dir: Path | None, workspace: Path | None = None, *, port: int | None = None) -> list[str]   # ["uv","run","marimo","edit",<folder relative to workspace>,"--no-token", ...]; None → "notebooks"
-def notebook_launch_command(config: HailerConfig, *, port: int | None = None) -> list[str]  # launch_command(config.notebooks_root, config.workspace, port=port)
-def marimo_server_command(notebooks_dir: Path, workspace: Path, port: int) -> list[str]   # [sys.executable,"-m","marimo","edit",<folder>,"--no-token","--headless","--port",N,"--skip-update-check"]
-def launch_hint(notebooks_dir: Path | None, workspace: Path | None = None) -> str   # "Start everything in one go: uv run hailer notebook" first, then the launch_command
+def launch_command(*, port: int | None = None) -> list[str]   # ["uvx","hailer","notebook","--foreground", ("--port",N)]: the command a person runs to start marimo on its own
+def marimo_server_command(notebooks_dir: Path, workspace: Path, port: int, *, headless: bool = True) -> list[str]
+    # [sys.executable,"-m","marimo","edit",<folder>,"--no-token",("--headless"),"--port",N,"--skip-update-check"]; used by
+    # `hailer notebook` (background, headless) and `--foreground` (headless only with --no-browser). Hailer's own
+    # interpreter, never `uv run`: works under uvx without a project .venv.
+def launch_hint() -> str   # "Start everything in one go: uvx hailer notebook", then launch_command() for another terminal, then "uvx hailer"
 def wait_for_health(url: str, timeout: float = 60.0, *, interval: float = 0.5, should_stop=None) -> bool
 def wait_for_session(client: MarimoClient, notebook: Path | None, timeout: float = 90.0, *, interval: float = 0.5) -> MarimoSession | None
 ```
 marimo is always started on the notebooks **folder** (never on a single file) so that every notebook,
 existing or created later, opens on the same server. Connection refused/timeout → `MarimoUnavailableError`
-with the exact `uv run marimo edit <folder> --no-token` command in the hint. HTTP 401/403 →
+with `launch_hint()` as the hint. HTTP 401/403 →
 `MarimoUnavailableError` mentioning `HAILER_MARIMO_TOKEN`.
 
 ## `notebooks.py`  (owner: notebook feature / foundation)
@@ -234,6 +235,9 @@ def render_template(kind: Literal["starter", "empty"], *, title: str, version: s
 def create_notebook(config: HailerConfig, name: str, *, kind: Literal["starter", "empty"] = "starter") -> Path
     # <notebooks_root>/<slug>.py (folder created); NotebookExistsError when it exists; NotebookPathError when the
     # name has no letters/digits; returns the absolute path. Never touches the state file.
+def ensure_notebook(path: Path, *, title: str, kind: Literal["starter", "empty"] = "starter") -> bool
+    # `hailer init`: write the template to exactly `path` (parents created) unless something exists there; True
+    # when it wrote. Never overwrites; OSError when it cannot write.
 ```
 
 ## `browser.py`  (owner: notebook feature)
@@ -443,11 +447,14 @@ stored: the system prompt is sent with every turn, so `/reload` applies from the
 Typer app; `def main() -> None` is the console entry. Commands: default (no subcommand) → chat; `notebook`
 (start marimo on `config.notebooks_root` in the background: `mkdir` it first, `marimo_server_command`, log in
 `.hailer/marimo.log`; or reuse a live server; open the active notebook; chat; stop marimo on exit unless
-`--keep-marimo`; `--foreground` runs marimo attached without the chat; `_reusable_server` accepts the configured
+`--keep-marimo`; `--foreground` runs `marimo_server_command(..., headless=--no-browser)` attached, without the
+chat; `_reusable_server` accepts the configured
 URL or a live server that has a session for the active notebook or for any notebook under the folder); `exec`
 (`-c CODE` | `-` stdin | file; prints result; exit 1 on failure); `status`; `doctor` (the preflight checks and a
 code-mode probe; it never calls the model endpoint); `login <provider>`; `logout <provider>`; `init` (write
-default config + `.config/hailer` skeleton). Global options `--verbose/-v`, `--config`, `--workspace`, `--new`
+default config + `.config/hailer` skeleton, then load that config and create the configured notebook with
+`notebooks.ensure_notebook` and the notebooks and data folders when missing; nothing but `hailer.toml` is ever
+overwritten, and only with `--force`; an unloadable `hailer.toml` skips the notebook step). Global options `--verbose/-v`, `--config`, `--workspace`, `--new`
 (do not resume), `--version`. Startup: `_load_config` (load config, then `config.notebook` := the active
 notebook from the state file, or, when `HAILER_NOTEBOOK` is set, that notebook written to the state file) →
 setup logging → Rich panel (`Notebook:` active, `Notebooks:` folder) → preflight (config, notebook,
@@ -456,7 +463,7 @@ credentials, marimo server, session) → agent start → REPL. Agent start (`Cha
 `start(forget_thread_id=<that thread>)` so the stored conversation is deleted; a different id coming back from
 a resume means the thread was gone, the CLI says so and resets the counters. Credentials: a `"missing"` key is
 a fatal preflight failure for every provider, the built-in `openai` included; `status` and `/status` show
-`<env_key> from env|keyring` or `<env_key> missing (run: uv run hailer login <id>)`. REPL: `You > ` prompt;
+`<env_key> from env|keyring` or `<env_key> missing (run: uvx hailer login <id>)`. REPL: `You > ` prompt;
 Ctrl+C during a turn cancels it (the agent re-raises `KeyboardInterrupt`, the CLI prints `Interrupted.`);
 Ctrl+C or EOF at the prompt exits; slash commands `/help /status /new /exit /quit /model /notebook /clear
 /context /skill /prompt /reload`. `/new` and `/model` share `_new_thread` (`agent.new_thread()`, counters

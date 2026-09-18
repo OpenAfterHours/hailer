@@ -87,7 +87,7 @@ DEFAULT_CONFIG_TEMPLATE = """\
 # Hailer project configuration.
 # Relative paths are resolved against the workspace (the folder containing this file).
 # Secrets never go in this file: API keys come from the OS credential store
-# (`uv run hailer login <provider>`) or an environment variable named by `env_key`.
+# (`uvx hailer login <provider>`) or an environment variable named by `env_key`.
 
 [hailer]
 notebook = "notebooks/analysis.py"   # default notebook; the chat can create and open others
@@ -103,7 +103,7 @@ data_dir = "data"                    # where the monthly parquet files live
 
 [model]
 name = "gpt-5.5"
-provider = "openai"                  # "openai" = api.openai.com with OPENAI_API_KEY (`uv run hailer login openai`)
+provider = "openai"                  # "openai" = api.openai.com with OPENAI_API_KEY (`uvx hailer login openai`)
 # reasoning_effort = "medium"        # minimal | low | medium | high | xhigh; "" sends no reasoning
 #                                      effort at all (for endpoints that reject the field)
 # summarize_after_tokens = 100000    # summarise older turns past this size; lower it for small
@@ -177,7 +177,7 @@ def find_config_path(
         if not requested.is_file():
             raise ConfigError(
                 f"Config file not found: {requested} (from {source}).",
-                hint="Check the path, or run `uv run hailer init` to create a config.",
+                hint="Check the path, or run `uvx hailer init` to create a config.",
             )
         return requested.resolve()
     for name in CONFIG_FILENAMES:
@@ -451,7 +451,7 @@ def validate(config: HailerConfig) -> list[str]:
         problems.append(
             f"Notebook not found: {config.notebook}. "
             "Set [hailer].notebook (or HAILER_NOTEBOOK) to an existing marimo notebook, "
-            "or run `uv run hailer init` to create the default one."
+            "or run `uvx hailer init` to create the default one."
         )
     root = config.notebooks_root
     try:
@@ -519,7 +519,7 @@ def validate(config: HailerConfig) -> list[str]:
         if not provider.env_key:
             problems.append(
                 f'{section}.env_key is missing; name the environment variable that holds the API key, e.g. env_key = "{provider.id.upper()}_API_KEY". '
-                f"Store the value with `uv run hailer login {provider.id}`."
+                f"Store the value with `uvx hailer login {provider.id}`."
             )
         for key in ("http_headers", "env_http_headers", "query_params"):
             for header_name in getattr(provider, key):

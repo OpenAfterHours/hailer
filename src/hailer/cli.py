@@ -1,14 +1,14 @@
 """Hailer command line: the conversational control plane.
 
-``uv run hailer``            chat with the agent (default; marimo must already be running)
-``uv run hailer notebook``   one-command session: start (or reuse) marimo, open the notebook, chat,
-                             stop marimo on exit
-``uv run hailer exec``       run code in the live kernel (debugging / scripting)
-``uv run hailer status``     show configuration, credentials source and marimo state
-``uv run hailer doctor``     run the preflight checks and print a table
-``uv run hailer login``      store an API key in the OS credential store
-``uv run hailer logout``     remove it
-``uv run hailer init``       write a starter hailer.toml and .config/hailer skeleton
+``uvx hailer``            chat with the agent (default; marimo must already be running)
+``uvx hailer notebook``   one-command session: start (or reuse) marimo, open the notebook, chat,
+                          stop marimo on exit
+``uvx hailer exec``       run code in the live kernel (debugging / scripting)
+``uvx hailer status``     show configuration, credentials source and marimo state
+``uvx hailer doctor``     run the preflight checks and print a table
+``uvx hailer login``      store an API key in the OS credential store
+``uvx hailer logout``     remove it
+``uvx hailer init``       set up a workspace: hailer.toml, .config/hailer, the starter notebook, data/
 
 Collaborators (config, marimo client, agent, secrets, context) are reached through
 small module-level factory functions so tests can replace them.
@@ -150,7 +150,6 @@ def _make_client(server: MarimoServer, config: HailerConfig) -> Any:
         config.marimo_token,
         notebook=config.notebook,
         workspace=config.workspace,
-        notebooks_dir=config.notebooks_root,
     )
 
 
@@ -160,10 +159,10 @@ def _notebook_url(server: MarimoServer, config: HailerConfig) -> str:
     return open_notebook_url(server, config.notebook, config.workspace)
 
 
-def _launch_command(config: HailerConfig, port: int | None = None) -> list[str]:
-    from hailer.marimo_client import notebook_launch_command
+def _launch_command() -> list[str]:
+    from hailer.marimo_client import launch_command
 
-    return notebook_launch_command(config, port=port)
+    return launch_command()
 
 
 def _cm_help_code() -> str:
@@ -220,10 +219,10 @@ def _open_browser(url: str) -> None:
     open_url(url)
 
 
-def _marimo_server_command(config: HailerConfig, port: int) -> list[str]:
+def _marimo_server_command(config: HailerConfig, port: int, *, headless: bool = True) -> list[str]:
     from hailer.marimo_client import marimo_server_command
 
-    return marimo_server_command(config.notebooks_root, config.workspace, port)
+    return marimo_server_command(config.notebooks_root, config.workspace, port, headless=headless)
 
 
 def _find_free_port(preferred: int) -> int:
@@ -456,10 +455,10 @@ def _marimo_state(config: HailerConfig) -> tuple[MarimoServer | None, MarimoSess
         return server, None, err
 
 
-def _launch_hint(config: HailerConfig) -> str:
+def _launch_hint() -> str:
     from hailer.marimo_client import launch_hint
 
-    return launch_hint(config.notebooks_root, config.workspace)
+    return launch_hint()
 
 
 def preflight(config: HailerConfig) -> list[Check]:
@@ -475,7 +474,7 @@ def marimo_checks(config: HailerConfig) -> list[Check]:
     server, session, err = _marimo_state(config)
     if server is None:
         summary = "Marimo is not running." if err is None else str(err)
-        hint = err.hint if err is not None and err.hint else _launch_hint(config)
+        hint = err.hint if err is not None and err.hint else _launch_hint()
         checks.append(Check("marimo", False, summary, hint=hint))
     else:
         checks.append(Check("marimo", True, server.url, fatal=False))
@@ -496,7 +495,7 @@ def local_checks(config: HailerConfig) -> list[Check]:
     fatal = [p for p in problems if not p.lower().startswith("warning")]
     warnings = [p for p in problems if p.lower().startswith("warning")]
     if fatal:
-        checks.append(Check("config", False, "; ".join(fatal), hint="Fix hailer.toml (run: uv run hailer init  to write a starter file).", fatal=True))
+        checks.append(Check("config", False, "; ".join(fatal), hint="Fix hailer.toml (uvx hailer init writes a starter file and creates a missing notebook).", fatal=True))
     else:
         summary = "ok" if not warnings else "; ".join(warnings)
         checks.append(Check("config", True, summary, fatal=False))
@@ -510,8 +509,9 @@ def local_checks(config: HailerConfig) -> list[Check]:
                 False,
                 f"not found: {config.notebook}",
                 hint=(
-                    "Fix [hailer].notebook in hailer.toml or restore the file. Notebooks created from the chat "
-                    f"(/notebook new <name>) live in {_relative(config.notebooks_root, config.workspace)}."
+                    "Run uvx hailer init to create it from the starter template, or fix [hailer].notebook in "
+                    "hailer.toml. Notebooks created from the chat (/notebook new <name>) live in "
+                    f"{_relative(config.notebooks_root, config.workspace)}."
                 ),
             )
         )
@@ -538,7 +538,7 @@ def local_checks(config: HailerConfig) -> list[Check]:
                     "credentials",
                     False,
                     f"{provider.env_key} is not set (required by provider {provider.id!r})",
-                    hint=f"Store it once with:\n\n    uv run hailer login {provider.id}\n\nor set the {provider.env_key} environment variable in this terminal.",
+                    hint=f"Store it once with:\n\n    uvx hailer login {provider.id}\n\nor set the {provider.env_key} environment variable in this terminal.",
                 )
             )
     return checks
@@ -839,7 +839,7 @@ class ChatLoop:
             except HailerError:
                 source = "missing"
         if source == "missing":
-            return f"{provider.env_key or 'API key'} missing (run: uv run hailer login {provider.id})"
+            return f"{provider.env_key or 'API key'} missing (run: uvx hailer login {provider.id})"
         return f"{provider.env_key or 'API key'} from {source}"
 
     def _model(self, args: str) -> None:
@@ -904,8 +904,8 @@ class ChatLoop:
             out.print(f"Marimo:    {server.url} ({state})", markup=False)
             out.print(f"URL:       {_notebook_url(server, cfg)}", markup=False)
             out.print("View:      app view (results only); Ctrl+. in the notebook toggles the code editor", markup=False)
-        out.print("Start everything in one go:  uv run hailer notebook", markup=False)
-        out.print(f"Launch:    {' '.join(_launch_command(cfg))}", markup=False)
+        out.print("Start everything in one go:  uvx hailer notebook", markup=False)
+        out.print(f"Launch:    {' '.join(_launch_command())}", markup=False)
         out.print(NOTEBOOK_USAGE, markup=False)
 
     def _server_sessions(self) -> tuple[MarimoServer | None, Any, list[MarimoSession]]:
@@ -1017,7 +1017,7 @@ class ChatLoop:
         cfg = self.config
         server, session, _err = _marimo_state(cfg)
         if server is None:
-            self.console.print("Marimo is not running; the notebook opens once it is (uv run hailer notebook).", markup=False)
+            self.console.print("Marimo is not running; the notebook opens once it is (uvx hailer notebook).", markup=False)
             return None, None
         client = _make_client(server, cfg)
         if session is not None:
@@ -1319,11 +1319,12 @@ def notebook(
                 _labelled(
                     "Notebook not found:",
                     "yellow",
-                    f" {config.notebook}. Marimo runs on the notebooks folder; create the notebook in the chat "
-                    "with /notebook new <name> or fix [hailer].notebook in hailer.toml.",
+                    f" {config.notebook}. Marimo runs on the notebooks folder; run uvx hailer init to create "
+                    "it, create another in the chat with /notebook new <name>, or fix [hailer].notebook in hailer.toml.",
                 )
             )
-        cmd = _launch_command(config, port=port)
+        # Hailer's own interpreter, like the background server: `uv run marimo` would need a project .venv.
+        cmd = _marimo_server_command(config, port, headless=no_browser)
         console.print("Launching: " + " ".join(cmd), markup=False)
         raise typer.Exit(code=_run_foreground(cmd, config.workspace))
 
@@ -1387,7 +1388,7 @@ def exec_(
     try:
         server = _find_server(config)
         if server is None:
-            raise MarimoUnavailableError("Marimo is not running.", hint=_launch_hint(config))
+            raise MarimoUnavailableError("Marimo is not running.", hint=_launch_hint())
         client = _make_client(server, config)
         result = client.execute(
             code,
@@ -1415,7 +1416,7 @@ def status(ctx: typer.Context) -> None:
         provider = config.provider
         _value, source = _resolve_key(provider)
         if source == "missing":
-            console.print(f"Credentials: {provider.env_key or 'API key'} missing (run: uv run hailer login {provider.id})", markup=False)
+            console.print(f"Credentials: {provider.env_key or 'API key'} missing (run: uvx hailer login {provider.id})", markup=False)
         else:
             console.print(f"Credentials: {provider.env_key or 'API key'} from {source}", markup=False)
     except KeyError:
@@ -1443,7 +1444,7 @@ def status(ctx: typer.Context) -> None:
     if config.config_path:
         console.print(f"Config:      {config.config_path}", markup=False)
     else:
-        console.print("Config:      defaults (no hailer.toml found; run: uv run hailer init)", markup=False)
+        console.print("Config:      defaults (no hailer.toml found; run: uvx hailer init)", markup=False)
 
 
 @app.command()
@@ -1553,6 +1554,36 @@ _PLACEHOLDERS: dict[str, str] = {
     ),
     "prompts/README.md": "# Prompts\n\nEach `<name>.md` can be sent with /prompt <name> [args]; `{{args}}` is replaced.\n",
 }
+INIT_NOTEBOOK_TITLE = "Hailer workspace"
+
+
+def _init_notebook_and_data(console: Console, workspace: Path, config_path: Path, *, verbose: bool) -> HailerConfig | None:
+    """Create the configured notebook (starter template) and the notebooks and data folders when missing.
+
+    Never overwrites a file. Returns the loaded configuration, or ``None`` when hailer.toml does not load.
+    """
+    from hailer.config import load_config
+
+    try:
+        config = load_config(workspace=workspace, config_path=config_path)
+    except HailerError as err:
+        _print_error(console, err, verbose=verbose)
+        console.print("Skipped the notebook and data folder; fix hailer.toml and run uvx hailer init again.", markup=False)
+        return None
+    shown = notebooks.notebook_display_name(config, config.notebook)
+    created: list[str] = []
+    try:
+        if notebooks.ensure_notebook(config.notebook, title=INIT_NOTEBOOK_TITLE):
+            created.append(f"{shown} (starter notebook)")
+        for folder in (config.notebooks_root, config.data_dir):
+            if not folder.is_dir():
+                folder.mkdir(parents=True)
+                created.append(notebooks.notebook_display_name(config, folder) + "/")
+    except OSError as err:
+        console.print(f"Could not create the notebook or data folder: {err}", style="red", markup=False)
+        return config
+    console.print("Created " + ", ".join(created) if created else f"{shown} already exists.", markup=False)
+    return config
 
 
 @app.command()
@@ -1560,7 +1591,11 @@ def init(
     ctx: typer.Context,
     force: bool = typer.Option(False, "--force", help="Overwrite an existing hailer.toml."),
 ) -> None:
-    """Write a starter hailer.toml and the .config/hailer folder skeleton."""
+    """Set up a workspace: hailer.toml, .config/hailer, the starter notebook and the data folder.
+
+    Only hailer.toml is ever overwritten (with --force); anything else that exists is kept, so running
+    it again fills in whatever is missing.
+    """
     opts = _opts(ctx)
     console = console_factory()
     workspace = opts.workspace or Path.cwd()
@@ -1600,12 +1635,16 @@ def init(
         console.print(f"Created {target} with: " + ", ".join(created), markup=False)
     else:
         console.print(f"{target} already set up.", markup=False)
+
+    config = _init_notebook_and_data(console, workspace, config_path, verbose=opts.verbose)
+    provider = config.model.provider if config is not None else "<provider>"
+    data = notebooks.notebook_display_name(config, config.data_dir) if config is not None else "data"
     console.print(
         "\nNext steps:\n"
         "  1. Edit hailer.toml (model, provider, notebook).\n"
-        "  2. If you use a custom endpoint: uv run hailer login <provider>\n"
-        "  3. Start marimo:  uv run hailer notebook\n"
-        "  4. Chat:          uv run hailer",
+        f"  2. Store the API key once:   uvx hailer login {provider}\n"
+        f"  3. Put your parquet files in {data}/ (named like '25-01 pra101.parquet').\n"
+        "  4. Start marimo and chat:     uvx hailer notebook",
         markup=False,
     )
 

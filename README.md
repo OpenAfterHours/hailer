@@ -16,7 +16,7 @@ receives your messages, code, and compact results, never the raw files.
                 ┌────────┴────────┐
                 │  Hailer         │   one Python process: a LangChain agent
 Terminal ─────► │  conversation   │   (create_agent + ChatOpenAI), Hailer's system
- uv run hailer  │  + tools        │   prompt, the conversation kept in .hailer/
+ uvx hailer     │  + tools        │   prompt, the conversation kept in .hailer/
                 │                 │
                 │  marimo_execute, marimo_status, notebook_cells, notebook_list,
                 │  notebook_create, notebook_open, notebook_close,
@@ -42,7 +42,8 @@ marimo itself, never edited behind the kernel's back.
 ## Requirements
 
 - Windows 11 is the primary target; macOS and Linux work too. No Git Bash, curl, jq or WSL is needed.
-- Python 3.12 or newer and [uv](https://docs.astral.sh/uv/).
+- [uv](https://docs.astral.sh/uv/). Hailer runs with `uvx`, so no project or virtual environment is needed;
+  uv fetches Python 3.12 or newer if the machine has none.
 - A web browser. **A kernel session only exists while the notebook is open in a browser tab**; Hailer
   tells you the URL to open when it is not.
 - An API key for the provider you configure: OpenAI, or your own OpenAI-compatible endpoint.
@@ -53,19 +54,17 @@ marimo itself, never edited behind the kernel's back.
 
 ## Installation
 
-From a checkout of this repository:
+Nothing to install beyond uv. `uvx hailer ...` fetches Hailer from PyPI the first time, keeps it in uv's
+cache with an environment of its own (marimo, Polars, DuckDB and the rest), and runs it from there. No
+`pyproject.toml` or `.venv` is needed in your folder, which suits ad-hoc analysis. `uvx hailer@latest ...`
+picks up a newer release; `uvx hailer@X.Y.Z ...` pins one.
 
-```bash
-uv sync
-```
+For a permanent `hailer` command instead, `uv tool install hailer` (or `pip install hailer` into an
+environment of your own) and drop the `uvx` from the commands below.
 
-Released versions are on PyPI:
-
-```bash
-uv tool install hailer     # or: pip install hailer
-```
-
-Optional sample data (six months of synthetic PRA101-style files, later months gain a column):
+Working on Hailer itself: from a checkout of this repository, `uv sync` and then `uv run hailer ...`, so
+the code you are changing is what runs. The checkout also has optional sample data (six months of
+synthetic PRA101-style files, later months gain a column):
 
 ```bash
 uv run python scripts/make_sample_data.py          # writes data/25-01 pra101.parquet ... 25-06
@@ -74,12 +73,18 @@ uv run python scripts/make_sample_data.py --help   # --out, --months, --rows, --
 
 ## Quick start
 
-One terminal is enough:
+In an empty folder, or the one that holds your data, one terminal is enough:
 
 ```bash
-uv run hailer init        # writes hailer.toml and .config/hailer/{context,skills,prompts} with examples
-uv run hailer notebook    # starts marimo, opens the notebook in your browser, and chats right here
+uvx hailer init           # hailer.toml, .config/hailer/{context,skills,prompts}, notebooks/analysis.py, data/
+uvx hailer login openai   # stores your API key in the OS credential store (or set OPENAI_API_KEY)
+uvx hailer notebook       # starts marimo, opens the notebook in your browser, and chats right here
 ```
+
+`hailer init` creates the starter notebook (`[hailer].notebook`) and the data folder (`[hailer].data_dir`)
+that `hailer.toml` names. It never overwrites anything except `hailer.toml` itself, and only with
+`--force`, so running it again just fills in what is missing (a deleted notebook, say). Put your monthly
+parquet files in `data/` (see [Data conventions](#data-conventions)).
 
 `hailer notebook` runs the startup checks, starts a token-less marimo server on the **notebooks folder**
 in the background (log in `.hailer/marimo.log`), opens the active notebook's URL so the kernel gets a
@@ -95,13 +100,14 @@ switches back. It is a normal edit session either way, so the agent works in it 
 
 Flags: `--port N` (default 2718; a free port is chosen when it is busy), `--no-browser` (print the URL
 instead of opening it), `--keep-marimo` (leave the server running after the chat), `--foreground` (just run
-marimo attached to this terminal, no chat), `--new` (start a fresh conversation).
+marimo attached to this terminal, no chat; it opens marimo's home page unless `--no-browser` is given),
+`--new` (start a fresh conversation).
 
-Chat only, when marimo is already running (started by `hailer notebook --keep-marimo` or by
-`uv run marimo edit notebooks --no-token` with the notebook open in a browser):
+Chat only, when marimo is already running (started by `uvx hailer notebook --keep-marimo`, or by
+`uvx hailer notebook --foreground` in another terminal, with the notebook open in a browser):
 
 ```bash
-uv run hailer
+uvx hailer
 ```
 
 ```text
@@ -151,8 +157,8 @@ Three corporate counterparties account for two thirds of the increase.
 I added a top-contributors table under the chart.
 ```
 
-Hailer resumes your previous conversation on the next start; use `uv run hailer --new` or `/new` for a fresh
-thread. `uv run hailer doctor` runs the same startup checks and prints fixes.
+Hailer resumes your previous conversation on the next start; use `uvx hailer --new` or `/new` for a fresh
+thread. `uvx hailer doctor` runs the same startup checks and prints fixes.
 
 ## Working with several notebooks
 
@@ -197,7 +203,7 @@ Where things live:
   `hailer.periods` helpers, `WORKSPACE`, `DATA_DIR`, `period_files`, a welcome cell with the notebook's
   title), so the agent can start analysing straight away. `--empty` gives marimo's plain empty notebook.
 - The active notebook is remembered in `.hailer/notebook.json` (git-ignored, next to `session.json`), so
-  the next `uv run hailer` or `uv run hailer notebook` resumes where you left off. Delete the file to go
+  the next `uvx hailer` or `uvx hailer notebook` resumes where you left off. Delete the file to go
   back to `[hailer].notebook`. `HAILER_NOTEBOOK=<path>` makes that notebook the active one for this and
   later sessions: every Hailer command (`hailer`, `hailer notebook`, `hailer exec`, `status`, `doctor`)
   writes it to the state file at startup, so the agent's tool server sees the same notebook.
@@ -211,7 +217,7 @@ notebooks_dir = "notebooks"               # where /notebook new and the agent's 
 
 ## Model configuration
 
-All model settings live in `hailer.toml` (repo root, or `.config/hailer/hailer.toml`). `uv run hailer init`
+All model settings live in `hailer.toml` (repo root, or `.config/hailer/hailer.toml`). `uvx hailer init`
 writes a commented starter file.
 
 ### OpenAI
@@ -222,7 +228,7 @@ name = "gpt-5.5"
 provider = "openai"
 ```
 
-Store an API key once with `uv run hailer login openai`, or set `OPENAI_API_KEY` in the terminal. Hailer
+Store an API key once with `uvx hailer login openai`, or set `OPENAI_API_KEY` in the terminal. Hailer
 talks to `https://api.openai.com/v1` over the Responses API. To use Chat Completions instead, or to turn
 streaming off, declare the provider without a `base_url`:
 
@@ -258,9 +264,9 @@ env_key          = "INTERNAL_MODEL_API_KEY"  # env var name; value from `hailer 
 Then:
 
 ```bash
-uv run hailer login internal     # stores the key in the OS credential store (hidden prompt)
-uv run hailer doctor             # config / notebook / credentials / marimo / session, with fixes
-uv run hailer
+uvx hailer login internal     # stores the key in the OS credential store (hidden prompt)
+uvx hailer doctor             # config / notebook / credentials / marimo / session, with fixes
+uvx hailer
 ```
 
 Or set `INTERNAL_MODEL_API_KEY` in the terminal instead of logging in; an environment variable always wins
@@ -307,12 +313,12 @@ Several providers can be declared; switch inside a session with `/model <name>` 
 
 ## Secrets
 
-`uv run hailer login <provider>` stores the API key in the operating system's credential store through
+`uvx hailer login <provider>` stores the API key in the operating system's credential store through
 `keyring` (Windows Credential Manager on Windows) under the service name `hailer`. Hailer reads it when the
 agent starts and hands it to the HTTP client inside its own process, which sends it only as the
 `Authorization` header of requests to that provider's endpoint. It is never written to `hailer.toml`, the
 session file, command history or logs, and never passed on a command line or to another process.
-`uv run hailer logout <provider>` removes it.
+`uvx hailer logout <provider>` removes it.
 
 An environment variable named by `env_key` takes precedence over the credential store, which keeps scripted
 and CI use simple. Note that any process running as the same user can read both credential-store entries and
@@ -418,7 +424,7 @@ A file that cannot be read raises `MalformedParquetError` naming the file. The s
 
 ## Logging
 
-Normal runs print only warnings. `uv run hailer --verbose` (or `HAILER_LOG_LEVEL=DEBUG`) logs provider,
+Normal runs print only warnings. `uvx hailer --verbose` (or `HAILER_LOG_LEVEL=DEBUG`) logs provider,
 session, marimo and tool activity and shows full tracebacks. Log output passes through a redaction filter
 that masks bearer tokens and the values of environment variables whose names end in `_KEY`, `_TOKEN`,
 `_SECRET` or `_PASSWORD`.
@@ -497,17 +503,17 @@ replaces it. `.hailer/` is in the repository's `.gitignore`.
 
 ## Troubleshooting
 
-`uv run hailer doctor` runs the five startup checks (config, notebook, credentials, marimo, session) and,
+`uvx hailer doctor` runs the five startup checks (config, notebook, credentials, marimo, session) and,
 when a session exists, confirms that marimo's code-mode API is available in the kernel.
 
 | Message | Meaning and fix |
 |---|---|
-| `Marimo is not running.` then `Start everything in one go: uv run hailer notebook`, `Or start it yourself with: uv run marimo edit notebooks --no-token`, `Then run Hailer again: uv run hailer` | No server answered at the configured or discovered URL. `uv run hailer notebook` starts one on the notebooks folder and runs the chat in the same terminal. Servers started with `--no-token` register themselves so Hailer finds them; otherwise set `marimo_url` in `hailer.toml`. |
+| `Marimo is not running.` then `Start everything in one go: uvx hailer notebook`, `Or run marimo on its own in another terminal: uvx hailer notebook --foreground`, `Then run Hailer again: uvx hailer` | No server answered at the configured or discovered URL. `uvx hailer notebook` starts one on the notebooks folder and runs the chat in the same terminal; `--foreground` runs only marimo, with Hailer's own Python environment, so the notebook can import Polars, DuckDB and `hailer.periods`. Servers started with `--no-token` register themselves so Hailer finds them; otherwise set `marimo_url` in `hailer.toml`. |
 | `Marimo exited early (code N)` or `Marimo did not answer on http://127.0.0.1:2718 within 60 s`, followed by `Log: .hailer\marimo.log` and its last lines | `hailer notebook` could not start marimo. The log tail usually names the cause (port in use by something else, a syntax error in the notebook, marimo not installed in the environment). |
 | `the notebook is not open in a browser` followed by `Open http://... in your browser.` | The server is up but has no kernel session. Open the URL; Hailer opens it for you once at startup. The URL ends in `&view-as=present` (app view); `Ctrl+.` in the notebook shows the code. |
-| `not found: <path>` for the notebook | The configured notebook (`[hailer].notebook`, or `HAILER_NOTEBOOK`) does not exist. Fix the path or restore the file; a deleted *active* notebook is not the cause, because Hailer already falls back to the configured one when the remembered notebook is gone. New notebooks are created from the chat with `/notebook new <name>`. |
+| `not found: <path>` for the notebook | The configured notebook (`[hailer].notebook`, or `HAILER_NOTEBOOK`) does not exist. `uvx hailer init` creates it from the starter template (your `hailer.toml` is kept), or fix the path; a deleted *active* notebook is not the cause, because Hailer already falls back to the configured one when the remembered notebook is gone. New notebooks are created from the chat with `/notebook new <name>`. |
 | `No notebook named '...' in notebooks.` or `... is outside the notebooks folder.` | `/notebook open` (or the agent's `notebook_open`) only opens marimo notebooks inside `[hailer].notebooks_dir`; the hint lists the available names. Move the file into the folder or point `notebooks_dir` at it. |
-| `INTERNAL_MODEL_API_KEY is not set (required by provider 'internal')`, or the same for `OPENAI_API_KEY` and provider `'openai'` | Every provider needs a key. Run `uv run hailer login <provider>` or set the variable in this terminal. Releases up to 0.2 could use a ChatGPT login for the `openai` provider; that is gone, so create an API key. |
+| `INTERNAL_MODEL_API_KEY is not set (required by provider 'internal')`, or the same for `OPENAI_API_KEY` and provider `'openai'` | Every provider needs a key. Run `uvx hailer login <provider>` or set the variable in this terminal. Releases up to 0.2 could use a ChatGPT login for the `openai` provider; that is gone, so create an API key. |
 | `The model endpoint rejected the API key for provider '...'` | The endpoint returned 401. Re-run `hailer login <provider>`. |
 | `Unknown model '...' for provider '...'` | The endpoint does not know `[model].name` (or the name given to `/model`). Its reply is quoted after `The endpoint said:`. |
 | `Could not reach the model endpoint at <base_url>` | Check `base_url`, VPN or proxy (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`), and that the endpoint is running. |
@@ -533,7 +539,7 @@ when a session exists, confirms that marimo's code-mode API is available in the 
   may still finish and switch the active notebook a moment later. Hailer re-reads the state after every
   turn and before `/notebook` and `/status`, so the next command shows the right notebook; a `/notebook
   new` typed in that instant can still be overtaken by the late switch.
-- `uv run hailer notebook` starts and stops marimo for you; plain `uv run hailer` expects a running server
+- `uvx hailer notebook` starts and stops marimo for you; plain `uvx hailer` expects a running server
   and tells you how to start one.
 - Every request carries about 9 KB of instructions and 5 KB of tool definitions (measured with an empty
   project context) plus the conversation; an endpoint with a strict request-size limit needs room for that.
