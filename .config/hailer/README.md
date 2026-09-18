@@ -35,7 +35,7 @@ Write the `description` as the trigger: *when* to use the skill and *what* it pr
 Plain Markdown prompts. `{{args}}` is replaced with whatever follows the name:
 
 ```
-You > /prompt monthly-pack 2025-06
+You > /prompt first-look customers.csv
 ```
 
 ## Reloading

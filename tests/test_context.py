@@ -178,10 +178,10 @@ def test_repo_example_skill_parses():
     )
     bundle = load_context(config)
     names = [s.name for s in bundle.skills]
-    assert "pra101-month-on-month" in names
-    skill = next(s for s in bundle.skills if s.name == "pra101-month-on-month")
+    assert "sales-month-on-month" in names
+    skill = next(s for s in bundle.skills if s.name == "sales-month-on-month")
     assert "month-on-month" in skill.description.lower()
-    assert "monthly-pack" in bundle.prompts
+    assert "first-look" in bundle.prompts
     assert "## 00-example.md" in bundle.context_text
     assert not [w for w in bundle.warnings if "secret" in w]
 

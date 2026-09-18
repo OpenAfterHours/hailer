@@ -436,8 +436,20 @@ def test_list_periods_missing_and_empty(tmp_path):
     tools = HailerTools(config, failing_factory)
     assert tools.list_periods().startswith("Data directory does not exist")
     config.data_dir.mkdir()
-    text = tools.list_periods("pra101")
-    assert "No period files found" in text and "'pra101'" in text and "25-01 pra101.parquet" in text
+    text = tools.list_periods("sales")
+    assert "No period files found" in text and "'sales'" in text and "25-01 sales.parquet" in text
+    assert "Other data files" not in text
+
+
+def test_list_periods_names_other_data_files(tmp_path):
+    config = make_config(tmp_path)
+    config.data_dir.mkdir()
+    (config.data_dir / "customers.csv").write_text("id,name\n1,a\n", encoding="utf-8")
+    (config.data_dir / "Survey 2024.json").write_text("[]", encoding="utf-8")
+    (config.data_dir / "notes.txt").write_text("not data", encoding="utf-8")
+    text = HailerTools(config, failing_factory).list_periods()
+    assert text.startswith("No period files found")
+    assert text.splitlines()[-1] == "Other data files (load them directly with Polars or DuckDB): customers.csv, Survey 2024.json"
 
 
 def test_list_periods_with_files(tmp_path):
@@ -445,10 +457,13 @@ def test_list_periods_with_files(tmp_path):
     pl = pytest.importorskip("polars")
     config = make_config(tmp_path)
     config.data_dir.mkdir()
-    pl.DataFrame({"exposure_class": ["Corporate"], "rwa": [1.0]}).write_parquet(config.data_dir / "25-01 pra101.parquet")
-    pl.DataFrame({"exposure_class": ["Retail"], "rwa": [2.0], "risk_weight": [0.5]}).write_parquet(config.data_dir / "25-02 pra101.parquet")
+    pl.DataFrame({"region": ["North"], "revenue": [1.0]}).write_parquet(config.data_dir / "25-01 sales.parquet")
+    pl.DataFrame({"region": ["South"], "revenue": [2.0], "discount": [0.1]}).write_parquet(config.data_dir / "25-02 sales.parquet")
+    (config.data_dir / "targets.csv").write_text("region,target\nNorth,5\n", encoding="utf-8")
     text = HailerTools(config, failing_factory).list_periods()
     assert "2025-01" in text and "2025-02" in text
+    assert "Other data files (load them directly with Polars or DuckDB): targets.csv" in text
+    assert "25-01 sales.parquet" not in text.splitlines()[-1], "period files are described, not listed again"
 
 
 def test_skill_and_page_tools(tmp_path):

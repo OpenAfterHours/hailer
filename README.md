@@ -1,9 +1,11 @@
 # Hailer
 
-Hailer is a conversational local analytics CLI with a live Marimo notebook as its workspace. You chat in the
-terminal; the agent runs Polars and DuckDB inside the running marimo kernel and puts tables, charts and
-summaries in the notebook you have open in your browser. Datasets stay on your machine: the model endpoint
-receives your messages, code, and compact results, never the raw files.
+Hailer lets you chat with your data. Put CSV, Parquet or JSON files in a folder, ask questions in plain
+English in the terminal, and the agent explores the data with Polars and DuckDB inside a live marimo
+notebook, putting tables, charts and summaries in the notebook open in your browser. It is built for
+analysts who want to go from a file to a chart in minutes, whatever the data is about: sales, operations,
+finance, survey results, logs. Datasets stay on your machine: the model endpoint receives your messages,
+code, and compact results, never the raw files.
 
 ## Architecture
 
@@ -64,10 +66,10 @@ environment of your own) and drop the `uvx` from the commands below.
 
 Working on Hailer itself: from a checkout of this repository, `uv sync` and then `uv run hailer ...`, so
 the code you are changing is what runs. The checkout also has optional sample data (six months of
-synthetic PRA101-style files, later months gain a column):
+synthetic sales orders, later months gain a column):
 
 ```bash
-uv run python scripts/make_sample_data.py          # writes data/25-01 pra101.parquet ... 25-06
+uv run python scripts/make_sample_data.py          # writes data/25-01 sales.parquet ... 25-06
 uv run python scripts/make_sample_data.py --help   # --out, --months, --rows, --start, --seed, --dataset
 ```
 
@@ -83,8 +85,9 @@ uvx hailer notebook       # starts marimo, opens the notebook in your browser, a
 
 `hailer init` creates the starter notebook (`[hailer].notebook`) and the data folder (`[hailer].data_dir`)
 that `hailer.toml` names. It never overwrites anything except `hailer.toml` itself, and only with
-`--force`, so running it again just fills in what is missing (a deleted notebook, say). Put your monthly
-parquet files in `data/` (see [Data conventions](#data-conventions)).
+`--force`, so running it again just fills in what is missing (a deleted notebook, say). Put the files you
+want to analyse in `data/`: CSV, Parquet or JSON, with any names (see [Data conventions](#data-conventions)).
+The notebook lists them when it opens, and you can start asking straight away.
 
 `hailer notebook` runs the startup checks, starts a token-less marimo server on the **notebooks folder**
 in the background (log in `.hailer/marimo.log`), opens the active notebook's URL so the kernel gets a
@@ -121,40 +124,35 @@ uvx hailer
 +---------------------------------------------------+
 Type /help for commands.
 
-You > load the PRA101 files and show me the periods
+You > what data do I have?
 
 Hailer >
-Loaded 6 months, 2025-01 to 2025-06 (risk_weight appears from 2025-04).
-I added a period table and a period selector to the notebook.
+Six monthly sales files, 2025-01 to 2025-06, 400 orders each (discount appears from 2025-04).
+I loaded them into one table, df, with a period column and added a summary to the notebook.
 
-You > compare the latest two periods
-
-Hailer >
-RWA rose 5.6% from May to June, mostly in corporate exposures.
-Added: month-on-month movement table and a summary.
-
-You > show the movement by exposure class
+You > chart revenue by month and region
 
 Hailer >
-Corporate +7.9%, retail +1.2%, sovereign flat.
-Added an exposure-class breakdown below the comparison.
+Revenue grew 8% from January to June, almost all of it in the North (+33%); the other regions are flat.
+Added: revenue_by_month (table) and a line chart by region.
 
-You > exclude defaults
-
-Hailer >
-Done. Corporate still drives the movement; defaults were 3% of the increase.
-The breakdown and summary now exclude default_flag rows.
-
-You > create a chart
+You > what is behind the North's growth?
 
 Hailer >
-Added a bar chart of RWA movement by exposure class.
+Home (+101%) and Sports (+85%); Electronics fell 12%.
+Added a category breakdown for the North with a bar chart.
 
-You > summarise the largest drivers
+You > exclude returns
 
 Hailer >
-Three corporate counterparties account for two thirds of the increase.
-I added a top-contributors table under the chart.
+Done. Returns were 2.7% of orders; the North is still up 29% without them.
+The table and both charts now exclude returned orders.
+
+You > which channel sells more?
+
+Hailer >
+Online: 55% of orders and 55% of revenue.
+Added a channel comparison below the category chart.
 ```
 
 Hailer resumes your previous conversation on the next start; use `uvx hailer --new` or `/new` for a fresh
@@ -170,7 +168,7 @@ In the chat, just say it:
 
 ```text
 You > start a new notebook for the Q2 churn review and load the churn files
-You > open the pra101 reconciliation notebook we did last week and add a chart by exposure class
+You > open the regional sales notebook we did last week and add a chart by category
 You > which notebooks do we have?
 ```
 
@@ -200,8 +198,8 @@ Where things live:
   Only files in that folder can be opened; names are matched case-insensitively and `q2 churn`,
   `q2_churn`, `q2_churn.py` and `notebooks/q2_churn.py` all mean the same file.
 - The **starter template** is the same set of cells as `notebooks/analysis.py` (imports, the
-  `hailer.periods` helpers, `WORKSPACE`, `DATA_DIR`, `period_files`, a welcome cell with the notebook's
-  title), so the agent can start analysing straight away. `--empty` gives marimo's plain empty notebook.
+  `hailer.periods` helpers, `WORKSPACE`, `DATA_DIR`, `data_files`, `period_files`, a welcome cell with the
+  notebook's title and the data files it found), so the agent can start analysing straight away. `--empty` gives marimo's plain empty notebook.
 - The active notebook is remembered in `.hailer/notebook.json` (git-ignored, next to `session.json`), so
   the next `uvx hailer` or `uvx hailer notebook` resumes where you left off. Delete the file to go
   back to `[hailer].notebook`. `HAILER_NOTEBOOK=<path>` makes that notebook the active one for this and
@@ -244,7 +242,7 @@ OpenAI, LiteLLM, vLLM, Ollama and so on.
 
 ```toml
 [model]
-name     = "risk-analyst-v3"          # whatever model id the endpoint expects
+name     = "analyst-v3"               # whatever model id the endpoint expects
 provider = "internal"
 # reasoning_effort = "medium"         # minimal | low | medium | high | xhigh; "" sends no reasoning effort
 # summarize_after_tokens = 100000     # summarise older turns past this size; lower it for small context windows
@@ -256,7 +254,7 @@ env_key          = "INTERNAL_MODEL_API_KEY"  # env var name; value from `hailer 
 # stream         = true                      # false if the endpoint rejects stream = true
 # stream_options = true                      # false omits stream_options (token counts may be lost)
 # name             = "Internal"
-# http_headers     = { "X-Team" = "risk-analytics" }
+# http_headers     = { "X-Team" = "data-analytics" }
 # env_http_headers = { "X-Client-Id" = "INTERNAL_CLIENT_ID" }
 # query_params     = { "api-version" = "2025-04-01-preview" }
 ```
@@ -335,7 +333,7 @@ URL. To let it read specific sites for context:
 
 ```toml
 [web]
-allowed_domains = ["docs.pola.rs", "duckdb.org", "**.bankofengland.co.uk"]
+allowed_domains = ["docs.pola.rs", "duckdb.org", "**.marimo.io"]
 max_page_bytes = 200000
 ```
 
@@ -368,7 +366,7 @@ tool, not what notebook code can do (see [Security](#security)).
 - **skills/**: only the `name` and `description` from each `SKILL.md` frontmatter go into the agent's
   instructions; the body and bundled files are loaded when the task matches (the agent calls `load_skill`
   and `read_skill_file`) or when you type `/skill <name> [message]`.
-- **prompts/**: `/prompt monthly-pack 2025-06` sends `prompts/monthly-pack.md` with `{{args}}` replaced.
+- **prompts/**: `/prompt first-look customers.csv` sends `prompts/first-look.md` with `{{args}}` replaced.
 - `/context` lists what is loaded; `/reload` re-reads the folder and applies from your next message, in the
   same conversation.
 
@@ -405,22 +403,29 @@ yourself, `hailer status`, `hailer doctor`,
 
 ## Data conventions
 
-Monthly files are named `YY-MM <dataset>.parquet`, for example `25-03 pra101.parquet` for March 2025. The
-data itself has no period column; Hailer derives it from the filename. Later months may add columns.
+Any CSV, Parquet or JSON file in `data/` can be analysed, whatever it is called: the starter notebook lists
+them in `data_files`, and the agent loads them with Polars or queries them with DuckDB when you ask.
+
+One naming convention is optional. When the same dataset arrives every month, name the files
+`YY-MM <dataset>.parquet`, for example `25-03 sales.parquet` for March 2025. The data itself then needs no
+period column; Hailer derives it from the filename, combines the months into one table and copes with
+columns that only appear in later months.
 
 `hailer.periods` (imported by the starter notebook, so the agent reuses it):
 
 | Function | Purpose |
 |---|---|
-| `parse_period(name)` | `"25-03 pra101.parquet"` → `Period(2025, 3)`; `None` if the name does not match. |
+| `list_data_files(data_dir)` | Every data file (CSV, Parquet, JSON, ...) directly in the folder, whatever its name, sorted by name. |
+| `parse_period(name)` | `"25-03 sales.parquet"` → `Period(2025, 3)`; `None` if the name does not match. |
 | `scan_period_files(data_dir, name=None)` | Sorted `PeriodFile`s for one dataset (or all) in a folder. |
 | `load_periods(files, columns=None)` | One Polars DataFrame with a leading `period` column (`YYYY-MM`); schema evolution handled with a relaxed diagonal concat. |
 | `scan_periods(files)` | Lazy variant of `load_periods`. |
 | `duckdb_periods_view(con, files, view_name="periods")` | Registers a DuckDB view over all files (`union_by_name`) with `period` derived from the filename. |
 | `describe_periods(files)` | Compact text: months found, common columns, columns present only in some months. |
 
-A file that cannot be read raises `MalformedParquetError` naming the file. The starter notebook
-(`notebooks/analysis.py`) defines `WORKSPACE`, `DATA_DIR` and `period_files` and shows a welcome table.
+A monthly file that cannot be read raises `MalformedParquetError` naming the file. The starter notebook
+(`notebooks/analysis.py`) defines `WORKSPACE`, `DATA_DIR`, `data_files` and `period_files` and shows a
+table of the data files it found.
 
 ## Logging
 
@@ -480,7 +485,7 @@ notebooks and data folders by path. With the `openai` provider this goes to Open
 to the `base_url` you configured, and nowhere else: when older turns are summarised, the same endpoint and
 model write the summary.
 
-**Not sent:** the parquet files or any dataframe, unless code explicitly prints or returns it (the agent is
+**Not sent:** your data files or any dataframe, unless code explicitly prints or returns it (the agent is
 instructed to inspect schemas, samples and aggregates and to keep outputs compact); API keys or other
 secrets (the key stays inside the Hailer process and is masked in logs).
 
@@ -541,7 +546,7 @@ when a session exists, confirms that marimo's code-mode API is available in the 
   new` typed in that instant can still be overtaken by the late switch.
 - `uvx hailer notebook` starts and stops marimo for you; plain `uvx hailer` expects a running server
   and tells you how to start one.
-- Every request carries about 9 KB of instructions and 5 KB of tool definitions (measured with an empty
+- Every request carries about 10 KB of instructions and 5 KB of tool definitions (measured with an empty
   project context) plus the conversation; an endpoint with a strict request-size limit needs room for that.
 - The endpoint must support function calling in the standard OpenAI shape. An endpoint that streams tool
   calls in a non-standard way may lose their arguments; `stream = false` on the provider avoids that.

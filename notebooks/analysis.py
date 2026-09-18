@@ -16,16 +16,25 @@ def _():
 
 @app.cell
 def _():
-    # Hailer's period utilities (YY-MM filename convention, schema-tolerant loading).
+    # Hailer's data helpers: list_data_files finds every data file; the others handle monthly
+    # files named "YY-MM <dataset>.parquet" (schema-tolerant loading with a period column).
     from hailer.periods import (
         describe_periods,
         duckdb_periods_view,
+        list_data_files,
         load_periods,
         scan_period_files,
         scan_periods,
     )
 
-    return describe_periods, duckdb_periods_view, load_periods, scan_period_files, scan_periods
+    return (
+        describe_periods,
+        duckdb_periods_view,
+        list_data_files,
+        load_periods,
+        scan_period_files,
+        scan_periods,
+    )
 
 
 @app.cell
@@ -38,52 +47,58 @@ def _(Path, mo):
 
 
 @app.cell
-def _(DATA_DIR, scan_period_files):
-    period_files = scan_period_files(DATA_DIR)
-    return (period_files,)
+def _(DATA_DIR, list_data_files, scan_period_files):
+    data_files = list_data_files(DATA_DIR)  # CSV, Parquet, JSON, Excel ... with any name
+    period_files = scan_period_files(DATA_DIR)  # the monthly "YY-MM <dataset>.parquet" ones
+    return data_files, period_files
 
 
 @app.cell
-def _(DATA_DIR, WORKSPACE, describe_periods, mo, period_files, pl):
+def _(DATA_DIR, WORKSPACE, data_files, describe_periods, mo, period_files, pl):
     # Welcome / status cell. Hailer adds analysis cells below this one.
     _header = mo.md(
         f"""
     # Hailer workspace
 
-    **Workspace:** `{WORKSPACE}`
-    **Data:** `{DATA_DIR}`
+    Chat with your data in the terminal (`uv run hailer`): ask a question in plain English and
+    Hailer loads the files, explores them and puts the tables, charts and summaries here.
 
-    Chat in the terminal (`uv run hailer`); results, tables and charts appear here.
+    **Workspace:** `{WORKSPACE}`
+
+    **Data:** `{DATA_DIR}`
     """
     )
-    if period_files:
-        _table = mo.ui.table(
-            pl.DataFrame(
-                {
-                    "file": [f.path.name for f in period_files],
-                    "dataset": [f.stem for f in period_files],
-                    "period": [f.period.label for f in period_files],
-                    "size_kb": [round(f.path.stat().st_size / 1024, 1) for f in period_files],
-                }
-            ),
-            selection=None,
-            label="Period files",
+    _parts = [_header]
+    if data_files:
+        _periods = {pf.path.name: pf.period.label for pf in period_files}
+        _columns = {
+            "file": [f.name for f in data_files],
+            "type": [f.suffix.lstrip(".").lower() for f in data_files],
+            "size_kb": [round(f.stat().st_size / 1024, 1) for f in data_files],
+        }
+        if _periods:
+            _columns["period"] = [_periods.get(f.name, "") for f in data_files]
+        _parts.append(mo.ui.table(pl.DataFrame(_columns), selection=None, label="Data files"))
+        _parts.append(
+            mo.md(
+                "Try asking: *what is in these files?* · *show the ten largest values* · "
+                "*chart the totals by month*"
+            )
         )
-        _summary = mo.md("```text\n" + describe_periods(period_files) + "\n```")
-        welcome = mo.vstack([_header, _table, _summary])
+        if period_files:
+            _parts.append(mo.md("**Monthly files**\n\n```text\n" + describe_periods(period_files) + "\n```"))
     else:
-        welcome = mo.vstack(
-            [
-                _header,
-                mo.callout(
-                    mo.md(
-                        "No period files found. Add files named like `25-01 pra101.parquet` to the data folder, "
-                        "or run `uv run python scripts/make_sample_data.py` for a synthetic example."
-                    ),
-                    kind="info",
+        _parts.append(
+            mo.callout(
+                mo.md(
+                    "No data files yet. Put the files you want to analyse (CSV, Parquet or JSON, any "
+                    "name) in the data folder above, or run `uv run python scripts/make_sample_data.py` "
+                    "for six months of synthetic sales data."
                 ),
-            ]
+                kind="info",
+            )
         )
+    welcome = mo.vstack(_parts)
     welcome
     return (welcome,)
 

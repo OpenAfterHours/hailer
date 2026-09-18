@@ -332,6 +332,7 @@ def test_render_template_is_valid_python_with_version(kind):
     if kind == "starter":
         assert "# Q2 churn" in text
         assert "hailer.periods" in text and "WORKSPACE" in text and "period_files" in text
+        assert "data_files = list_data_files(DATA_DIR)" in text and "pra101" not in text
     else:
         assert "Q2 churn" not in text
 

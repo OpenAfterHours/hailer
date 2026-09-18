@@ -470,8 +470,8 @@ class HailerTools:
             lines.extend(self._session_lines(self._bring_up(path)))
             if kind == "starter":
                 lines.append(
-                    "The starter template already defines mo, pl, duckdb, Path, WORKSPACE, DATA_DIR, period_files "
-                    "and the hailer.periods helpers; add analysis cells below the welcome cell."
+                    "The starter template already defines mo, pl, duckdb, Path, WORKSPACE, DATA_DIR, data_files, "
+                    "period_files and the hailer.periods helpers; add analysis cells below the welcome cell."
                 )
             else:
                 lines.append(
@@ -541,9 +541,10 @@ class HailerTools:
     # -- data, skills, web ------------------------------------------------- #
 
     def list_periods(self, name: str = "") -> str:
-        """Describe the monthly data files in the data directory (files named like
-        '25-01 pra101.parquet'): periods available, common columns and columns that only
-        appear in some months. Optional dataset name filter, e.g. 'pra101'."""
+        """Describe the data directory: monthly files named like '25-01 sales.parquet'
+        (YY-MM then the dataset name) with the periods available, common columns and columns
+        that only appear in some months, plus the names of any other data files (CSV, JSON,
+        ...). Optional dataset name filter for the monthly files, e.g. 'sales'."""
 
         def go() -> str:
             from . import periods  # lazy
@@ -552,13 +553,20 @@ class HailerTools:
             if not data_dir.is_dir():
                 return f"Data directory does not exist: {data_dir}"
             files = periods.scan_period_files(data_dir, name.strip() or None)
-            if not files:
-                return (
+            if files:
+                text = periods.describe_periods(files)
+            else:
+                text = (
                     f"No period files found in {data_dir}"
                     + (f" for '{name.strip()}'" if name.strip() else "")
-                    + ". Files must be named like '25-01 pra101.parquet' (YY-MM then the dataset name)."
+                    + ". Monthly files are named like '25-01 sales.parquet' (YY-MM then the dataset name)."
                 )
-            return periods.describe_periods(files)
+            listed = {pf.path.name for pf in files}
+            others = [p.name for p in periods.list_data_files(data_dir) if p.name not in listed]
+            if others:
+                shown = ", ".join(others[:20]) + (f" (and {len(others) - 20} more)" if len(others) > 20 else "")
+                text += f"\nOther data files (load them directly with Polars or DuckDB): {shown}"
+            return text
 
         return self._run(go)
 

@@ -1,9 +1,10 @@
-"""Utilities for monthly data files whose period is encoded in the filename.
+"""Utilities for the files in the data folder.
 
-Convention: ``YY-MM <dataset>.parquet``, e.g. ``25-03 pra101.parquet`` is the
-``pra101`` dataset for March 2025. The parquet data itself is not assumed to
-contain a period column; these helpers add one, and they cope with columns
-appearing in later months (schema evolution).
+:func:`list_data_files` finds every data file, whatever its name (CSV, Parquet, JSON, ...).
+The rest of the module is for an optional convention: monthly files named
+``YY-MM <dataset>.parquet``, e.g. ``25-03 sales.parquet`` is the ``sales`` dataset for
+March 2025. The parquet data itself is not assumed to contain a period column; these
+helpers add one, and they cope with columns appearing in later months (schema evolution).
 """
 
 from __future__ import annotations
@@ -22,6 +23,25 @@ PERIOD_RE = re.compile(r"^(?P<yy>\d{2})-(?P<mm>\d{2})\s+(?P<stem>.+)$")
 
 _READ_ERRORS: tuple[type[BaseException], ...] = (pl.exceptions.PolarsError, OSError, ValueError, TypeError)
 
+#: File types :func:`list_data_files` reports: what Polars or DuckDB reads (Excel needs an extra package).
+DATA_SUFFIXES: tuple[str, ...] = (
+    ".csv", ".tsv", ".parquet", ".json", ".jsonl", ".ndjson", ".xlsx", ".xls", ".arrow", ".feather", ".ipc",
+)
+
+
+# --------------------------------------------------------------------------- #
+# Any data file
+# --------------------------------------------------------------------------- #
+
+
+def list_data_files(data_dir: Path) -> list[Path]:
+    """The data files directly in ``data_dir`` (any name, a type in :data:`DATA_SUFFIXES`), sorted by name."""
+    data_dir = Path(data_dir)
+    if not data_dir.is_dir():
+        return []
+    files = [p for p in data_dir.iterdir() if p.is_file() and p.suffix.lower() in DATA_SUFFIXES]
+    return sorted(files, key=lambda p: p.name.lower())
+
 
 # --------------------------------------------------------------------------- #
 # Filename parsing
@@ -34,7 +54,7 @@ def _file_stem(name: str | Path) -> str:
 
 
 def parse_period(name: str | Path) -> Period | None:
-    """``"25-03 pra101.parquet"`` → ``Period(2025, 3)``; ``None`` when the name does not follow the convention."""
+    """``"25-03 sales.parquet"`` → ``Period(2025, 3)``; ``None`` when the name does not follow the convention."""
     match = PERIOD_RE.match(_file_stem(name).strip())
     if not match:
         return None
@@ -165,7 +185,7 @@ def _schema(pf: PeriodFile) -> dict[str, pl.DataType]:
 def describe_periods(files: Sequence[PeriodFile]) -> str:
     """Compact text summary: count, span, common columns, and columns that only appear in some periods."""
     if not files:
-        return "No period files found (expected names like '25-01 pra101.parquet')."
+        return "No period files found (expected names like '25-01 sales.parquet')."
     ordered = sorted(files, key=lambda f: (f.period, f.stem))
     schemas = [(pf, _schema(pf)) for pf in ordered]
     stems = sorted({pf.stem for pf in ordered})
@@ -197,9 +217,11 @@ def describe_periods(files: Sequence[PeriodFile]) -> str:
 
 
 __all__ = [
+    "DATA_SUFFIXES",
     "PERIOD_RE",
     "describe_periods",
     "duckdb_periods_view",
+    "list_data_files",
     "load_periods",
     "parse_period",
     "parse_period_file",

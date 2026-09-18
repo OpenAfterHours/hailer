@@ -93,6 +93,23 @@ def test_scan_sorted_and_filtered(data_dir):
     assert all(f.path.suffix == ".parquet" for f in all_files)
 
 
+def test_list_data_files_any_name(data_dir):
+    (data_dir / "Customers.CSV").write_text("id\n1\n", encoding="utf-8")
+    (data_dir / "survey.jsonl").write_text("{}\n", encoding="utf-8")
+    (data_dir / "archive.parquet").mkdir()  # folders are skipped, whatever their suffix
+    names = [p.name for p in pf.list_data_files(data_dir)]
+    assert names == [
+        "25-01 pra101.parquet",
+        "25-01 pra102.parquet",
+        "25-02 pra101.parquet",
+        "25-03 pra101.parquet",
+        "Customers.CSV",
+        "readme.parquet",
+        "survey.jsonl",
+    ]
+    assert pf.list_data_files(data_dir / "missing") == []
+
+
 def test_load_periods_adds_period_first_and_tolerates_schema_change(data_dir):
     files = pf.scan_period_files(data_dir, "pra101")
     df = pf.load_periods(files)

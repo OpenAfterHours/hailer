@@ -1,8 +1,8 @@
-"""Generate synthetic PRA101-style monthly parquet files for demos and tests.
+"""Generate synthetic monthly sales files for demos and tests.
 
-Writes files named ``YY-MM pra101.parquet`` (default: six months from 2025-01)
-with credit-risk-like columns. Later months add a ``risk_weight`` column so the
-schema-evolution handling in ``hailer.periods`` is exercised. Deterministic.
+Writes files named ``YY-MM sales.parquet`` (default: six months from 2025-01), one row per
+order. Later months add a ``discount`` column so the schema-evolution handling in
+``hailer.periods`` is exercised. Deterministic.
 
 Usage:
     uv run python scripts/make_sample_data.py            # writes into ./data
@@ -12,16 +12,20 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import calendar
 import random
+from datetime import date
 from pathlib import Path
 
 import polars as pl
 
-EXPOSURE_CLASSES = ["Corporate", "Retail", "Sovereign", "Institution", "Equity"]
-COUNTRIES = ["GB", "US", "DE", "FR", "JP", "NL"]
-BASE_RISK_WEIGHT = {"Corporate": 1.0, "Retail": 0.75, "Sovereign": 0.0, "Institution": 0.5, "Equity": 2.5}
-# Month-on-month growth factors per class; corporates drive most of the RWA increase.
-GROWTH = {"Corporate": 1.045, "Retail": 1.01, "Sovereign": 1.0, "Institution": 1.005, "Equity": 0.99}
+REGIONS = ["North", "South", "East", "West"]
+CATEGORIES = ["Electronics", "Home", "Clothing", "Sports", "Books"]
+CHANNELS = ["Online", "Store"]
+UNIT_PRICE = {"Electronics": 90.0, "Home": 45.0, "Clothing": 35.0, "Sports": 55.0, "Books": 20.0}
+DISCOUNTS = [0.0, 0.0, 0.0, 0.05, 0.1, 0.2]
+# Month-on-month growth factors per region; the North drives most of the revenue increase.
+GROWTH = {"North": 1.08, "South": 1.01, "East": 1.0, "West": 0.99}
 
 
 def _parse_start(value: str) -> tuple[int, int]:
@@ -43,40 +47,45 @@ def _months(start: tuple[int, int], count: int) -> list[tuple[int, int]]:
     return out
 
 
-def build_month(index: int, rows: int, rng: random.Random, *, with_risk_weight: bool) -> pl.DataFrame:
-    counterparty_ids = [f"CP{n:05d}" for n in range(1, rows + 1)]
-    classes = [EXPOSURE_CLASSES[n % len(EXPOSURE_CLASSES)] for n in range(rows)]
-    countries = [rng.choice(COUNTRIES) for _ in range(rows)]
-    default_flags = [rng.random() < 0.04 for _ in range(rows)]
-    exposures: list[float] = []
-    rwas: list[float] = []
-    risk_weights: list[float] = []
-    for cls, defaulted in zip(classes, default_flags, strict=True):
-        base = rng.uniform(50_000, 5_000_000) * (1.2 if cls == "Corporate" else 1.0)
-        exposure = base * (GROWTH[cls] ** index)
-        weight = BASE_RISK_WEIGHT[cls] * (1.5 if defaulted else 1.0) * rng.uniform(0.9, 1.1)
-        exposures.append(round(exposure, 2))
-        risk_weights.append(round(weight, 4))
-        rwas.append(round(exposure * weight, 2))
+def build_month(year: int, month: int, index: int, rows: int, rng: random.Random, *, with_discount: bool) -> pl.DataFrame:
+    last_day = calendar.monthrange(year, month)[1]
+    order_ids = [f"{year % 100:02d}{month:02d}-{n:05d}" for n in range(1, rows + 1)]
+    order_dates = [date(year, month, rng.randint(1, last_day)) for _ in range(rows)]
+    regions = [REGIONS[n % len(REGIONS)] for n in range(rows)]
+    categories = [rng.choice(CATEGORIES) for _ in range(rows)]
+    channels = [CHANNELS[0] if rng.random() < 0.55 else CHANNELS[1] for _ in range(rows)]
+    returned = [rng.random() < 0.03 for _ in range(rows)]
+    units: list[int] = []
+    revenue: list[float] = []
+    discounts: list[float] = []
+    for region, category in zip(regions, categories, strict=True):
+        quantity = rng.randint(1, 3)
+        discount = rng.choice(DISCOUNTS)
+        price = UNIT_PRICE[category] * rng.uniform(0.9, 1.1)
+        units.append(quantity)
+        discounts.append(discount)
+        revenue.append(round(quantity * price * (1 - discount) * GROWTH[region] ** index, 2))
     data: dict[str, object] = {
-        "counterparty_id": counterparty_ids,
-        "exposure_class": classes,
-        "country": countries,
-        "default_flag": default_flags,
-        "exposure_value": exposures,
-        "rwa": rwas,
+        "order_id": order_ids,
+        "order_date": order_dates,
+        "region": regions,
+        "category": categories,
+        "channel": channels,
+        "units": units,
+        "revenue": revenue,
+        "returned": returned,
     }
-    if with_risk_weight:
-        data["risk_weight"] = risk_weights
+    if with_discount:
+        data["discount"] = discounts
     return pl.DataFrame(data)
 
 
-def write_sample_data(out: Path, *, months: int = 6, rows: int = 400, start: tuple[int, int] = (2025, 1), seed: int = 42, dataset: str = "pra101") -> list[Path]:
+def write_sample_data(out: Path, *, months: int = 6, rows: int = 400, start: tuple[int, int] = (2025, 1), seed: int = 42, dataset: str = "sales") -> list[Path]:
     out.mkdir(parents=True, exist_ok=True)
     rng = random.Random(seed)
     written: list[Path] = []
     for index, (year, month) in enumerate(_months(start, months)):
-        df = build_month(index, rows, rng, with_risk_weight=index >= 3)
+        df = build_month(year, month, index, rows, rng, with_discount=index >= 3)
         path = out / f"{year % 100:02d}-{month:02d} {dataset}.parquet"
         df.write_parquet(path)
         written.append(path)
@@ -87,10 +96,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--out", type=Path, default=Path("data"), help="output directory (default: data)")
     parser.add_argument("--months", type=int, default=6, help="number of monthly files (default: 6)")
-    parser.add_argument("--rows", type=int, default=400, help="rows per file (default: 400)")
+    parser.add_argument("--rows", type=int, default=400, help="orders per file (default: 400)")
     parser.add_argument("--start", type=_parse_start, default=(2025, 1), help="first period as YY-MM (default: 25-01)")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--dataset", default="pra101", help="dataset name used in filenames (default: pra101)")
+    parser.add_argument("--dataset", default="sales", help="dataset name used in filenames (default: sales)")
     args = parser.parse_args(argv)
     written = write_sample_data(args.out, months=args.months, rows=args.rows, start=args.start, seed=args.seed, dataset=args.dataset)
     for path in written:
