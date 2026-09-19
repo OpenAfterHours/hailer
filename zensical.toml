@@ -1,0 +1,86 @@
+# Preview: uv run --locked --group docs zensical serve
+# Build:   uv run --locked --group docs zensical build --strict
+[project]
+site_name = "Hailer"
+site_description = "Chat with your data. Keep the analysis. Explore CSV, Parquet, JSON and Excel files in a live marimo notebook."
+site_url = "https://openafterhours.github.io/hailer/"
+site_author = "OpenAfterHours"
+repo_url = "https://github.com/OpenAfterHours/hailer"
+repo_name = "OpenAfterHours/hailer"
+edit_uri = "edit/main/docs/site/"
+# Publish user guides only; engineering records remain in docs/ at their existing paths.
+docs_dir = "docs/site"
+site_dir = "site"
+copyright = "OpenAfterHours · Built after hours."
+extra_css = ["assets/stylesheets/tokens.css", "assets/stylesheets/theme.css", "assets/stylesheets/landing.css"]
+extra_javascript = ["assets/javascripts/landing.js"]
+nav = [
+  { "Home" = "index.md" },
+  { "Get started" = [
+    { "Your first analysis" = "getting-started/quickstart.md" },
+    { "Installation and upgrades" = "getting-started/installation.md" },
+  ] },
+  { "Using Hailer" = [
+    { "Everyday workflow" = "using/workflow.md" },
+    { "Notebooks and sessions" = "using/notebooks.md" },
+    { "Working with your data" = "using/data.md" },
+  ] },
+  { "Configuration" = [
+    { "Models and endpoints" = "configuration/models.md" },
+    { "Context, skills and prompts" = "configuration/context.md" },
+    { "Allowed web domains" = "configuration/web.md" },
+    { "Credentials" = "configuration/credentials.md" },
+    { "Running inside abeam" = "configuration/abeam.md" },
+  ] },
+  { "Security and runtimes" = [
+    { "Data handling and security" = "security/data-handling.md" },
+    { "Local and Docker runtimes" = "security/runtimes.md" },
+    { "Docker setup and operations" = "security/docker.md" },
+  ] },
+  { "Reference and development" = [
+    { "Chat and CLI commands" = "reference/commands.md" },
+    { "Troubleshooting" = "reference/troubleshooting.md" },
+    { "Known limitations" = "reference/limitations.md" },
+    { "Architecture" = "development/architecture.md" },
+    { "Development and tests" = "development/contributing.md" },
+    { "Maintaining the docs" = "development/docs.md" },
+    { "Releasing" = "development/releasing.md" },
+  ] },
+]
+
+[project.theme]
+variant = "classic"
+custom_dir = "docs/overrides"
+logo = "assets/images/hailer.svg"
+favicon = "assets/images/hailer.svg"
+features = ["navigation.sections", "navigation.top", "navigation.footer", "navigation.tracking", "search.highlight", "content.code.copy", "content.action.edit"]
+
+[project.theme.font]
+text = "Inter"
+code = "JetBrains Mono"
+
+[[project.theme.palette]]
+scheme = "slate"
+primary = "orange"
+accent = "orange"
+toggle.icon = "material/brightness-7"
+toggle.name = "Switch to light mode"
+
+[[project.theme.palette]]
+scheme = "default"
+primary = "orange"
+accent = "orange"
+toggle.icon = "material/brightness-4"
+toggle.name = "Switch to dark mode"
+
+[project.markdown_extensions.admonition]
+[project.markdown_extensions.attr_list]
+[project.markdown_extensions.md_in_html]
+[project.markdown_extensions.toc]
+permalink = true
+[project.markdown_extensions.pymdownx.details]
+[project.markdown_extensions.pymdownx.highlight]
+anchor_linenums = true
+[project.markdown_extensions.pymdownx.superfences]
+[project.markdown_extensions.pymdownx.tabbed]
+alternate_style = true

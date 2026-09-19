@@ -31,8 +31,12 @@ hailer = "hailer.cli:main"
 
 [project.urls]
 Repository = "https://github.com/openafterhours/hailer"
+Documentation = "https://openafterhours.github.io/hailer/"
 
 [dependency-groups]
+docs = [
+    "zensical==0.0.45",
+]
 dev = [
     "pytest>=9.0",
 ]

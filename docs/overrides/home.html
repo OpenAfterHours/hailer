@@ -1,0 +1,154 @@
+{% extends "main.html" %}
+
+{% block header %}
+<header class="hl-nav hl-width" data-md-component="header">
+  <a class="hl-brand" href="{{ '.' | url }}" aria-label="Hailer home">
+    <img src="{{ 'assets/images/hailer.svg' | url }}" width="36" height="36" alt="">
+    <span>hailer</span><span class="hl-byline">by OpenAfterHours</span>
+  </a>
+  <nav aria-label="Primary">
+    <a href="{{ 'getting-started/quickstart/' | url }}">Docs</a>
+    <a href="{{ 'security/data-handling/' | url }}">Data &amp; security</a>
+    <a class="hl-github" href="{{ config.repo_url }}">GitHub <span aria-hidden="true">↗</span></a>
+  </nav>
+</header>
+{% endblock %}
+
+{% block container %}
+<div class="hl-landing" id="hailer" tabindex="-1" data-md-component="content">
+  <section class="hl-hero hl-width" aria-labelledby="hl-title">
+    <div class="hl-sky" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+    <p class="hl-eyebrow"><span class="hl-status-dot" aria-hidden="true"></span> A conversation. A notebook. Your analysis.</p>
+    <h1 id="hl-title">Chat with your data.<br><span>Keep the analysis.</span></h1>
+    <p class="hl-lede">Ask in plain English. Hailer explores your files and builds tables,
+      charts and editable Python in a live <a href="https://marimo.io/">marimo</a> notebook.</p>
+    <div class="hl-actions">
+      <a class="hl-button hl-primary" href="{{ 'getting-started/quickstart/' | url }}">Get started <span aria-hidden="true">→</span></a>
+      <a class="hl-button hl-secondary" href="#see-it-work">See it in action <span aria-hidden="true">↓</span></a>
+    </div>
+    <p class="hl-formats">CSV <span>·</span> Parquet <span>·</span> JSON <span>·</span> Excel <span class="hl-format-divider">/</span> Windows, macOS &amp; Linux</p>
+  </section>
+
+  <section class="hl-demo-section hl-width" id="see-it-work" aria-labelledby="hl-demo-title">
+    <div class="hl-section-label">
+      <h2 id="hl-demo-title">From question to notebook</h2>
+      <span>Sample walkthrough · sales.csv</span>
+    </div>
+    <div class="hl-demo" data-hl-demo>
+      <div class="hl-terminal">
+        <div class="hl-window-bar"><span class="hl-window-dots" aria-hidden="true"><i></i><i></i><i></i></span><span>hailer <span class="hl-dim">/ my-analysis</span></span><span class="hl-window-label">TERMINAL</span></div>
+        <div class="hl-transcript" aria-live="polite" aria-atomic="true">
+          <p class="hl-shell"><span>$</span> uvx hailer</p>
+          <p class="hl-terminal-ready"><span aria-hidden="true">✓</span> Notebook ready. What would you like to explore?</p>
+          <div data-hl-step="0">
+            <p class="hl-speaker">YOU</p>
+            <p class="hl-question">Chart total revenue by month,<br>split by region.</p>
+            <p class="hl-speaker hl-assistant">HAILER</p>
+            <p class="hl-answer">I've added a chart to your notebook. Both regions grew from January to February.</p>
+            <p class="hl-saved"><span aria-hidden="true">↗</span> Chart added to analysis.py</p>
+          </div>
+          <div data-hl-step="1" hidden>
+            <p class="hl-speaker">YOU</p>
+            <p class="hl-question">How much did total revenue grow?</p>
+            <p class="hl-speaker hl-assistant">HAILER</p>
+            <p class="hl-answer">Total revenue rose from 2,100 to 2,600 — an increase of 500, or 23.8%. I've added the summary below the chart.</p>
+            <p class="hl-saved"><span aria-hidden="true">↗</span> Summary added to analysis.py</p>
+          </div>
+          <div data-hl-step="2" hidden>
+            <p class="hl-speaker">YOUR NOTEBOOK</p>
+            <p class="hl-question">The Python is yours to inspect and edit.</p>
+            <p class="hl-answer">In marimo, toggle app view to see the cells behind the chart. The analysis stays in your notebook when the conversation ends.</p>
+            <p class="hl-saved"><span aria-hidden="true">↗</span> Ctrl+. <span class="hl-dim">/ Cmd+. on macOS</span></p>
+          </div>
+        </div>
+        <div class="hl-composer"><span aria-hidden="true">›</span><span>Ask a follow-up…</span><span class="hl-cursor" aria-hidden="true"></span></div>
+        <div class="hl-terminal-context">analysis.py <span>·</span> conversation saved</div>
+      </div>
+      <div class="hl-signal" aria-hidden="true"><span>→</span><i></i></div>
+      <div class="hl-notebook">
+        <div class="hl-window-bar"><span class="hl-notebook-mark" aria-hidden="true">✳</span><span>analysis.py</span><span class="hl-window-label">MARIMO NOTEBOOK</span></div>
+        <div class="hl-notebook-body">
+          <div data-hl-output="chart">
+            <div class="hl-chart-heading"><div><p class="hl-notebook-eyebrow">SALES OVERVIEW</p><h3>Small file. Clearer picture.</h3></div><span class="hl-file-label">sales.csv</span></div>
+            <div class="hl-legend"><span><i class="hl-north"></i>North</span><span><i class="hl-south"></i>South</span></div>
+            <svg class="hl-chart" viewBox="0 0 540 218" role="img" aria-labelledby="hl-chart-title hl-chart-desc">
+              <title id="hl-chart-title">Revenue by month and region</title>
+              <desc id="hl-chart-desc">January 2026: North 1,200, South 900. February 2026: North 1,500, South 1,100.</desc>
+              <g class="hl-chart-grid"><path d="M50 25H520M50 70H520M50 115H520M50 160H520"/></g>
+              <g class="hl-chart-axis"><text x="37" y="29">1,500</text><text x="37" y="74">1,000</text><text x="37" y="119">500</text><text x="37" y="164">0</text></g>
+              <g class="hl-chart-bars"><rect x="118" y="52" width="52" height="108" rx="3" fill="#ff9100"/><rect x="182" y="79" width="52" height="81" rx="3" fill="#899eb5"/><rect x="340" y="25" width="52" height="135" rx="3" fill="#ff9100"/><rect x="404" y="61" width="52" height="99" rx="3" fill="#899eb5"/></g>
+              <g class="hl-chart-values"><text x="144" y="43">1,200</text><text x="208" y="70">900</text><text x="366" y="16">1,500</text><text x="430" y="52">1,100</text></g>
+              <g class="hl-chart-months"><text x="176" y="186">Jan 2026</text><text x="398" y="186">Feb 2026</text></g>
+            </svg>
+            <p class="hl-chart-caption" data-hl-caption>Revenue by month, split by region. Four rows, two regions.</p>
+            <p class="hl-chart-insight" data-hl-insight hidden><strong>+23.8%</strong><span>Total revenue growth<br><small>2,100 → 2,600 · January to February</small></span></p>
+          </div>
+          <div data-hl-output="code" hidden>
+            <p class="hl-notebook-eyebrow">THE CELLS BEHIND THE CHART</p>
+            <h3>Readable. Editable. Yours.</h3>
+            <pre class="hl-demo-code"><code><span class="hl-code-keyword">import</span> polars <span class="hl-code-keyword">as</span> pl
+<span class="hl-code-keyword">import</span> altair <span class="hl-code-keyword">as</span> alt
+
+sales = pl.read_csv(DATA_DIR / <span class="hl-code-string">"sales.csv"</span>)
+revenue = sales.group_by(
+    <span class="hl-code-string">"month"</span>, <span class="hl-code-string">"region"</span>
+).agg(pl.col(<span class="hl-code-string">"revenue"</span>).sum())
+
+alt.Chart(revenue).mark_bar().encode(
+    x=<span class="hl-code-string">"month:N"</span>, y=<span class="hl-code-string">"revenue:Q"</span>,
+    color=<span class="hl-code-string">"region:N"</span>, xOffset=<span class="hl-code-string">"region:N"</span>,
+)</code></pre>
+          </div>
+        </div>
+        <div class="hl-notebook-footer"><span class="hl-status-dot" aria-hidden="true"></span> Saved as Python <span>notebooks/analysis.py</span></div>
+      </div>
+    </div>
+    <div class="hl-demo-controls" data-hl-controls hidden role="group" aria-label="Walkthrough steps">
+      <button type="button" data-hl-select="0" aria-pressed="true"><span>01</span> Ask a question</button>
+      <button type="button" data-hl-select="1" aria-pressed="false"><span>02</span> Refine the analysis</button>
+      <button type="button" data-hl-select="2" aria-pressed="false"><span>03</span> View the code</button>
+    </div>
+    <p class="hl-demo-note">Illustrated with sample data. <a href="{{ 'assets/examples/sales.csv' | url }}" download>Download the CSV <span aria-hidden="true">↓</span></a> and <a href="{{ 'getting-started/quickstart/' | url }}">try it yourself</a>.</p>
+  </section>
+
+  <section class="hl-keep hl-width" aria-labelledby="hl-keep-title">
+    <div class="hl-section-intro"><p class="hl-eyebrow">MORE THAN A CHAT HISTORY</p><h2 id="hl-keep-title">Something to come back to.</h2><p>Follow the next question. Your notebook keeps the work.</p></div>
+    <div class="hl-benefits">
+      <article><span class="hl-feature-number">01 / EXPLORE</span><h3>Start with your files.</h3><p>Find missing values, compare months or explore an Excel worksheet. Ask the question in the words you'd use with a colleague.</p><a href="{{ 'using/data/' | url }}">Working with your data <span aria-hidden="true">↗</span></a></article>
+      <article><span class="hl-feature-number">02 / UNDERSTAND</span><h3>See how you got there.</h3><p>Charts and tables sit alongside their Python code. Open the cells, inspect the calculation and make your own changes in marimo.</p><a href="{{ 'using/workflow/' | url }}">The everyday workflow <span aria-hidden="true">↗</span></a></article>
+      <article><span class="hl-feature-number">03 / CONTINUE</span><h3>Pick up the thread.</h3><p>Reopen your workspace to resume the conversation and active notebook. Start another notebook when the analysis moves somewhere new.</p><a href="{{ 'using/notebooks/' | url }}">Notebooks and sessions <span aria-hidden="true">↗</span></a></article>
+    </div>
+  </section>
+
+  <section class="hl-start hl-width" aria-labelledby="hl-start-title">
+    <div class="hl-section-intro"><p class="hl-eyebrow">YOUR FIRST ANALYSIS</p><h2 id="hl-start-title">Bring a question. Start here.</h2><p>You'll need <a href="https://docs.astral.sh/uv/getting-started/installation/">uv</a>, a browser and a model API key.</p></div>
+    <ol class="hl-steps">
+      <li><span class="hl-step-number">1</span><h3>Create a workspace</h3><p>A folder for your data, notebooks and settings.</p><pre><code>mkdir my-analysis
+cd my-analysis
+uvx hailer init</code></pre></li>
+      <li><span class="hl-step-number">2</span><h3>Connect your model</h3><p>Sign in with an OpenAI API key, or <a href="{{ 'configuration/models/' | url }}">configure another endpoint</a>.</p><pre><code>uvx hailer login openai</code></pre></li>
+      <li><span class="hl-step-number">3</span><h3>Add data. Say hello.</h3><p>Put files in <code>data/</code>, then start Hailer. Keep the notebook tab open.</p><pre><code>uvx hailer</code></pre></li>
+    </ol>
+    <a class="hl-text-link" href="{{ 'getting-started/quickstart/' | url }}">Follow the complete quickstart <span aria-hidden="true">→</span></a>
+  </section>
+
+  <section class="hl-trust hl-width" aria-labelledby="hl-trust-title">
+    <div><p class="hl-eyebrow">KNOW WHERE YOUR DATA GOES</p><h2 id="hl-trust-title">Local files.<br>A model you configure.</h2></div>
+    <div class="hl-trust-copy"><p>Your analysis runs on your machine. Your messages, code and notebook tool outputs — which can include data samples — go to your configured model endpoint.</p><p>The default local runtime runs code with your account's file and network access. Optional Docker isolation restricts the kernel's access; its outputs still go to the model.</p><a href="{{ 'security/data-handling/' | url }}">Read about data handling <span aria-hidden="true">↗</span></a><a href="{{ 'security/runtimes/' | url }}">Choose your runtime <span aria-hidden="true">↗</span></a></div>
+  </section>
+
+  <section class="hl-explore hl-width" aria-labelledby="hl-explore-title">
+    <div><p class="hl-eyebrow">TAKE IT FROM HERE</p><h2 id="hl-explore-title">Make Hailer part<br>of your workflow.</h2></div>
+    <div class="hl-doc-links">
+      <a href="{{ 'configuration/context/' | url }}"><span><strong>Teach it your project</strong><small>Context, reusable prompts and skills</small></span><span aria-hidden="true">↗</span></a>
+      <a href="{{ 'reference/commands/' | url }}"><span><strong>Find a command</strong><small>Terminal commands and chat shortcuts</small></span><span aria-hidden="true">↗</span></a>
+      <a href="{{ 'reference/troubleshooting/' | url }}"><span><strong>Get unstuck</strong><small>Diagnostics and fixes for common problems</small></span><span aria-hidden="true">↗</span></a>
+      <a href="{{ 'development/contributing/' | url }}"><span><strong>Explore the project</strong><small>Architecture, development and tests</small></span><span aria-hidden="true">↗</span></a>
+    </div>
+  </section>
+</div>
+{% endblock %}
+{% block site_nav %}{% endblock %}
+{% block footer %}
+<footer class="hl-footer hl-width"><a href="https://openafterhours.club">OpenAfterHours <span aria-hidden="true">↗</span></a><span>Built after hours. Ready for your next question.</span><a href="{{ config.repo_url }}">View on GitHub</a></footer>
+{% endblock %}
