@@ -254,7 +254,7 @@ def harness(tmp_path, monkeypatch):
         h.context_loads += 1
         return h.bundle
 
-    def wait_session(client, notebook, timeout):
+    def wait_session(client, notebook, timeout, *, should_stop=None):
         h.session_waits.append(notebook)
         if h.waited_session == "default":
             return client.grant(notebook)  # the tab loaded: the notebook now has a session
@@ -646,7 +646,7 @@ def nb(harness, monkeypatch):
         h.health_waits.append(url)
         return h.healthy
 
-    def wait_session(client, notebook, timeout):
+    def wait_session(client, notebook, timeout, *, should_stop=None):
         h.session_waits.append(notebook)
         if h.waited_session == "default":
             return MarimoSession("s9", "analysis.py", "notebooks/analysis.py")

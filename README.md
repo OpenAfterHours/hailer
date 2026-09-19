@@ -410,23 +410,33 @@ credentials, customer names and row-level data out of it.
 | `/clear` | Clear the screen. |
 | `/exit`, `/quit` | Exit Hailer (Ctrl+C at the prompt, Ctrl+D on an empty line, or Ctrl+Z then Enter, also exit). |
 
-At the `You > ` prompt, pasting a block of several lines sends it as one message, newlines included:
-Hailer turns on the terminal's bracketed paste while it waits for you and turns it off before the agent
-starts. Enter sends; Up and Down recall your earlier messages from this session (they are not saved to disk).
-The prompt does not capture the mouse or switch to an alternate screen, so scrolling and selecting text work
-as usual. When the input is not a terminal (a pipe or a script), Hailer reads plain lines instead.
+Interactive chat keeps a framed input box below the conversation. Your submitted messages, Hailer's
+replies and command results appear above it. The context line shows the active notebook, model and
+number of loaded context files; the activity line shows what Hailer is doing.
 
-Ctrl+C while the agent is working cancels that turn, including the request to the model endpoint, and
-returns to the prompt. The conversation carries on: your interrupted message is kept and sent together with
-the next one. The conversation itself is stored in `.hailer/threads.sqlite` in the workspace, which is how
+Enter sends; Alt+Enter inserts a newline. Pasting several lines keeps them in one editable message.
+Up and Down move through multiline input and recall earlier messages at its boundaries (history stays
+in memory for this session). You can draft your next message while Hailer works; Enter preserves that
+draft until the current operation finishes or is cancelled. Requests are not queued.
+
+The interface uses normal terminal scrollback and text selection. It does not capture the mouse or
+switch to an alternate screen. Use `hailer --plain` or `hailer notebook --plain` for the line-oriented
+`You >` interface. Pipes and terminals reporting `TERM=dumb` or `TERM=unknown` use plain input automatically.
+
+Ctrl+C during a turn cancels the model request and keeps the composer open. A notebook command already
+performing a blocking operation finishes its cleanup before another command can start. Cancellation does
+not undo tool actions that have already happened. Ctrl+C while idle exits; Ctrl+D on empty input or
+Ctrl+Z then Enter also exits. The conversation is stored in `.hailer/threads.sqlite`, which is how
 `hailer` resumes it after a restart; `/new` (or `hailer --new`) discards it and starts another.
+Completed replies are displayed once, with Markdown formatting; live activity does not print interim
+model commentary. `/clear` clears the display without resetting the conversation.
 
-Other subcommands: `hailer notebook [--port N] [--no-browser] [--keep-marimo] [--foreground] [--new]` (the
+Other subcommands: `hailer notebook [--port N] [--no-browser] [--keep-marimo] [--foreground] [--new] [--plain]` (the
 one-command session described in Quick start; marimo runs on the notebooks folder), `hailer exec -c "code"`
 (or `hailer exec script.py`, `hailer exec -` for stdin) to run Python in the active notebook's kernel
 yourself, `hailer status`, `hailer doctor`,
 `hailer login|logout <provider>`, `hailer init [--force]`. Global options: `--verbose`, `--config <path>`,
-`--workspace <path>`, `--new`, `--version`.
+`--workspace <path>`, `--new`, `--plain`, `--version`.
 
 ## Data conventions
 

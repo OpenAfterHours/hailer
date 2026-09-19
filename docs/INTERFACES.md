@@ -196,7 +196,7 @@ def marimo_server_command(notebooks_dir: Path, workspace: Path, port: int, *, he
     # interpreter, never `uv run`: works under uvx without a project .venv.
 def launch_hint() -> str   # "uvx hailer (or: uvx hailer notebook)" starts marimo for this workspace, then launch_command() for another terminal
 def wait_for_health(url: str, timeout: float = 60.0, *, interval: float = 0.5, should_stop=None) -> bool
-def wait_for_session(client: MarimoClient, notebook: Path | None, timeout: float = 90.0, *, interval: float = 0.5) -> MarimoSession | None
+def wait_for_session(client: MarimoClient, notebook: Path | None, timeout: float = 90.0, *, interval: float = 0.5, should_stop: Callable[[], bool] | None = None) -> MarimoSession | None  # None on timeout/cancellation; a request already in flight uses the client's timeout
 ```
 marimo is always started on the notebooks **folder** (never on a single file) so that every notebook,
 existing or created later, opens on the same server. Connection refused/timeout → `MarimoUnavailableError`
@@ -382,6 +382,10 @@ class HailerAgent:
     def set_model(self, name: str, provider: str | None = None) -> None   # from the next turn; undeclared provider → ConfigError and nothing changes; never starts a thread (the CLI starts exactly one)
     def run_turn(self, text: str, *, on_event: Callable[[AgentEvent], None] | None = None, skill: SkillInfo | None = None, preamble: str | None = None) -> TurnSummary
     def close(self) -> None            # idempotent; start() works again afterwards
+    async def astart(self, *, resume_thread_id: str | None = None, forget_thread_id: str | None = None) -> str
+    async def anew_thread(self) -> str
+    async def arun_turn(self, text: str, *, on_event: Callable[[AgentEvent], None] | None = None, skill: SkillInfo | None = None, preamble: str | None = None) -> TurnSummary
+    async def aclose(self) -> None      # cancel and await the active turn first; leaves caller's loop running
     bundle: ContextBundle              # property; assigning it (/reload) applies from the next turn of the same conversation
     model: str; provider_id: str; started: bool    # read-only properties
     thread_id: str | None; key_source: str         # "env" | "keyring" | "missing", refreshed whenever the model is built
@@ -392,10 +396,12 @@ class HailerAgent:
   (`request_headers`), `default_query` (`query_params`), `disable_streaming=True` (`stream = false`),
   `reasoning_effort`, `http_async_client`. `parallel_tool_calls` is never sent, so a strict gateway sees only
   `model`, `messages`, `tools`, `stream` (and `reasoning_effort` when set). Reasons: see "Runtime facts".
-- Lifecycle: the public methods are synchronous. One `asyncio.Runner` lives from the first call until
-  `close()` and every call is `runner.run(...)`, which turns Ctrl+C into a cancellation that aborts the HTTP
-  request in flight. There is no `interrupt()`: `run_turn` re-raises `KeyboardInterrupt` with the turn already
-  cancelled. Other non-Hailer exceptions go through `map_exception` with the model and provider in use. The
+- Lifecycle: async methods use the caller's event loop throughout start, turns, reset and close.
+  The synchronous facade owns one `asyncio.Runner`, preserving Ctrl+C/`KeyboardInterrupt` behavior.
+  Async cancellation propagates as `CancelledError`; callers cancel and await the active turn before
+  `aclose()`. HTTP and SQLite resources are bound to one loop; mixing lifecycles or loops before closing
+  raises `AgentError`. Cleanup completes before propagating cancellation. Other non-Hailer exceptions
+  go through `map_exception` with the model and provider in use. The
   graph is built on first use and rebuilt after `set_model` or a `bundle` assignment: the old HTTP client is
   closed, the key resolved (`"missing"` → `CredentialsError` with the `hailer login <id>` hint, for every
   provider), the model built with an `openai.DefaultAsyncHttpxClient()` the agent owns (honours
@@ -473,7 +479,7 @@ is down a failure); `login <provider>`; `logout <provider>`; `init` (write
 default config + `.config/hailer` skeleton, then load that config and create the configured notebook with
 `notebooks.ensure_notebook` and the notebooks and data folders when missing; nothing but `hailer.toml` is ever
 overwritten, and only with `--force`; an unloadable `hailer.toml` skips the notebook step). Global options `--verbose/-v`, `--config`, `--workspace`, `--new`
-(do not resume), `--version`. Startup: `_load_config` (load config, then `config.notebook` := the active
+(do not resume), `--plain`, `--version`. Startup: `_load_config` (load config, then `config.notebook` := the active
 notebook from the state file, or, when `HAILER_NOTEBOOK` is set, that notebook written to the state file) →
 setup logging → local checks (config, notebook, credentials) → marimo (reuse or start, see above) → Rich panel
 (`Notebook:` active, `Notebooks:` folder) → agent start → REPL. Agent start (`ChatLoop.start`):
@@ -481,16 +487,33 @@ setup logging → local checks (config, notebook, credentials) → marimo (reuse
 `start(forget_thread_id=<that thread>)` so the stored conversation is deleted; a different id coming back from
 a resume means the thread was gone, the CLI says so and resets the counters. Credentials: a `"missing"` key is
 a fatal preflight failure for every provider, the built-in `openai` included; `status` and `/status` show
-`<env_key> from env|keyring` or `<env_key> missing (run: uvx hailer login <id>)`. REPL: `You > ` prompt read by
-`_LineReader` (from `_make_line_reader(console)`): prompt_toolkit `PromptSession` when stdin and stdout are
-terminals (bracketed paste on while waiting, off before `read()` returns; in-memory history; no mouse, no
-alternate screen; CPR off on VT100 outputs), else Rich's plain `Console.input`. A pasted block is one message
-with its newlines. Ctrl+C during a turn cancels it (the agent re-raises `KeyboardInterrupt`, the CLI prints
-`Interrupted.`); Ctrl+C, Ctrl+D on an empty line, EOF, or Ctrl+Z then Enter at the prompt exits; slash commands `/help /status /new /exit /quit /model /notebook /clear
-/context /skill /prompt /reload`. `/new` and `/model` share `_new_thread` (`agent.new_thread()`, counters
-reset, session saved): `/model <name>` or `/model <provider>:<name>` refuses an undeclared provider, else
-calls `agent.set_model(name, provider)` and starts exactly one new thread. `/reload` re-reads `.config/hailer`
-and assigns `agent.bundle`; it applies from the next message.
+`<env_key> from env|keyring` or `<env_key> missing (run: uvx hailer login <id>)`. Interactive chat is selected when stdin/stdout are terminals, unless `--plain` is set or
+`TERM` is `dumb`/`unknown`. `--plain` is a global option and also an option on `notebook`.
+
+`chat.py:ChatController` holds shared session, slash-command and notebook operations; `cli.ChatLoop`
+binds its injectable CLI collaborators. Plain mode uses `_LineReader`/`_TurnDisplay`. Explicit plain and
+unsupported terminals use `Console.input` without starting prompt_toolkit; their Rich console also
+disables live status/cursor controls, including during startup and notebook waits.
+
+`chat_ui.py:ChatUI` owns one inline prompt_toolkit application (no alternate screen, mouse capture or CPR),
+a bounded multiline composer, context/activity lines, and a serialized output queue. Rich transcript
+output goes through `run_in_terminal`; log handlers are temporarily routed through the same queue,
+retaining redaction. Bracketed paste stays enabled throughout the live composer and is restored on exit.
+Enter submits once; Alt+Enter inserts a newline; history is in memory. A busy submission leaves the draft
+intact and does not enqueue a request. Ctrl+C cancels active work and awaits cleanup, or exits while idle;
+Ctrl+D exits only empty and idle; Ctrl+Z then Enter exits while idle. `/exit` and `/quit` also exit.
+
+The interactive controller awaits `astart`, `arun_turn`, `anew_thread` and `aclose` on one event loop.
+Blocking notebook operations run off the UI loop. Cancellation sets a cooperative stop flag, stops
+session polling between requests, and waits for the worker before releasing the busy state. Informational
+cell counting has a five-second timeout. User submissions are echoed by the UI; expanded prompts and skill contents are
+sent to the agent without a second transcript echo. Expected errors keep the composer usable.
+
+Slash commands remain `/help /status /new /exit /quit /model /notebook /clear /context /skill /prompt /reload`.
+`/new` and `/model` each reset counters and persist exactly one new thread. Model changes refuse undeclared
+providers. `/reload` assigns a freshly read context bundle for the next turn. Context/model/notebook
+information refreshes on each render; startup reports the agent's actual model/provider rather than stale
+session metadata. `/clear` affects the display only.
 
 Notebook switching (`ChatLoop`): `/notebook` shows the active notebook, folder, `Recent:` (from
 `notebooks.load_recent`, excluding the active one), marimo state, URL, launch command and `NOTEBOOK_USAGE`;
@@ -510,10 +533,11 @@ without opening a browser, at the start of `/notebook` and `/status`: on a chang
 prints `Active notebook is now <name>.` and (turn end only) opens the URL once when the notebook has no session;
 no preamble is queued because the model made the switch itself. `COMMANDS["notebook"]` =
 `Show or switch the active notebook. Usage: /notebook [list | new <name> [--empty] | open <name> | close [name]]`.
-Progress (`_TurnDisplay`): a single Rich status line updated from `AgentEvent`s: `Thinking...`, `Using: <tool>`
+Progress (plain `_TurnDisplay`, interactive `ChatUI.on_event`): a single activity line updated from `AgentEvent`s: `Thinking...`, `Using: <tool>`
 on `tool_call`, `Writing reply...` at the first `message_delta`, the text of a `status` event. Deltas are
 never printed (a model can stream commentary next to its tool calls and then the answer, which printed the
-answer twice); `finish` prints `final_response` once under `Hailer >`, or `(no reply)`. After a turn the CLI
+answer twice); `finish` prints `final_response` once, or `(no reply)`. Interactive answers use Rich Markdown
+under `Hailer`; plain answers retain `Hailer >`. After a turn the CLI
 adds the turn and its tokens to the session file. Errors: print message + hint; exit code 1 when startup
 fails, the REPL carries on after a failed turn; traceback only with `--verbose`.
 

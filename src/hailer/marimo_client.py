@@ -191,17 +191,36 @@ def wait_for_session(
     timeout: float = 90.0,
     *,
     interval: float = 0.5,
+    should_stop: Callable[[], bool] | None = None,
 ) -> MarimoSession | None:
-    """Poll ``/api/sessions`` until the notebook has a kernel session; ``None`` on timeout."""
+    """Poll for a kernel session; return ``None`` on timeout or cooperative cancellation.
+
+    With ``should_stop``, check between requests and at most every 0.1 s while waiting.
+    An in-flight request still finishes under the client's own network timeout.
+    """
     deadline = time.monotonic() + timeout
     while True:
+        if should_stop is not None and should_stop():
+            return None
         try:
-            return client.resolve_session(notebook)
+            session = client.resolve_session(notebook)
         except NoSessionError:
             pass
+        else:
+            return None if should_stop is not None and should_stop() else session
         if time.monotonic() >= deadline:
             return None
-        time.sleep(interval)
+        if should_stop is None:
+            time.sleep(interval)
+            continue
+        next_attempt = min(deadline, time.monotonic() + interval)
+        while True:
+            if should_stop():
+                return None
+            remaining = next_attempt - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.1, remaining))
 
 
 def registry_entry_path(url: str, registry: Path | None = None) -> Path:

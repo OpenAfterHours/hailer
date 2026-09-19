@@ -533,6 +533,57 @@ def test_wait_for_session_none_on_timeout(fake, tmp_path):
     assert mc.wait_for_session(client, nb, timeout=0.3, interval=0.05) is None
 
 
+def test_wait_for_session_cancelled_before_request():
+    class Client:
+        def resolve_session(self, notebook):
+            pytest.fail("a cancelled wait must not start a request")
+
+    assert mc.wait_for_session(Client(), None, should_stop=lambda: True) is None
+
+
+def test_wait_for_session_cancelled_during_long_poll_interval(monkeypatch):
+    stopped = threading.Event()
+    attempts = []
+
+    class Clock:
+        now = 0.0
+        sleeps = []
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.sleeps.append(seconds)
+            self.now += seconds
+            stopped.set()
+
+    class Client:
+        def resolve_session(self, notebook):
+            attempts.append(notebook)
+            raise NoSessionError("not open")
+
+    clock = Clock()
+    monkeypatch.setattr(mc, "time", clock)
+    assert mc.wait_for_session(Client(), None, timeout=60, interval=30, should_stop=stopped.is_set) is None
+    assert len(attempts) == 1
+    assert clock.sleeps == [0.1], "cancellation must not wait for the full polling interval"
+
+
+@pytest.mark.parametrize("session_ready", [False, True])
+def test_wait_for_session_cancelled_during_request(monkeypatch, session_ready):
+    stopped = threading.Event()
+
+    class Client:
+        def resolve_session(self, notebook):
+            stopped.set()
+            if session_ready:
+                return MarimoSession("s1", None, None)
+            raise NoSessionError("not open")
+
+    monkeypatch.setattr(mc.time, "sleep", lambda seconds: pytest.fail("no sleep after cancellation"))
+    assert mc.wait_for_session(Client(), None, should_stop=stopped.is_set) is None
+
+
 def test_registry_entry_path_and_removal(tmp_path):
     registry = tmp_path / "servers"
     registry.mkdir()
