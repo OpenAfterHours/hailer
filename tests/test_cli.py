@@ -1582,7 +1582,7 @@ def test_chat_attached_to_a_docker_kernel_runs_as_docker(harness, monkeypatch):
     assert harness.agent_servers == [], "chat-only: the tools discover the server on every call (they follow a restart)"
 
 
-def test_chat_shows_the_network_setting_of_the_kernel_in_use(harness):
+def test_chat_shows_the_network_setting_of_the_kernel_in_use(harness, docker):
     harness.config = docker_config(harness.config)  # hailer.toml: no network
     harness.server = replace(DOCKER_SERVER, network_access=True)
     result = chat()
