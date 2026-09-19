@@ -458,12 +458,39 @@ def live_kernel_error(state: KernelState) -> KernelRuntimeError:
     )
 
 
+def unanswered_kernel_error(state: KernelState) -> KernelRuntimeError:
+    """Why no new server may start while ``state``'s server may still run but does not answer."""
+    if state.runtime == KERNEL_RUNTIME_DOCKER:
+        what = f"A docker kernel Hailer started for this workspace ({', '.join(state.containers) or 'its containers'})"
+    else:
+        what = "A local marimo server Hailer started for this workspace" + (f" (process {state.pid})" if state.pid is not None else "")
+    return KernelRuntimeError(
+        f"{what} may still be running, but it does not answer at {state.url}.",
+        hint=(
+            "It may be busy, stuck or suspended; starting another would orphan it. Wait and run this command "
+            "again, or stop it with uvx hailer kernel stop first."
+        ),
+    )
+
+
 def refuse_live_kernel(workspace: Path, *, probe: Probe | None = None, gone: Callable[[KernelState], bool] | None = None) -> None:
-    """The start guard both runtimes share: ``KernelRuntimeError`` while a server Hailer started for
-    this workspace still answers (starting would replace its record and orphan it)."""
-    state = live_kernel_state(workspace, probe=probe, gone=gone)
-    if state is not None:
+    """The start guard both runtimes share: ``KernelRuntimeError`` while ``kernel.json`` records a
+    server that answers, or one that does not answer but is not provably gone (its process still
+    exists, its containers are still there): a busy or suspended server must not be orphaned by
+    a new start that replaces its record. A record that is provably gone is deleted."""
+    state = read_kernel_state(workspace)
+    if state is None:
+        return
+    if (probe or answers_with_token)(state.url, state.token):
         raise live_kernel_error(state)
+    is_gone = gone if gone is not None else record_is_gone
+    try:
+        dead = is_gone(state)
+    except Exception:  # noqa: BLE001 - uncertain: keep the record, refuse
+        dead = False
+    if not dead:
+        raise unanswered_kernel_error(state)
+    delete_kernel_state(workspace, token=state.token)
 
 
 # --------------------------------------------------------------------------- #
@@ -771,14 +798,23 @@ class LocalKernel(RunningKernel):
         return log_tail(self.log_path, lines, token=self.server.token) if self.log_path is not None else []
 
     def wait(self) -> int:
+        """Until marimo exits or Ctrl+C. When it exits by itself, ``ended`` says so (ended from
+        outside this terminal, or failed; its own output is above)."""
         if self.proc is None:
             return 0
         try:
             while True:
                 try:
-                    return int(self.proc.wait(timeout=0.5))  # a short timeout keeps Ctrl+C deliverable on Windows
+                    code = int(self.proc.wait(timeout=0.5))  # a short timeout keeps Ctrl+C deliverable on Windows
                 except subprocess.TimeoutExpired:
                     continue
+                self.ended = (
+                    "marimo shut itself down."
+                    if code == 0
+                    else f"marimo stopped (exit code {code}): it was ended from outside this terminal (uvx hailer kernel "
+                    "stop, Task Manager or kill), or it failed; its own output is above."
+                )
+                return code
         except KeyboardInterrupt:
             # marimo got the Ctrl+C too and shuts down by itself (its stdin is not a terminal).
             try:
@@ -967,7 +1003,7 @@ def runtime_for(config: HailerConfig, runner: Any = None) -> KernelRuntime:
 
         return DockerRuntime(config, runner=runner)
     raise ConfigError(
-        f"Unknown kernel runtime {runtime!r}.",
+        f'Unknown kernel runtime "{runtime}".',
         hint='Set [kernel] runtime to "local" or "docker" in hailer.toml (or HAILER_KERNEL).',
     )
 

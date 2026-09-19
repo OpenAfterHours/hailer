@@ -4,7 +4,10 @@
 containers and networks the way Docker 29 does: each gets an id when it is created (``run -d``,
 ``create`` and ``network create`` print it), names are unique, ``--filter label=...`` narrows
 ``ps`` and ``network ls``, and removing something that is not there answers like Docker (``rm -f``
-exits 0 with "No such container" on stderr; ``network rm`` exits 1 with "not found").
+exits 0 with "No such container" on stderr; ``network rm`` exits 1 with "not found"). A container
+in state ``removing`` answers ``rm -f`` with "removal ... is already in progress" (and is then
+gone); ``network_busy`` makes the next N ``network rm`` calls answer "has active endpoints"
+(containers still detaching), as when ``kernel stop`` races another terminal's cleanup.
 
 ``fail`` maps an argv prefix to (exit code, stderr); ``timeout`` holds argv prefixes that time out;
 ``stream_hook`` is called with the argv inside :meth:`stream` (e.g. to raise KeyboardInterrupt).
@@ -76,6 +79,7 @@ class FakeDocker:
         self.fail: dict[tuple[str, ...], tuple[int, str]] = {}
         self.timeout: set[tuple[str, ...]] = set()
         self.stream_hook = None
+        self.network_busy = 0
         self.calls: list[list[str]] = []
         self.streams: list[list[str]] = []
         self._created = 0
@@ -182,8 +186,10 @@ class FakeDocker:
             network = self.network(args[2])
             if network is None:
                 return self._done(args, 1, "", f"Error response from daemon: network {args[2]} not found\nexit status 1")
-            if any(network.id in c.networks and c.state == "running" for c in self.containers.values()):
-                return self._done(args, 1, "", f"Error response from daemon: error while removing network: network {network.name} has active endpoints")
+            busy = any(network.id in c.networks and c.state == "running" for c in self.containers.values())
+            if busy or self.network_busy > 0:
+                self.network_busy = max(0, self.network_busy - 1)
+                return self._done(args, 1, "", f"Error response from daemon: error while removing network: network {network.name} id {network.id} has active endpoints")
             del self.networks[network.id]
             return self._done(args, 0, args[2] + "\n")
         if head in ("run", "create"):
@@ -207,14 +213,19 @@ class FakeDocker:
         if head == "rm":
             refs = [a for a in args[1:] if not a.startswith("-")]
             out, err = [], []
+            code = 0
             for ref in refs:
                 container = self.container(ref)
                 if container is None:
                     err.append(f"Error response from daemon: No such container: {ref}")
+                elif container.state == "removing":  # another command is removing it right now
+                    del self.containers[container.id]
+                    err.append(f"Error response from daemon: removal of container {ref} is already in progress")
+                    code = 1
                 else:
                     del self.containers[container.id]
                     out.append(ref)
-            return self._done(args, 0, "".join(f"{line}\n" for line in out), "\n".join(err))
+            return self._done(args, code, "".join(f"{line}\n" for line in out), "\n".join(err))
         if head == "inspect":
             return self._inspect(args)
         if head == "logs":
@@ -250,10 +261,20 @@ class FakeDocker:
 
     def _inspect(self, args: list[str]) -> subprocess.CompletedProcess[str]:
         rest = args[1:]
-        if rest[:2] == ["--type", "container"]:
-            rest = rest[2:]
+        kind = "container"
+        if rest[:1] == ["--type"]:
+            kind, rest = rest[1], rest[2:]
         fmt, refs = rest[1], rest[2:]
         out, missing = [], []
+        if kind == "network":
+            for ref in refs:
+                network = self.network(ref)
+                if network is None:
+                    missing.append(ref)
+                else:
+                    out.append(fmt.replace("{{.Id}}", network.id))
+            err = "\n".join(f"Error response from daemon: network {ref} not found" for ref in missing)
+            return self._done(args, 1 if missing else 0, "".join(f"{line}\n" for line in out), err)
         for ref in refs:
             c = self.container(ref)
             if c is None:

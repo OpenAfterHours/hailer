@@ -248,7 +248,27 @@ def test_the_start_guard_names_the_live_server(tmp_path):
     with pytest.raises(KernelRuntimeError) as exc:
         k.refuse_live_kernel(tmp_path, probe=answers((LIVE, TOKEN)))
     assert "local marimo server" in str(exc.value) and "uvx hailer kernel stop" in exc.value.hint
-    k.refuse_live_kernel(tmp_path, probe=answers(), gone=lambda s: False)  # not live: fine
+    k.refuse_live_kernel(tmp_path, probe=answers(), gone=lambda s: True)  # provably gone: fine, and dropped
+    assert k.read_kernel_state(tmp_path) is None
+
+
+@pytest.mark.parametrize("foreground", [False, True])
+def test_a_server_that_does_not_answer_but_is_not_gone_is_never_orphaned(tmp_path, monkeypatch, foreground):
+    """A busy or suspended server: its process still exists, so a new start must not replace its record."""
+    monkeypatch.setattr(k, "process_running", lambda pid: True)
+    state = k.KernelState(runtime="local", url=LIVE, port=2718, token="theirs", pid=4321)
+    k.write_kernel_state(tmp_path, state)
+    procs = Procs()
+    with pytest.raises(KernelRuntimeError) as exc:
+        runtime(tmp_path, procs).start(2720, foreground=foreground)
+    assert str(exc.value) == (
+        f"A local marimo server Hailer started for this workspace (process 4321) may still be running, but it does not answer at {LIVE}."
+    )
+    assert "busy, stuck or suspended" in exc.value.hint and "uvx hailer kernel stop" in exc.value.hint
+    assert procs.calls == [] and k.read_kernel_state(tmp_path) == state
+    monkeypatch.setattr(k, "process_running", lambda pid: None)  # the OS cannot say: still refused
+    with pytest.raises(KernelRuntimeError):
+        runtime(tmp_path, procs).prepare(say=pytest.fail)
 
 
 # --------------------------------------------------------------------------- #
@@ -440,8 +460,11 @@ def test_foreground_start_attaches_to_this_terminal(tmp_path):
     assert kind == "attach" and "--headless" in cmd and stdin_text == TOKEN and "OPENAI_API_KEY" not in env
     assert running.log_hint == "this terminal" and running.log_tail() == []
     assert k.read_kernel_state(tmp_path).url == "http://127.0.0.1:2720"
-    procs.proc.returncode = 0  # marimo exits (Ctrl+C in its terminal)
-    assert running.wait() == 0
+    procs.proc.returncode = 0  # marimo exits by itself (the shutdown button)
+    assert running.wait() == 0 and running.ended == "marimo shut itself down."
+    procs.proc.returncode = 1  # ended from outside: kernel stop in another terminal, Task Manager
+    assert running.wait() == 1
+    assert running.ended.startswith("marimo stopped (exit code 1): it was ended from outside this terminal (uvx hailer kernel stop")
     running.stop()
     assert k.read_kernel_state(tmp_path) is None
 

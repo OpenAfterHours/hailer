@@ -28,10 +28,19 @@ Where the implementation differs from the plan:
 - **Mount-layout rules (new).** Section 4.4's "never mounted" list assumed the default layout. A notebooks
   folder equal to the workspace let notebook code rewrite `hailer.toml` back to `local`, so docker mode now
   refuses a notebooks or data folder that is, or contains, a drive root, the home folder, the workspace,
-  `.hailer`, the config file or the context, skills and prompts folders; the notebooks folder may not sit
-  inside those either, and the data folder may not sit inside the notebooks folder. UNC paths are an error
-  (mapped network drives stay a warning), and `marimo_url` cannot be combined with docker. Checked by
-  `validate` and again before every start (`config.docker_mount_problems`).
+  `.hailer`, the config file or the context, skills and prompts folders, or that is, contains or sits inside
+  a credential folder (`~/.config`, `~/.ssh`, `~/.aws`, `~/.azure`, `~/.gnupg`, `~/.docker`, `~/.kube`,
+  `%APPDATA%`, `%LOCALAPPDATA%`); the notebooks folder may not sit inside Hailer's folders either, and the
+  data folder may not sit inside the notebooks folder. UNC paths are an error (mapped network drives stay a
+  warning), and `marimo_url` cannot be combined with docker. All of these live in one function,
+  `config.docker_mount_problems`, which `validate` reports and every start runs again (`--foreground`, which
+  never validates, once started a kernel whose "read-only" data sat in the writable notebooks mount).
+- **Files that run code later (new).** Notebook code can write `.git` (hooks, `core.fsmonitor`),
+  `.vscode`, `.idea`, `.devcontainer` or `hailer.toml` into the notebooks folder, which git, editors (VS Code
+  scans nested repositories) or Hailer would act on later. A notebooks folder that already is a git
+  repository is refused in docker mode; when a docker kernel stops (chat end, `--foreground` end,
+  `kernel stop`) and in `doctor`, Hailer names any of these at the top of the folder in a loud warning.
+  Nothing is removed for the user.
 - **`kernel.json` records ids and settings.** Besides names and the image it holds the container and
   network ids Docker printed, and the settings the kernel was started with (network, mounts, memory,
   cpus). Everything is removed and inspected by id, so an old handle cannot remove a newer kernel that
@@ -39,7 +48,13 @@ Where the implementation differs from the plan:
 - **Leftovers are never removed while running.** Section 4.5 had a start remove containers that fail the
   health and token check and start fresh. A start now refuses instead when a kernel container it has no
   working record of is still running (a probe that got it wrong must not destroy a kernel in use), and
-  points at `uvx hailer kernel stop`. Stopped leftovers are still cleaned up.
+  points at `uvx hailer kernel stop`. It also refuses while the recorded kernel, docker or local, does not
+  answer but is not provably gone (containers or process still there: busy, stuck, suspended), and keeps the
+  record, which is only deleted once it is provably gone or the cleanup succeeded. Stopped leftovers are
+  still cleaned up. `kernel stop` racing another terminal's cleanup treats "removal ... already in
+  progress" as done, retries a network whose containers are still detaching, and checks what is really
+  left before reporting a failure; only object-specific "not found" answers count as gone (a broken docker
+  context is reported as Docker not reachable).
 - **Reuse only with the same settings.** `uvx hailer notebook` refuses a kept kernel started with other
   folders, network, image, memory or cpus (`The running kernel was started with other settings (...)`,
   with the stop hint); chat-only `uvx hailer` attaches with a warning. The network setting the prompt and
@@ -71,7 +86,8 @@ Where the implementation differs from the plan:
   leaving the folder (first 5,000 entries). A `runtime` key that lands under `[model]` or `[hailer]` (the
   `[kernel]` line still commented out) is a warning naming the fix, and `init --kernel` says so when it
   kept an existing `hailer.toml`.
-- **`--foreground` says why it ended**: out of memory, removed from outside, or the exit code.
+- **`--foreground` says why it ended**: out of memory, removed from outside, or the exit code (the local
+  runtime too: `marimo stopped (exit code N): it was ended from outside this terminal ...`).
   `uvx hailer kernel stop` stops a kept server of either runtime, reports what it removed, says when Docker
   is not running, and exits 1 when a removal failed.
 - **The agent's tools know the kernel.** `marimo_status` reports the runtime and the kernel paths, and

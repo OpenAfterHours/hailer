@@ -1487,6 +1487,7 @@ def docker(harness, monkeypatch):
 
     monkeypatch.setattr(cli, "_runtime_for", runtime_for)
     monkeypatch.setattr(cli, "_docker_runner", lambda: fake)
+    monkeypatch.setattr(kernel_docker, "_sleep", lambda seconds: None)  # network rm retries
     monkeypatch.setattr(kernel_mod, "answers_with_token", no_server)  # a test that needs a live server patches it again
     monkeypatch.setattr(kernel_docker, "answers_with_token", no_server)
     return fake
@@ -2037,3 +2038,110 @@ def test_init_kernel_flag_with_an_existing_config(harness, tmp_path, monkeypatch
     assert result.exit_code == 0 and load_config(workspace=ws, env={}).kernel.runtime == "docker"
     result = init_cmd(tmp_path / "other", "--kernel", "vm")
     assert result.exit_code == 2 and not (tmp_path / "other" / "hailer.toml").exists()
+
+
+# --------------------------------------------------------------------------- #
+# Final fix pass: one rule set on every start path, planted files, status, wording
+# --------------------------------------------------------------------------- #
+
+
+def test_foreground_refuses_data_inside_the_notebooks_folder(harness, nb, docker):
+    """--foreground never runs validate(): the start itself refuses, before any container, instead of
+    starting a kernel whose "read-only" data sits in the writable notebooks mount."""
+    config = docker_config(harness.config)
+    harness.config = replace(config, data_dir=config.notebooks_root / "data")
+    result = notebook_cmd(["--foreground", "--no-browser"])
+    assert result.exit_code == 1
+    assert f"[hailer].data_dir ({config.notebooks_root / 'data'}) is inside the notebooks folder" in result.output
+    assert not docker.commands("run") and not docker.commands("network", "create") and not docker.streams
+
+
+def test_foreground_refuses_a_notebooks_folder_that_is_a_git_repository(harness, nb, docker):
+    harness.config = docker_config(harness.config)
+    (harness.config.notebooks_root / ".git").mkdir()
+    result = notebook_cmd(["--foreground", "--no-browser"])
+    assert result.exit_code == 1 and "is a git repository (it has .git at its top level)" in result.output
+    assert not docker.commands("run")
+
+
+def test_a_chat_that_stops_its_docker_kernel_warns_about_planted_files(harness, nb, docker):
+    def plant():
+        (harness.config.notebooks_root / ".vscode").mkdir(exist_ok=True)  # what notebook code could do
+        (harness.config.notebooks_root / ".git").mkdir(exist_ok=True)
+
+    harness.agent.on_turn = plant
+    result = notebook_cmd(["--kernel", "docker"], input_text="hi\n/exit\n")
+    assert result.exit_code == 0, result.output
+    stopped = result.output.index("Stopped marimo.")
+    warning = f"WARNING: the notebooks folder {harness.config.notebooks_root} has .git, .vscode at its top level."
+    assert warning in result.output[stopped:], result.output
+    assert "delete them before you run git in that folder, open it in an editor" in result.output
+
+
+def test_foreground_end_warns_about_planted_files(harness, nb, docker):
+    def plant_then_ctrl_c(args):
+        if args[:2] == ["logs", "-f"]:
+            (harness.config.notebooks_root / ".devcontainer").mkdir()
+            raise KeyboardInterrupt
+
+    docker.stream_hook = plant_then_ctrl_c
+    result = notebook_cmd(["--kernel", "docker", "--foreground", "--no-browser"])
+    assert result.exit_code == 0, result.output
+    assert f"WARNING: the notebooks folder {harness.config.notebooks_root} has .devcontainer at its top level." in result.output
+
+
+def test_kernel_stop_prints_the_planted_files_warning(harness, docker):
+    from hailer.kernel import KernelState, write_kernel_state
+    from hailer.kernel_docker import docker_names
+
+    names = docker_names(harness.config.workspace)
+    kernel_c = docker.add_container(names.kernel, workspace=str(harness.config.workspace))
+    write_kernel_state(
+        harness.config.workspace,
+        KernelState(
+            runtime="docker", url="http://127.0.0.1:2731", port=2731, token=TOKEN, containers=(names.kernel,), container_ids=(kernel_c.id,),
+            mounts=((str(harness.config.notebooks_root), "/work/notebooks"), (str(harness.config.data_dir), "/work/data")),
+        ),
+    )  # fmt: skip
+    (harness.config.notebooks_root / ".idea").mkdir()
+    result = runner.invoke(cli.app, ["kernel", "stop"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    assert f"WARNING: the notebooks folder {harness.config.notebooks_root} has .idea at its top level." in result.output
+
+
+def test_a_local_foreground_server_ended_from_outside_says_so(harness, nb):
+    nb.foreground_proc = ForegroundProc(exit_code=1)  # e.g. `uvx hailer kernel stop` in another terminal
+    result = notebook_cmd(["--foreground", "--no-browser"])
+    assert result.exit_code == 1
+    assert "marimo stopped (exit code 1): it was ended from outside this terminal (uvx hailer kernel stop" in result.output
+
+
+def test_status_shows_the_kernel_in_use_even_when_its_health_check_is_slow(harness, monkeypatch):
+    """status attached through the health-gated session check: a busy server flipped the Kernel line."""
+    harness.server = replace(DOCKER_SERVER, network_access=True)
+    harness.client = FakeClient(healthy=False)  # /health did not answer in time
+    result = runner.invoke(cli.app, ["status"], catch_exceptions=False)
+    assert "Kernel:     docker (hailer-kernel " in result.output and "network on: the internet and this machine" in result.output
+
+
+def test_kernel_flag_values_are_quoted_like_other_messages(harness, nb):
+    result = notebook_cmd(["--kernel", "podman"])
+    assert result.exit_code == 2 and '--kernel must be "local" or "docker", not "podman".' in result.output
+
+
+def test_doctor_fails_a_unc_data_folder_with_the_start_wording(harness, docker, monkeypatch):
+    """doctor showed WARN while a start refused: same rule, same wording, FAIL."""
+    import hailer.config as config_module
+    from hailer import kernel_docker
+    from hailer.config import docker_mount_problems
+
+    monkeypatch.setattr(config_module, "_on_windows", lambda: True)
+    monkeypatch.setattr(kernel_docker, "_on_windows", lambda: True)
+    monkeypatch.setattr(cli, "_validate_config", docker_mount_problems)  # validate()'s own checks would wait on the share
+    share = Path(r"\\fileserver\team\sales")
+    harness.config = replace(docker_config(harness.config), data_dir=share)
+    result = runner.invoke(cli.app, ["doctor"], catch_exceptions=False, env={"COLUMNS": "400"})
+    assert result.exit_code == 1
+    lines = result.output.splitlines()
+    assert any(" config " in line and "FAIL" in line and "is on a network share (UNC path), which Docker" in line for line in lines), result.output
+    assert not any(line.lstrip("│| ").startswith("data ") for line in lines), "no second row saying something else"

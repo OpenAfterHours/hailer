@@ -18,16 +18,19 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
 from hailer import __version__, kernel_image
+from hailer.config import is_unc_path
 from hailer.errors import HailerError, KernelRuntimeError
 from hailer.kernel import (
     KERNEL_DATA_DIR,
@@ -47,6 +50,7 @@ from hailer.kernel import (
     live_kernel_state,
     new_token,
     note_kernel_start,
+    process_running,
     read_kernel_state,
     refuse_live_kernel,
     write_kernel_state,
@@ -80,8 +84,22 @@ DOCKER_NOT_RUNNING = "Docker is not running."
 #: What docker says when an image cannot be downloaded because the registry does not have it (or
 #: will not show it to this user): the release that publishes it has not happened yet.
 _UNPUBLISHED_SIGNS = ("denied", "not found", "manifest unknown", "unauthorized", "does not exist")
-#: What docker says about an object that is not there (a removal that has nothing left to do).
-_MISSING_SIGNS = ("no such container", "no such network", "no such object", "not found")
+#: What docker says about an object that is not there (a removal that has nothing left to do):
+#: object-specific wording only. A bare "not found" would also match a broken docker context
+#: ("context not found"), which must never count as "already removed".
+_MISSING_SIGNS = ("no such container", "no such network", "no such object")
+_MISSING_NETWORK_RE = re.compile(r"\bnetwork \S+ not found")
+#: What docker says when another command is removing the same container right now.
+_REMOVAL_IN_PROGRESS = "already in progress"
+#: What docker says when a network still has containers attached (they are being removed).
+_ACTIVE_ENDPOINTS = "active endpoints"
+#: How often, and how far apart, ``network rm`` is retried while containers are still detaching.
+NETWORK_RM_RETRIES = 6
+NETWORK_RM_RETRY_SEC = 0.5
+#: Files at the top of the notebooks folder that make other programs run code on this machine
+#: (git hooks and settings, editor and dev-container settings) or mark another workspace. The
+#: docker kernel can write them there, so they are reported (never removed) when a kernel stops.
+PLANTABLE_FILES = (".git", ".vscode", ".idea", ".devcontainer", "hailer.toml")
 #: Container states that mean "running" for the leftover rule (a paused kernel still holds its work).
 _RUNNING_STATES = ("running", "restarting", "paused", "removing")
 
@@ -115,6 +133,11 @@ def docker_not_installed() -> KernelRuntimeError:
 
 def docker_not_running(detail: str = "") -> KernelRuntimeError:
     hint = "Start Docker Desktop (or the Docker service), wait until it is running, and run the command again."
+    if "context" in detail.lower():  # DOCKER_CONTEXT or `docker context use` names a context that does not work
+        hint = (
+            "The docker command cannot reach an engine through its current context: check DOCKER_CONTEXT and "
+            "`docker context ls` (`docker context use default` switches back), then run the command again."
+        )
     if detail:
         hint += f"\n{detail}"
     return KernelRuntimeError(DOCKER_NOT_RUNNING, hint=hint)
@@ -127,10 +150,14 @@ def docker_said(result: subprocess.CompletedProcess[str]) -> str:
     return ("docker said: " + " / ".join(lines[-3:])) if lines else ""
 
 
+def _said(result: subprocess.CompletedProcess[str]) -> str:
+    return f"{result.stderr or ''}\n{result.stdout or ''}".lower()
+
+
 def _missing(result: subprocess.CompletedProcess[str]) -> bool:
     """True when docker failed because the object is not there (nothing left to remove)."""
-    text = f"{result.stderr or ''}\n{result.stdout or ''}".lower()
-    return any(sign in text for sign in _MISSING_SIGNS)
+    text = _said(result)
+    return any(sign in text for sign in _MISSING_SIGNS) or _MISSING_NETWORK_RE.search(text) is not None
 
 
 def _say(text: str) -> None:
@@ -331,18 +358,21 @@ def _links_outside(folder: Path, limit: int = LINK_SCAN_LIMIT) -> list[str]:
 
 
 def folder_problems(
-    folder: Path, what: str, setting: str, *, windows: bool | None = None, drive_type: Callable[[str], int] = _drive_type, links: bool = False
+    folder: Path, what: str, setting: str, *, windows: bool | None = None, drive_type: Callable[[str], int] | None = None, links: bool = False
 ) -> list[str]:
-    """Reasons the kernel container may not see ``folder`` (the ``what`` folder, set by
-    ``setting``), each with its fix (empty: none).
+    """Reasons the kernel container may not see all of ``folder`` (the ``what`` folder, set by
+    ``setting``), each with its fix (empty: none). Warnings only.
 
-    On Windows: a UNC path or a mapped network drive, which Docker Desktop usually cannot mount.
-    With ``links``: symlinks or junctions inside the folder that point outside it, which do not
-    resolve in the container (only the folder itself is mounted).
+    On Windows: a mapped network drive, which Docker Desktop usually cannot mount. (A UNC path is
+    fatal, not a warning: :func:`hailer.config.docker_mount_problems` reports it, so nothing is
+    said here.) With ``links``: symlinks or junctions inside the folder that point outside it,
+    which do not resolve in the container (only the folder itself is mounted).
     """
     text = str(folder)
     if windows if windows is not None else _on_windows():
-        where = network_location(text, drive_type)
+        where = network_location(text, drive_type or _drive_type)
+        if where == UNC_PATH:  # fatal elsewhere, and never walked over the network
+            return []
         if where is not None:  # no link scan: it would walk the share over the network, and the fix is the same
             return [
                 f"The {what} folder {text} is on {where}; Docker Desktop usually cannot mount it. "
@@ -358,9 +388,31 @@ def folder_problems(
     ]
 
 
-def data_path_problems(data_dir: Path, *, windows: bool | None = None, drive_type: Callable[[str], int] = _drive_type) -> list[str]:
+def data_path_problems(data_dir: Path, *, windows: bool | None = None, drive_type: Callable[[str], int] | None = None) -> list[str]:
     """:func:`folder_problems` for the data folder, links included."""
     return folder_problems(data_dir, "data", "[hailer].data_dir", windows=windows, drive_type=drive_type, links=True)
+
+
+def planted_files(notebooks: Path | None) -> list[str]:
+    """The :data:`PLANTABLE_FILES` at the top of the notebooks folder (sorted; empty when none,
+    or when the folder cannot be read)."""
+    if notebooks is None:
+        return []
+    try:
+        return [name for name in PLANTABLE_FILES if os.path.lexists(Path(notebooks) / name)]
+    except OSError:
+        return []
+
+
+def planted_warning(notebooks: Path, names: Sequence[str]) -> str:
+    """The warning for :func:`planted_files` (printed when a docker kernel stops, and by doctor)."""
+    return (
+        f"WARNING: the notebooks folder {notebooks} has {', '.join(names)} at its top level. The docker kernel "
+        "can write there, so treat them as untrusted: git hooks and settings (core.fsmonitor), editor and "
+        "dev-container settings run commands on this machine, and a hailer.toml makes the folder look like "
+        "another workspace. Unless you put them there yourself, delete them before you run git in that folder, "
+        "open it in an editor, or run Hailer from inside it."
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -446,19 +498,42 @@ class Removal:
         self.failed += other.failed
 
 
-def _remove(runner: DockerRunner, kind: str, ident: str, shown: str) -> Removal:
-    """Remove one container (``kind="container"``) or network by id; "not there" counts as gone."""
-    args = ["rm", "-f", ident] if kind == "container" else ["network", "rm", ident]
+#: Waits between ``network rm`` retries; tests replace it.
+_sleep: Callable[[float], None] = time.sleep
+
+
+def _still_there(runner: DockerRunner, kind: str, ident: str) -> bool:
+    """Whether the container or network ``ident`` still exists (True when docker cannot say)."""
     try:
-        result = runner.run(args, timeout=DOCKER_TIMEOUT_SEC)
-    except subprocess.TimeoutExpired:
-        return Removal(failed=[f"{shown}: docker did not answer within {int(DOCKER_TIMEOUT_SEC)} s"])
-    if result.returncode == 0:
-        # `docker rm -f` exits 0 for a container that is not there too; it echoes the ones it removed.
-        if kind == "container" and ident not in (result.stdout or ""):
+        result = runner.run(["inspect", "--type", kind, "--format", "{{.Id}}", ident], timeout=DOCKER_PROBE_TIMEOUT_SEC)
+    except (HailerError, OSError, subprocess.TimeoutExpired):
+        return True
+    return not (result.returncode != 0 and _missing(result))
+
+
+def _remove(runner: DockerRunner, kind: str, ident: str, shown: str) -> Removal:
+    """Remove one container (``kind="container"``) or network by id. "Not there" and "someone else
+    is removing it" count as gone (``kernel stop`` racing the cleanup of the terminal that started
+    the kernel); a network whose containers are still detaching is retried for a few seconds.
+    Before anything is reported as failed, docker is asked whether it is still there."""
+    args = ["rm", "-f", ident] if kind == "container" else ["network", "rm", ident]
+    for attempt in range(NETWORK_RM_RETRIES if kind == "network" else 1):
+        if attempt:
+            _sleep(NETWORK_RM_RETRY_SEC)
+        try:
+            result = runner.run(args, timeout=DOCKER_TIMEOUT_SEC)
+        except subprocess.TimeoutExpired:
+            return Removal(failed=[f"{shown}: docker did not answer within {int(DOCKER_TIMEOUT_SEC)} s"])
+        if result.returncode == 0:
+            # `docker rm -f` exits 0 for a container that is not there too; it echoes the ones it removed.
+            if kind == "container" and ident not in (result.stdout or ""):
+                return Removal(gone=[shown])
+            return Removal(removed=[shown])
+        if _missing(result) or _REMOVAL_IN_PROGRESS in _said(result):
             return Removal(gone=[shown])
-        return Removal(removed=[shown])
-    if _missing(result):
+        if _ACTIVE_ENDPOINTS not in _said(result):
+            break
+    if not _still_there(runner, kind, ident):
         return Removal(gone=[shown])
     return Removal(failed=[f"{shown}: {docker_said(result) or f'exit code {result.returncode}'}"])
 
@@ -480,6 +555,18 @@ class DockerKernel(RunningKernel):
             if known == ident:
                 return name
         return ident[:12]
+
+    @property
+    def notebooks_folder(self) -> Path | None:
+        """The host folder this kernel had mounted as its notebooks folder."""
+        paths = self.server.paths
+        if paths is None:
+            return None
+        return next((Path(host) for host, kernel in paths.mounts if kernel == KERNEL_NOTEBOOKS_DIR), None)
+
+    def planted(self) -> list[str]:
+        """:func:`planted_files` in this kernel's notebooks folder (checked when it stops)."""
+        return planted_files(self.notebooks_folder)
 
     def remove(self) -> Removal:
         """Remove this kernel's containers, then its network, by id. Raises only what the runner
@@ -644,8 +731,10 @@ class DockerRuntime:
 
     def check(self) -> list[Check]:
         """Rows ``kernel``, ``docker`` (CLI, engine, version), ``image`` (present, version),
-        ``data`` (path warnings) and, when Docker may not see it, ``notebooks``. An image that is
-        not downloaded yet is only a warning: ``prepare`` downloads it."""
+        ``data`` (path warnings) and, when there is something to say, ``notebooks`` (Docker may not
+        see it; files at its top that other programs run code from). An image that is not
+        downloaded yet is only a warning: ``prepare`` downloads it. The layouts that are never
+        mounted are ``config`` problems (:func:`hailer.config.docker_mount_problems`)."""
         rows = [Check("kernel", True, self.describe(), fatal=False)]
         try:
             version = self.engine_version()
@@ -654,10 +743,16 @@ class DockerRuntime:
         else:
             rows.append(Check("docker", True, f"Docker {version} (Linux engine)", fatal=False))
             rows.append(self._image_check())
-        rows.append(self._data_check())
+        data = self._data_check()
+        if data is not None:
+            rows.append(data)
         notebooks = folder_problems(self.config.notebooks_root, "notebooks", "[hailer].notebooks_dir")
         if notebooks:
             rows.append(Check("notebooks", False, "the container may not see the notebooks folder", hint="\n".join(notebooks), fatal=False))
+        planted = planted_files(self.config.notebooks_root)
+        if planted and ".git" not in planted:  # .git: the config row already refuses the folder
+            summary = f"{', '.join(planted)} at the top of the notebooks folder"
+            rows.append(Check("notebooks", False, summary, hint=planted_warning(self.config.notebooks_root, planted), fatal=False))
         return rows
 
     def _image_check(self) -> Check:
@@ -678,7 +773,9 @@ class DockerRuntime:
             return Check("image", False, str(err), hint=err.hint)
         return Check("image", True, f"{self.image} (Hailer {found})", fatal=False)
 
-    def _data_check(self) -> Check:
+    def _data_check(self) -> Check | None:
+        if _on_windows() and is_unc_path(self.config.data_dir):
+            return None  # fatal, and said once: the config row (docker_mount_problems) refuses it
         problems = data_path_problems(self.config.data_dir)
         if problems:
             return Check("data", False, "the container may not see all of the data folder", hint="\n".join(problems), fatal=False)
@@ -778,23 +875,12 @@ class DockerRuntime:
         return self._download()
 
     def mount_problems(self) -> list[str]:
-        """Why the notebooks or data folder must not be mounted (empty: both are fine): folders
-        that expose Hailer's own files, the home folder or a drive (see
-        :func:`hailer.config.docker_mount_problems`), and UNC paths, which Docker cannot mount."""
+        """Why the notebooks or data folder must not be mounted (empty: both are fine). Every rule
+        lives in :func:`hailer.config.docker_mount_problems`, which ``validate()`` reports too;
+        this runs on every start path, ``--foreground`` included (it never validates)."""
         from hailer.config import docker_mount_problems  # lazy: config does not import the runtimes
 
-        problems = docker_mount_problems(self.config)
-        if _on_windows():
-            for folder, what, setting in (
-                (self.config.notebooks_root, "notebooks", "[hailer].notebooks_dir"),
-                (self.config.data_dir, "data", "[hailer].data_dir"),
-            ):
-                if network_location(folder, lambda root: 0) == UNC_PATH:
-                    problems.append(
-                        f"The {what} folder {folder} is on a network share (UNC path), which Docker cannot mount. "
-                        f"Copy it to a folder on a local disk and point {setting} at it."
-                    )
-        return problems
+        return docker_mount_problems(self.config, windows=_on_windows())
 
     def _check_mounts(self) -> None:
         problems = self.mount_problems()
@@ -1026,11 +1112,11 @@ class DockerRuntime:
         if not self._prepared:
             self.prepare()
         self._check_mounts()
-        refuse_live_kernel(workspace, probe=self._probe, gone=self._gone)
-        delete_kernel_state(workspace)  # not live (checked just now): a stale record at most
-        leftovers = self.remove_leftovers()
+        refuse_live_kernel(workspace, probe=self._probe, gone=self._gone)  # drops a record that is provably gone
+        leftovers = self.remove_leftovers()  # refuses a running kernel it has no working record of
         if leftovers.failed:
             raise KernelRuntimeError("Docker could not remove what an earlier kernel left behind.", hint="\n".join(leftovers.failed))
+        delete_kernel_state(workspace)  # only now: whatever an old record named has been removed
         for folder in (config.notebooks_root, config.data_dir):
             try:
                 folder.mkdir(parents=True, exist_ok=True)  # before Docker creates a missing one owned by root
@@ -1111,10 +1197,12 @@ class DockerRuntime:
 
 @dataclass
 class StopReport:
-    """What ``uvx hailer kernel stop`` did (``done``) and what it could not do (``failed``)."""
+    """What ``uvx hailer kernel stop`` did (``done``), what it could not do (``failed``) and what
+    the user must look at now (``warnings``: files a docker kernel may have planted)."""
 
     done: list[str] = field(default_factory=list)
     failed: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
 def _removed_line(outcome: Removal, url: str) -> str:
@@ -1148,9 +1236,12 @@ def stop_workspace_kernels(
         docker_error = err
     report = StopReport()
     state = read_kernel_state(workspace)
+    docker_notebooks: Path | None = None  # the notebooks folder a docker kernel had mounted, when one was stopped
     if state is not None and state.runtime == KERNEL_RUNTIME_DOCKER:
+        stopped = docker._kernel(state.server(), state)
+        docker_notebooks = stopped.notebooks_folder or config.notebooks_root
         if docker_error is None:
-            outcome = docker._kernel(state.server(), state).remove()
+            outcome = stopped.remove()
             if not outcome.failed:
                 delete_kernel_state(workspace, token=state.token)
             report.done.append(_removed_line(outcome, state.url))
@@ -1168,7 +1259,13 @@ def stop_workspace_kernels(
             report.done.append(f"Stopped the local marimo server at {state.url}{process}.")
         else:
             delete_kernel_state(workspace)
-            report.done.append(f"Removed the record of a marimo server that no longer answers ({state.url}).")
+            line = f"Removed the record of a marimo server that no longer answers ({state.url})."
+            if state.pid is not None and process_running(state.pid):
+                line += (
+                    f" Process {state.pid} is still running: if it is that server (stuck or suspended), end it "
+                    "yourself (Task Manager, or kill); Hailer does not end a process it cannot identify."
+                )
+            report.done.append(line)
     if docker_error is None:
         try:
             leftovers = docker.remove_leftovers(running=True)
@@ -1177,7 +1274,11 @@ def stop_workspace_kernels(
         else:
             if leftovers.removed:
                 report.done.append("Removed " + ", ".join(leftovers.removed) + ".")
+                docker_notebooks = docker_notebooks or config.notebooks_root
             report.failed += [f"Could not remove {failure}" for failure in leftovers.failed]
+    planted = planted_files(docker_notebooks)
+    if planted and docker_notebooks is not None:
+        report.warnings.append(planted_warning(docker_notebooks, planted))
     elif str(docker_error) == DOCKER_NOT_RUNNING:
         report.done.append(
             "Docker is not running, so containers an earlier docker kernel may have left were not checked "

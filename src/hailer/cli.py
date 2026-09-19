@@ -1333,7 +1333,7 @@ def _kernel_choice(console: Console, value: str | None) -> str | None:
         return None
     choice = value.strip().lower()
     if choice not in VALID_KERNEL_RUNTIMES:
-        console.print(f'--kernel must be "local" or "docker", not {value!r}.', style="red", markup=False)
+        console.print(f'--kernel must be "local" or "docker", not "{value}".', style="red", markup=False)
         raise typer.Exit(code=2)
     return choice
 
@@ -1403,6 +1403,18 @@ def _run_foreground(console: Console, config: HailerConfig, runtime: Any, port: 
         return code
     finally:
         running.stop()
+        _warn_about_planted_files(console, running)
+
+
+def _warn_about_planted_files(console: Console, running: Any) -> None:
+    """After a docker kernel stopped: files at the top of its notebooks folder that git or an
+    editor would run code from (the kernel could write them there). Loud, and never removed."""
+    planted = getattr(running, "planted", None)
+    names = planted() if callable(planted) else []
+    if names:
+        from hailer.kernel_docker import planted_warning
+
+        console.print(planted_warning(running.notebooks_folder, names), style="bold red", markup=False)
 
 
 def _wait_for_notebook(console: Console, config: HailerConfig, server: MarimoServer, *, open_browser: bool) -> None:
@@ -1515,6 +1527,7 @@ def notebook(
             else:
                 running.stop()
                 console.print("Stopped marimo.", markup=False)
+                _warn_about_planted_files(console, running)
 
 
 @app.command("exec")
@@ -1565,8 +1578,10 @@ def status(ctx: typer.Context) -> None:
     opts = _opts(ctx)
     console = console_factory()
     config = _config_or_exit(console, opts)
+    # Like doctor: the kernel in use, found without the health-gated session check (a busy server
+    # must not flip the Kernel line back to hailer.toml's settings).
+    config = _attach_runtime(config, _discovered_server(config))
     server, session, err = _marimo_state(config)
-    config = _attach_runtime(config, server)
     _startup_panel(console, config)
     try:
         provider = config.provider
@@ -1745,6 +1760,8 @@ def kernel_stop(ctx: typer.Context) -> None:
         console.print(line, markup=False)
     for line in report.failed:
         console.print(line, style="red", markup=False)
+    for line in report.warnings:
+        console.print(line, style="bold red", markup=False)
     if report.failed:
         raise typer.Exit(code=1)
 

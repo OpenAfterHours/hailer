@@ -147,7 +147,8 @@ def find_workspace(start: Path | None = None) -> Path      # cwd or first parent
 def find_config_path(workspace: Path, explicit: Path | None = None, env: Mapping[str, str] = os.environ) -> Path | None
 def load_config(workspace: Path | None = None, config_path: Path | None = None, env: Mapping[str, str] = os.environ) -> HailerConfig
 def validate(config: HailerConfig) -> list[str]            # human-readable problems, empty if fine
-def docker_mount_problems(config: HailerConfig) -> list[str]   # why the notebooks/data folder must not be mounted into a docker kernel (below)
+def docker_mount_problems(config: HailerConfig, *, windows: bool | None = None) -> list[str]   # every docker-mode layout rule (below)
+def is_unc_path(path) -> bool                              # \\server\share\... or \\?\UNC\...
 def config_template(kernel: str | None = None) -> str      # DEFAULT_CONFIG_TEMPLATE; kernel="local"|"docker" switches its [kernel] section on with that runtime
 def write_default_config(path: Path, *, overwrite: bool = False, kernel: str | None = None) -> None
 ```
@@ -180,18 +181,28 @@ overrides it, then `--kernel` in the CLI; stored lower-cased), `image` (`HAILER_
 `pass_env` (list of names, local runtime only). A wrong type is a `ConfigError` that quotes the value as
 written (`must be a number, not "2" (str)`). `validate` adds: `runtime` known, `memory` matches
 `<number>[b|k|m|g]` above 0, `cpus > 0`, `pass_env` entries are names; and with `runtime = "docker"`:
-`pass_env` set → warning (docker gets no host variables), `marimo_url` set → fatal, `data_dir` inside the
-notebooks folder → fatal, plus every `docker_mount_problems` entry (fatal). A key from `_KNOWN_KERNEL` found
+`pass_env` set → warning (docker gets no host variables), `marimo_url` set → fatal, plus every
+`docker_mount_problems` entry (fatal); with `runtime = "local"`: a `pass_env` name that is a provider's
+`env_key` or `env_http_headers` variable, `OPENAI_API_KEY` or `HAILER_MARIMO_TOKEN` → warning. The older
+"notebooks folder is the workspace itself" warning is left out in docker mode (the fatal rule says it once).
+Kernel runtime values are quoted with double quotes (`Unknown kernel runtime "podman".`, `--kernel must be
+"local" or "docker", not "podman".`). A key from `_KNOWN_KERNEL` found
 under `[hailer]` or `[model]` (an uncommented `runtime` whose `[kernel]` line is still commented out) is a
 warning naming the fix, not "unknown key". The CLI's `config` row turns warnings into a warning row, so
 they show at session start too.
 
-`docker_mount_problems(config)` (one message per folder, each with its fix): neither the notebooks folder
-nor the data folder may be, or contain, a drive root, `Path.home()`, the workspace, `<workspace>/.hailer`,
-`config.config_path`, `context_dir`, `skills_dir` or `prompts_dir` ("is" / "contains", compared resolved and
-by `os.path.samefile`); the notebooks folder (writable) may not sit inside `.hailer` or those three folders
-either. `validate` runs it for docker configs; `DockerRuntime` runs it again before a start, because
-environment variables can move the folders.
+`docker_mount_problems(config, *, windows=None)` is the one place for every docker-mode layout rule (at
+most one message per folder, each with its fix), in this order per folder: Windows UNC path ("The data
+folder \\server\share\sales is on a network share (UNC path), which Docker cannot mount. ..."; checked first,
+nothing touches the share); a drive root; is or contains `Path.home()`, the workspace, `<workspace>/.hailer`,
+`config.config_path`, `context_dir`, `skills_dir` or `prompts_dir` (compared resolved and by
+`os.path.samefile`); is, contains or sits inside a credential folder (`CREDENTIAL_FOLDERS` under home:
+`.config`, `.ssh`, `.aws`, `.azure`, `.gnupg`, `.docker`, `.kube`; on Windows also `%APPDATA%` and
+`%LOCALAPPDATA%`; "sits inside" does not apply within `tempfile.gettempdir()`); for the notebooks folder:
+inside `.hailer` or those three folders, or `.git` (file or folder) at its top ("is a git repository (it
+has .git at its top level)"); for the data folder: inside or equal to the notebooks folder. `validate`
+runs it for docker configs; `DockerRuntime.mount_problems` is exactly this, run by `prepare` and `start`
+on every start path (`--foreground` never validates, and environment variables can move the folders).
 
 Errors added for the notebook feature (`errors.py`): `NotebookExistsError` (create: name taken) and
 `NotebookPathError` (outside the notebooks folder, or not a marimo notebook; also raised by
@@ -331,9 +342,14 @@ def live_kernel_state(workspace, *, probe=None, gone=None) -> KernelState | None
     # only when gone(state) (default record_is_gone) proves the server dead: a slow server is never taken for dead
 def record_is_gone(state: KernelState, *, docker_runner=None) -> bool   # local: its pid has ended; docker: containers_gone
 def process_running(pid: int) -> bool | None                             # None = cannot tell (Windows: OpenProcess/GetExitCodeProcess)
-def live_kernel_error(state) -> KernelRuntimeError; def refuse_live_kernel(workspace, *, probe=None, gone=None) -> None
-    # the start guard both runtimes share: KernelRuntimeError ("A docker kernel Hailer started for this workspace is
-    # already running at <url>." / "A local marimo server Hailer started for this workspace is still running at <url>.")
+def live_kernel_error(state) -> KernelRuntimeError; def unanswered_kernel_error(state) -> KernelRuntimeError
+def refuse_live_kernel(workspace, *, probe=None, gone=None) -> None
+    # the start guard both runtimes share. KernelRuntimeError while the record's server answers ("A docker kernel Hailer
+    # started for this workspace is already running at <url>." / "A local marimo server Hailer started for this workspace
+    # is still running at <url>."), and while it does not answer but is not provably gone ("A docker kernel Hailer started
+    # for this workspace (<containers>) may still be running, but it does not answer at <url>." / "A local marimo server
+    # Hailer started for this workspace (process N) may still be running, ..."): a busy or suspended server is never
+    # orphaned and its record is kept. A record that is provably gone is deleted
 def note_kernel_start(workspace, runtime, notebooks_root) -> None       # .hailer/last-kernel.json; never raises
 def docker_wrote_notebooks(workspace, notebooks_root) -> bool            # the last server on this folder was a docker kernel
 def withheld_variables(config: HailerConfig, environ: Mapping[str, str]) -> list[str]
@@ -356,6 +372,8 @@ def log_tail(path, lines=15, *, token=None) -> list[str]                  # toke
 
 @dataclass class RunningKernel:            # a server a runtime started or found
     server: MarimoServer; log_hint: str; stop_hint: str; workspace: Path | None; ended: str   # ended: why wait() returned (empty after Ctrl+C)
+    # LocalKernel.wait: "marimo shut itself down." (exit 0) / "marimo stopped (exit code N): it was ended from outside
+    # this terminal (uvx hailer kernel stop, Task Manager or kill), or it failed; its own output is above."
     def stop(self) -> None                 # idempotent, never raises; deletes kernel.json only while it records this server's token
     def log_tail(self, lines: int = 15) -> list[str]
     def wait(self) -> int                  # --foreground: block until the kernel stops or Ctrl+C
@@ -392,22 +410,35 @@ class DockerRunner(Protocol):              # args never include "docker"; both r
     def run(self, args, *, timeout=None, check=False) -> CompletedProcess[str]     # captured text; check: non-zero exit → KernelRuntimeError quoting docker
     def stream(self, args, *, keep_errors=False) -> CompletedProcess[str]          # output in this terminal (pull, build, logs -f); keep_errors keeps docker's last 20 error lines in .stderr
 class SubprocessDockerRunner:              # the docker CLI on PATH (shutil.which), stdin empty, UTF-8
-def docker_not_installed() -> KernelRuntimeError; def docker_not_running(detail="") -> KernelRuntimeError
+def docker_not_installed() -> KernelRuntimeError
+def docker_not_running(detail="") -> KernelRuntimeError   # hint names DOCKER_CONTEXT / `docker context use default` when docker said "context"
 def docker_said(result) -> str             # "docker said: <last 3 lines>" or ""
 def workspace_id(workspace) -> str         # 10 hex chars of sha256(normcase(resolved path))
 def docker_names(workspace) -> DockerNames # hailer-kernel-<id>, hailer-fwd-<id>, hailer-net-<id>
 def mount_arg(source, target, *, readonly=False) -> str   # --mount type=bind,source=...,target=...[,readonly] (CSV-quoted)
 def linux_host_user() -> tuple[int, int] | None           # (uid, gid) on a Linux host unless root; None elsewhere
 def network_location(path, drive_type=...) -> str | None   # Windows: UNC_PATH ("a network share (UNC path)") or "a mapped network drive (Z:)" (GetDriveTypeW == 4)
-def folder_problems(folder, what, setting, *, windows=None, drive_type=..., links=False) -> list[str]   # warnings with the fix; links: symlinks/junctions leading outside (first 5000 entries)
+def folder_problems(folder, what, setting, *, windows=None, drive_type=None, links=False) -> list[str]
+    # warnings with the fix: a mapped network drive; links: symlinks/junctions leading outside (first 5000 entries).
+    # Nothing for a UNC path: that is fatal, said once by config.docker_mount_problems
+PLANTABLE_FILES = (".git", ".vscode", ".idea", ".devcontainer", "hailer.toml")
+def planted_files(notebooks: Path | None) -> list[str]       # PLANTABLE_FILES at the top of the notebooks folder
+def planted_warning(notebooks, names) -> str                # "WARNING: the notebooks folder <path> has <names> at its top level. ..."
 def data_path_problems(data_dir, ...) -> list[str]         # folder_problems for the data folder, links included
 def containers_gone(state: KernelState, runner=None) -> bool   # docker says the kernel container is gone or stopped; False when docker cannot be asked
 def settings_mismatch(state: KernelState, config: HailerConfig) -> list[str]
     # phrases such as "memory 4g, hailer.toml: 2g": the mounted folders always; network, image, memory, cpus when config asks for docker
 def mismatch_error(diffs) -> KernelRuntimeError   # "The running kernel was started with other settings (...)." + the kernel stop hint
-@dataclass class Removal: removed, gone, failed: list[str]   # "not there" counts as gone
+@dataclass class Removal: removed, gone, failed: list[str]
+    # one container (rm -f) or network (network rm) at a time, by id. Gone: docker's object-specific "No such container /
+    # No such network / no such object / network <x> not found" (never a bare "not found": a broken docker context says
+    # "context not found"), and "removal ... is already in progress" (another terminal removing it). "has active
+    # endpoints" is retried (NETWORK_RM_RETRIES x NETWORK_RM_RETRY_SEC). Before anything is reported as failed,
+    # `docker inspect --type container|network` checks it is still there
 @dataclass class DockerKernel(RunningKernel):
     runner; containers; container_ids; network; network_id   # everything removed and inspected by id, never by name
+    notebooks_folder: Path | None          # the host folder mounted at /work/notebooks (from server.paths)
+    def planted(self) -> list[str]         # planted_files(notebooks_folder); the CLI prints planted_warning after stop()
     def remove(self) -> Removal            # containers, then the network
     def log_tail(self, lines=15, *, container=None) -> list[str]   # docker logs --tail, token masked
     def wait(self) -> int                  # docker logs -f; then sets ended from docker inspect: removed from outside, out of memory, exit 137, "exited (code N)"
@@ -415,11 +446,12 @@ class DockerRuntime:
     # DockerRuntime(config, *, runner=None, token_factory=new_token, start_timeout=60.0, health=None, user=linux_host_user, probe=None)
     name = "docker"; paths = docker_paths(config); names: DockerNames; image: str (config.kernel.effective_image)
     def check(self) -> list[Check]         # kernel; docker ("Docker <v> (Linux engine)" or the error); image (missing = non-fatal warning,
-                                           # other version = fatal); data (path warnings); notebooks (only when Docker may not see it)
+                                           # other version = fatal); data (path warnings; no row for a UNC folder: the config row fails it);
+                                           # notebooks (warnings: a mapped network drive; planted files other than .git, which is fatal)
     def engine_version(self) -> str        # docker version --format "{{.Server.Version}} {{.Server.Os}}"; not installed / not running / non-Linux engine → KernelRuntimeError
     def engine_cpus(self) -> int | None
     def pull(self, say=None) -> str        # hailer kernel pull: always downloads, then checks the version label
-    def mount_problems(self) -> list[str]  # config.docker_mount_problems + UNC notebooks/data folders (Windows)
+    def mount_problems(self) -> list[str]  # config.docker_mount_problems(config, windows=os.name == "nt"): the same rules as validate()
     def prepare(self, say=None) -> None    # engine; mounts; refuse_live_kernel; the image (pulled with progress when missing: "Downloading the
                                            # kernel image <image> (first use; this can take a few minutes) ..."), its version label; cpus clamped to engine_cpus with a note
     def network_command(self) -> list[str] # network create --internal + labels
@@ -438,15 +470,17 @@ class DockerRuntime:
         # ("A kernel container for this workspace is still running, but Hailer cannot reach it: ..."), never removed
     def find_running(self) -> RunningKernel | None   # live_kernel_state + the container carries this workspace's label
     def start(self, port: int, *, foreground: bool = False) -> RunningKernel
-        # prepare if needed; mounts again; refuse_live_kernel; drop a stale record; remove_leftovers(); mkdir both folders;
+        # prepare if needed; mounts again; refuse_live_kernel; remove_leftovers(); only then delete the old record; mkdir both folders;
         # network (unless network=true), kernel, forwarder (create, network connect, start); wait for /health through the
         # forwarder (stops early when a container exits); KernelState with names, ids and settings; note_kernel_start.
         # Any failure or Ctrl+C removes what was created. foreground changes nothing (DockerKernel.wait follows the log)
-@dataclass class StopReport: done: list[str]; failed: list[str]
+@dataclass class StopReport: done: list[str]; failed: list[str]; warnings: list[str]
 def stop_workspace_kernels(config, runner=None, *, procs=None, probe=None) -> StopReport
     # hailer kernel stop: the kernel.json server of either runtime (a local one only when it answers with its token, so a
-    # reused pid is never killed), then remove_leftovers(running=True). Reports, never raises once anything was
-    # cleaned, except when a docker kernel still answers and Docker cannot be reached (kernel.json kept)
+    # reused pid is never killed; a silent local record is cleared with "Process N is still running: ..." when its pid
+    # exists), then remove_leftovers(running=True). warnings: planted_warning for the stopped docker kernel's notebooks
+    # folder. Reports, never raises once anything was cleaned, except when a docker kernel still answers and Docker
+    # cannot be reached (kernel.json kept). The CLI prints done, failed (red, exit 1) and warnings (bold red)
 ```
 
 ## `kernel_image.py`  (owner: docker kernel, 2026-09-19)
@@ -756,12 +790,15 @@ docker kernel makes the session docker (`attach_runtime`). Otherwise `runtime.pr
 spinner: docker pull progress) and `runtime.start(port)` under a spinner (`Starting marimo[ in Docker] on
 <url> ...`), `Marimo is running at <url>  (log: <log_hint>)`. The chat is pinned to the server object
 (`ChatLoop(server=...)`, `HailerAgent(server=...)`) and `marimo_url` is set to its URL for the prompt. On exit
-`running.stop()` (`Stopped marimo.`) unless `--keep-marimo` (`Marimo is still running at <url> (<stop_hint>;
-log: <log_hint>). uvx hailer in this workspace attaches to it.`). `--foreground`: `kernel_checks`, `prepare`,
+`running.stop()` (`Stopped marimo.`, then for a docker kernel `planted_warning` in bold red when
+`DockerKernel.planted()` finds files) unless `--keep-marimo` (`Marimo is still running at <url> (<stop_hint>;
+log: <log_hint>). uvx hailer in this workspace attaches to it.`). `--foreground`: `kernel_checks`, `prepare`
+(which refuses every layout in `config.docker_mount_problems`, since this path never validates),
 `start(port, foreground=True)`, print the `Kernel:` line and the signed-in home URL (opened unless
-`--no-browser`), block in `RunningKernel.wait()`, print `running.ended` when set, always `stop()`); `exec`
-(`-c CODE` | `-` stdin | file; prints result; exit 1 on failure); `status` (discovers the server first and
-applies `attach_runtime`, so the panel shows the kernel in use); `doctor` (`local_checks` + `kernel_checks` of
+`--no-browser`), block in `RunningKernel.wait()`, print `running.ended` when set, always `stop()` and then the
+planted-files warning); `exec` (`-c CODE` | `-` stdin | file; prints result; exit 1 on failure); `status`
+(attaches with `_discovered_server()`, not the health-gated `_marimo_state`, like doctor, so a busy server
+does not flip the Kernel line); `doctor` (`local_checks` + `kernel_checks` of
 the attached config + a mismatch warning row + `marimo_checks`; with a session, a code-mode probe and an
 `import hailer.periods` probe (`warn  notebook helpers: ...`); it never calls the model endpoint); `login
 <provider>`; `logout <provider>`; `init [--force] [--kernel local|docker]` (write `config_template(kernel)` +

@@ -553,18 +553,68 @@ def _is_drive_root(folder: Path) -> bool:
     return resolved.parent == resolved
 
 
-def docker_mount_problems(config: HailerConfig) -> list[str]:
-    """Why the notebooks folder or the data folder must not be mounted into a docker kernel (one
-    problem per folder; empty when both are fine).
+#: Folders under the home folder that hold credentials (keys, cloud and cluster logins, other
+#: tools' tokens): a docker kernel never mounts them, a folder inside them or a folder around them.
+CREDENTIAL_FOLDERS: tuple[str, ...] = (".config", ".ssh", ".aws", ".azure", ".gnupg", ".docker", ".kube")
+#: On Windows also these (applications keep their logins and browser profiles there).
+CREDENTIAL_FOLDER_VARS: tuple[str, ...] = ("APPDATA", "LOCALAPPDATA")
 
-    Neither mount may be, or contain, a drive root, the home folder, the workspace folder,
-    Hailer's ``.hailer`` folder (the kernel's token, the conversations), the config file or the
-    context, skills and prompts folders: notebook code would read Hailer's own files and, through
-    the writable notebooks folder, change them (switch the runtime back to local, plant context
-    sent to the model). The notebooks folder may not sit inside ``.hailer`` or those folders
-    either. :class:`~hailer.kernel_docker.DockerRuntime` checks this again before it starts, since
-    environment variables can move the folders.
+
+def _on_windows() -> bool:
+    return os.name == "nt"
+
+
+def is_unc_path(path: Path | str) -> bool:
+    """True for a Windows network-share path (``\\\\server\\share\\...``, also ``\\\\?\\UNC\\...``)."""
+    import ntpath
+
+    drive = ntpath.splitdrive(str(path))[0].replace("/", "\\")
+    if drive.upper().startswith(("\\\\?\\", "\\\\.\\")):
+        return drive[4:].upper().startswith("UNC\\")
+    return drive.startswith("\\\\")
+
+
+def _credential_folders(windows: bool) -> list[Path]:
+    try:
+        home = Path.home()
+    except RuntimeError:  # no home folder to protect
+        home = None
+    folders = [home / name for name in CREDENTIAL_FOLDERS] if home is not None else []
+    if windows:
+        folders += [Path(os.environ[var]) for var in CREDENTIAL_FOLDER_VARS if os.environ.get(var)]
+    return folders
+
+
+def _in_temp(folder: Path) -> bool:
+    """Inside the system's temporary folder (on Windows that is inside %LOCALAPPDATA%)."""
+    import tempfile
+
+    return _inside_or_equal(folder, Path(tempfile.gettempdir()))
+
+
+def docker_mount_problems(config: HailerConfig, *, windows: bool | None = None) -> list[str]:
+    """Every reason, in docker mode, not to mount the notebooks folder or the data folder (at most
+    one per folder, plus the data-inside-notebooks rule; empty when both are fine). The one place
+    for these rules: ``validate()`` reports them and :class:`~hailer.kernel_docker.DockerRuntime`
+    refuses to start on them, on every start path (``--foreground`` never runs ``validate()``, and
+    environment variables can move the folders after hailer.toml was read).
+
+    - Windows: a UNC path (a network share): Docker cannot mount it.
+    - Neither mount may be a whole drive, or be or contain the home folder, the workspace folder,
+      Hailer's ``.hailer`` folder (the kernel's token, the conversations), the config file or the
+      context, skills and prompts folders: notebook code would read Hailer's own files and,
+      through the writable notebooks folder, change them (switch the runtime back to local, plant
+      context sent to the model). The notebooks folder may not sit inside ``.hailer`` or those
+      folders either.
+    - Neither mount may be, contain or sit inside a folder that holds credentials
+      (:data:`CREDENTIAL_FOLDERS` under home; on Windows %APPDATA% and %LOCALAPPDATA%, outside the
+      temporary folder).
+    - The data folder may not be, or sit inside, the notebooks folder (it would become writable).
+    - The notebooks folder may not be a git repository (``.git`` at its top level): notebook code
+      could add hooks or ``core.fsmonitor`` to it, which run on this machine the next time git or
+      an editor touches the repository.
     """
+    windows = _on_windows() if windows is None else windows
     workspace = Path(config.workspace)
     hailer_dir = workspace / ".hailer"
     guarded: list[tuple[Path, str]] = [(workspace, "the workspace folder"), (hailer_dir, "Hailer's .hailer folder")]
@@ -576,6 +626,7 @@ def docker_mount_problems(config: HailerConfig) -> list[str]:
         guarded.append((config.config_path, f"the config file {config.config_path.name}"))
     private = [(config.context_dir, "the context folder"), (config.skills_dir, "the skills folder"), (config.prompts_dir, "the prompts folder")]
     guarded += private
+    credentials = _credential_folders(windows)
     docker = '[kernel] runtime = "docker"'
     problems: list[str] = []
     mounts = (
@@ -584,6 +635,12 @@ def docker_mount_problems(config: HailerConfig) -> list[str]:
     )
     for folder, what, writable, verb, setting, example in mounts:
         fix = f"Keep the {what} a folder of its own, such as {example}, and point {setting} at it."
+        if windows and is_unc_path(folder):  # first: resolving a share's path can wait on the network
+            problems.append(
+                f"The {what} {folder} is on a network share (UNC path), which Docker cannot mount. "
+                f"Copy it to a folder on a local disk and point {setting} at it."
+            )
+            continue
         if _is_drive_root(folder):
             problems.append(f"The {what} ({folder}) is a whole drive. With {docker} it is mounted {writable}into the container. {fix}")
             continue
@@ -596,6 +653,16 @@ def docker_mount_problems(config: HailerConfig) -> list[str]:
                 f"so notebook code could {verb} Hailer's own files. {fix}"
             )
             continue
+        secret = next((target for target in credentials if _inside_or_equal(target, folder)), None)
+        if secret is None and not _in_temp(folder):
+            secret = next((target for target in credentials if _inside_or_equal(folder, target)), None)
+        if secret is not None:
+            relation = "is" if _same_folder(secret, folder) else ("contains" if _inside_or_equal(secret, folder) else "is inside")
+            problems.append(
+                f"The {what} ({folder}) {relation} {secret}, a folder that holds credentials. With {docker} it is "
+                f"mounted {writable}into the container, so notebook code could {verb} them. {fix}"
+            )
+            continue
         if writable:
             inside = next(((target, name) for target, name in [(hailer_dir, "Hailer's .hailer folder"), *private] if _inside_or_equal(folder, target)), None)
             if inside is not None:
@@ -603,6 +670,20 @@ def docker_mount_problems(config: HailerConfig) -> list[str]:
                     f"The {what} ({folder}) is inside {inside[1]}. With {docker} it is writable from notebook code, "
                     f"so notebook code could change Hailer's own files. {fix}"
                 )
+                continue
+            if os.path.lexists(Path(folder) / ".git"):
+                problems.append(
+                    f"The notebooks folder ({folder}) is a git repository (it has .git at its top level). With {docker} "
+                    "it is writable from notebook code, which could add git hooks or settings (core.fsmonitor) that run "
+                    "on this machine the next time git or an editor touches the repository. Keep the notebooks in a "
+                    "plain subfolder of your repository (such as notebooks/), or remove the nested repository."
+                )
+        elif _inside_or_equal(folder, config.notebooks_root):
+            problems.append(
+                f"[hailer].data_dir ({folder}) is inside the notebooks folder ({config.notebooks_root}). "
+                f"With {docker} the notebooks folder is writable from notebook code, so the data would be too. "
+                "Keep the data in its own folder (the default is data/ next to notebooks/)."
+            )
     return problems
 
 
@@ -626,6 +707,7 @@ def _kernel_problems(config: HailerConfig) -> list[str]:
         if not name or "=" in name:
             problems.append(f'Invalid [kernel].pass_env entry "{name}"; list environment variable names, e.g. pass_env = ["DB_PASSWORD"].')
     if kernel.runtime != KERNEL_RUNTIME_DOCKER:
+        problems.extend(_pass_env_warnings(config))
         return problems
     if kernel.pass_env:
         problems.append(
@@ -638,14 +720,30 @@ def _kernel_problems(config: HailerConfig) -> list[str]:
             "Hailer starts and finds its own container. Remove marimo_url, or set runtime = \"local\" to use "
             "that server."
         )
-    if _inside_or_equal(config.data_dir, config.notebooks_root):
-        problems.append(
-            f"[hailer].data_dir ({config.data_dir}) is inside the notebooks folder ({config.notebooks_root}). "
-            'With [kernel] runtime = "docker" the notebooks folder is writable from notebook code, so the data '
-            "would be too. Keep the data in its own folder (the default is data/ next to notebooks/)."
-        )
     problems.extend(docker_mount_problems(config))
     return problems
+
+
+def _pass_env_warnings(config: HailerConfig) -> list[str]:
+    """``[kernel].pass_env`` names that hand notebook code Hailer's own secrets: a provider's API key
+    or header variable, or ``HAILER_MARIMO_TOKEN``."""
+    own: dict[str, str] = {"OPENAI_API_KEY": "the API key of the openai provider", "HAILER_MARIMO_TOKEN": "the marimo server token"}
+    for provider in config.providers.values():
+        if provider.env_key:
+            own[provider.env_key] = f'the API key of provider "{provider.id}"'
+        for header, variable in provider.env_http_headers.items():
+            own[variable] = f'the {header} header of provider "{provider.id}"'
+
+    def fold(name: str) -> str:
+        return name.upper() if os.name == "nt" else name
+
+    folded = {fold(name): what for name, what in own.items()}
+    return [
+        f'Warning: [kernel].pass_env lets notebook code read {name} ({folded[fold(name)]}); code the model writes could '
+        "then use or leak it. Remove it from pass_env unless notebooks truly need it."
+        for name in config.kernel.pass_env
+        if fold(name) in folded
+    ]
 
 
 def validate(config: HailerConfig) -> list[str]:
@@ -675,7 +773,7 @@ def validate(config: HailerConfig) -> list[str]:
         folder_is_workspace = root.resolve() == Path(config.workspace).resolve()
     except OSError:
         folder_is_workspace = False
-    if folder_is_workspace:
+    if folder_is_workspace and config.kernel.runtime != KERNEL_RUNTIME_DOCKER:  # docker mode: fatal, reported once below
         problems.append(
             f"Warning: the notebooks folder is the workspace itself ({root}); marimo would scan the whole "
             "workspace (including .venv) for notebooks. Keep notebooks in a subfolder such as notebooks/ and "
@@ -770,7 +868,7 @@ def config_template(kernel: str | None = None) -> str:
     if kernel is None:
         return DEFAULT_CONFIG_TEMPLATE
     if kernel not in VALID_KERNEL_RUNTIMES:
-        raise ConfigError(f"Unknown kernel runtime {kernel!r}.", hint='Use "local" or "docker".')
+        raise ConfigError(f'Unknown kernel runtime "{kernel}".', hint='Use "local" or "docker".')
     return DEFAULT_CONFIG_TEMPLATE.replace(_KERNEL_SECTION_OFF, f'[kernel]\nruntime = "{kernel}"', 1)
 
 
