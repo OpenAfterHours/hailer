@@ -937,7 +937,8 @@ package-install rule) are appended by `agent.system_prompt`. Loaded with
 - `test_docker_integration.py`: opt-in (`HAILER_DOCKER_TESTS=1` skips with the reason when Docker, the
   image or Chrome is missing, `strict` fails instead; `HAILER_TEST_CHROME` picks the browser,
   `HAILER_KERNEL_IMAGE` the image; it never pulls). One module-scoped real `DockerRuntime` kernel for a
-  temporary workspace with sample sales data, a session opened by headless Chrome, then: code runs as
+  temporary workspace with sample sales data, a session held open by headless Chrome on a real clock
+  until fixture teardown (DevTools captures the diagnostic screenshot), then: code runs as
   non-root in `/work` on the mounted data and the starter notebook ran on open; a code-mode cell is saved in
   the host notebook; data writes, network and DNS are refused; neither a host secret nor the token is in the
   kernel's environment; `kernel.json` holds the ids Docker gave; stopping leaves no container, network or

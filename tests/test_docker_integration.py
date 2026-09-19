@@ -17,20 +17,23 @@ install folder on Windows and macOS.
 Run it with ``HAILER_DOCKER_TESTS=1 uv run pytest tests/test_docker_integration.py -rs``.
 
 One module-scoped kernel serves every test: :class:`~hailer.kernel.DockerRuntime` starts it for a
-temporary workspace holding sample sales data, headless Chrome opens the notebook (marimo keeps the
-session after the browser exits), and the tests talk to it through
+temporary workspace holding sample sales data, headless Chrome stays connected to the notebook,
+and the tests talk to it through
 :class:`~hailer.marimo_client.MarimoClient` with host paths, as the agent's tools do. The last test
 stops it and checks that nothing is left behind (by the ids kernel.json records).
 """
 
 from __future__ import annotations
 
+import base64
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
 import sys
 import time
+import urllib.request
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -106,8 +109,12 @@ def find_chrome() -> str | None:
 
 
 def open_in_browser(chrome: str, url: str, scratch: Path) -> subprocess.Popen:
-    """Headless Chrome on ``url`` with its own profile; it screenshots the page and exits after the
-    virtual time budget, and marimo keeps the notebook's session."""
+    """Keep Chrome connected until fixture teardown, using real time for kernel startup.
+
+    A virtual-time budget can fast-forward marimo's WebSocket timers before the real kernel
+    is ready (the v0.2.7 release showed "kernel not found" and never initialized DATA_DIR).
+    Capture screenshots through DevTools instead of a command-line mode that exits early.
+    """
     args = [
         chrome,
         "--headless=new",
@@ -115,14 +122,39 @@ def open_in_browser(chrome: str, url: str, scratch: Path) -> subprocess.Popen:
         "--no-first-run",
         "--no-default-browser-check",
         f"--user-data-dir={scratch / 'chrome-profile'}",
-        f"--screenshot={scratch / 'notebook.png'}",
+        "--remote-debugging-port=0",
+        "--remote-debugging-address=127.0.0.1",
         "--window-size=1280,900",
-        "--virtual-time-budget=25000",
         url,
     ]
     if sys.platform.startswith("linux"):
         args.insert(1, "--no-sandbox")  # CI runners often cannot give Chrome its sandbox; the page is our own
     return subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def capture_screenshot(scratch: Path) -> None:
+    """Best-effort diagnostics from the existing page; never change its clock or reload it."""
+    try:
+        # websockets is already required by marimo; no browser driver or extra dependency is needed.
+        from websockets.sync.client import connect
+
+        port = int((scratch / "chrome-profile" / "DevToolsActivePort").read_text().splitlines()[0])
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(f"http://127.0.0.1:{port}/json/list", timeout=5) as response:
+            pages = json.load(response)
+        page = next(page for page in pages if page["type"] == "page")
+        with connect(page["webSocketDebuggerUrl"], proxy=None, open_timeout=5, close_timeout=1) as socket:
+            socket.send(json.dumps({"id": 1, "method": "Page.captureScreenshot", "params": {"format": "png"}}))
+            deadline = time.monotonic() + 5
+            while True:
+                reply = json.loads(socket.recv(timeout=max(0, deadline - time.monotonic())))
+                if reply.get("id") == 1:
+                    (scratch / "notebook.png").write_bytes(base64.b64decode(reply["result"]["data"]))
+                    return
+    except Exception as exc:
+        # A diagnostic failure must not mask the test failure or prevent container cleanup.
+        # Avoid exception text: the page URL contains the marimo token.
+        print(f"Could not capture the notebook screenshot ({type(exc).__name__}).", file=sys.stderr)
 
 
 def _end(proc: subprocess.Popen) -> None:
@@ -174,6 +206,7 @@ class Kernel:
     kernel: DockerKernel
     client: MarimoClient
     chrome: subprocess.Popen
+    browser_scratch: Path
 
     @property
     def notebook(self) -> Path:
@@ -187,6 +220,7 @@ class Kernel:
         return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
 
     def diagnostics(self) -> str:
+        capture_screenshot(self.browser_scratch)
         return "docker logs (kernel):\n" + "\n".join(self.kernel.log_tail(30))
 
 
@@ -243,9 +277,14 @@ def docker_kernel(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Kernel]:
             if wait_for_session(client, config.notebook, timeout=SESSION_TIMEOUT_SEC) is None:
                 tail = "\n".join(kernel.log_tail(30))
                 pytest.fail(f"no marimo session for {config.notebook.name} within {SESSION_TIMEOUT_SEC:.0f} s\n{tail}")
-            yield Kernel(config=config, runtime=runtime, kernel=kernel, client=client, chrome=chrome_proc)
+            yield Kernel(
+                config=config, runtime=runtime, kernel=kernel, client=client,
+                chrome=chrome_proc, browser_scratch=scratch,
+            )
         finally:
             if chrome_proc is not None:
+                if not (scratch / "notebook.png").exists():
+                    capture_screenshot(scratch)
                 _end(chrome_proc)
             kernel.stop()
             try:
@@ -255,6 +294,7 @@ def docker_kernel(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Kernel]:
 
 
 def test_notebook_code_runs_in_the_container_on_the_mounted_data(docker_kernel: Kernel):
+    assert docker_kernel.chrome.poll() is None, "Chrome must stay connected while the notebook initializes"
     result = docker_kernel.run("import os, platform\nprint(platform.system(), os.getcwd(), os.getuid() != 0)")
     assert result.success, result.stderr + docker_kernel.diagnostics()
     assert result.stdout.split() == ["Linux", "/work", "True"], "Linux, in /work, not as root"
@@ -276,6 +316,7 @@ def test_notebook_code_runs_in_the_container_on_the_mounted_data(docker_kernel: 
         ]  # fmt: skip
 
     assert _poll(started, 60), docker_kernel.run("print(DATA_DIR)").stderr + docker_kernel.diagnostics()
+    assert docker_kernel.chrome.poll() is None, "Chrome must remain connected after notebook initialization"
 
 
 def test_excel_can_be_read_in_the_container_without_installing_packages(docker_kernel: Kernel):
