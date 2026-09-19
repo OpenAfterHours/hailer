@@ -60,7 +60,7 @@ from hailer.models import KERNEL_RUNTIME_DOCKER, Check, HailerConfig, KernelConf
 
 #: marimo's port inside the kernel container; the forwarder listens on the same port in its own.
 KERNEL_PORT = 2718
-#: The image's user (``analyst``, uid and gid 1000) and its home, a tmpfs owned by the kernel's user.
+#: The image's uid and gid (1000) and its home, a tmpfs owned by the kernel's user.
 IMAGE_UID = 1000
 IMAGE_GID = 1000
 KERNEL_HOME = "/home/analyst"

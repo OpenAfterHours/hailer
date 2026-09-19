@@ -23,6 +23,8 @@ this script adds what a release needs: several platforms and ``--push``.
 - ``--context DIR`` prepares the context in ``DIR`` and keeps it; the default is a temporary folder.
 - ``--dry-run`` prints the command and runs nothing (the context shows as ``<context>`` unless
   ``--context`` is given, which is then prepared so the printed command can be run by hand).
+- ``--base-image``, ``--pip-config`` and ``--pip-cert`` work like ``hailer kernel build``:
+  select a corporate Python base and mount pip configuration/CA files as build secrets.
 
 Needs Docker with the buildx plugin (Docker Desktop and GitHub's Ubuntu runners have it). Building
 ``linux/arm64`` on an amd64 machine needs QEMU (Docker Desktop has it; CI runs setup-qemu-action).
@@ -40,6 +42,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from hailer import kernel_image
+from hailer.errors import HailerError
 
 DEFAULT_PLATFORMS = ("linux/amd64", "linux/arm64")
 CONTEXT_PLACEHOLDER = "<context>"
@@ -122,6 +125,10 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     where.add_argument("--load", dest="output", action="store_const", const="load", help="load the image into the local Docker engine")
     parser.add_argument("--context", type=Path, metavar="DIR", help="prepare the build context here and keep it")
     parser.add_argument("--dry-run", action="store_true", help="print the command and run nothing")
+    parser.add_argument("--base-image", metavar="IMAGE", help="Python 3.12+ base image with venv and ensurepip")
+    parser.add_argument("--pip-config", type=Path, metavar="FILE", help="pip configuration mounted as a build secret")
+    parser.add_argument("--pip-cert", type=Path, metavar="FILE", help="pip PEM CA bundle mounted as a build secret")
+    parser.add_argument("--no-cache", action="store_true", help="reinstall packages without cached build layers")
     args = parser.parse_args(argv)
     args.extra = extra
     if not args.tags:
@@ -153,6 +160,16 @@ def _build(args: argparse.Namespace, context: Path, build_args: Mapping[str, str
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        args.extra = [
+            *kernel_image.build_options(
+                base_image=args.base_image, pip_config=args.pip_config, pip_cert=args.pip_cert, no_cache=args.no_cache,
+            ),
+            *args.extra,
+        ]
+    except HailerError as exc:
+        warn(f"aborted: {exc}. {exc.hint}")
+        return 1
 
     if args.dry_run:
         if args.context is not None:

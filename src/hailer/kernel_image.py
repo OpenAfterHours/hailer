@@ -16,8 +16,10 @@ check the argument lists without Docker.
 
 from __future__ import annotations
 
+import csv
 import importlib.metadata
 import importlib.resources
+import io
 import json
 import shutil
 import subprocess
@@ -26,6 +28,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from hailer import __version__
+from hailer.errors import KernelRuntimeError
 from hailer.models import KERNEL_IMAGE_REPOSITORY
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only; hailer.kernel_docker imports this module
@@ -76,20 +79,56 @@ def prepare_context(dest: Path) -> dict[str, str]:
     return build_args()
 
 
-def build_command(tag: str, context: Path, args: dict[str, str]) -> list[str]:
+def build_options(
+    *, base_image: str | None = None, pip_config: Path | None = None, pip_cert: Path | None = None,
+    no_cache: bool = False,
+) -> list[str]:
+    """Extra Docker build arguments shared by the CLI and the buildx script.
+
+    Files are passed directly as BuildKit secrets, never read into command arguments or copied
+    into the context. Docker parses --secret as CSV (a Windows path can contain commas).
+    """
+    options: list[str] = ["--no-cache"] if no_cache else []
+    if base_image is not None:
+        if not base_image.strip():
+            raise KernelRuntimeError("The base image must not be empty.", hint="Use --base-image REGISTRY/IMAGE:TAG.")
+        options += ["--build-arg", f"BASE_IMAGE={base_image}"]
+    for name, path, flag in (("pip_config", pip_config, "--pip-config"), ("pip_cert", pip_cert, "--pip-cert")):
+        if path is None:
+            continue
+        try:
+            source = Path(path).expanduser().resolve(strict=True)
+            # Check readability before starting a build, without reading the contents.
+            with source.open("rb"):
+                pass
+        except OSError as exc:
+            raise KernelRuntimeError(
+                f"Cannot read {flag} file: {path}", hint="Choose an existing, readable file.",
+            ) from exc
+        value = io.StringIO()
+        csv.writer(value, lineterminator="\n").writerow(["type=file", f"id={name}", f"src={source}"])
+        options += ["--secret", value.getvalue().rstrip("\n")]
+    return options
+
+
+def build_command(tag: str, context: Path, args: dict[str, str], *, options: list[str] | None = None) -> list[str]:
     """``docker build`` arguments (without ``docker``) for ``context`` and its build args."""
     cmd = ["build", "--tag", tag]
     for name, value in args.items():
         cmd += ["--build-arg", f"{name}={value}"]
-    return cmd + [str(context)]
+    return cmd + (options or []) + [str(context)]
 
 
-def build(tag: str, runner: DockerRunner) -> int:
+def build(
+    tag: str, runner: DockerRunner, *, base_image: str | None = None,
+    pip_config: Path | None = None, pip_cert: Path | None = None, no_cache: bool = False,
+) -> int:
     """Build the image as ``tag`` on this machine, docker's output in this terminal; the exit code."""
+    options = build_options(base_image=base_image, pip_config=pip_config, pip_cert=pip_cert, no_cache=no_cache)
     with tempfile.TemporaryDirectory(prefix="hailer-kernel-") as tmp:
         context = Path(tmp)
         args = prepare_context(context)
-        return runner.stream(build_command(tag, context, args)).returncode
+        return runner.stream(build_command(tag, context, args, options=options)).returncode
 
 
 def pull(image: str, runner: DockerRunner) -> subprocess.CompletedProcess[str]:
@@ -119,6 +158,7 @@ __all__ = [
     "build",
     "build_args",
     "build_command",
+    "build_options",
     "default_image",
     "image_version",
     "package_dir",

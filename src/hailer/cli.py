@@ -1312,6 +1312,20 @@ def kernel_build(
         help="Name and tag for the image (default: \\[kernel].image, else ghcr.io/openafterhours/hailer-kernel:<version>).",
         show_default=False,
     ),
+    base_image: str | None = typer.Option(
+        None, "--base-image", help="Python base image, e.g. registry.company/python:3.13 (Python 3.12+ with venv).",
+    ),
+    pip_config: Path | None = typer.Option(
+        None, "--pip-config", help="Pip configuration file for the build (mirror/authentication); mounted as a build secret.",
+        exists=True, file_okay=True, dir_okay=False, readable=True, resolve_path=True,
+    ),
+    pip_cert: Path | None = typer.Option(
+        None, "--pip-cert", help="PEM CA bundle for pip during the build; mounted as a build secret.",
+        exists=True, file_okay=True, dir_okay=False, readable=True, resolve_path=True,
+    ),
+    no_cache: bool = typer.Option(
+        False, "--no-cache", help="Reinstall packages without cached build layers (use after changing mirror settings).",
+    ),
 ) -> None:
     """Build the kernel image on this machine, for machines that cannot download it."""
     from hailer import kernel_image
@@ -1330,11 +1344,17 @@ def kernel_build(
             f"Polars {args['POLARS_VERSION']}, DuckDB {args['DUCKDB_VERSION']}) ...",
             markup=False,
         )
-        code = kernel_image.build(image, runtime.runner)
+        code = kernel_image.build(
+            image, runtime.runner, base_image=base_image, pip_config=pip_config, pip_cert=pip_cert, no_cache=no_cache,
+        )
         if code != 0:
             raise KernelRuntimeError(
                 f"docker build failed (exit code {code}).",
-                hint="docker's output is above. The build downloads the base image from Docker Hub and the Python packages from PyPI.",
+                hint=(
+                    "Docker's output is above. Check access to the base image and package index. "
+                    "Corporate mirrors: use --base-image and --pip-config; for a private CA, add --pip-cert. "
+                    "The build needs BuildKit and a Linux base with Python 3.12+, venv and ensurepip."
+                ),
             )
     except HailerError as err:
         _print_error(console, err, verbose=opts.verbose)
