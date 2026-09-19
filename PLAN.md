@@ -123,8 +123,9 @@ What users must do:
   ignored, and `HAILER_CODEX_HOME` is no longer read.
 - Expect a new conversation: earlier conversations do not carry over.
 
-The reasoning and the measurements are in `docs/LANGCHAIN_MIGRATION.md`; the spike behind it is in
-`spikes/langchain/`. The rest of this file describes the new design only.
+The lessons for future changes are in [docs/LEARNINGS.md](docs/LEARNINGS.md), with maintained evidence in
+`tests/test_agent.py`, `tests/fake_gateway.py` and `tests/test_tools.py`. The original proposal and
+experiments remain in Git history. The rest of this file describes the new design only.
 
 ## 2026-09-16: notebooks from the chat
 
@@ -360,7 +361,7 @@ Why Hailer's own tools instead of the upstream shell scripts:
 
 Not used: marimo's hidden `marimo edit --mcp code-mode` flag exposes `list_sessions` / `execute_code` over streamable HTTP at `/mcp/server` (needs `marimo[mcp]`). It is experimental, it requires the user to remember the flag, and the agent has no MCP client.
 
-Agent design rules and the finding behind each (`docs/LANGCHAIN_MIGRATION.md`; the docstrings in `hailer.agent` and `hailer.tools`):
+Agent design rules and the finding behind each ([docs/LEARNINGS.md](docs/LEARNINGS.md); the docstrings in `hailer.agent` and `hailer.tools`):
 
 - **Sync public methods over one `asyncio.Runner`** that lives as long as the agent. LangGraph's synchronous `stream()` blocks in an untimed wait on Windows and Ctrl+C arrived 5 to 9 s late, after the turn had finished; under asyncio it cancels the task and aborts the HTTP request at once.
 - **Blocking tools run on daemon threads.** Each `StructuredTool` has an async path that runs the call on a daemon thread, so Ctrl+C and exit never wait for a kernel call (on the loop's default executor, quitting waited 7 s for a call with 7 s left). The abandoned call finishes in the background and its result is dropped.
@@ -428,10 +429,9 @@ A global `~/.config/hailer/` layer (same structure, loaded before the project on
 hailer/
 ├── pyproject.toml         [project.scripts] hailer = "hailer.cli:main"
 ├── hailer.toml            example project config
-├── README.md, .gitignore, PLAN.md, uv.lock
-├── docs/                  INTERFACES.md, LANGCHAIN_MIGRATION.md (the proposal behind the 2026-09-18 change),
+├── README.md, AGENTS.md, .gitignore, PLAN.md, uv.lock
+├── docs/                  INTERFACES.md, LEARNINGS.md (guidance and regression checks for future agents),
 │                          DOCKER_KERNEL_PLAN.md (the plan behind the 2026-09-19 change)
-├── spikes/langchain/      the spike behind that proposal (throwaway; not packaged, not collected by pytest)
 ├── .config/hailer/        example context/, skills/, prompts/ with a short README
 ├── notebooks/analysis.py  valid marimo notebook: imports (mo, pl, duckdb), paths, welcome cell
 ├── data/                  .gitkeep, README.md
