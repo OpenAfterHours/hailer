@@ -1,7 +1,7 @@
 # Hailer module contracts
 
 This is the contract every module is built against. `PLAN.md` explains *why* (for the agent:
-`docs/LANGCHAIN_MIGRATION.md`; for the kernel runtimes: `docs/DOCKER_KERNEL_PLAN.md`); this file says *what*
+[LEARNINGS.md](LEARNINGS.md); for the kernel runtimes: `docs/DOCKER_KERNEL_PLAN.md`); this file says *what*
 each module exposes so work can proceed in parallel.
 Shared types live in `src/hailer/models.py`, errors in `src/hailer/errors.py`. Do not change those two files
 without agreement (report a needed change instead).
@@ -47,7 +47,10 @@ without agreement (report a needed change instead).
   running after Ctrl+C (it finishes on its daemon thread) may write the file later; the CLI re-reads it after
   every turn (finished, failed or interrupted) and before `/notebook` and `/status`.
 
-## Runtime facts (verified; marimo: PLAN.md §1, LangChain: `docs/LANGCHAIN_MIGRATION.md` §3 and `spikes/langchain/`)
+## Runtime facts
+
+For marimo verification, see PLAN.md §1. For LangChain lessons and maintained regression checks, see
+[LEARNINGS.md](LEARNINGS.md) and `tests/test_agent.py`.
 
 - Multi-notebook (verified live on marimo 0.24.2, both `marimo edit <file>` and `marimo edit <dir>`): one
   server opens any *existing* notebook at runtime via `?file=<key>`, no restart needed (in single-file mode the
