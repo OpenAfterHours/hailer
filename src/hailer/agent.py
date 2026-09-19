@@ -9,10 +9,10 @@ custom ``base_url``) into a chat model; :class:`HailerAgent` runs the tool loop 
 Everything runs inside the Hailer process. The API key is read from the environment or the OS
 credential store (:mod:`hailer.secrets`) and handed to the HTTP client; it is never logged.
 
-The public methods are synchronous. Inside, one asyncio event loop lives as long as the agent:
-``asyncio.Runner.run`` turns Ctrl+C into a cancellation that aborts the HTTP request in flight,
-which LangGraph's synchronous ``stream()`` cannot do on Windows (it blocks in an untimed wait and
-the interrupt arrived seconds late, after the turn had finished).
+Async callers own the event loop for the agent's lifecycle. The synchronous facade instead keeps
+one ``asyncio.Runner``: it turns Ctrl+C into cancellation of the HTTP request in flight, which
+LangGraph's synchronous ``stream()`` cannot do on Windows. Resources always stay on the same loop
+until they are closed; synchronous and asynchronous lifecycles cannot be mixed.
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ from hailer.models import (
     SkillInfo,
     TurnSummary,
 )
-from hailer.session import SESSION_DIRNAME
+from hailer.statedir import ensure_state_dir, state_dir
 
 log = get_logger("hailer.agent")
 
@@ -439,11 +439,12 @@ class HailerAgent:
         self._environ: Mapping[str, str] = env if env is not None else os.environ
         self._model_factory = model_factory
         self._tools = tools
-        self._threads_path = threads_path or (Path(config.workspace) / SESSION_DIRNAME / THREADS_FILENAME)
+        self._threads_path = threads_path or (state_dir(config.workspace) / THREADS_FILENAME)
         self._model = config.model.name
         self._provider_id = config.model.provider
         self.thread_id: str | None = None
         self._runner: asyncio.Runner | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._conn: Any = None
         self._saver: Any = None
         self._graph: Any = None
@@ -463,7 +464,7 @@ class HailerAgent:
 
     @property
     def started(self) -> bool:
-        return self._runner is not None
+        return self._loop is not None
 
     @property
     def bundle(self) -> ContextBundle:
@@ -477,11 +478,31 @@ class HailerAgent:
 
     # ---- lifecycle ---------------------------------------------------------------
 
-    def _run(self, coro: Any) -> Any:
+    def _check_sync_call(self) -> None:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise AgentError("Use the agent's async methods inside an event loop.")
+        if self._loop is not None and self._runner is None:
+            raise AgentError("This agent has an async lifecycle; use its async methods on the original event loop.")
+
+    def _run(self, operation: Callable[[], Any]) -> Any:
+        self._check_sync_call()
         if self._runner is None:
-            disable_tracing_unless_opted_in()
             self._runner = asyncio.Runner()
-        return self._runner.run(coro)
+        return self._runner.run(operation())
+
+    def _bind_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        if (self._runner is not None and loop is not self._runner.get_loop()) or (
+            self._loop is not None and loop is not self._loop
+        ):
+            raise AgentError("Use this agent on its original event loop until it has been closed.")
+        if self._loop is None:
+            disable_tracing_unless_opted_in()
+            self._loop = loop
 
     def _chat_model(self) -> Any:
         provider = provider_by_id(self.config, self._provider_id)
@@ -507,12 +528,15 @@ class HailerAgent:
         )
 
     async def _close_http(self) -> None:
-        http, self._http = self._http, None
+        http = self._http
         if http is not None:
             try:
                 await http.aclose()
             except Exception as exc:  # noqa: BLE001 - best effort
                 log.debug("closing the HTTP client failed: %s", type(exc).__name__)
+            # Keep ownership if a cancelled turn interrupted a rebuild while closing the client;
+            # the next rebuild or aclose can finish releasing it.
+            self._http = None
 
     async def _ensure_graph(self) -> Any:
         if self._graph is not None:
@@ -526,7 +550,10 @@ class HailerAgent:
         if self._saver is None:
             import aiosqlite
 
-            self._threads_path.parent.mkdir(parents=True, exist_ok=True)
+            if self._threads_path.parent == state_dir(self.config.workspace):
+                ensure_state_dir(self.config.workspace)
+            else:
+                self._threads_path.parent.mkdir(parents=True, exist_ok=True)
             self._conn = await aiosqlite.connect(str(self._threads_path))
             self._saver = AsyncSqliteSaver(self._conn)
         if self._tools is None:
@@ -567,6 +594,10 @@ class HailerAgent:
 
         ``forget_thread_id`` names a conversation the user chose not to resume (``hailer --new``); it is deleted.
         """
+        return self._run(lambda: self.astart(resume_thread_id=resume_thread_id, forget_thread_id=forget_thread_id))
+
+    async def astart(self, *, resume_thread_id: str | None = None, forget_thread_id: str | None = None) -> str:
+        """Open or resume a conversation on the caller's event loop; see :meth:`start`."""
 
         async def go() -> str:
             await self._ensure_graph()
@@ -580,7 +611,7 @@ class HailerAgent:
                 log.debug("thread %s is not in %s; starting a new one", resume_thread_id, self._threads_path.name)
             return self._new_thread_id()
 
-        return self._guarded(go())
+        return await self._aguarded(go)
 
     def _new_thread_id(self) -> str:
         self.thread_id = uuid.uuid4().hex
@@ -589,6 +620,10 @@ class HailerAgent:
 
     def new_thread(self) -> str:
         """Start a new conversation; the previous one is deleted."""
+        return self._run(self.anew_thread)
+
+    async def anew_thread(self) -> str:
+        """Start a new conversation on the owning loop, deleting the previous one."""
         previous = self.thread_id
 
         async def go() -> str:
@@ -596,7 +631,7 @@ class HailerAgent:
             await self._forget(previous)
             return self._new_thread_id()
 
-        return self._guarded(go())
+        return await self._aguarded(go)
 
     def set_model(self, name: str, provider: str | None = None) -> None:
         """Change the model (and optionally the provider) for the following turns."""
@@ -607,28 +642,60 @@ class HailerAgent:
         self._graph = None  # rebuilt with the new model on the next turn
 
     def close(self) -> None:
-        runner, self._runner = self._runner, None
-        conn, self._conn = self._conn, None
-        self._saver = None
-        self._graph = None
+        """Close the resources and event loop owned by the synchronous facade."""
+        self._check_sync_call()
+        runner = self._runner
         if runner is None:
             return
-
-        async def go() -> None:
-            await self._close_http()
-            if conn is not None:
-                await conn.close()
-
         try:
-            runner.run(go())
+            runner.run(self.aclose())
         except Exception as exc:  # noqa: BLE001 - best effort on the way out
             log.debug("close failed: %s", type(exc).__name__)
         finally:
             runner.close()
+            self._runner = None
 
-    def _guarded(self, coro: Any) -> Any:
+    async def aclose(self) -> None:
+        """Close HTTP and SQLite on their owning loop; leave the caller's loop running.
+
+        Cleanup finishes even when this await is cancelled, then cancellation propagates. Callers
+        must first cancel and await their active turn before closing the agent.
+        """
+        if self._loop is None:
+            return
+        self._bind_loop()
+        conn, self._conn = self._conn, None
+        self._saver = None
+        self._graph = None
+
+        async def cleanup() -> None:
+            try:
+                await self._close_http()
+            finally:
+                if conn is not None:
+                    try:
+                        await conn.close()
+                    except Exception as exc:  # noqa: BLE001 - best effort on the way out
+                        log.debug("closing the conversation store failed: %s", type(exc).__name__)
+
+        task = asyncio.create_task(cleanup())
+        cancelled = False
         try:
-            return self._run(coro)
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    cancelled = True
+            task.result()
+        finally:
+            self._loop = None
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _aguarded(self, operation: Callable[[], Any]) -> Any:
+        self._bind_loop()
+        try:
+            return await operation()
         except HailerError:
             raise
         except Exception as exc:
@@ -694,8 +761,24 @@ class HailerAgent:
         placed above the user's text in the same message (the system prompt explains ``[Hailer]``
         paragraphs). Ctrl+C cancels the turn and re-raises ``KeyboardInterrupt``.
         """
+        return self._run(lambda: self.arun_turn(text, on_event=on_event, skill=skill, preamble=preamble))
+
+    async def arun_turn(
+        self,
+        text: str,
+        *,
+        on_event: Callable[[AgentEvent], None] | None = None,
+        skill: SkillInfo | None = None,
+        preamble: str | None = None,
+    ) -> TurnSummary:
+        """Run a turn on the owning loop, propagating task cancellation unchanged.
+
+        The next turn repairs any unfinished history, including tool calls whose effect is unknown.
+        Event callbacks are synchronous and execute on the owning loop.
+        """
+        self._bind_loop()
         if self.thread_id is None:
-            self.start()
+            await self.astart()
         emit = on_event or (lambda _event: None)
         content = self._turn_text(text, skill, preamble)
         started = time.monotonic()
@@ -737,7 +820,7 @@ class HailerAgent:
                     if delta:
                         emit(AgentEvent("message_delta", delta))
 
-        self._guarded(go())  # KeyboardInterrupt passes through: Runner.run cancelled the turn already
+        await self._aguarded(go)
 
         return TurnSummary(
             final_response=final[0],

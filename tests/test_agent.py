@@ -495,6 +495,16 @@ def test_map_generic_failures_and_hailer_errors_pass_through(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
+def test_start_keeps_an_existing_gitignore_in_hailer(harness):
+    h = harness([])
+    folder = h.config.workspace / ".hailer"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / ".gitignore").write_text("# mine\n", encoding="utf-8")
+    h.agent.start()
+    assert (folder / "threads.sqlite").is_file()
+    assert (folder / ".gitignore").read_text(encoding="utf-8") == "# mine\n"
+
+
 def test_undeclared_provider_fails_at_construction(tmp_path):
     cfg = make_config(tmp_path, model=ModelConfig(name="x", provider="azure"))
     with pytest.raises(ConfigError):
@@ -507,6 +517,8 @@ def test_start_creates_the_store_and_a_thread(harness):
     thread_id = h.agent.start()
     assert thread_id and h.agent.thread_id == thread_id and h.agent.started
     assert (h.config.workspace / ".hailer" / "threads.sqlite").is_file()
+    ignore = (h.config.workspace / ".hailer" / ".gitignore").read_text(encoding="utf-8")
+    assert "*" in ignore.splitlines(), ".hailer/ ignores itself"
     assert h.factory_calls == [("internal", "internal-analyst", KEY_ENV["INTERNAL_MODEL_API_KEY"])]
     assert h.agent.key_source == "env"
 
@@ -601,6 +613,105 @@ def test_close_is_idempotent_and_the_agent_can_start_again(harness):
     assert not h.agent.started
     h.agent.start()
     assert h.agent.run_turn("hello").final_response == "ok"
+
+
+def test_async_lifecycle_resumes_resets_and_restarts(harness):
+    h = harness([say("one"), say("two"), say("three")])
+
+    async def exercise() -> None:
+        await h.agent.aclose()  # closing an unused agent must not bind a loop
+        assert not h.agent.started
+        try:
+            first = await h.agent.astart()
+            assert h.agent.started and h.agent._runner is None
+            assert (await h.agent.arun_turn("hello")).final_response == "one"
+            await h.agent.aclose()
+            await h.agent.aclose()
+            assert not h.agent.started
+            assert await h.agent.astart(resume_thread_id=first) == first
+            assert (await h.agent.arun_turn("hello again")).final_response == "two"
+            assert roles(h.model.seen[-1]) == ["system", "human", "ai", "human"]
+            assert await h.agent.anew_thread() != first
+            assert (await h.agent.arun_turn("fresh")).final_response == "three"
+            assert roles(h.model.seen[-1]) == ["system", "human"]
+            assert await h.agent._saver.aget_tuple({"configurable": {"thread_id": first}}) is None
+        finally:
+            await h.agent.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_async_agent_rejects_other_loops_and_sync_calls_without_losing_resources(harness):
+    h = harness([say("still usable")])
+    with asyncio.Runner() as owner:
+        owner.run(h.agent.astart())
+        try:
+            with pytest.raises(AgentError, match="original event loop"):
+                asyncio.run(h.agent.arun_turn("wrong loop"))
+            with pytest.raises(AgentError, match="original event loop"):
+                asyncio.run(h.agent.aclose())
+            with pytest.raises(AgentError, match="async lifecycle"):
+                h.agent.run_turn("wrong facade")
+            with pytest.raises(AgentError, match="async lifecycle"):
+                h.agent.close()
+            assert owner.run(h.agent.arun_turn("right loop")).final_response == "still usable"
+        finally:
+            owner.run(h.agent.aclose())
+
+
+def test_sync_agent_rejects_async_calls_and_nested_runner_without_losing_resources(harness):
+    h = harness([say("still usable")])
+    h.agent.start()
+
+    async def wrong_loop() -> None:
+        with pytest.raises(AgentError, match="original event loop"):
+            await h.agent.arun_turn("wrong loop")
+        with pytest.raises(AgentError, match="original event loop"):
+            await h.agent.aclose()
+        with pytest.raises(AgentError, match="async methods inside an event loop"):
+            h.agent.run_turn("nested runner")
+        with pytest.raises(AgentError, match="async methods inside an event loop"):
+            h.agent.close()
+
+    asyncio.run(wrong_loop())
+    assert h.agent.run_turn("right loop").final_response == "still usable"
+
+
+def test_async_close_finishes_http_and_sqlite_cleanup_despite_repeated_cancellation(harness):
+    h = harness([])
+
+    async def exercise() -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        closed_on: list[asyncio.AbstractEventLoop] = []
+
+        class SlowHttp:
+            async def aclose(self) -> None:
+                entered.set()
+                await release.wait()
+                closed_on.append(asyncio.get_running_loop())
+
+        await h.agent.astart()
+        conn = h.agent._conn
+        h.agent._http = SlowHttp()
+        closing = asyncio.create_task(h.agent.aclose())
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            closing.cancel()
+            await asyncio.sleep(0)
+            closing.cancel()
+            await asyncio.sleep(0)
+            assert not closing.done()
+        finally:
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(closing, timeout=5)
+        assert closed_on == [asyncio.get_running_loop()]
+        assert not h.agent.started and h.agent._http is None and h.agent._conn is None
+        with pytest.raises(ValueError, match="no active connection"):
+            await conn.execute("SELECT 1")
+
+    asyncio.run(exercise())
 
 
 # --------------------------------------------------------------------------- #
@@ -778,6 +889,80 @@ def test_ctrl_c_during_a_tool_leaves_a_valid_conversation(harness):
     assert isinstance(sent[4], HumanMessage) and sent[4].content == "what happened?"
 
 
+def test_async_cancellation_during_model_propagates_and_next_turn_repairs_history(harness):
+    entered: asyncio.Event
+    cleaned: asyncio.Event
+
+    async def slow_reply(_messages: list[Any]) -> AIMessage:
+        entered.set()
+        try:
+            await asyncio.Future()
+        finally:
+            cleaned.set()
+        return say("unreachable")
+
+    h = harness([lambda messages: slow_reply(messages), say("after cancellation")])
+
+    async def exercise() -> None:
+        nonlocal entered, cleaned
+        entered, cleaned = asyncio.Event(), asyncio.Event()
+        try:
+            turn = asyncio.create_task(h.agent.arun_turn("slow question"))
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            turn.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(turn, timeout=5)
+            assert cleaned.is_set()
+            summary = await h.agent.arun_turn("try again")
+            assert summary.final_response == "after cancellation"
+            assert roles(h.model.seen[-1]) == ["system", "human"]
+            assert h.model.seen[-1][1].content == "slow question\n\ntry again"
+        finally:
+            await h.agent.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_async_cancellation_during_tool_repairs_history_on_followup(harness):
+    h = harness([call("slow", {"seconds": 30}, "async_slow"), say("carried on")])
+
+    async def exercise() -> None:
+        async def wait_for_tool() -> None:
+            while "slow:start" not in h.tool_log:
+                await asyncio.sleep(0.001)
+
+        try:
+            turn = asyncio.create_task(h.agent.arun_turn("run the slow thing"))
+            await asyncio.wait_for(wait_for_tool(), timeout=5)
+            turn.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(turn, timeout=5)
+            assert h.tool_log == ["slow:start"]
+            assert (await h.agent.arun_turn("what happened?")).final_response == "carried on"
+            sent = h.model.seen[-1]
+            assert roles(sent) == ["system", "human", "ai", "tool", "human"]
+            assert sent[3].tool_call_id == "async_slow" and sent[3].content == INTERRUPTED_TOOL_RESULT
+        finally:
+            await h.agent.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_async_provider_error_is_mapped_and_followup_turn_can_succeed(harness):
+    h = harness([status_error(422, {"message": "Unsupported field"}), say("recovered")])
+
+    async def exercise() -> None:
+        try:
+            with pytest.raises(ProviderError, match="rejected the request") as err:
+                await h.agent.arun_turn("first")
+            assert "Unsupported field" in err.value.hint
+            assert (await h.agent.arun_turn("again")).final_response == "recovered"
+        finally:
+            await h.agent.aclose()
+
+    asyncio.run(exercise())
+
+
 # --------------------------------------------------------------------------- #
 # On the wire: a strict Chat-Completions-only gateway (real ChatOpenAI, loopback only)
 # --------------------------------------------------------------------------- #
@@ -861,6 +1046,45 @@ def test_wire_stream_false_never_asks_for_a_stream(wire):
     assert [r["body"].get("stream") for r in gateway.requests] == [False, False]
     assert (summary.input_tokens, summary.output_tokens) == (22, 14)
     assert [e.text for e in events if e.kind == "tool_call"] == ["marimo_execute"]
+
+
+def test_async_wire_lifecycle_owns_http_and_sqlite_on_one_loop(wire, monkeypatch):
+    clients: list[Any] = []
+    created_on: list[asyncio.AbstractEventLoop] = []
+    closed_on: list[asyncio.AbstractEventLoop] = []
+    original_client = openai.DefaultAsyncHttpxClient
+
+    class TrackedClient(original_client):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            clients.append(self)
+            created_on.append(asyncio.get_running_loop())
+
+        async def aclose(self) -> None:
+            closed_on.append(asyncio.get_running_loop())
+            await super().aclose()
+
+    monkeypatch.setattr(openai, "DefaultAsyncHttpxClient", TrackedClient)
+    with FakeGateway() as gateway:
+        agent = wire(gateway)
+
+        async def exercise() -> None:
+            await agent.astart()
+            conn = agent._conn
+            try:
+                assert (await agent.arun_turn("hello")).final_response
+                agent.set_model("corp-gpt")
+                assert (await agent.arun_turn("hello again")).final_response
+                assert clients[0].is_closed and not clients[-1].is_closed
+                assert agent._conn is conn  # model changes retain the conversation store
+            finally:
+                await agent.aclose()
+            assert all(client.is_closed for client in clients)
+            assert created_on == closed_on == [asyncio.get_running_loop()] * 2
+            with pytest.raises(ValueError, match="no active connection"):
+                await conn.execute("SELECT 1")
+
+        asyncio.run(exercise())
 
 
 def test_wire_reasoning_effort_is_sent_only_when_configured(wire):

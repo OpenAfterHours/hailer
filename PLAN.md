@@ -1,5 +1,14 @@
 # Hailer: implementation plan
 
+## 2026-09-19: final Docker kernel review and integration
+
+The interrupted review fixes were recovered from `worktree-docker-kernel` and integrated with the current
+automatic startup and persistent chat composer. Both chat entry points retain their kernel connection
+and reject mismatched kept kernels. The final pass also covers nested repository/workspace controls,
+credential folders inside temporary paths, busy-kernel diagnostics, state-write cleanup and retryable
+Docker shutdown. The docs below retain the earlier implementation evidence; the current findings and
+validation are in [docs/DOCKER_KERNEL_REVIEW.md](docs/DOCKER_KERNEL_REVIEW.md).
+
 ## 2026-09-19: the notebook kernel can run in Docker
 
 Where marimo and its kernel run is now a setting, `[kernel] runtime`: `local` (the default, as before) or

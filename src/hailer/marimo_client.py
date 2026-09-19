@@ -8,6 +8,8 @@ Talks to a handful of endpoints with the standard library only:
                                                ``stdout`` / ``stderr`` / ``done`` events
 - ``GET  {url}/``                             the page; carries the server (skew-protection) token
 - ``POST {url}/api/home/shutdown_session``    close a kernel session (needs the server token)
+- ``POST {url}/api/home/workspace_files``     the folder the server was started on (``root``;
+                                               needs the server token)
 
 One marimo server hosts every notebook: it is started on the notebooks *folder*, and any
 existing notebook gets its own kernel session when a browser opens ``?file=<absolute path>``.
@@ -36,7 +38,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import quote, urlsplit
 
-from hailer.errors import MarimoExecutionError, MarimoUnavailableError, NoSessionError, NotebookPathError
+from hailer.errors import HailerError, MarimoExecutionError, MarimoUnavailableError, NoSessionError, NotebookPathError
 from hailer.models import KERNEL_RUNTIME_LOCAL, ExecResult, HailerConfig, MarimoServer, MarimoSession
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only; hailer.kernel imports this module
@@ -44,6 +46,7 @@ if TYPE_CHECKING:  # pragma: no cover - annotations only; hailer.kernel imports 
 
 SERVER_TOKEN_HEADER = "Marimo-Server-Token"
 _HEALTH_TIMEOUT = 1.0
+_DISCOVERY_TIMEOUT = 5.0  # per request while asking registry servers which folder they serve
 _SERVER_TOKEN_RE = re.compile(r"<marimo-server-token[^>]*\bdata-token=[\"']([^\"']+)[\"']", re.IGNORECASE)
 
 # --------------------------------------------------------------------------- #
@@ -101,14 +104,12 @@ def marimo_server_command(notebooks_dir: Path, workspace: Path, port: int, *, he
 
 
 def launch_hint() -> str:
-    """The fix printed under "Marimo is not running." — the one-command route first."""
+    """The fix printed when this workspace has no marimo server — the one-command route first."""
     return (
-        "Start everything in one go:\n\n"
-        "    uvx hailer notebook\n\n"
+        "Start Hailer; it starts marimo for this workspace and stops it when the chat ends:\n\n"
+        "    uvx hailer        (or: uvx hailer notebook)\n\n"
         "Or run marimo on its own in another terminal:\n\n"
-        f"    {_format_command(launch_command())}\n\n"
-        "Then run Hailer again:\n\n"
-        "    uvx hailer"
+        f"    {_format_command(launch_command())}"
     )
 
 
@@ -238,17 +239,36 @@ def wait_for_session(
     timeout: float = 90.0,
     *,
     interval: float = 0.5,
+    should_stop: Callable[[], bool] | None = None,
 ) -> MarimoSession | None:
-    """Poll ``/api/sessions`` until the notebook has a kernel session; ``None`` on timeout."""
+    """Poll for a kernel session; return ``None`` on timeout or cooperative cancellation.
+
+    With ``should_stop``, check between requests and at most every 0.1 s while waiting.
+    An in-flight request still finishes under the client's own network timeout.
+    """
     deadline = time.monotonic() + timeout
     while True:
+        if should_stop is not None and should_stop():
+            return None
         try:
-            return client.resolve_session(notebook)
+            session = client.resolve_session(notebook)
         except NoSessionError:
             pass
+        else:
+            return None if should_stop is not None and should_stop() else session
         if time.monotonic() >= deadline:
             return None
-        time.sleep(interval)
+        if should_stop is None:
+            time.sleep(interval)
+            continue
+        next_attempt = min(deadline, time.monotonic() + interval)
+        while True:
+            if should_stop():
+                return None
+            remaining = next_attempt - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.1, remaining))
 
 
 def registry_entry_path(url: str, registry: Path | None = None) -> Path:
@@ -378,6 +398,41 @@ def discover_servers(registry: Path | None = None) -> list[MarimoServer]:
     return found
 
 
+AFFINITY_NONE = 0
+"""The server belongs to some other folder (or cannot say which)."""
+AFFINITY_WORKSPACE = 1
+"""The server was started on this workspace's notebooks folder, or hosts a notebook inside it."""
+AFFINITY_ACTIVE = 2
+"""The server hosts a kernel session for the active notebook."""
+
+
+def workspace_affinity(client: "MarimoClient", config: HailerConfig) -> int:
+    """How strongly the server behind ``client`` belongs to this workspace (``AFFINITY_*``).
+
+    A kernel session for a notebook inside the notebooks folder is proof, and needs only
+    ``/api/sessions``. Without one, the server's root folder decides (what ``hailer notebook``
+    passes to ``marimo edit``), so a server whose tab is not open yet is still recognised. The
+    root must equal the notebooks folder: a server started on a parent folder (a repository
+    checkout that contains this worktree, say) is not this workspace's server. Never raises.
+    """
+    try:
+        sessions = client.sessions()
+    except (HailerError, OSError, ValueError):  # not marimo, an old marimo, or it went away
+        return AFFINITY_NONE
+    if match_session(sessions, config.notebook, config.workspace) is not None:
+        return AFFINITY_ACTIVE
+    folder = _normalise_path(config.notebooks_root)
+    for session in sessions:
+        path = _session_path(session, config.workspace)
+        if path is not None and path.startswith(folder.rstrip(os.sep) + os.sep):
+            return AFFINITY_WORKSPACE
+    try:
+        root = client.root()
+    except (HailerError, OSError, ValueError):
+        return AFFINITY_NONE
+    return AFFINITY_WORKSPACE if root and _normalise_path(root) == folder else AFFINITY_NONE
+
+
 def _attach_allowed(requested: str, runtime: str) -> bool:
     """Fail closed: a docker request never gets a local server; a local one may get either (a docker
     kernel is strictly more isolated)."""
@@ -393,7 +448,7 @@ def find_server(config: HailerConfig, registry: Path | None = None) -> MarimoSer
     2. ``.hailer/kernel.json``: the server Hailer started for this workspace, when it answers with
        its token (:func:`hailer.kernel.live_kernel_state`, which also drops a record whose server
        is provably gone, so the next call does not wait on it again).
-    3. marimo's registry of ``--no-token`` servers: the single live one. Local runtime only.
+    3. marimo's registry of ``--no-token`` servers: the best workspace match. Local runtime only.
 
     Fails closed: when ``config.kernel.runtime`` is ``docker`` no local server is returned (not
     from ``marimo_url``, the registry, or a ``kernel.json`` that says local).
@@ -413,10 +468,16 @@ def find_server(config: HailerConfig, registry: Path | None = None) -> MarimoSer
             return live.server()
     if requested != KERNEL_RUNTIME_LOCAL:
         return None
-    live = discover_servers(registry)
-    if len(live) == 1:
-        return live[0]
-    return None
+    best: MarimoServer | None = None
+    best_affinity = AFFINITY_NONE
+    for server in discover_servers(registry):
+        client = MarimoClient(server.url, config.marimo_token, timeout=_DISCOVERY_TIMEOUT, workspace=config.workspace)
+        affinity = workspace_affinity(client, config)
+        if affinity > best_affinity:
+            best, best_affinity = server, affinity
+        if affinity == AFFINITY_ACTIVE:
+            break
+    return best
 
 
 # --------------------------------------------------------------------------- #
@@ -653,6 +714,25 @@ class MarimoClient:
                 hint="Check that the session id is current; GET /api/sessions lists the open ones.",
             ) from err
 
+    def root(self) -> str | None:
+        """The folder the server was started on (``marimo edit <folder>``); ``None`` for a single-file server.
+
+        marimo reports it (absolute, symlinks not resolved) from ``POST /api/home/workspace_files``,
+        which needs the server token. That call also rescans the folder, so it is only used while
+        looking for this workspace's server.
+        """
+        headers = {"Content-Type": "application/json", SERVER_TOKEN_HEADER: self.server_token()}
+        try:
+            with self._open("POST", "/api/home/workspace_files", body=b"{}", headers=headers) as resp:
+                payload = json.loads(resp.read().decode("utf-8", "replace") or "{}")
+        except urllib.error.HTTPError as err:
+            raise MarimoUnavailableError(
+                f"Marimo at {self.base_url} answered HTTP {err.code} to /api/home/workspace_files.",
+                hint="Hailer expects marimo 0.24.x; check the marimo server log.",
+            ) from err
+        root = payload.get("root") if isinstance(payload, dict) else None
+        return root if isinstance(root, str) and root else None
+
     def notebook_url(self, notebook: Path | None = None) -> str:
         """The URL that opens ``notebook`` (token only with ``token_in_links``; see the class docstring)."""
         nb = notebook or self.notebook
@@ -844,6 +924,9 @@ def build_create_cell_code(code: str, *, name: str | None = None, hide_code: boo
 
 
 __all__ = [
+    "AFFINITY_ACTIVE",
+    "AFFINITY_NONE",
+    "AFFINITY_WORKSPACE",
     "CM_HELP_CODE",
     "LIST_CELLS_CODE",
     "NOTEBOOK_GLOBALS_CODE",
@@ -863,6 +946,7 @@ __all__ = [
     "registry_dir",
     "wait_for_health",
     "wait_for_session",
+    "workspace_affinity",
 ]
 
 if sys.platform == "win32":  # pragma: no cover - documentation only

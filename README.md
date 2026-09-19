@@ -129,13 +129,16 @@ stops it later), `--foreground` (just run marimo attached to this terminal, no c
 page unless `--no-browser` is given), `--new` (start a fresh conversation), `--kernel local|docker` (where
 notebook code runs for this run; the default comes from `[kernel] runtime`).
 
-Chat only, when marimo is already running (started by `uvx hailer notebook --keep-marimo`, or by
-`uvx hailer notebook --foreground` in another terminal, with the notebook open in a browser). The chat
-finds a server Hailer started through `.hailer/kernel.json`:
+Bare `uvx hailer` does the same as `uvx hailer notebook` with its defaults: it reuses this workspace's
+marimo server or starts one, opens the notebook, chats, and stops only a server it started. A kept server
+is found through `.hailer/kernel.json`:
 
 ```bash
 uvx hailer
 ```
+
+A pinned server (`[hailer].marimo_url` in `hailer.toml`, or `HAILER_MARIMO_URL`) is used as is, whichever
+folder it serves. If it does not answer, Hailer says so and exits; it never starts a server in its place.
 
 ```text
 +--------------------- Hailer ----------------------+
@@ -182,6 +185,22 @@ Added a channel comparison below the category chart.
 
 Hailer resumes your previous conversation on the next start; use `uvx hailer --new` or `/new` for a fresh
 thread. `uvx hailer doctor` runs the same startup checks and prints fixes.
+
+## Running inside abeam
+
+[abeam](https://github.com/OpenAfterHours/abeam) runs coding-agent CLIs in a terminal pane beside git status,
+a file viewer and a shell. It starts `hailer` from your `PATH`, so install Hailer as a tool first:
+
+```bash
+uv tool install hailer
+abeam +hailer
+```
+
+abeam forwards every argument, so `abeam +hailer notebook --no-browser` or `abeam +hailer --new` behave as
+they do in a terminal. abeam starts Hailer in a git worktree; commit `hailer.toml` (and your notebooks) so
+each worktree is a workspace of its own, since Hailer uses the nearest folder holding `hailer.toml` or
+`pyproject.toml`. Each workspace then gets its own marimo server, `.hailer/` stays out of the git pane, and a
+pasted block of several lines arrives as one message.
 
 ## Working with several notebooks
 
@@ -284,8 +303,7 @@ runtime  = "docker"   # "local" (default) or "docker"
   Kernel:     docker (hailer-kernel X.Y.Z; network on: the internet and this machine; data read-only)
   ```
 
-  A docker kernel Hailer started for this workspace is the one in use whatever the file says: chat-only
-  `uvx hailer` attaches to it and the line says `docker`.
+  A docker kernel Hailer started for this workspace is the one in use whatever the file says: `uvx hailer` attaches to it when its mounted folders match and the line says `docker`.
 - **Docker mode fails closed.** Docker missing or not running, Docker Desktop set to Windows containers,
   an image for another Hailer version, or a folder layout it refuses (below): Hailer stops and says how to
   fix it (see [Troubleshooting](#troubleshooting)). It never runs notebook code on this machine instead.
@@ -346,9 +364,10 @@ row, and every start stops on it, `--foreground` included (the same rules, in on
   temporary folder inside it is fine).
 - The notebooks folder may not sit inside `.hailer/` or those folders either, and the data folder may not
   sit inside the notebooks folder (it would become writable).
-- The notebooks folder may not be a git repository (`.git` at its top level): notebook code could add git
-  hooks or settings there that run on this machine the next time git or an editor touches it. Keep the
-  notebooks in a plain subfolder of your repository, such as `notebooks/`.
+- The notebooks folder may not contain `.git` or `hailer.toml`, including in subfolders: notebook code
+  could change repository hooks or another workspace's settings. Keep notebooks in a plain subfolder of
+  your repository, such as `notebooks/`, and move nested repositories and workspaces outside that folder.
+  Hailer checks names without following symlinks or junctions; an unreadable subtree stops startup.
 - The default layout, `notebooks/` and `data/` in the workspace, passes. The data folder can be anywhere
   else on the machine: set `[hailer].data_dir` to an absolute path and it is mounted read-only where it is.
 - Windows: a folder on a network share (a UNC path such as `\\server\share\sales`) cannot be mounted: it
@@ -367,21 +386,22 @@ row, and every start stops on it, `--foreground` included (the same rules, in on
   `127.0.0.1:<port>` only, which carries the browser's and Hailer's requests to the kernel (Docker
   publishes no port for a container on an internal network). `<id>` comes from the workspace path, so two
   workspaces can run side by side. With `network = true` there is only the kernel, published directly.
-  When the chat ends, all of it is removed.
-- **Reuse.** `--keep-marimo` leaves the kernel running; the next `uvx hailer notebook` or chat-only
-  `uvx hailer` in the workspace attaches to it. `uvx hailer notebook` reuses it only when it was started
-  with the settings `hailer.toml` asks for now (folders, network, image, memory, cpus); otherwise it stops
-  and says to run `uvx hailer kernel stop` first. Chat-only `uvx hailer` attaches anyway, with a warning.
-  `--kernel local` also attaches to a running docker kernel, which is the more isolated of the two.
+  When the chat ends, Hailer removes the kernel it started. Reused kernels are left running.
+- **Reuse.** `--keep-marimo` leaves the kernel running. Both `uvx hailer` and `uvx hailer notebook`
+  reuse it only when its mounted folders match. When Docker is configured, image, network, memory and
+  CPU settings must also match; otherwise the command asks you to run `uvx hailer kernel stop` first.
+  `--kernel local` can attach to a running Docker kernel with matching folders. The chat keeps that
+  server's token and path mapping in memory, including across notebook and model switches.
 - **`--foreground`** starts the kernel and follows its log in this terminal. Ctrl+C stops and removes it;
   when it ends for another reason, Hailer says why (out of memory, removed from outside, exited).
 - **`uvx hailer kernel stop`** stops this workspace's kernel, docker or local, and removes every container
   and network labelled with the workspace, running or not. It prints what it removed, says when Docker is
-  not running (so leftovers could not be checked), and exits 1 when a removal failed (a container another
+  not running (so leftovers could not be checked), and exits 1 when a recorded Docker kernel cannot be stopped or a removal failed (a container another
   terminal is removing at the same moment counts as removed, and a network whose containers are still
-  detaching is retried for a few seconds).
+  detaching is retried for a few seconds). If Docker is unreachable, the recorded Docker kernel is kept
+  for retry. An unanswered health check alone never proves those containers are gone.
 - **Files the kernel may have planted.** When a docker kernel stops (the chat ends, `--foreground` ends,
-  `uvx hailer kernel stop`), Hailer looks at the top of the notebooks folder for `.git`, `.vscode`,
+  `uvx hailer kernel stop`), Hailer scans the notebooks folder and its subfolders for `.git`, `.vscode`,
   `.idea`, `.devcontainer` and `hailer.toml` and prints a loud `WARNING` naming them: notebook code can
   write there, and git or an editor would run commands from them. Delete them (unless you put them there
   yourself) before you run git in that folder or open it in an editor. `uvx hailer doctor` shows the
@@ -581,18 +601,34 @@ credentials, customer names and row-level data out of it.
 | `/prompt <name> [args]` | Send a saved prompt from `.config/hailer/prompts`. |
 | `/reload` | Re-read `.config/hailer`; applies from your next message. |
 | `/clear` | Clear the screen. |
-| `/exit`, `/quit` | Exit Hailer (Ctrl+C at the prompt, or Ctrl+Z then Enter, also exit). |
+| `/exit`, `/quit` | Exit Hailer (Ctrl+C at the prompt, Ctrl+D on an empty line, or Ctrl+Z then Enter, also exit). |
 
-Ctrl+C while the agent is working cancels that turn, including the request to the model endpoint, and
-returns to the prompt. The conversation carries on: your interrupted message is kept and sent together with
-the next one. The conversation itself is stored in `.hailer/threads.sqlite` in the workspace, which is how
+Interactive chat keeps a framed input box below the conversation. Your submitted messages, Hailer's
+replies and command results appear above it. The context line shows the active notebook, model and
+number of loaded context files; the activity line shows what Hailer is doing.
+
+Enter sends; Alt+Enter inserts a newline. Pasting several lines keeps them in one editable message.
+Up and Down move through multiline input and recall earlier messages at its boundaries (history stays
+in memory for this session). You can draft your next message while Hailer works; Enter preserves that
+draft until the current operation finishes or is cancelled. Requests are not queued.
+
+The interface uses normal terminal scrollback and text selection. It does not capture the mouse or
+switch to an alternate screen. Use `hailer --plain` or `hailer notebook --plain` for the line-oriented
+`You >` interface. Pipes and terminals reporting `TERM=dumb` or `TERM=unknown` use plain input automatically.
+
+Ctrl+C during a turn cancels the model request and keeps the composer open. A notebook command already
+performing a blocking operation finishes its cleanup before another command can start. Cancellation does
+not undo tool actions that have already happened. Ctrl+C while idle exits; Ctrl+D on empty input or
+Ctrl+Z then Enter also exits. The conversation is stored in `.hailer/threads.sqlite`, which is how
 `hailer` resumes it after a restart; `/new` (or `hailer --new`) discards it and starts another.
+Completed replies are displayed once, with Markdown formatting; live activity does not print interim
+model commentary. `/clear` clears the display without resetting the conversation.
 
 Other subcommands:
 
 | Command | What it does |
 |---|---|
-| `hailer notebook [--port N] [--no-browser] [--keep-marimo] [--foreground] [--new] [--kernel RUNTIME]` | The one-command session described in Quick start; marimo runs on the notebooks folder. `RUNTIME` is `local` or `docker`. |
+| `hailer notebook [--port N] [--no-browser] [--keep-marimo] [--foreground] [--new] [--plain] [--kernel RUNTIME]` | The one-command session described in Quick start; marimo runs on the notebooks folder. `RUNTIME` is `local` or `docker`. |
 | `hailer exec -c "code"` (or `hailer exec script.py`, `hailer exec -` for stdin) | Run Python in the active notebook's kernel yourself. |
 | `hailer status`, `hailer doctor` | Configuration and state; the startup checks with fixes. |
 | `hailer login <provider>`, `hailer logout <provider>` | Store or remove a provider's API key. |
@@ -602,7 +638,7 @@ Other subcommands:
 | `hailer kernel stop` | Stop this workspace's kernel (local or docker) and remove its containers and network. |
 
 Global options go before the subcommand: `--verbose`, `--config <path>`, `--workspace <path>`, `--new`,
-`--version` (for example `uvx hailer --workspace C:\projects\sales kernel stop`).
+`--plain`, `--version` (for example `uvx hailer --workspace C:\projects\sales kernel stop`).
 
 ## Data conventions
 
@@ -781,10 +817,11 @@ and press Ctrl+C if a turn goes somewhere you did not intend.
   notebooks folder, including a `.git` folder (hooks and settings such as `core.fsmonitor` run when git
   or an editor that scans nested repositories, like VS Code, touches it), `.vscode`, `.idea` or
   `.devcontainer` settings, or a `hailer.toml` that makes the folder look like another workspace. Hailer
-  refuses a notebooks folder that already is a git repository, and when a docker kernel stops (the chat
-  ends, `--foreground` ends, `uvx hailer kernel stop`) it prints a `WARNING` naming any of these at the top
-  of the folder; `uvx hailer doctor` shows the same. Delete them before you run git in that folder or open
-  it in an editor, unless you put them there yourself.
+  refuses existing repositories and nested Hailer workspaces anywhere in the notebooks tree. At stop
+  and in `doctor`, it warns about repository, editor and workspace controls in that tree. These checks
+  do not prevent an editor from acting on a new file while the kernel is running. Disable automatic
+  repository discovery and automatic editor tasks for folders holding untrusted notebooks. Review new
+  control files before opening them; Hailer never removes them for you.
 - *The token is on the container's command line*, so `docker inspect` shows it. Anyone who can use Docker
   on the machine can already `docker exec` into the container, so hiding it would gain nothing.
 - *The image is trusted by name.* Hailer checks its tag and version label, not a signature, and runs
@@ -807,11 +844,10 @@ third party. Set `HAILER_TRACING=1` if you do want the tracing variables in your
 **On disk:** the conversation (your messages, the agent's replies, tool calls and their truncated results)
 is stored unencrypted in `.hailer/threads.sqlite` inside the workspace until `/new` or `hailer --new`
 replaces it. `.hailer/kernel.json` records the marimo server Hailer started (runtime, URL, token and, for
-docker, the container and network ids and the settings it was started with) and is deleted when Hailer
-stops it; `.hailer/last-kernel.json` notes which runtime last used the notebooks folder. `.hailer/marimo.log`
+docker, the container and network ids and the settings it was started with) and is deleted after successful cleanup; failed Docker cleanup keeps the record for retry; `.hailer/last-kernel.json` notes which runtime last used the notebooks folder. `.hailer/marimo.log`
 holds the local server's output, including its signed-in URL, and is emptied at each start. On macOS and
 Linux these three files are readable by you only. `.hailer/` is never mounted into a docker kernel and is
-in the repository's `.gitignore`.
+kept out of git by its own `.gitignore` containing `*`; Hailer never edits your repository's `.gitignore`.
 
 ## Troubleshooting
 
@@ -822,7 +858,10 @@ available in the kernel.
 
 | Message | Meaning and fix |
 |---|---|
-| `Marimo is not running.` then `Start everything in one go: uvx hailer notebook`, `Or run marimo on its own in another terminal: uvx hailer notebook --foreground`, `Then run Hailer again: uvx hailer` | No server answered at the configured or discovered URL. `uvx hailer notebook` starts one on the notebooks folder and runs the chat in the same terminal; `--foreground` runs only marimo, with Hailer's own Python environment (or the kernel image), so the notebook can import Polars, DuckDB and `hailer.periods`. A server Hailer started is found through `.hailer/kernel.json`. In the local runtime a marimo server you started yourself with `--no-token` registers itself so Hailer finds it; otherwise set `marimo_url` in `hailer.toml`. In docker mode only a kernel Hailer started for this workspace is used. |
+| `No marimo server is running for this workspace.` (`doctor` or `exec`; `status` says `none for this workspace`) | Run `uvx hailer` or `uvx hailer notebook` to start or reuse this workspace's kernel. Hailer finds its own servers through `.hailer/kernel.json`; local registry servers must serve this notebooks folder. Docker mode never attaches to a local server. |
+| `Marimo is not running at <url>.` with a hint about `[hailer].marimo_url` | The pinned URL does not answer. Start marimo there or remove the setting; Hailer never starts a replacement for an explicit pin. |
+| `Could not finish stopping the Docker kernel` or `Could not stop the Docker kernel` | The record is kept and the command exits 1. Restore access to Docker and run `uvx hailer kernel stop` again. |
+| `Could not record the Docker kernel` or `Could not record the local kernel` | Writing `.hailer/kernel.json` failed. Hailer stops what it started; check disk space and permissions before retrying. |
 | `Marimo exited early (code N)` or `Marimo did not answer on http://127.0.0.1:2718 within 60 s`, followed by `Log: <workspace>\.hailer\marimo.log` and its last lines | `hailer notebook` could not start marimo. The log tail usually names the cause (port in use by something else, a syntax error in the notebook, marimo not installed in the environment). |
 | `the notebook is not open in a browser` followed by `Open http://... in your browser.` | The server is up but has no kernel session. Open the URL; Hailer opens it for you once at startup. The URL ends in `&view-as=present` (app view) and, for a server Hailer started, `&access_token=...`; `Ctrl+.` in the notebook shows the code. |
 | The browser shows marimo's sign-in page instead of the notebook | The link has no `access_token`: links in the agent's replies and tool results leave the token out, because they go to the model endpoint. Run `/notebook` in the chat for the signed-in link. |
@@ -832,10 +871,10 @@ available in the kernel.
 | `The kernel image for Hailer X.Y.Z is not published (or not visible to you): ghcr.io/openafterhours/hailer-kernel:X.Y.Z.` | The registry refused the download: this version has no published image (a development version, or a release whose image job has not finished), or the image is not public. `uvx hailer kernel build` builds it on this machine; or set `[kernel].image` (or `HAILER_KERNEL_IMAGE`) to a copy you can reach, such as a company mirror. `Could not download the kernel image ...`, with docker's own error above it, is a network, proxy or registry problem with the same fixes. |
 | `The kernel image <image> is for Hailer A.B.C; this is Hailer X.Y.Z.` (or `(no version label)`) | `[kernel].image` names an image built for another Hailer, and a different marimo would break code mode. `uvx hailer kernel pull` downloads the matching one, `uvx hailer kernel build` builds it; or point `image` at the matching tag. |
 | `The notebooks folder (<path>) is the workspace folder. With [kernel] runtime = "docker" it is mounted writable into the container, so notebook code could change Hailer's own files.` (also `is a whole drive`, `contains your home folder`, `is inside Hailer's .hailer folder`, `is inside C:\Users\<you>\.aws, a folder that holds credentials`, the same for `The data folder`, and `[hailer].data_dir (...) is inside the notebooks folder`) | Docker mode refuses, on every start (`--foreground` too), a mount that would hand notebook code Hailer's own files or your credentials (see [Which folders can be mounted](#which-folders-can-be-mounted)). Keep the notebooks and the data in folders of their own, such as `notebooks/` and `data/`, and point `[hailer].notebooks_dir` and `[hailer].data_dir` at them. |
-| `The notebooks folder (<path>) is a git repository (it has .git at its top level).` | In docker mode notebook code could add git hooks or settings (`core.fsmonitor`) there that run on this machine the next time git or an editor touches the repository. Keep the notebooks in a plain subfolder of your repository (such as `notebooks/`), or remove the nested repository. |
-| `WARNING: the notebooks folder <path> has .git, .vscode at its top level.` (any of `.git`, `.vscode`, `.idea`, `.devcontainer`, `hailer.toml`), when a docker kernel stops or in `doctor` | The docker kernel can write to the notebooks folder, and git, editors and Hailer read these. Unless you put them there yourself, delete them before you run git in that folder, open it in an editor, or run Hailer from inside it. Hailer never removes them for you. |
+| `The notebooks folder (<path>) is a git repository (it has .git at its top level).` or `contains repository or workspace controls: ...` | In docker mode notebook code could add git hooks or settings (`core.fsmonitor`) there that run on this machine the next time git or an editor touches the repository. Keep the notebooks in a plain subfolder of your repository (such as `notebooks/`), or remove the nested repository. |
+| `WARNING: the notebooks folder <path> contains .git, project/.vscode.` (any of `.git`, `.vscode`, `.idea`, `.devcontainer`, `hailer.toml`), when a docker kernel stops or in `doctor` | The docker kernel can write to the notebooks folder, and git, editors and Hailer read these. Unless you put them there yourself, delete them before you run git in that folder, open it in an editor, or run Hailer from inside it. Hailer never removes them for you. |
 | `The data folder \\server\share\sales is on a network share (UNC path), which Docker cannot mount.` (an error in `doctor`'s `config` row and at every start), or in `doctor`: `the container may not see all of the data folder` with `... is on a mapped network drive (Z:); Docker Desktop usually cannot mount it.` (a warning) | Docker Desktop cannot mount network locations. Copy the data to a folder on a local disk and point `[hailer].data_dir` at it (the same for the notebooks folder and `[hailer].notebooks_dir`). `N link(s) in the data folder point outside it` means symlinks or junctions the container cannot follow: copy those files into the folder. |
-| `The running kernel was started with other settings (memory 4g, hailer.toml: 2g).` | A kernel left running (`--keep-marimo`, `--foreground`) was started with other folders, network, image, memory or cpus than `hailer.toml` asks for now, so `uvx hailer notebook` does not reuse it. Run `uvx hailer kernel stop`, then the command again. Chat-only `uvx hailer` uses the kernel as it is and warns: `the running kernel was started with other settings (...); the chat uses it as it is`. |
+| `The running kernel was started with other settings (memory 4g, hailer.toml: 2g).` | A kernel left running (`--keep-marimo`, `--foreground`) was started with other folders, network, image, memory or cpus than `hailer.toml` asks for now, so `uvx hailer notebook` does not reuse it. Run `uvx hailer kernel stop`, then the command again. Bare `uvx hailer` follows the same reuse rules. |
 | `A kernel container for this workspace is still running, but Hailer cannot reach it: hailer-kernel-<id>.` | A docker kernel from an earlier run (a crash, a closed terminal) that Hailer has no working record of. Hailer never removes a running kernel on its own, since it may be in use. `uvx hailer kernel stop` removes it. |
 | `A docker kernel Hailer started for this workspace is already running at <url>.` or `A local marimo server Hailer started for this workspace is still running at <url>.` | Starting another server would orphan the running one (a second `--foreground`, or `--kernel docker` while a local server Hailer started is still up). `uvx hailer notebook` and `uvx hailer` attach to a running docker kernel. Otherwise end the session that started it, or run `uvx hailer kernel stop`. |
 | `A docker kernel Hailer started for this workspace (hailer-kernel-<id>, hailer-fwd-<id>) may still be running, but it does not answer at <url>.` (or `A local marimo server ... (process N) may still be running, ...`) | The recorded kernel does not answer, but its containers or its process still exist (busy, stuck or suspended), so a new start would orphan it. Wait and try again, or run `uvx hailer kernel stop`. For a local server whose process still runs, `kernel stop` clears the record and says so (`Process N is still running: ...`); end that process yourself if it is the stuck server. |
@@ -853,7 +892,7 @@ available in the kernel.
 | `Warning: [kernel].pass_env lets notebook code read CORP_API_KEY (the API key of provider "corp"); ...` | `pass_env` names one of Hailer's own secrets (a provider's key or header variable, or `HAILER_MARIMO_TOKEN`), so code the model writes could use or leak it. Remove it unless notebooks truly need it. |
 | `not found: <path>` for the notebook | The configured notebook (`[hailer].notebook`, or `HAILER_NOTEBOOK`) does not exist. `uvx hailer init` creates it from the starter template (your `hailer.toml` is kept), or fix the path; a deleted *active* notebook is not the cause, because Hailer already falls back to the configured one when the remembered notebook is gone. New notebooks are created from the chat with `/notebook new <name>`. |
 | `No notebook named '...' in notebooks.` or `... is outside the notebooks folder.` | `/notebook open` (or the agent's `notebook_open`) only opens marimo notebooks inside `[hailer].notebooks_dir`; the hint lists the available names. Move the file into the folder or point `notebooks_dir` at it. |
-| `INTERNAL_MODEL_API_KEY is not set (required by provider 'internal')`, or the same for `OPENAI_API_KEY` and provider `'openai'` | Every provider needs a key. Run `uvx hailer login <provider>` or set the variable in this terminal. Releases up to 0.2 could use a ChatGPT login for the `openai` provider; that is gone, so create an API key. |
+| `INTERNAL_MODEL_API_KEY is not set (required by provider 'internal')`, or the same for `OPENAI_API_KEY` and provider `'openai'` | Every provider needs a key. Run `uvx hailer login <provider>` or set the variable in this terminal. Releases up to 0.2.2 could use a ChatGPT login for the `openai` provider; that is gone, so create an API key. |
 | `The model endpoint rejected the API key for provider '...'` | The endpoint returned 401. Re-run `hailer login <provider>`. |
 | `Unknown model '...' for provider '...'` | The endpoint does not know `[model].name` (or the name given to `/model`). Its reply is quoted after `The endpoint said:`. |
 | `Could not reach the model endpoint at <base_url>` | Check `base_url`, VPN or proxy (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`), and that the endpoint is running. |
@@ -862,8 +901,8 @@ available in the kernel.
 | `The endpoint at <base_url> refused access (HTTP 403).` | The key was accepted but is not allowed for this model, route or organisation. Check the endpoint's access policy and the provider's `http_headers` / `env_http_headers`. |
 | `The endpoint at <base_url> is unavailable (HTTP 429)` (or 5xx) | Rate limit or an outage on the endpoint's side. Retry in a moment. |
 | `The conversation no longer fits the model's context window.` | Start again with `/new`, and lower `[model].summarize_after_tokens` so older turns are summarised before the model's limit is reached. |
-| `Warning: unknown key [model_providers.x].merge_messages ... is ignored` (also `parallel_tool_calls`, `requires_openai_auth`, `[hailer].codex_home`, `[web].allow_shell_network`) | Settings from releases up to 0.2 that no longer mean anything. The file still loads; delete the keys to silence the warning. |
-| `Previous conversation could not be resumed; started a new one.` after upgrading from 0.2 | Conversations from before 0.3 were stored elsewhere and do not carry over. |
+| `Warning: unknown key [model_providers.x].merge_messages ... is ignored` (also `parallel_tool_calls`, `requires_openai_auth`, `[hailer].codex_home`, `[web].allow_shell_network`) | Settings from releases up to 0.2.2 that no longer mean anything. The file still loads; delete the keys to silence the warning. |
+| `Previous conversation could not be resumed; started a new one.` after upgrading from 0.2.2 or earlier | Conversations from before 0.2.3 (the Codex releases) were stored elsewhere and do not carry over. |
 | A tool result starting with `ERROR:` inside the conversation | The agent hit a marimo or allowlist problem; the text contains the fix (for example the URL to open). |
 | `Marimo at <url> rejected the request (HTTP 401).` (or 403) and the hint mentions `.hailer/kernel.json` and `HAILER_MARIMO_TOKEN` | The server was started with a token. If Hailer started it, run Hailer in the same workspace, so it reads the token from `.hailer/kernel.json`. For a server you started yourself, export its token as `HAILER_MARIMO_TOKEN` (kept in memory only), or restart it with `--no-token`. |
 

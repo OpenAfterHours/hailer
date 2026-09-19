@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import pytest
+from fake_marimo import running
 
 from fake_marimo import FakeMarimo
 from hailer import marimo_client as mc
@@ -310,13 +311,91 @@ def test_find_server_prefers_config(fake, tmp_path):
     assert server == MarimoServer(url="http://localhost:9999", source="config")
 
 
-def test_find_server_single_registry_entry(fake, tmp_path):
+def _register(reg: Path, *servers) -> None:
+    """Registry entries for ``servers`` the way marimo writes them (``<host>_<port>.json``)."""
+    for srv in servers:
+        port = srv.server_address[1]
+        _write_entry(reg, f"127.0.0.1_{port}.json", server_id=f"127.0.0.1:{port}", pid=1, host="127.0.0.1", port=port, base_url="", started_at="", version="0.24.2")
+
+
+def test_find_server_pinned_url_is_returned_even_when_down(tmp_path):
+    cfg = _config(tmp_path, marimo_url=f"http://127.0.0.1:{_free_port()}")
+    assert mc.find_server(cfg, registry=tmp_path / "servers").url == cfg.marimo_url
+
+
+def test_find_server_ignores_a_lone_server_for_another_workspace(fake, tmp_path):
+    """One live server, started on another worktree's notebooks folder: not ours, even though it is the only one."""
     reg = tmp_path / "servers"
-    port = fake.server_address[1]
-    _write_entry(reg, "a.json", server_id="a", pid=1, host="127.0.0.1", port=port, base_url="", started_at="", version="")
-    assert mc.find_server(_config(tmp_path), registry=reg).url == fake.url
-    _write_entry(reg, "b.json", server_id="b", pid=1, host="127.0.0.1", port=port, base_url="", started_at="", version="")
-    assert mc.find_server(_config(tmp_path), registry=reg) is None  # ambiguous
+    ws = tmp_path / "wt-a"
+    other = tmp_path / "wt-b"
+    fake.root = str(other / "notebooks")
+    fake.sessions = {"s1": {"filename": "analysis.py", "path": str(other / "notebooks" / "analysis.py")}}
+    _register(reg, fake)
+    assert mc.find_server(_config(ws, notebook=ws / "notebooks" / "analysis.py"), registry=reg) is None
+
+
+def test_find_server_picks_the_server_started_on_this_workspace(fake, tmp_path):
+    """Two live servers, no tab open on either: the one whose root is our notebooks folder wins."""
+    reg = tmp_path / "servers"
+    ws = tmp_path / "wt-a"
+    fake.root = str(tmp_path / "wt-b" / "notebooks")
+    with running() as ours:
+        ours.root = str(ws / "notebooks")
+        _register(reg, fake, ours)
+        found = mc.find_server(_config(ws, notebook=ws / "notebooks" / "analysis.py"), registry=reg)
+        assert found is not None and found.url == ours.url and found.source == "registry"
+
+
+def test_find_server_picks_the_server_hosting_a_notebook_of_this_workspace(fake, tmp_path):
+    """A server started elsewhere (single-file mode: no root) that hosts one of our notebooks is ours."""
+    reg = tmp_path / "servers"
+    ws = tmp_path / "wt-a"
+    fake.root = str(tmp_path / "wt-b" / "notebooks")
+    with running() as ours:
+        ours.sessions = {"s2": {"filename": "other.py", "path": str(ws / "notebooks" / "sub" / "other.py")}}
+        _register(reg, fake, ours)
+        found = mc.find_server(_config(ws, notebook=ws / "notebooks" / "analysis.py"), registry=reg)
+        assert found is not None and found.url == ours.url
+        assert ours.page_hits == 0, "a session inside the notebooks folder is proof enough; no root lookup"
+
+
+def test_find_server_prefers_the_server_hosting_the_active_notebook(fake, tmp_path):
+    reg = tmp_path / "servers"
+    ws = tmp_path
+    fake.root = str(ws / "notebooks")  # ours, but the active notebook is open on the other one
+    with running() as active:
+        active.sessions = {"s1": {"filename": "analysis.py", "path": str(ws / "notebooks" / "analysis.py")}}
+        _register(reg, fake, active)
+        assert mc.find_server(_config(ws), registry=reg).url == active.url
+
+
+def test_find_server_does_not_claim_a_server_on_a_parent_folder(fake, tmp_path):
+    """A server on the main checkout does not belong to a worktree nested inside it."""
+    reg = tmp_path / "servers"
+    main = tmp_path / "repo"
+    worktree = main / ".claude" / "worktrees" / "wt"
+    fake.root = str(main)
+    _register(reg, fake)
+    assert mc.find_server(_config(worktree, notebook=worktree / "notebooks" / "analysis.py"), registry=reg) is None
+    fake.root = str(main / "notebooks")
+    assert mc.find_server(_config(worktree, notebook=worktree / "notebooks" / "analysis.py"), registry=reg) is None
+
+
+def test_root_reads_workspace_files_with_the_server_token(fake, tmp_path):
+    fake.root = str(tmp_path / "notebooks")
+    assert mc.MarimoClient(fake.url).root() == str(tmp_path / "notebooks")
+    request = fake.requests[-1]
+    assert request["path"] == "/api/home/workspace_files"
+    assert request["headers"].get("Marimo-Server-Token") == fake.server_token
+    fake.root = None
+    assert mc.MarimoClient(fake.url).root() is None, "a single-file server has no folder"
+
+
+def test_workspace_affinity_is_none_for_something_that_is_not_marimo(fake, tmp_path):
+    fake.mode = "no_token_tag"  # answers /health and /api/sessions, but no server token and no workspace_files
+    assert mc.workspace_affinity(mc.MarimoClient(fake.url), _config(tmp_path)) == mc.AFFINITY_NONE
+    fake.mode = "sessions_500"
+    assert mc.workspace_affinity(mc.MarimoClient(fake.url), _config(tmp_path)) == mc.AFFINITY_NONE
 
 
 # --------------------------------------------------------------------------- #
@@ -457,6 +536,57 @@ def test_wait_for_session_none_on_timeout(fake, tmp_path):
     nb = tmp_path / "notebooks" / "analysis.py"
     client = mc.MarimoClient(fake.url, notebook=nb, workspace=tmp_path)
     assert mc.wait_for_session(client, nb, timeout=0.3, interval=0.05) is None
+
+
+def test_wait_for_session_cancelled_before_request():
+    class Client:
+        def resolve_session(self, notebook):
+            pytest.fail("a cancelled wait must not start a request")
+
+    assert mc.wait_for_session(Client(), None, should_stop=lambda: True) is None
+
+
+def test_wait_for_session_cancelled_during_long_poll_interval(monkeypatch):
+    stopped = threading.Event()
+    attempts = []
+
+    class Clock:
+        now = 0.0
+        sleeps = []
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.sleeps.append(seconds)
+            self.now += seconds
+            stopped.set()
+
+    class Client:
+        def resolve_session(self, notebook):
+            attempts.append(notebook)
+            raise NoSessionError("not open")
+
+    clock = Clock()
+    monkeypatch.setattr(mc, "time", clock)
+    assert mc.wait_for_session(Client(), None, timeout=60, interval=30, should_stop=stopped.is_set) is None
+    assert len(attempts) == 1
+    assert clock.sleeps == [0.1], "cancellation must not wait for the full polling interval"
+
+
+@pytest.mark.parametrize("session_ready", [False, True])
+def test_wait_for_session_cancelled_during_request(monkeypatch, session_ready):
+    stopped = threading.Event()
+
+    class Client:
+        def resolve_session(self, notebook):
+            stopped.set()
+            if session_ready:
+                return MarimoSession("s1", None, None)
+            raise NoSessionError("not open")
+
+    monkeypatch.setattr(mc.time, "sleep", lambda seconds: pytest.fail("no sleep after cancellation"))
+    assert mc.wait_for_session(Client(), None, should_stop=stopped.is_set) is None
 
 
 def test_registry_entry_path_and_removal(tmp_path):
@@ -617,6 +747,7 @@ def test_find_server_ignores_a_record_whose_server_is_gone_or_not_ours(fake, tmp
     from hailer.kernel import read_kernel_state
 
     reg = _registry_with(tmp_path, fake)
+    fake.root = str(_kernel_cfg(tmp_path).notebooks_root)
     _record(tmp_path, f"http://127.0.0.1:{_free_port()}")  # stale: nothing listens there
     assert mc.find_server(_kernel_cfg(tmp_path), registry=reg).source == "registry"
     assert read_kernel_state(tmp_path) is not None, "no pid: it cannot be proven dead, so it is kept"
@@ -676,9 +807,9 @@ def test_find_server_local_request_may_attach_to_a_docker_kernel(fake, tmp_path)
 
 def test_launch_hint_offers_one_command_route_first():
     hint = mc.launch_hint()
-    assert hint.index("uvx hailer notebook\n") < hint.index("uvx hailer notebook --foreground")
-    assert hint.rstrip().endswith("uvx hailer")
-    assert "Or run marimo on its own in another terminal:" in hint and "Then run Hailer again:" in hint
+    assert hint.index("uvx hailer        (or: uvx hailer notebook)") < hint.index("uvx hailer notebook --foreground")
+    assert "starts marimo for this workspace" in hint, "bare hailer starts its own server"
+    assert "Or run marimo on its own in another terminal:" in hint
     assert "uv run" not in hint
 
 

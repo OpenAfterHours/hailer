@@ -30,7 +30,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
 from hailer import __version__, kernel_image
-from hailer.config import is_unc_path
+from hailer.config import NOTEBOOK_CONTROL_FILES, is_unc_path, notebook_control_files
 from hailer.errors import HailerError, KernelRuntimeError
 from hailer.kernel import (
     KERNEL_DATA_DIR,
@@ -55,7 +55,7 @@ from hailer.kernel import (
     refuse_live_kernel,
     write_kernel_state,
 )
-from hailer.marimo_client import answers_with_token, wait_for_health
+from hailer.marimo_client import wait_for_health
 from hailer.models import KERNEL_RUNTIME_DOCKER, Check, HailerConfig, KernelConfig, MarimoServer
 
 #: marimo's port inside the kernel container; the forwarder listens on the same port in its own.
@@ -96,10 +96,10 @@ _ACTIVE_ENDPOINTS = "active endpoints"
 #: How often, and how far apart, ``network rm`` is retried while containers are still detaching.
 NETWORK_RM_RETRIES = 6
 NETWORK_RM_RETRY_SEC = 0.5
-#: Files at the top of the notebooks folder that make other programs run code on this machine
+#: Files in the notebooks tree that make other programs run code on this machine
 #: (git hooks and settings, editor and dev-container settings) or mark another workspace. The
 #: docker kernel can write them there, so they are reported (never removed) when a kernel stops.
-PLANTABLE_FILES = (".git", ".vscode", ".idea", ".devcontainer", "hailer.toml")
+PLANTABLE_FILES = NOTEBOOK_CONTROL_FILES
 #: Container states that mean "running" for the leftover rule (a paused kernel still holds its work).
 _RUNNING_STATES = ("running", "restarting", "paused", "removing")
 
@@ -394,12 +394,12 @@ def data_path_problems(data_dir: Path, *, windows: bool | None = None, drive_typ
 
 
 def planted_files(notebooks: Path | None) -> list[str]:
-    """The :data:`PLANTABLE_FILES` at the top of the notebooks folder (sorted; empty when none,
+    """The :data:`PLANTABLE_FILES` in the notebooks tree (sorted relative paths; empty when none,
     or when the folder cannot be read)."""
     if notebooks is None:
         return []
     try:
-        return [name for name in PLANTABLE_FILES if os.path.lexists(Path(notebooks) / name)]
+        return notebook_control_files(Path(notebooks))
     except OSError:
         return []
 
@@ -407,7 +407,7 @@ def planted_files(notebooks: Path | None) -> list[str]:
 def planted_warning(notebooks: Path, names: Sequence[str]) -> str:
     """The warning for :func:`planted_files` (printed when a docker kernel stops, and by doctor)."""
     return (
-        f"WARNING: the notebooks folder {notebooks} has {', '.join(names)} at its top level. The docker kernel "
+        f"WARNING: the notebooks folder {notebooks} contains {', '.join(names)}. The docker kernel "
         "can write there, so treat them as untrusted: git hooks and settings (core.fsmonitor), editor and "
         "dev-container settings run commands on this machine, and a hailer.toml makes the folder look like "
         "another workspace. Unless you put them there yourself, delete them before you run git in that folder, "
@@ -434,7 +434,7 @@ def containers_gone(state: KernelState, runner: DockerRunner | None = None) -> b
         return False
     if result.returncode != 0:
         return _missing(result)
-    return (result.stdout or "").strip() != "true"
+    return (result.stdout or "").strip() == "false"
 
 
 def _on_off(value: bool) -> str:
@@ -549,6 +549,7 @@ class DockerKernel(RunningKernel):
     container_ids: tuple[str, ...] = ()
     network: str | None = None
     network_id: str | None = None
+    stop_error: str = ""
 
     def _name(self, ident: str) -> str:
         for name, known in zip(self.containers, self.container_ids):
@@ -579,10 +580,15 @@ class DockerKernel(RunningKernel):
         return outcome
 
     def stop(self) -> None:
+        self.stop_error = ""
         try:
-            self.remove()
-        except Exception:  # noqa: BLE001 - best effort on the way out
-            pass
+            outcome = self.remove()
+        except Exception as err:  # noqa: BLE001 - best effort on the way out
+            self.stop_error = f"Could not stop the Docker kernel: {err}. Run uvx hailer kernel stop to retry."
+            return  # keep the record: kernel stop can retry when Docker is reachable
+        if outcome.failed:
+            self.stop_error = "Could not finish stopping the Docker kernel: " + "; ".join(outcome.failed) + ". Run uvx hailer kernel stop to retry."
+            return
         super().stop()
 
     def log_tail(self, lines: int = 15, *, container: str | None = None) -> list[str]:
@@ -751,7 +757,7 @@ class DockerRuntime:
             rows.append(Check("notebooks", False, "the container may not see the notebooks folder", hint="\n".join(notebooks), fatal=False))
         planted = planted_files(self.config.notebooks_root)
         if planted and ".git" not in planted:  # .git: the config row already refuses the folder
-            summary = f"{', '.join(planted)} at the top of the notebooks folder"
+            summary = f"{', '.join(planted)} in the notebooks folder"
             rows.append(Check("notebooks", False, summary, hint=planted_warning(self.config.notebooks_root, planted), fatal=False))
         return rows
 
@@ -896,8 +902,8 @@ class DockerRuntime:
         (with docker's progress in this terminal) when it is missing. A ``[kernel].cpus`` above
         what Docker has is lowered, with a note. Raises ``KernelRuntimeError``."""
         out = say or _say
-        self.engine_version()
         self._check_mounts()
+        self.engine_version()
         refuse_live_kernel(Path(self.config.workspace), probe=self._probe, gone=self._gone)
         found = self._image_version()
         if found is None:
@@ -1168,9 +1174,8 @@ class DockerRuntime:
             if tail:
                 hint += "\n" + "\n".join(f"    {line}" for line in tail)
             raise KernelRuntimeError(message, hint=hint)
-        write_kernel_state(
-            workspace,
-            KernelState(
+        try:
+            write_kernel_state(workspace, KernelState(
                 runtime=self.name,
                 url=url,
                 port=port,
@@ -1184,8 +1189,13 @@ class DockerRuntime:
                 mounts=tuple((str(host), str(kernel_path)) for host, kernel_path in self.paths.mounts),
                 memory=config.kernel.memory,
                 cpus=config.kernel.cpus,
-            ),
-        )
+            ))
+        except OSError as err:
+            kernel.stop()
+            raise KernelRuntimeError(
+                f"Could not record the Docker kernel: {err}",
+                hint="Check the permissions and free space in .hailer, then try again. uvx hailer kernel stop removes any leftovers.",
+            ) from err
         note_kernel_start(workspace, self.name, config.notebooks_root)
         return kernel
 
@@ -1206,6 +1216,9 @@ class StopReport:
 
 
 def _removed_line(outcome: Removal, url: str) -> str:
+    if outcome.failed:
+        detail = f" Removed {', '.join(outcome.removed)}." if outcome.removed else ""
+        return f"Could not finish stopping the docker kernel at {url}; its record was kept." + detail
     if outcome.removed:
         return f"Stopped the docker kernel at {url} (removed {', '.join(outcome.removed)})."
     return f"Removed the record of a docker kernel whose containers were already gone ({url})."
@@ -1223,9 +1236,9 @@ def stop_workspace_kernels(
     what it actually removed; failures are reported, never raised, once anything was cleaned up.
 
     A local server is stopped by its pid only when it answers with its token (so a stale record
-    never kills an unrelated process that reused the pid). Raises ``KernelRuntimeError`` only when
-    a docker kernel still answers but Docker cannot be reached to remove it (``kernel.json`` is
-    kept then).
+    never kills an unrelated process that reused the pid). Raises ``KernelRuntimeError`` when
+    a Docker record exists but Docker cannot be reached to remove its containers (``kernel.json``
+    is kept even when the server does not answer).
     """
     workspace = Path(config.workspace)
     docker = DockerRuntime(config, runner=runner, probe=probe)
@@ -1246,11 +1259,8 @@ def stop_workspace_kernels(
                 delete_kernel_state(workspace, token=state.token)
             report.done.append(_removed_line(outcome, state.url))
             report.failed += [f"Could not remove {failure}" for failure in outcome.failed]
-        elif (probe or answers_with_token)(state.url, state.token):
-            raise docker_error
         else:
-            delete_kernel_state(workspace)
-            report.done.append(f"Removed the record of a docker kernel that no longer answers ({state.url}).")
+            raise docker_error  # no engine: silence does not prove its containers are gone
     elif state is not None:
         running = LocalRuntime(config, procs=procs, probe=probe).find_running()
         if running is not None:
@@ -1279,7 +1289,7 @@ def stop_workspace_kernels(
     planted = planted_files(docker_notebooks)
     if planted and docker_notebooks is not None:
         report.warnings.append(planted_warning(docker_notebooks, planted))
-    elif str(docker_error) == DOCKER_NOT_RUNNING:
+    if str(docker_error) == DOCKER_NOT_RUNNING:
         report.done.append(
             "Docker is not running, so containers an earlier docker kernel may have left were not checked "
             "(start Docker Desktop and run uvx hailer kernel stop again to remove them)."

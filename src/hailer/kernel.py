@@ -59,7 +59,7 @@ from hailer.models import (
     KernelConfig,
     MarimoServer,
 )
-from hailer.session import SESSION_DIRNAME
+from hailer.statedir import STATE_DIRNAME as SESSION_DIRNAME, ensure_state_dir
 
 KERNEL_STATE_FILENAME = "kernel.json"
 #: Which runtime last started a server on which notebooks folder (``.hailer/last-kernel.json``).
@@ -325,7 +325,7 @@ def read_kernel_state(workspace: Path) -> KernelState | None:
 
 def _write_private(path: Path, data: object) -> Path:
     """Write ``data`` as JSON to ``path`` (atomic; owner-only permissions on POSIX)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_state_dir(path.parent.parent)
     tmp = path.with_suffix(".json.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -624,7 +624,7 @@ def _feed_stdin(proc: Any, text: str) -> None:
 def _fresh_log(log_path: Path) -> Any:
     """``log_path`` emptied and opened for the child (owner-only on POSIX): marimo prints its
     signed-in URL, so an old server's token never stays behind in the log."""
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_state_dir(log_path.parent.parent)
     fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0), 0o600)
     if os.name != "nt":
         os.chmod(log_path, 0o600)
@@ -982,7 +982,13 @@ class LocalRuntime:
             if tail:
                 hint += "\n" + "\n".join(f"    {line}" for line in tail)
             raise KernelRuntimeError(message, hint=hint)
-        write_kernel_state(workspace, KernelState(runtime=self.name, url=url, port=port, token=token, pid=server.pid))
+        try:
+            write_kernel_state(workspace, KernelState(runtime=self.name, url=url, port=port, token=token, pid=server.pid))
+        except OSError as err:
+            kernel.stop()
+            raise KernelRuntimeError(
+                f"Could not record the local kernel: {err}", hint="Check the permissions and free space in .hailer, then try again.",
+            ) from err
         note_kernel_start(workspace, self.name, config.notebooks_root)
         return kernel
 

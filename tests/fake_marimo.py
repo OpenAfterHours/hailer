@@ -72,6 +72,13 @@ class _Handler(BaseHTTPRequestHandler):
         if not self._authorised():
             self._send(401, b'{"detail":"unauthorised"}')
             return
+        if self.path == "/api/home/workspace_files":
+            if self.headers.get("Marimo-Server-Token") != self.server.server_token:
+                self._send(401, b'{"error":"Invalid server token"}')
+                return
+            payload = {"root": self.server.root or "", "files": [], "hasMore": False, "fileCount": 0}
+            self._send(200, json.dumps(payload).encode())
+            return
         if self.path == "/api/home/shutdown_session":
             # every POST except /api/kernel/execute needs the skew-protection token
             if self.headers.get("Marimo-Server-Token") != self.server.server_token or self.server.mode == "stale_token":
@@ -118,6 +125,7 @@ class FakeMarimo(ThreadingHTTPServer):
         self.server_token = "skew-token-123"
         self.page_hits = 0
         self.requests: list[dict] = []
+        self.root: str | None = None  # the folder `marimo edit` was started on; None for a single-file server
 
     @property
     def url(self) -> str:
@@ -143,3 +151,6 @@ def serving(*, token: str | None = None) -> Iterator[FakeMarimo]:
         yield srv
     finally:
         srv.stop()
+
+
+running = serving

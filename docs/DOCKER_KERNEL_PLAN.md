@@ -38,8 +38,8 @@ Where the implementation differs from the plan:
 - **Files that run code later (new).** Notebook code can write `.git` (hooks, `core.fsmonitor`),
   `.vscode`, `.idea`, `.devcontainer` or `hailer.toml` into the notebooks folder, which git, editors (VS Code
   scans nested repositories) or Hailer would act on later. A notebooks folder that already is a git
-  repository is refused in docker mode; when a docker kernel stops (chat end, `--foreground` end,
-  `kernel stop`) and in `doctor`, Hailer names any of these at the top of the folder in a loud warning.
+  repository, or contains a nested repository or Hailer workspace, is refused in docker mode; when a docker kernel stops (chat end, `--foreground` end,
+  `kernel stop`) and in `doctor`, Hailer names any of these throughout the notebooks tree in a loud warning.
   Nothing is removed for the user.
 - **`kernel.json` records ids and settings.** Besides names and the image it holds the container and
   network ids Docker printed, and the settings the kernel was started with (network, mounts, memory,
@@ -57,12 +57,12 @@ Where the implementation differs from the plan:
   context is reported as Docker not reachable).
 - **Reuse only with the same settings.** `uvx hailer notebook` refuses a kept kernel started with other
   folders, network, image, memory or cpus (`The running kernel was started with other settings (...)`,
-  with the stop hint); chat-only `uvx hailer` attaches with a warning. The network setting the prompt and
+  with the stop hint); bare `uvx hailer` follows the same rules after integration with the current chat startup. The network setting the prompt and
   the `Kernel:` line show always comes from the kernel in use (`kernel.attach_runtime`), and asking for
   `local` attaches to a running docker kernel, the more isolated of the two.
 - **The chat keeps its server in memory.** `hailer notebook` hands the chat and the agent's tools the
   server it started or reused, so a `kernel.json` rewritten by another terminal cannot redirect them;
-  chat-only `uvx hailer` rediscovers the server on every call.
+  bare `uvx hailer` uses the same startup and retains the server too, in both composer and plain mode.
 - **More withheld from the local kernel, and a way back.** Beyond the four suffixes of section 4.7, the
   local server's environment also drops `_PASSWD`, `_PWD`, `_CREDENTIALS`, `_CONNECTION_STRING` and `APIKEY`
   suffixes, the names `PASSWORD`, `SECRET`, `TOKEN`, `PGPASSWORD` and `MYSQL_PWD`, and the provider
@@ -102,6 +102,8 @@ Where the implementation differs from the plan:
   download and 875 MB on disk. Not yet measured: the first pull from GHCR (nothing is published before the
   first release) and read time for a large Parquet file through a Windows bind mount. The arm64 image is
   checked only by wheel availability until the first release builds it.
+
+Final review, merge checks and remaining release validation are recorded in [DOCKER_KERNEL_REVIEW.md](DOCKER_KERNEL_REVIEW.md).
 
 ## 1. Summary
 

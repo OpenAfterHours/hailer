@@ -315,8 +315,8 @@ def test_doctor_warns_about_files_other_programs_run_code_from(tmp_path):
     (notebooks / ".vscode").mkdir(parents=True)
     (notebooks / "hailer.toml").write_text("", encoding="utf-8")
     row = next(r for r in docker_runtime(tmp_path, FakeDocker()).check() if r.name == "notebooks")
-    assert not row.ok and not row.fatal and row.summary == ".vscode, hailer.toml at the top of the notebooks folder"
-    assert row.hint.startswith(f"WARNING: the notebooks folder {notebooks} has .vscode, hailer.toml at its top level.")
+    assert not row.ok and not row.fatal and row.summary == ".vscode, hailer.toml in the notebooks folder"
+    assert row.hint.startswith(f"WARNING: the notebooks folder {notebooks} contains .vscode, hailer.toml.")
     assert "delete them before you run git in that folder, open it in an editor" in row.hint
     assert kd.planted_files(notebooks) == [".vscode", "hailer.toml"] and kd.planted_files(None) == []
 
@@ -638,7 +638,8 @@ def test_docker_kernel_stop_never_raises(tmp_path):
         workspace=tmp_path, runner=Broken(), containers=("hailer-kernel-x",), container_ids=("a" * 64,), network_id="b" * 64,
     )  # fmt: skip
     kernel.stop()
-    assert k.read_kernel_state(tmp_path) is None
+    assert k.read_kernel_state(tmp_path) is not None, "kept so another stop can retry"
+    assert "docker vanished" in kernel.stop_error
     assert kernel.log_tail() == []
 
 
@@ -819,7 +820,8 @@ def test_kernel_stop_reports_what_it_could_not_remove(tmp_path):
     fake.fail[("network", "rm")] = (1, "Error response from daemon: network has active endpoints")
     report = kd.stop_workspace_kernels(make_config(tmp_path), runner=fake, probe=answers())
     names = kd.docker_names(tmp_path)
-    assert report.done[0] == f"Stopped the docker kernel at http://127.0.0.1:2731 (removed {names.kernel}, {names.forwarder})."
+    assert "its record was kept" in report.done[0]
+    assert f"Removed {names.kernel}, {names.forwarder}." in report.done[0]
     assert report.failed and all(line.startswith(f"Could not remove {names.network}: docker said:") for line in report.failed)
     assert k.read_kernel_state(tmp_path) is not None, "kept: something is still there"
 
@@ -869,8 +871,9 @@ def test_kernel_stop_with_docker_down_or_missing(tmp_path):
         "no Docker at all: nothing to say"
     )
     k.write_kernel_state(tmp_path, k.KernelState(runtime="docker", url="http://127.0.0.1:9", port=9, token=TOKEN))
-    report = kd.stop_workspace_kernels(make_config(tmp_path), runner=down, probe=answers())
-    assert report.done[0] == "Removed the record of a docker kernel that no longer answers (http://127.0.0.1:9)."
+    with pytest.raises(KernelRuntimeError, match="Docker is not running"):
+        kd.stop_workspace_kernels(make_config(tmp_path), runner=down, probe=answers())
+    assert k.read_kernel_state(tmp_path) is not None, "an unreachable engine cannot prove the kernel is gone"
     k.write_kernel_state(tmp_path, k.KernelState(runtime="docker", url=LIVE, port=2718, token=TOKEN))
     with pytest.raises(KernelRuntimeError) as exc:
         kd.stop_workspace_kernels(make_config(tmp_path), runner=down, probe=answers((LIVE, TOKEN)))

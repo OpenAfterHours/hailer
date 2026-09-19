@@ -23,8 +23,8 @@ from typing import Literal
 
 from hailer.errors import NotebookExistsError, NotebookNotFoundError, NotebookPathError
 from hailer.models import HailerConfig
+from hailer.statedir import ensure_state_dir, state_dir
 
-STATE_DIRNAME = ".hailer"
 STATE_FILENAME = "notebook.json"
 RECENT_LIMIT = 10
 FALLBACK_MARIMO_VERSION = "0.24.2"
@@ -201,7 +201,7 @@ class NotebookInfo:
 
 def state_path(workspace: Path) -> Path:
     """``<workspace>/.hailer/notebook.json``."""
-    return Path(workspace) / STATE_DIRNAME / STATE_FILENAME
+    return state_dir(workspace) / STATE_FILENAME
 
 
 def _read_state(workspace: Path) -> dict:
@@ -274,8 +274,7 @@ def load_recent(config: HailerConfig) -> list[Path]:
 
 def save_active_notebook(config: HailerConfig, notebook: Path) -> None:
     """Persist ``notebook`` as the active one (atomic write) and push it onto the recent list."""
-    path = state_path(config.workspace)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path = ensure_state_dir(config.workspace) / STATE_FILENAME
     key = notebook_display_name(config, notebook)
     previous = [r for r in (_read_state(config.workspace).get("recent") or []) if isinstance(r, str) and r != key]
     payload = {"active": key, "recent": [key, *previous][:RECENT_LIMIT]}

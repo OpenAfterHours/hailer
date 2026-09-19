@@ -100,7 +100,7 @@ DEFAULT_CONFIG_TEMPLATE = """\
 notebook = "notebooks/analysis.py"   # default notebook; the chat can create and open others
 # notebooks_dir = "notebooks"        # folder for notebooks created or opened from the chat (default: the notebook's folder)
 data_dir = "data"                    # the data files to analyse (CSV, Parquet, JSON, ...)
-# marimo_url = "http://127.0.0.1:2718"  # optional; auto-discovered from the marimo registry when omitted
+# marimo_url = "http://127.0.0.1:2718"  # optional pin; when omitted Hailer reuses this workspace's marimo or starts one
 # context_dir = ".config/hailer/context"  # always-on context (*.md) sent with every session
 # skills_dir  = ".config/hailer/skills"   # on-demand skills (<name>/SKILL.md)
 # prompts_dir = ".config/hailer/prompts"  # reusable prompts (/prompt <name>)
@@ -558,6 +558,31 @@ def _is_drive_root(folder: Path) -> bool:
 CREDENTIAL_FOLDERS: tuple[str, ...] = (".config", ".ssh", ".aws", ".azure", ".gnupg", ".docker", ".kube")
 #: On Windows also these (applications keep their logins and browser profiles there).
 CREDENTIAL_FOLDER_VARS: tuple[str, ...] = ("APPDATA", "LOCALAPPDATA")
+NOTEBOOK_CONTROL_FILES = (".git", ".vscode", ".idea", ".devcontainer", "hailer.toml")
+
+
+def notebook_control_files(folder: Path) -> list[str]:
+    """Relative paths of repository, editor and workspace controls in a notebooks tree.
+
+    Inspect names only, never load their contents or follow symlinks/junctions. A missing root
+    is safe to create; other read errors propagate so startup cannot approve an unchecked tree.
+    """
+    found: list[str] = []
+    pending = [Path(folder)]
+    while pending:
+        current = pending.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    path = Path(entry.path)
+                    if entry.name.lower() in NOTEBOOK_CONTROL_FILES:
+                        found.append(path.relative_to(folder).as_posix())
+                    if entry.name.lower() != ".git" and entry.is_dir(follow_symlinks=False) and not path.is_junction():
+                        pending.append(path)
+        except FileNotFoundError:
+            if current != Path(folder):
+                raise  # the tree changed while checked: retry startup
+    return sorted(found)
 
 
 def _on_windows() -> bool:
@@ -654,8 +679,10 @@ def docker_mount_problems(config: HailerConfig, *, windows: bool | None = None) 
             )
             continue
         secret = next((target for target in credentials if _inside_or_equal(target, folder)), None)
-        if secret is None and not _in_temp(folder):
-            secret = next((target for target in credentials if _inside_or_equal(folder, target)), None)
+        if secret is None:
+            appdata = [Path(os.environ[var]) for var in CREDENTIAL_FOLDER_VARS if windows and os.environ.get(var)]
+            secret = next((target for target in credentials if _inside_or_equal(folder, target)
+                           and not (_in_temp(folder) and any(_same_folder(target, app) for app in appdata))), None)
         if secret is not None:
             relation = "is" if _same_folder(secret, folder) else ("contains" if _inside_or_equal(secret, folder) else "is inside")
             problems.append(
@@ -677,6 +704,19 @@ def docker_mount_problems(config: HailerConfig, *, windows: bool | None = None) 
                     "it is writable from notebook code, which could add git hooks or settings (core.fsmonitor) that run "
                     "on this machine the next time git or an editor touches the repository. Keep the notebooks in a "
                     "plain subfolder of your repository (such as notebooks/), or remove the nested repository."
+                )
+                continue
+            try:
+                controls = notebook_control_files(Path(folder))
+            except OSError as err:
+                problems.append(f"Cannot inspect the notebooks folder ({folder}) for nested repositories or workspaces: {err}. {fix}")
+                continue
+            unsafe = [name for name in controls if Path(name).name.lower() in (".git", "hailer.toml")]
+            if unsafe:
+                problems.append(
+                    f"The notebooks folder ({folder}) contains repository or workspace controls: {', '.join(unsafe)}. "
+                    "Notebook code could change their hooks or settings and run commands on this machine later. "
+                    "Move those repositories or workspaces outside the notebooks folder before using Docker."
                 )
         elif _inside_or_equal(folder, config.notebooks_root):
             problems.append(

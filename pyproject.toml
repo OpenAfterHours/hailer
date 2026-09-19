@@ -19,6 +19,8 @@ dependencies = [
     "duckdb>=1.5",
     "typer>=0.27",
     "rich>=15.0",
+    # The inline chat composer: persistent input, bracketed paste, editing and history.
+    "prompt-toolkit>=3.0.53,<4",
     # OS credential store (Windows Credential Manager on Windows) for API keys.
     "keyring>=25.6",
 ]
