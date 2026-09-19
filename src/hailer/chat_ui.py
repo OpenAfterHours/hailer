@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
+from collections import deque
 from collections.abc import Awaitable, Callable
 from contextlib import contextmanager
 from typing import Any
@@ -161,6 +163,9 @@ class ChatUI:
         self._on_submit = on_submit
         self._context = context
         self._queue: asyncio.Queue[Callable[[], None] | None] = asyncio.Queue()
+        self._pending: deque[Callable[[], None]] = deque()
+        self._pending_lock = threading.Lock()
+        self._draining_pending = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._writer: asyncio.Task[None] | None = None
         self._writer_error: BaseException | None = None
@@ -346,15 +351,37 @@ class ChatUI:
         self.console.print()
 
     def _on_ui_thread(self, callback: Callable[[], None]) -> None:
-        if self._loop is not None:
+        # Commit order before scheduling the loop notification: a worker's
+        # output/status must not be overtaken by a later main-thread callback
+        # merely because its call_soon_threadsafe wake has not been delivered.
+        with self._pending_lock:
+            self._pending.append(callback)
+        loop = self._loop
+        if loop is not None:
             try:
-                same_loop = asyncio.get_running_loop() is self._loop
+                same_loop = asyncio.get_running_loop() is loop
             except RuntimeError:
                 same_loop = False
-            if not same_loop:
-                self._loop.call_soon_threadsafe(callback)
-                return
-        callback()
+            if same_loop:
+                self._drain_pending()
+            else:
+                loop.call_soon_threadsafe(self._drain_pending)
+        # Before startup or after shutdown, flush() delivers pending callbacks.
+
+    def _drain_pending(self) -> None:
+        """Apply the ordered bridge on the UI thread, never on a worker."""
+        if self._draining_pending:
+            return
+        self._draining_pending = True
+        try:
+            while True:
+                with self._pending_lock:
+                    if not self._pending:
+                        return
+                    callback = self._pending.popleft()
+                callback()
+        finally:
+            self._draining_pending = False
 
     def _enqueue(self, callback: Callable[[], None]) -> None:
         self._on_ui_thread(lambda: self._queue.put_nowait(callback))
@@ -403,6 +430,9 @@ class ChatUI:
 
     async def flush(self) -> None:
         """Wait for queued output, or print it directly before/after UI startup."""
+        # Include callbacks already posted by workers even when their loop
+        # notifications are still pending; queue.join alone cannot see them.
+        self._drain_pending()
         if self._writer_error is not None:
             raise self._writer_error
         if self._writer is None:
@@ -496,6 +526,7 @@ class ChatUI:
         def ready() -> None:
             # pre_run inherits the application's context; run_in_terminal can
             # then find the correct application from this writer task.
+            self._drain_pending()
             self._writer = asyncio.create_task(self._write_transcript())
 
         try:

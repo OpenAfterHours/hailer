@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import threading
 from contextlib import contextmanager
 
 import pytest
@@ -234,6 +235,59 @@ def test_logs_from_worker_are_redacted_serialized_and_handler_restored(monkeypat
             logger.propagate, logger.level = old_propagate, old_level
 
     monkeypatch.setenv("TEST_UI_KEY", "secret-value-123")
+    asyncio.run(scenario())
+
+
+def test_worker_output_precedes_main_output_before_thread_notification_is_delivered():
+    async def scenario():
+        async def submit(_text):
+            pass
+
+        with terminal(submit) as (ui, _keys, _screen, transcript, _size):
+            running = await start(ui)
+
+            def worker_print(text):
+                worker = threading.Thread(target=lambda: ui.console.print(text, markup=False))
+                worker.start()
+                # Hold this event-loop turn until the worker has enqueued its
+                # output. Its call_soon_threadsafe notification cannot run yet.
+                worker.join(timeout=5)
+                assert not worker.is_alive()
+
+            worker_print("Worker first")
+            ui.console.print("Main second", markup=False)
+            await ui.flush()
+            assert transcript.getvalue() == "Worker first\nMain second\n"
+
+            worker_print("Flush must observe this worker output")
+            # No main-thread print wakes the writer: flush must account for
+            # already-enqueued output whose notification is still pending.
+            await ui.flush()
+            assert transcript.getvalue().endswith("Flush must observe this worker output\n")
+            ui.exit()
+            await asyncio.wait_for(running, 5)
+
+    asyncio.run(scenario())
+
+
+def test_delayed_worker_status_cannot_overwrite_later_ready_status():
+    async def scenario():
+        async def submit(_text):
+            pass
+
+        with terminal(submit) as (ui, _keys, _screen, _transcript, _size):
+            running = await start(ui)
+            worker = threading.Thread(target=lambda: ui.set_activity("Working..."))
+            worker.start()
+            worker.join(timeout=5)
+            assert not worker.is_alive()
+            ui.set_activity("Ready")
+            # Let the earlier worker's delayed notification run afterwards.
+            await asyncio.sleep(0)
+            assert ui.activity == "Ready"
+            ui.exit()
+            await asyncio.wait_for(running, 5)
+
     asyncio.run(scenario())
 
 
