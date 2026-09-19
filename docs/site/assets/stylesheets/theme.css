@@ -1,0 +1,30 @@
+/* The OpenAfterHours docs shell. Palette and typography are in tokens.css. */
+:root { --md-text-font: "Inter"; --md-code-font: "JetBrains Mono"; }
+.md-typeset h1, .md-typeset h2, .md-typeset h3, .md-header__title { font-family: var(--font-display); letter-spacing: -.025em; }
+[data-md-color-scheme="slate"] {
+  --md-default-bg-color: var(--oah-slate-900);
+  --md-default-bg-color--light: var(--oah-slate-850);
+  --md-default-fg-color: var(--oah-slate-100);
+  --md-default-fg-color--light: var(--oah-slate-300);
+  --md-primary-fg-color: var(--oah-slate-900);
+  --md-primary-bg-color: var(--oah-slate-100);
+  --md-accent-fg-color: var(--oah-orange);
+  --md-typeset-a-color: var(--oah-orange-soft);
+  --md-code-bg-color: var(--oah-slate-850);
+  --md-code-fg-color: var(--oah-slate-100);
+}
+[data-md-color-scheme="default"] {
+  --md-primary-fg-color: var(--oah-slate-900);
+  --md-primary-bg-color: #fff;
+  --md-accent-fg-color: #a65300;
+  --md-typeset-a-color: #a65300;
+}
+/* The stock orange palette also scopes link colours inside the typeset/nav
+   components. Keep small links readable against the light background. */
+[data-md-color-scheme="default"] .md-typeset a,
+[data-md-color-scheme="default"] .md-nav__link--active { color: #a65300; }
+.md-header { border-bottom: 1px solid rgba(160,164,171,.16); box-shadow: none; }
+.md-typeset h1 { color: var(--md-default-fg-color); font-weight: 650; }
+.md-typeset a:hover { text-decoration: underline; text-underline-offset: 3px; }
+.md-typeset table:not([class]) { font-size: .72rem; }
+.md-typeset pre > code { border-radius: 6px; }

@@ -8,6 +8,10 @@ __pycache__/
 build/
 dist/
 
+# Documentation builds and local build cache
+/site/
+.cache/
+
 # uv / virtualenv
 .venv/
 uv.lock.bak
