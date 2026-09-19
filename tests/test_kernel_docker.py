@@ -826,7 +826,10 @@ def test_kernel_stop_reports_what_it_could_not_remove(tmp_path):
     assert k.read_kernel_state(tmp_path) is not None, "kept: something is still there"
 
 
-def test_kernel_stop_stops_a_live_local_server_and_never_kills_a_stale_pid(tmp_path):
+def test_kernel_stop_stops_a_live_local_server_and_never_kills_a_stale_pid(tmp_path, monkeypatch):
+    # These are fake PIDs; a CI runner may have real processes with the same numbers.
+    monkeypatch.setattr(k, "process_running", lambda pid: False)
+    monkeypatch.setattr(kd, "process_running", lambda pid: False)
     procs = Procs()
     k.write_kernel_state(tmp_path, k.KernelState(runtime="local", url=LIVE, port=2718, token=TOKEN, pid=77))
     report = kd.stop_workspace_kernels(make_config(tmp_path), runner=FakeDocker(installed=False), procs=procs.local_processes(), probe=answers((LIVE, TOKEN)))
