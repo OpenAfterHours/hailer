@@ -8,10 +8,8 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from rich.console import Console
 
-import hailer.cli as cli
-from hailer import notebooks, session, statedir
+from hailer import kernel, notebooks, session, statedir
 from hailer.models import HailerConfig, SessionState
 
 NOTEBOOK_SOURCE = "import marimo\n\napp = marimo.App()\n"
@@ -45,13 +43,17 @@ def save_active_notebook(config: HailerConfig, monkeypatch) -> Path:
 
 def start_marimo(config: HailerConfig, monkeypatch) -> Path:
     """The marimo log: `hailer` / `hailer notebook` create it when they start a server."""
-    monkeypatch.setattr(cli, "_find_free_port", lambda preferred: preferred)
-    monkeypatch.setattr(cli, "_marimo_server_command", lambda config, port, headless=True: ["marimo"])
-    monkeypatch.setattr(cli, "_spawn_marimo", lambda cmd, cwd, log_path: (log_path.write_text("started\n"), FakeProc())[1])
-    monkeypatch.setattr(cli, "_wait_for_health", lambda url, timeout, should_stop=None: True)
-    console = Console(force_terminal=False, width=120, color_system=None)
-    _server, _proc, log_path = cli._start_marimo(console, config, 2718)
-    return log_path
+    from fake_kernel import Procs
+
+    def spawn(cmd, cwd, log_path, **kwargs):
+        with kernel._fresh_log(log_path) as log:
+            log.write(b"started\n")
+        return FakeProc()
+
+    procs = Procs().local_processes()
+    procs.spawn = spawn
+    running = kernel.LocalRuntime(config, procs=procs, probe=lambda *args: False).start(2718)
+    return running.log_path
 
 
 WRITERS = [save_session, save_active_notebook, start_marimo]

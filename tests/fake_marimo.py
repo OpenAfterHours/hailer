@@ -1,15 +1,24 @@
-"""A local stand-in for a marimo edit server (the endpoints Hailer uses), for offline tests.
+"""A fake marimo edit server on loopback (test helper, standard library only).
 
-Shared by test_marimo_client.py and test_cli.py; imported by module name like fake_gateway.
+Answers what :mod:`hailer.marimo_client` talks to: ``/health``, ``/api/sessions`` (token-checked
+when ``token`` is set: 401 without ``Authorization: Bearer <token>``), the page with its
+skew-protection token, ``/api/home/shutdown_session`` and a scripted SSE ``/api/kernel/execute``
+(``mode``). Every POST is recorded in ``requests``.
+
+:func:`serving` runs one on a daemon thread with a short poll interval, so stopping it takes a
+few milliseconds instead of ``serve_forever``'s default half second.
 """
 
 from __future__ import annotations
 
 import json
 import threading
+from collections.abc import Iterator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Iterator
+
+#: How often a serving FakeMarimo checks for shutdown (the stdlib default, 0.5 s, slowed every test).
+POLL_INTERVAL_SEC = 0.05
 
 
 def _sse(events: list[tuple[str, dict]], newline: str = "\n") -> bytes:
@@ -122,15 +131,26 @@ class FakeMarimo(ThreadingHTTPServer):
     def url(self) -> str:
         return f"http://127.0.0.1:{self.server_address[1]}"
 
+    def start(self) -> FakeMarimo:
+        """Serve on a daemon thread (stop it with :meth:`stop`)."""
+        threading.Thread(target=self.serve_forever, kwargs={"poll_interval": POLL_INTERVAL_SEC}, daemon=True).start()
+        return self
+
+    def stop(self) -> None:
+        self.shutdown()
+        self.server_close()
+
 
 @contextmanager
-def running() -> Iterator[FakeMarimo]:
-    """A FakeMarimo serving on a background thread until the block ends."""
+def serving(*, token: str | None = None) -> Iterator[FakeMarimo]:
+    """A running FakeMarimo (requiring ``token`` when given), stopped afterwards."""
     srv = FakeMarimo()
-    thread = threading.Thread(target=srv.serve_forever, daemon=True)
-    thread.start()
+    srv.token = token
+    srv.start()
     try:
         yield srv
     finally:
-        srv.shutdown()
-        srv.server_close()
+        srv.stop()
+
+
+running = serving

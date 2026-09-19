@@ -48,6 +48,35 @@ class AsyncFakeAgent(FakeAgent):
         FakeAgent.close(self)
 
 
+def test_composer_keeps_docker_connection_across_switches(harness):
+    from dataclasses import replace
+    from test_cli import DOCKER_SERVER, TOKEN
+    from hailer.kernel import attach_runtime, docker_paths, kernel_state_path
+
+    server = replace(DOCKER_SERVER, paths=docker_paths(harness.config))
+    harness.config = attach_runtime(harness.config, server)
+    harness.agent = AsyncFakeAgent()
+    harness.server = None  # discovery cannot supply the connection after startup
+    write_notebook(harness.config, "other")
+
+    async def scenario(controller, ui):
+        assert harness.agent_servers == [server]
+        kernel_state_path(harness.config.workspace).unlink(missing_ok=True)
+        await ui.submit("/new")
+        await ui.submit("/model changed-model")
+        await ui.submit("/notebook open other")
+        await ui.submit("/status")
+        await ui.submit("inspect it")
+        assert controller.server is server
+        assert harness.opened[-1] == (
+            f"{server.url}/?file=/work/notebooks/other.py&view-as=present&access_token={TOKEN}"
+        )
+        assert all(TOKEN not in (preamble or "") for preamble in harness.agent.preambles)
+
+    _controller, _ui, output = run_session(harness, scenario, server=server)
+    assert "docker (hailer-kernel" in output and "no network; data read-only" in output
+
+
 class StubUI:
     def __init__(self, console: Console, submit: Any, context: Any, scenario: Any) -> None:
         self.console = console
@@ -85,10 +114,11 @@ def run_session(
     scenario: Callable[[Any, StubUI], Awaitable[None]],
     *,
     new_thread: bool = False,
+    server: Any = None,
 ) -> tuple[Any, StubUI, str]:
     output = io.StringIO()
     console = Console(file=output, force_terminal=False, width=120, highlight=False)
-    controller = cli.ChatLoop(console, h.config, cli.CliOptions(new_thread=new_thread))
+    controller = cli.ChatLoop(console, h.config, cli.CliOptions(new_thread=new_thread), server=server)
     made: list[StubUI] = []
 
     def factory(console: Console, submit: Any, context: Any) -> StubUI:

@@ -28,11 +28,12 @@ class _CommandStopped(Exception):
 
 
 class ChatController:
-    def __init__(self, console: Console, config: HailerConfig, opts: Any, *, services: Any) -> None:
+    def __init__(self, console: Console, config: HailerConfig, opts: Any, *, services: Any, server: MarimoServer | None = None) -> None:
         self._cli = services
         self.console = console
         self.config = config
         self.opts = opts
+        self.server = server
         self.state: SessionState = load_session(config.workspace)
         self.bundle: ContextBundle = ContextBundle()
         self.agent: Any = None
@@ -51,7 +52,7 @@ class ChatController:
     def start(self) -> None:
         self.bundle = self._cli._load_context(self.config)
         self._print_context_warnings()
-        self.agent = self._cli._make_agent(self.config, self.bundle)
+        self.agent = self._cli._make_agent(self.config, self.bundle, self.server)
         resume = None if self.opts.new_thread else self.state.thread_id
         forget = self.state.thread_id if self.opts.new_thread else None  # --new: drop the stored conversation
         thread_id = self.agent.start(resume_thread_id=resume, forget_thread_id=forget)
@@ -120,7 +121,7 @@ class ChatController:
     async def astart(self) -> None:
         self.bundle = await self._blocking(self._cli._load_context, self.config)
         self._print_context_warnings()
-        self.agent = self._cli._make_agent(self.config, self.bundle)
+        self.agent = self._cli._make_agent(self.config, self.bundle, self.server)
         resume = None if self.opts.new_thread else self.state.thread_id
         forget = self.state.thread_id if self.opts.new_thread else None
         thread_id = await self.agent.astart(resume_thread_id=resume, forget_thread_id=forget)
@@ -282,9 +283,9 @@ class ChatController:
         name = notebooks.notebook_display_name(self.config, active)
         self.console.print(Text(f"Active notebook is now {name}.", style="dim"))
         if open_browser:
-            server, session, _err = self._cli._marimo_state(self.config)
+            server, session, _err = self._cli._marimo_state(self.config, self.server)
             if server is not None and session is None:
-                url = self._cli._notebook_url(server, self.config)
+                url = self._cli._notebook_link(self.console, server, self.config)
                 self.console.print(f"Opening {url} in your browser...", markup=False)
                 self._cli._open_browser(url)
         return True
@@ -333,7 +334,7 @@ class ChatController:
 
     def _status(self) -> None:
         self._sync_active_notebook(open_browser=False)  # a late tool call may have switched notebooks
-        server, session, _err = self._cli._marimo_state(self.config)
+        server, session, _err = self._cli._marimo_state(self.config, self.server)
         if server is None:
             marimo = "not running"
         elif session is None:
@@ -349,6 +350,7 @@ class ChatController:
             ("Turns", str(self.state.turns)),
             ("Tokens", f"{self.state.input_tokens} in / {self.state.output_tokens} out"),
             ("Marimo", marimo),
+            ("Kernel", self._cli._kernel_line(self.config)),
             ("Notebook", self._cli._relative(self.config.notebook, self.config.workspace)),
             ("Notebooks", self._cli._relative(self.config.notebooks_root, self.config.workspace)),
             ("Web access", self._cli._web_line(self.config)),
@@ -447,13 +449,13 @@ class ChatController:
         recent = [p for p in notebooks.load_recent(cfg) if not self._cli._same_file(p, cfg.notebook)]
         if recent:
             out.print("Recent:    " + ", ".join(self._display_name(p) for p in recent[:5]), markup=False)
-        server, session, _err = self._cli._marimo_state(cfg)
+        server, session, _err = self._cli._marimo_state(cfg, self.server)
         if server is None:
             out.print("Marimo:    not running", markup=False)
         else:
             state = f"session {session.session_id}" if session is not None else "not open in a browser"
             out.print(f"Marimo:    {server.url} ({state})", markup=False)
-            out.print(f"URL:       {self._cli._notebook_url(server, cfg)}", markup=False)
+            out.print(f"URL:       {self._cli._notebook_link(out, server, cfg)}", markup=False)
             out.print("View:      app view (results only); Ctrl+. in the notebook toggles the code editor", markup=False)
         out.print("Start everything in one go:  uvx hailer notebook", markup=False)
         out.print(f"Launch:    {' '.join(self._cli._launch_command())}", markup=False)
@@ -462,7 +464,7 @@ class ChatController:
     def _server_sessions(self) -> tuple[MarimoServer | None, Any, list[MarimoSession]]:
         """(server, client, open sessions); server is None when marimo is not running."""
         try:
-            server = self._cli._find_server(self.config)
+            server = self.server or self._cli._find_server(self.config)
         except HailerError:
             return None, None, []
         if server is None:
@@ -568,7 +570,7 @@ class ChatController:
         """Open the active notebook in the browser when it has no kernel session; (session, client)."""
         cfg = self.config
         self._check_stopped()
-        server, session, _err = self._cli._marimo_state(cfg)
+        server, session, _err = self._cli._marimo_state(cfg, self.server)
         self._check_stopped()
         if server is None:
             self.console.print("Marimo is not running; the notebook opens once it is (uvx hailer notebook).", markup=False)
@@ -577,7 +579,7 @@ class ChatController:
         if session is not None:
             self.console.print(f"Notebook is open (session {session.session_id}).", markup=False)
             return session, client
-        url = self._cli._notebook_url(server, cfg)
+        url = self._cli._notebook_link(self.console, server, cfg)
         self.console.print(f"Opening {url} in your browser...", markup=False)
         self._cli._open_browser(url)
         with self.console.status("Waiting for the notebook to open..."):

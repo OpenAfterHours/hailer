@@ -126,7 +126,6 @@ Rules that keep the notebook valid and readable:
 - No destructive file operations (deleting, overwriting, moving data) without the user clearly asking.
 - Never send raw datasets, credentials, tokens or environment variable values anywhere, including into
   your own replies.
-- Do not install packages unless the task truly needs it; if so use `ctx.packages.add()` and say so.
 
 ## How to reply
 

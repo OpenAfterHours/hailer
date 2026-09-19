@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,8 @@ import pytest
 from hailer.config import (
     CONFIG_FILENAMES,
     DEFAULT_CONFIG_TEMPLATE,
+    config_template,
+    docker_mount_problems,
     find_config_path,
     find_workspace,
     load_config,
@@ -16,7 +19,7 @@ from hailer.config import (
     write_default_config,
 )
 from hailer.errors import ConfigError
-from hailer.models import HailerConfig
+from hailer.models import HailerConfig, KernelConfig
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -506,6 +509,137 @@ def test_validate_unknown_keys_are_warnings(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# [kernel]
+# --------------------------------------------------------------------------- #
+
+
+def test_kernel_defaults_to_local(tmp_path: Path) -> None:
+    cfg = load_config(workspace=_make_workspace(tmp_path), env={})
+    assert cfg.kernel == KernelConfig(runtime="local", image=None, memory="4g", cpus=2.0, network=False)
+
+
+def test_kernel_section_is_parsed(tmp_path: Path) -> None:
+    ws = _make_workspace(
+        tmp_path,
+        '[kernel]\nruntime = "Docker"\nimage = "registry.example/hailer-kernel:dev"\nmemory = "8G"\ncpus = 1.5\nnetwork = true\n',
+    )
+    cfg = load_config(workspace=ws, env={})
+    assert cfg.kernel == KernelConfig(runtime="docker", image="registry.example/hailer-kernel:dev", memory="8G", cpus=1.5, network=True)
+    assert _errors(validate(cfg)) == []
+    (tmp_path / "ints").mkdir()
+    cfg2 = load_config(workspace=_make_workspace(tmp_path / "ints", '[kernel]\ncpus = 4\nimage = ""\n'), env={})
+    assert cfg2.kernel.cpus == 4.0 and cfg2.kernel.image is None, "an empty image means the default one"
+
+
+def test_kernel_env_overrides_the_file(tmp_path: Path) -> None:
+    ws = _make_workspace(tmp_path, '[kernel]\nruntime = "docker"\nimage = "from-file"\n')
+    cfg = load_config(workspace=ws, env={"HAILER_KERNEL": "local", "HAILER_KERNEL_IMAGE": "from-env"})
+    assert (cfg.kernel.runtime, cfg.kernel.image) == ("local", "from-env")
+    assert load_config(workspace=ws, env={}).kernel.runtime == "docker"
+
+
+@pytest.mark.parametrize(
+    ("text", "fragment"),
+    [
+        ('[kernel]\ncpus = "2"\n', "[kernel].cpus"),
+        ("[kernel]\ncpus = true\n", "[kernel].cpus"),
+        ("[kernel]\nmemory = 4\n", "[kernel].memory"),
+        ('[kernel]\nnetwork = "no"\n', "[kernel].network"),
+        ("[kernel]\nruntime = 1\n", "[kernel].runtime"),
+        ('kernel = "docker"\n', "[kernel]"),
+    ],
+)
+def test_kernel_wrong_types_raise_config_error(tmp_path: Path, text: str, fragment: str) -> None:
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(workspace=_make_workspace(tmp_path, text), env={})
+    assert fragment in str(excinfo.value) and excinfo.value.hint
+
+
+@pytest.mark.parametrize(
+    ("text", "env", "fragment"),
+    [
+        ('[kernel]\nruntime = "podman"\n', {}, '[kernel].runtime "podman"'),
+        ("", {"HAILER_KERNEL": "vm"}, '[kernel].runtime "vm"'),
+        ('[kernel]\nmemory = "lots"\n', {}, '[kernel].memory "lots"'),
+        ('[kernel]\nmemory = "4 GB"\n', {}, '[kernel].memory "4 GB"'),  # quoted as written, not lower-cased
+        ('[kernel]\npass_env = [""]\n', {}, "[kernel].pass_env"),
+        ('[kernel]\nmemory = "4tb"\n', {}, "[kernel].memory"),
+        ('[kernel]\nmemory = "0g"\n', {}, "[kernel].memory"),
+        ("[kernel]\ncpus = 0\n", {}, "[kernel].cpus"),
+        ("[kernel]\ncpus = -1.5\n", {}, "[kernel].cpus"),
+    ],
+)
+def test_kernel_bad_values_are_fatal(tmp_path: Path, text: str, env: dict, fragment: str) -> None:
+    errors = _errors(validate(load_config(workspace=_make_workspace(tmp_path, text), env=env)))
+    assert len(errors) == 1 and fragment in errors[0], errors
+
+
+def test_docker_refuses_marimo_url(tmp_path: Path) -> None:
+    ws = _make_workspace(tmp_path, '[hailer]\nmarimo_url = "http://127.0.0.1:2718"\n[kernel]\nruntime = "docker"\n')
+    errors = _errors(validate(load_config(workspace=ws, env={})))
+    assert len(errors) == 1 and "marimo_url" in errors[0] and "its own container" in errors[0]
+    assert _errors(validate(load_config(workspace=ws, env={"HAILER_KERNEL": "local"}))) == [], "fine for local"
+    (tmp_path / "env").mkdir()
+    plain = _make_workspace(tmp_path / "env", '[kernel]\nruntime = "docker"\n')
+    errors = _errors(validate(load_config(workspace=plain, env={"HAILER_MARIMO_URL": "http://127.0.0.1:2718"})))
+    assert len(errors) == 1 and "HAILER_MARIMO_URL" in errors[0]
+
+
+@pytest.mark.parametrize("data_dir", ["notebooks", "notebooks/data", "NOTEBOOKS/Data"])
+def test_docker_refuses_data_inside_the_notebooks_folder(tmp_path: Path, data_dir: str) -> None:
+    if data_dir != data_dir.lower() and not Path(str(tmp_path).upper()).exists():
+        pytest.skip("case-insensitive file system only")
+    ws = _make_workspace(tmp_path, f'[hailer]\ndata_dir = "{data_dir}"\n[kernel]\nruntime = "docker"\n')
+    (ws / "notebooks" / "data").mkdir(exist_ok=True)
+    errors = _errors(validate(load_config(workspace=ws, env={})))
+    assert len(errors) == 1 and "[hailer].data_dir" in errors[0] and "writable" in errors[0]
+    assert _errors(validate(load_config(workspace=ws, env={"HAILER_KERNEL": "local"}))) == [], "local mounts nothing"
+
+
+def test_docker_allows_notebooks_inside_the_data_folder(tmp_path: Path) -> None:
+    ws = _make_workspace(tmp_path, notebook=False)
+    _write(ws / "data" / "notebooks" / "analysis.py", "import marimo\n")
+    _write(
+        ws / "hailer.toml",
+        '[hailer]\nnotebook = "data/notebooks/analysis.py"\ndata_dir = "data"\n[kernel]\nruntime = "docker"\n',
+    )
+    assert _errors(validate(load_config(workspace=ws, env={}))) == []
+
+
+def test_kernel_unknown_keys_are_warnings(tmp_path: Path) -> None:
+    ws = _make_workspace(tmp_path, '[kernel]\nruntime = "local"\nmounts = ["x"]\n')
+    problems = validate(load_config(workspace=ws, env={}))
+    assert _errors(problems) == []
+    assert any(p.startswith("Warning:") and "[kernel].mounts" in p for p in problems)
+    assert not any("unknown section [kernel]" in p for p in problems)
+
+
+def test_template_documents_the_kernel_section_commented_out() -> None:
+    assert "# [kernel]\n# runtime = \"local\"" in DEFAULT_CONFIG_TEMPLATE
+    assert "HAILER_KERNEL" in DEFAULT_CONFIG_TEMPLATE
+    for key in ("image", "memory", "cpus", "network"):
+        assert f"\n# {key} " in DEFAULT_CONFIG_TEMPLATE
+    uncommented = DEFAULT_CONFIG_TEMPLATE.replace("# [kernel]", "[kernel]").replace('# runtime = "local"', 'runtime = "docker"')
+    import tomllib
+
+    assert tomllib.loads(uncommented)["kernel"] == {"runtime": "docker"}, "`init --kernel docker` can switch it on in place"
+
+
+@pytest.mark.parametrize("runtime", ["docker", "local"])
+def test_write_default_config_can_switch_the_kernel_section_on(tmp_path: Path, runtime: str) -> None:
+    ws = _make_workspace(tmp_path)
+    write_default_config(ws / "hailer.toml", kernel=runtime)
+    text = (ws / "hailer.toml").read_text(encoding="utf-8")
+    assert f'\n[kernel]\nruntime = "{runtime}"' in text and "\n# image " in text, "the other keys stay commented out"
+    config = load_config(workspace=ws, env={})
+    assert config.kernel == KernelConfig(runtime=runtime)
+    assert _errors(validate(config)) == [] and not any("[kernel]" in p for p in validate(config))
+    assert config_template() == DEFAULT_CONFIG_TEMPLATE
+    with pytest.raises(ConfigError):
+        config_template("podman")
+
+
+# --------------------------------------------------------------------------- #
 # Template and repo example
 # --------------------------------------------------------------------------- #
 
@@ -566,3 +700,170 @@ def test_validate_provider_key_typo_is_an_unknown_key_warning(tmp_path: Path) ->
     )
     problems = validate(load_config(workspace=ws, env={}))
     assert any("stream_option" in p and "unknown" in p.lower() for p in problems)
+
+
+# --------------------------------------------------------------------------- #
+# [kernel]: mounts that would expose Hailer's own files, pass_env, misplaced keys, wording
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("text", "fragment"),
+    [
+        ('[hailer]\nnotebook = "analysis.py"\n', "The notebooks folder ({ws}) is the workspace folder"),
+        ('[hailer]\nnotebooks_dir = "."\n', "The notebooks folder ({ws}) is the workspace folder"),
+        ('[hailer]\ndata_dir = "."\n', "The data folder ({ws}) is the workspace folder"),
+        ('[hailer]\ndata_dir = ".hailer"\n', "The data folder ({ws}{sep}.hailer) is Hailer's .hailer folder"),
+        ('[hailer]\nnotebooks_dir = ".config/hailer/context"\nnotebook = ".config/hailer/context/a.py"\n', "is the context folder"),
+        ('[hailer]\nnotebooks_dir = ".hailer/nb"\nnotebook = ".hailer/nb/a.py"\n', "is inside Hailer's .hailer folder"),
+    ],
+)
+def test_docker_refuses_mounts_that_expose_hailers_own_files(tmp_path: Path, text: str, fragment: str) -> None:
+    """The kernel could rewrite hailer.toml (switch to local), read .hailer/ (the kernel's token,
+    conversations) or plant context. Fatal in docker mode only: the local runtime mounts nothing."""
+    ws = _make_workspace(tmp_path, text + '[kernel]\nruntime = "docker"\n')
+    for name in ("analysis.py", ".config/hailer/context/a.py", ".hailer/nb/a.py"):
+        _write(ws / name, "import marimo\n")
+    errors = _errors(validate(load_config(workspace=ws, env={})))
+    expected = fragment.format(ws=ws.resolve(), sep=os.sep)
+    assert any(expected in e for e in errors), errors
+    local = _errors(validate(load_config(workspace=ws, env={"HAILER_KERNEL": "local"})))
+    assert not any("With [kernel] runtime" in e for e in local), "the local runtime mounts nothing"
+
+
+def test_docker_refuses_a_data_folder_moved_by_the_environment(tmp_path: Path) -> None:
+    ws = _make_workspace(tmp_path, '[kernel]\nruntime = "docker"\n')
+    errors = _errors(validate(load_config(workspace=ws, env={"HAILER_DATA_DIR": str(ws)})))
+    assert any("The data folder" in e and "is the workspace folder" in e for e in errors), errors
+
+
+def test_docker_refuses_the_home_folder_and_a_whole_drive(tmp_path: Path, monkeypatch) -> None:
+    ws = _make_workspace(tmp_path, '[kernel]\nruntime = "docker"\n')
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    errors = _errors(validate(load_config(workspace=ws, env={"HAILER_DATA_DIR": str(tmp_path)})))
+    assert any("The data folder" in e and "is your home folder" in e for e in errors), errors
+    errors = _errors(validate(load_config(workspace=ws, env={"HAILER_DATA_DIR": ws.anchor})))
+    assert any("is a whole drive" in e for e in errors), errors
+
+
+def test_the_default_layout_is_fine_for_docker(tmp_path: Path) -> None:
+    ws = _make_workspace(tmp_path, '[kernel]\nruntime = "docker"\n')
+    config = load_config(workspace=ws, env={})
+    assert docker_mount_problems(config) == [] and _errors(validate(config)) == []
+
+
+def test_pass_env_is_a_list_of_names_for_the_local_runtime(tmp_path: Path) -> None:
+    ws = _make_workspace(tmp_path, '[kernel]\npass_env = ["DB_PASSWORD", " AWS_SECRET_ACCESS_KEY "]\n')
+    config = load_config(workspace=ws, env={})
+    assert config.kernel.pass_env == ("DB_PASSWORD", "AWS_SECRET_ACCESS_KEY")
+    assert not any("pass_env" in p for p in validate(config))
+    (tmp_path / "docker").mkdir()
+    docker = _make_workspace(tmp_path / "docker", '[kernel]\nruntime = "docker"\npass_env = ["DB_PASSWORD"]\n')
+    problems = validate(load_config(workspace=docker, env={}))
+    assert any(p.startswith("Warning: [kernel].pass_env applies to the local runtime only") for p in problems)
+    (tmp_path / "bad").mkdir()
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(workspace=_make_workspace(tmp_path / "bad", '[kernel]\npass_env = "DB_PASSWORD"\n'), env={})
+    assert 'must be a list of strings, not "DB_PASSWORD"' in str(excinfo.value) and 'pass_env = ["DB_PASSWORD"]' in excinfo.value.hint
+
+
+@pytest.mark.parametrize("section", ["model", "hailer"])
+def test_a_kernel_setting_in_another_table_is_named(tmp_path: Path, section: str) -> None:
+    """Uncommenting only the runtime line of the template lands it under [model]: silently local."""
+    text = '[hailer]\nruntime = "docker"\n' if section == "hailer" else '[model]\nname = "gpt-5.5"\nruntime = "docker"\n'
+    ws = _make_workspace(tmp_path, text)
+    config = load_config(workspace=ws, env={})
+    assert config.kernel.runtime == "local"
+    warnings = [p for p in validate(config) if p.startswith("Warning:")]
+    assert any(f"[{section}].runtime" in w and "belongs under [kernel]" in w and "Uncomment the [kernel] line" in w for w in warnings), warnings
+    assert not any(f"unknown key [{section}].runtime" in w for w in warnings), "one warning, the specific one"
+
+
+def test_type_errors_quote_what_was_written(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(workspace=_make_workspace(tmp_path, '[kernel]\ncpus = "2"\n'), env={})
+    assert 'must be a number, not "2" (str)' in str(excinfo.value) and "without quotes" in excinfo.value.hint
+
+
+@pytest.mark.parametrize("name", [".ssh", ".aws", ".config", ".kube"])
+def test_docker_refuses_credential_folders_under_home(tmp_path: Path, monkeypatch, name: str) -> None:
+    import hailer.config as config_module
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(config_module, "_in_temp", lambda folder: False)  # tmp_path stands in for a real home
+    (home / name / "sub").mkdir(parents=True)
+    ws = _make_workspace(tmp_path, '[kernel]\nruntime = "docker"\n')
+    for data, relation in ((home / name, "is"), (home / name / "sub", "is inside")):
+        errors = _errors(validate(load_config(workspace=ws, env={"HAILER_DATA_DIR": str(data)})))
+        expected = f"The data folder ({data.resolve()}) {relation} {(home / name).resolve()}, a folder that holds credentials."
+        assert any(e.startswith(expected) for e in errors), errors
+
+
+def test_docker_refuses_appdata_on_windows_but_not_the_temporary_folder(tmp_path: Path, monkeypatch) -> None:
+    import tempfile
+
+    import hailer.config as config_module
+
+    roaming = tmp_path / "Roaming"
+    (roaming / "Tool").mkdir(parents=True)
+    monkeypatch.setenv("APPDATA", str(roaming))
+    ws = _make_workspace(tmp_path, '[kernel]\nruntime = "docker"\n')
+    config = load_config(workspace=ws, env={"HAILER_DATA_DIR": str(roaming / "Tool")})
+    in_temp = config_module._in_temp
+    monkeypatch.setattr(config_module, "_in_temp", lambda folder: False)  # tmp_path stands in for %APPDATA%
+    problems = docker_mount_problems(config, windows=True)
+    assert any("is inside" in p and "a folder that holds credentials" in p for p in problems), problems
+    monkeypatch.setattr(config_module, "_in_temp", in_temp)
+    monkeypatch.setenv("APPDATA", str(tmp_path / "elsewhere"))
+    monkeypatch.setenv("LOCALAPPDATA", str(Path(tempfile.gettempdir()).parent))
+    assert docker_mount_problems(load_config(workspace=ws, env={}), windows=True) == [], "a workspace in the temporary folder is fine"
+    assert not any("credentials" in p for p in docker_mount_problems(config, windows=False)), "Windows only"
+
+
+def test_docker_refuses_a_notebooks_folder_that_is_a_git_repository(tmp_path: Path) -> None:
+    ws = _make_workspace(tmp_path, '[kernel]\nruntime = "docker"\n')
+    (ws / "notebooks" / ".git").mkdir()
+    errors = _errors(validate(load_config(workspace=ws, env={})))
+    assert any(e.startswith(f"The notebooks folder ({(ws / 'notebooks').resolve()}) is a git repository") for e in errors), errors
+    assert not _errors(validate(load_config(workspace=ws, env={"HAILER_KERNEL": "local"}))), "local mode mounts nothing"
+
+
+def test_docker_refuses_unc_folders_as_errors(tmp_path: Path) -> None:
+    ws = _make_workspace(tmp_path, '[kernel]\nruntime = "docker"\n')
+    config = load_config(workspace=ws, env={})
+    from dataclasses import replace
+
+    share = replace(config, data_dir=Path(r"\\fileserver\team\sales"))
+    assert docker_mount_problems(share, windows=True) == [
+        "The data folder \\\\fileserver\\team\\sales is on a network share (UNC path), which Docker cannot mount. "
+        "Copy it to a folder on a local disk and point [hailer].data_dir at it."
+    ]
+
+
+def test_a_notebooks_folder_that_is_the_workspace_is_reported_once_in_docker_mode(tmp_path: Path) -> None:
+    ws = _make_workspace(tmp_path, '[hailer]\nnotebooks_dir = "."\nnotebook = "analysis.py"\n[kernel]\nruntime = "docker"\n')
+    _write(ws / "analysis.py", "import marimo\n")
+    problems = validate(load_config(workspace=ws, env={}))
+    assert sum("is the workspace" in p for p in problems) == 1, problems
+    local = validate(load_config(workspace=ws, env={"HAILER_KERNEL": "local"}))
+    assert any(p.startswith("Warning: the notebooks folder is the workspace itself") for p in local), "the local warning stays"
+
+
+def test_pass_env_naming_hailers_own_secrets_is_a_warning(tmp_path: Path) -> None:
+    text = (
+        '[model]\nprovider = "corp"\n[model_providers.corp]\nbase_url = "https://llm.example.internal/v1"\n'
+        'env_key = "CORP_API_KEY"\nenv_http_headers = { "X-Client-Id" = "CORP_CLIENT_ID" }\n'
+        '[kernel]\npass_env = ["CORP_API_KEY", "CORP_CLIENT_ID", "HAILER_MARIMO_TOKEN", "DB_PASSWORD"]\n'
+    )
+    warnings = [p for p in validate(load_config(workspace=_make_workspace(tmp_path, text), env={})) if "pass_env" in p]
+    assert len(warnings) == 3 and all(w.startswith("Warning: [kernel].pass_env lets notebook code read ") for w in warnings)
+    assert 'CORP_API_KEY (the API key of provider "corp")' in warnings[0]
+    assert 'CORP_CLIENT_ID (the X-Client-Id header of provider "corp")' in warnings[1]
+    assert "HAILER_MARIMO_TOKEN (the marimo server token)" in warnings[2]
+
+
+def test_kernel_runtime_errors_quote_like_the_rest(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError) as excinfo:
+        config_template("podman")
+    assert str(excinfo.value) == 'Unknown kernel runtime "podman".'

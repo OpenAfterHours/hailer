@@ -26,9 +26,12 @@ from typing import Any
 
 from hailer.errors import ConfigError
 from hailer.models import (
+    KERNEL_RUNTIME_DOCKER,
+    VALID_KERNEL_RUNTIMES,
     VALID_WIRE_APIS,
     WIRE_API_RESPONSES,
     HailerConfig,
+    KernelConfig,
     ModelConfig,
     ProviderConfig,
     WebConfig,
@@ -47,7 +50,7 @@ VALID_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 
 # Known keys per section; anything else is reported by validate() as a warning.
-_KNOWN_TOP = {"hailer", "model", "model_providers", "web"}
+_KNOWN_TOP = {"hailer", "model", "model_providers", "web", "kernel"}
 _KNOWN_HAILER = {
     "notebook",
     "notebooks_dir",
@@ -73,6 +76,10 @@ _KNOWN_PROVIDER = {
     "query_params",
 }
 _KNOWN_WEB = {"allowed_domains", "max_page_bytes"}
+_KNOWN_KERNEL = {"runtime", "image", "memory", "cpus", "network", "pass_env"}
+
+# docker --memory: a number with an optional b/k/m/g unit ("4g", "512m", "1.5g").
+_MEMORY_RE = re.compile(r"^(\d+(?:\.\d+)?)[bkmg]?$", re.IGNORECASE)
 
 # A domain rule: optional "*." (subdomains only) or "**." (apex + subdomains)
 # prefix, then DNS labels. "localhost" and IPv4 literals are also accepted.
@@ -130,6 +137,20 @@ provider = "openai"                  # "openai" = api.openai.com with OPENAI_API
 # [web]
 # allowed_domains = ["docs.pola.rs", "duckdb.org", "**.marimo.io"]
 # max_page_bytes = 200000
+
+# Where notebook code runs. "local" (the default): marimo runs in Hailer's own Python, as you,
+# with your files and network (not isolated). "docker": marimo runs in a container that sees only
+# the notebooks folder and, read-only, the data folder, with no network; it needs Docker Desktop
+# or Docker Engine. HAILER_KERNEL overrides runtime for one run. To switch it on, uncomment both
+# the section line, [kernel], and the settings under it.
+#
+# [kernel]
+# runtime = "local"                  # "local" or "docker"
+# image   = ""                       # docker: default ghcr.io/openafterhours/hailer-kernel:<hailer version>
+# memory  = "4g"                     # docker: container memory limit (no swap on top)
+# cpus    = 2                        # docker: container CPU limit
+# network = false                    # docker: true lets notebook code reach the internet and this machine
+# pass_env = []                      # local: variables with secret-looking names notebook code may read
 """
 
 
@@ -220,13 +241,24 @@ def _section(data: Mapping[str, Any], name: str, path: Path | None) -> dict[str,
     return value
 
 
+def _written(value: object) -> str:
+    """How a value looks in the TOML file, for an error message ("2" for the text 2, 2 for the number)."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return f'"{value}"'
+    if isinstance(value, (int, float)):
+        return repr(value)
+    return f"a {type(value).__name__}"
+
+
 def _str(table: Mapping[str, Any], key: str, section: str, path: Path | None, default: str | None = None) -> str | None:
     value = table.get(key, default)
     if value is None:
         return None
     if not isinstance(value, str):
         raise ConfigError(
-            f"[{section}].{key} in {path} must be a string, not {type(value).__name__}.",
+            f"[{section}].{key} in {path} must be a string, not {_written(value)} ({type(value).__name__}).",
             hint=f'Quote the value, e.g. {key} = "...".',
         )
     return value
@@ -236,17 +268,27 @@ def _int(table: Mapping[str, Any], key: str, section: str, path: Path | None, de
     value = table.get(key, default)
     if isinstance(value, bool) or not isinstance(value, int):
         raise ConfigError(
-            f"[{section}].{key} in {path} must be an integer, not {type(value).__name__}.",
+            f"[{section}].{key} in {path} must be an integer, not {_written(value)} ({type(value).__name__}).",
             hint=f"Write a plain number, e.g. {key} = {default}.",
         )
     return value
+
+
+def _number(table: Mapping[str, Any], key: str, section: str, path: Path | None, default: float) -> float:
+    value = table.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(
+            f"[{section}].{key} in {path} must be a number, not {_written(value)} ({type(value).__name__}).",
+            hint=f"Write a plain number without quotes, e.g. {key} = {default:g}.",
+        )
+    return float(value)
 
 
 def _bool(table: Mapping[str, Any], key: str, section: str, path: Path | None, default: bool) -> bool:
     value = table.get(key, default)
     if not isinstance(value, bool):
         raise ConfigError(
-            f"[{section}].{key} in {path} must be true or false, not {type(value).__name__}.",
+            f"[{section}].{key} in {path} must be true or false, not {_written(value)} ({type(value).__name__}).",
             hint=f"Write {key} = true or {key} = false (no quotes).",
         )
     return value
@@ -264,14 +306,17 @@ def _str_map(table: Mapping[str, Any], key: str, section: str, path: Path | None
     return dict(value)
 
 
-def _str_list(table: Mapping[str, Any], key: str, section: str, path: Path | None) -> list[str]:
+def _str_list(
+    table: Mapping[str, Any], key: str, section: str, path: Path | None, example: str = '["docs.pola.rs", "duckdb.org"]'
+) -> list[str]:
     value = table.get(key, [])
     if value is None:
         return []
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        got = "a list with unquoted items" if isinstance(value, list) else _written(value)
         raise ConfigError(
-            f"[{section}].{key} in {path} must be a list of strings.",
-            hint=f'Example: {key} = ["docs.pola.rs", "duckdb.org"].',
+            f"[{section}].{key} in {path} must be a list of strings, not {got}.",
+            hint=f"Example: {key} = {example}.",
         )
     return list(value)
 
@@ -315,6 +360,7 @@ def load_config(
     model_tbl = _section(data, "model", path)
     providers_tbl = _section(data, "model_providers", path)
     web_tbl = _section(data, "web", path)
+    kernel_tbl = _section(data, "kernel", path)
 
     notebook = env.get("HAILER_NOTEBOOK") or _str(hailer_tbl, "notebook", "hailer", path, DEFAULT_NOTEBOOK)
     notebooks_dir = env.get("HAILER_NOTEBOOKS_DIR") or _str(hailer_tbl, "notebooks_dir", "hailer", path)
@@ -360,6 +406,18 @@ def load_config(
         max_page_bytes=_int(web_tbl, "max_page_bytes", "web", path, WebConfig().max_page_bytes),
     )
 
+    kernel_defaults = KernelConfig()
+    runtime = env.get("HAILER_KERNEL") or _str(kernel_tbl, "runtime", "kernel", path, kernel_defaults.runtime)
+    image = env.get("HAILER_KERNEL_IMAGE") or _str(kernel_tbl, "image", "kernel", path)
+    kernel = KernelConfig(
+        runtime=(runtime or "").strip().lower() or kernel_defaults.runtime,  # validate() reports unknown values
+        image=(image or "").strip() or None,
+        memory=(_str(kernel_tbl, "memory", "kernel", path, kernel_defaults.memory) or "").strip(),  # as written: messages quote it
+        cpus=_number(kernel_tbl, "cpus", "kernel", path, kernel_defaults.cpus),
+        network=_bool(kernel_tbl, "network", "kernel", path, kernel_defaults.network),
+        pass_env=tuple(name.strip() for name in _str_list(kernel_tbl, "pass_env", "kernel", path, '["DB_PASSWORD"]')),
+    )
+
     resolved_notebook = _resolve(ws, notebook or DEFAULT_NOTEBOOK)
     return HailerConfig(
         workspace=ws,
@@ -377,6 +435,7 @@ def load_config(
         ),
         providers=providers,
         web=web,
+        kernel=kernel,
         marimo_url=marimo_url,
         marimo_token=(env.get("HAILER_MARIMO_TOKEN") or None),
         log_level=log_level,
@@ -413,6 +472,18 @@ def _unknown_key_warnings(path: Path) -> list[str]:
             if key not in known:
                 warnings.append(f"Warning: unknown key [{section}].{key} in {path} is ignored.")
 
+    def misplaced_kernel_keys(table: Mapping[str, Any], section: str) -> dict[str, Any]:
+        """Warn about [kernel] settings that landed in ``section`` (an uncommented ``runtime`` line
+        whose ``[kernel]`` line is still commented out); the rest of ``table``."""
+        for key in table:
+            if key in _KNOWN_KERNEL and key not in _KNOWN_HAILER and key not in _KNOWN_MODEL:
+                warnings.append(
+                    f"Warning: [{section}].{key} in {path} is ignored: {key} belongs under [kernel]. Uncomment the "
+                    "[kernel] line above it too, or add one (uvx hailer notebook --kernel docker tries the docker "
+                    "kernel once without editing the file)."
+                )
+        return {k: v for k, v in table.items() if not (k in _KNOWN_KERNEL and k not in _KNOWN_HAILER and k not in _KNOWN_MODEL)}
+
     for key in data:
         if key not in _KNOWN_TOP:
             warnings.append(f"Warning: unknown section [{key}] in {path} is ignored.")
@@ -423,10 +494,11 @@ def _unknown_key_warnings(path: Path) -> list[str]:
                 f"Warning: [hailer].marimo_token in {path} is ignored; secrets do not belong in the file. "
                 "Set the HAILER_MARIMO_TOKEN environment variable instead."
             )
-        check({k: v for k, v in hailer_tbl.items() if k != "marimo_token"}, _KNOWN_HAILER, "hailer")
+        rest = misplaced_kernel_keys(hailer_tbl, "hailer")
+        check({k: v for k, v in rest.items() if k != "marimo_token"}, _KNOWN_HAILER, "hailer")
     model_tbl = data.get("model") or {}
     if isinstance(model_tbl, dict):
-        check(model_tbl, _KNOWN_MODEL, "model")
+        check(misplaced_kernel_keys(model_tbl, "model"), _KNOWN_MODEL, "model")
     providers_tbl = data.get("model_providers") or {}
     if isinstance(providers_tbl, dict):
         for pid, raw in providers_tbl.items():
@@ -440,7 +512,278 @@ def _unknown_key_warnings(path: Path) -> list[str]:
     web_tbl = data.get("web") or {}
     if isinstance(web_tbl, dict):
         check(web_tbl, _KNOWN_WEB, "web")
+    kernel_tbl = data.get("kernel") or {}
+    if isinstance(kernel_tbl, dict):
+        check(kernel_tbl, _KNOWN_KERNEL, "kernel")
     return warnings
+
+
+def _inside_or_equal(path: Path, root: Path) -> bool:
+    """True when ``path`` is ``root`` or below it: compared resolved, and by file identity for the
+    folders that exist (case-insensitive file systems, links)."""
+    try:
+        path, root = Path(path).resolve(), Path(root).resolve()
+    except OSError:
+        return False
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        pass
+    if not root.is_dir():
+        return False
+    for candidate in (path, *path.parents):
+        try:
+            if candidate.is_dir() and os.path.samefile(candidate, root):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _same_folder(a: Path, b: Path) -> bool:
+    return _inside_or_equal(a, b) and _inside_or_equal(b, a)
+
+
+def _is_drive_root(folder: Path) -> bool:
+    try:
+        resolved = Path(folder).resolve()
+    except OSError:
+        return False
+    return resolved.parent == resolved
+
+
+#: Folders under the home folder that hold credentials (keys, cloud and cluster logins, other
+#: tools' tokens): a docker kernel never mounts them, a folder inside them or a folder around them.
+CREDENTIAL_FOLDERS: tuple[str, ...] = (".config", ".ssh", ".aws", ".azure", ".gnupg", ".docker", ".kube")
+#: On Windows also these (applications keep their logins and browser profiles there).
+CREDENTIAL_FOLDER_VARS: tuple[str, ...] = ("APPDATA", "LOCALAPPDATA")
+NOTEBOOK_CONTROL_FILES = (".git", ".vscode", ".idea", ".devcontainer", "hailer.toml")
+
+
+def notebook_control_files(folder: Path) -> list[str]:
+    """Relative paths of repository, editor and workspace controls in a notebooks tree.
+
+    Inspect names only, never load their contents or follow symlinks/junctions. A missing root
+    is safe to create; other read errors propagate so startup cannot approve an unchecked tree.
+    """
+    found: list[str] = []
+    pending = [Path(folder)]
+    while pending:
+        current = pending.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    path = Path(entry.path)
+                    if entry.name.lower() in NOTEBOOK_CONTROL_FILES:
+                        found.append(path.relative_to(folder).as_posix())
+                    if entry.name.lower() != ".git" and entry.is_dir(follow_symlinks=False) and not path.is_junction():
+                        pending.append(path)
+        except FileNotFoundError:
+            if current != Path(folder):
+                raise  # the tree changed while checked: retry startup
+    return sorted(found)
+
+
+def _on_windows() -> bool:
+    return os.name == "nt"
+
+
+def is_unc_path(path: Path | str) -> bool:
+    """True for a Windows network-share path (``\\\\server\\share\\...``, also ``\\\\?\\UNC\\...``)."""
+    import ntpath
+
+    drive = ntpath.splitdrive(str(path))[0].replace("/", "\\")
+    if drive.upper().startswith(("\\\\?\\", "\\\\.\\")):
+        return drive[4:].upper().startswith("UNC\\")
+    return drive.startswith("\\\\")
+
+
+def _credential_folders(windows: bool) -> list[Path]:
+    try:
+        home = Path.home()
+    except RuntimeError:  # no home folder to protect
+        home = None
+    folders = [home / name for name in CREDENTIAL_FOLDERS] if home is not None else []
+    if windows:
+        folders += [Path(os.environ[var]) for var in CREDENTIAL_FOLDER_VARS if os.environ.get(var)]
+    return folders
+
+
+def _in_temp(folder: Path) -> bool:
+    """Inside the system's temporary folder (on Windows that is inside %LOCALAPPDATA%)."""
+    import tempfile
+
+    return _inside_or_equal(folder, Path(tempfile.gettempdir()))
+
+
+def docker_mount_problems(config: HailerConfig, *, windows: bool | None = None) -> list[str]:
+    """Every reason, in docker mode, not to mount the notebooks folder or the data folder (at most
+    one per folder, plus the data-inside-notebooks rule; empty when both are fine). The one place
+    for these rules: ``validate()`` reports them and :class:`~hailer.kernel_docker.DockerRuntime`
+    refuses to start on them, on every start path (``--foreground`` never runs ``validate()``, and
+    environment variables can move the folders after hailer.toml was read).
+
+    - Windows: a UNC path (a network share): Docker cannot mount it.
+    - Neither mount may be a whole drive, or be or contain the home folder, the workspace folder,
+      Hailer's ``.hailer`` folder (the kernel's token, the conversations), the config file or the
+      context, skills and prompts folders: notebook code would read Hailer's own files and,
+      through the writable notebooks folder, change them (switch the runtime back to local, plant
+      context sent to the model). The notebooks folder may not sit inside ``.hailer`` or those
+      folders either.
+    - Neither mount may be, contain or sit inside a folder that holds credentials
+      (:data:`CREDENTIAL_FOLDERS` under home; on Windows %APPDATA% and %LOCALAPPDATA%, outside the
+      temporary folder).
+    - The data folder may not be, or sit inside, the notebooks folder (it would become writable).
+    - The notebooks folder may not be a git repository (``.git`` at its top level): notebook code
+      could add hooks or ``core.fsmonitor`` to it, which run on this machine the next time git or
+      an editor touches the repository.
+    """
+    windows = _on_windows() if windows is None else windows
+    workspace = Path(config.workspace)
+    hailer_dir = workspace / ".hailer"
+    guarded: list[tuple[Path, str]] = [(workspace, "the workspace folder"), (hailer_dir, "Hailer's .hailer folder")]
+    try:
+        guarded.insert(0, (Path.home(), "your home folder"))
+    except RuntimeError:  # no home folder to protect
+        pass
+    if config.config_path is not None:
+        guarded.append((config.config_path, f"the config file {config.config_path.name}"))
+    private = [(config.context_dir, "the context folder"), (config.skills_dir, "the skills folder"), (config.prompts_dir, "the prompts folder")]
+    guarded += private
+    credentials = _credential_folders(windows)
+    docker = '[kernel] runtime = "docker"'
+    problems: list[str] = []
+    mounts = (
+        (config.notebooks_root, "notebooks folder", "writable ", "change", "[hailer].notebooks_dir (or the folder of [hailer].notebook)", "notebooks/"),
+        (config.data_dir, "data folder", "", "read", "[hailer].data_dir", "data/"),
+    )
+    for folder, what, writable, verb, setting, example in mounts:
+        fix = f"Keep the {what} a folder of its own, such as {example}, and point {setting} at it."
+        if windows and is_unc_path(folder):  # first: resolving a share's path can wait on the network
+            problems.append(
+                f"The {what} {folder} is on a network share (UNC path), which Docker cannot mount. "
+                f"Copy it to a folder on a local disk and point {setting} at it."
+            )
+            continue
+        if _is_drive_root(folder):
+            problems.append(f"The {what} ({folder}) is a whole drive. With {docker} it is mounted {writable}into the container. {fix}")
+            continue
+        found = next(((target, name) for target, name in guarded if _inside_or_equal(target, folder)), None)
+        if found is not None:
+            target, name = found
+            relation = "is" if _same_folder(target, folder) else "contains"
+            problems.append(
+                f"The {what} ({folder}) {relation} {name}. With {docker} it is mounted {writable}into the container, "
+                f"so notebook code could {verb} Hailer's own files. {fix}"
+            )
+            continue
+        secret = next((target for target in credentials if _inside_or_equal(target, folder)), None)
+        if secret is None:
+            appdata = [Path(os.environ[var]) for var in CREDENTIAL_FOLDER_VARS if windows and os.environ.get(var)]
+            secret = next((target for target in credentials if _inside_or_equal(folder, target)
+                           and not (_in_temp(folder) and any(_same_folder(target, app) for app in appdata))), None)
+        if secret is not None:
+            relation = "is" if _same_folder(secret, folder) else ("contains" if _inside_or_equal(secret, folder) else "is inside")
+            problems.append(
+                f"The {what} ({folder}) {relation} {secret}, a folder that holds credentials. With {docker} it is "
+                f"mounted {writable}into the container, so notebook code could {verb} them. {fix}"
+            )
+            continue
+        if writable:
+            inside = next(((target, name) for target, name in [(hailer_dir, "Hailer's .hailer folder"), *private] if _inside_or_equal(folder, target)), None)
+            if inside is not None:
+                problems.append(
+                    f"The {what} ({folder}) is inside {inside[1]}. With {docker} it is writable from notebook code, "
+                    f"so notebook code could change Hailer's own files. {fix}"
+                )
+                continue
+            if os.path.lexists(Path(folder) / ".git"):
+                problems.append(
+                    f"The notebooks folder ({folder}) is a git repository (it has .git at its top level). With {docker} "
+                    "it is writable from notebook code, which could add git hooks or settings (core.fsmonitor) that run "
+                    "on this machine the next time git or an editor touches the repository. Keep the notebooks in a "
+                    "plain subfolder of your repository (such as notebooks/), or remove the nested repository."
+                )
+                continue
+            try:
+                controls = notebook_control_files(Path(folder))
+            except OSError as err:
+                problems.append(f"Cannot inspect the notebooks folder ({folder}) for nested repositories or workspaces: {err}. {fix}")
+                continue
+            unsafe = [name for name in controls if Path(name).name.lower() in (".git", "hailer.toml")]
+            if unsafe:
+                problems.append(
+                    f"The notebooks folder ({folder}) contains repository or workspace controls: {', '.join(unsafe)}. "
+                    "Notebook code could change their hooks or settings and run commands on this machine later. "
+                    "Move those repositories or workspaces outside the notebooks folder before using Docker."
+                )
+        elif _inside_or_equal(folder, config.notebooks_root):
+            problems.append(
+                f"[hailer].data_dir ({folder}) is inside the notebooks folder ({config.notebooks_root}). "
+                f"With {docker} the notebooks folder is writable from notebook code, so the data would be too. "
+                "Keep the data in its own folder (the default is data/ next to notebooks/)."
+            )
+    return problems
+
+
+def _kernel_problems(config: HailerConfig) -> list[str]:
+    kernel = config.kernel
+    problems: list[str] = []
+    if kernel.runtime not in VALID_KERNEL_RUNTIMES:
+        problems.append(
+            f'Invalid [kernel].runtime "{kernel.runtime}" (or HAILER_KERNEL); use "local" (notebook code runs '
+            'in Hailer\'s own Python, as you) or "docker" (it runs in an isolated container).'
+        )
+    memory = _MEMORY_RE.match(kernel.memory)
+    if memory is None or float(memory.group(1)) <= 0:
+        problems.append(
+            f'Invalid [kernel].memory "{kernel.memory}"; write a size such as "4g" or "512m" '
+            "(a number with an optional b, k, m or g unit, no space)."
+        )
+    if not kernel.cpus > 0:
+        problems.append(f"Invalid [kernel].cpus {kernel.cpus:g}; use a number above 0, e.g. cpus = 2.")
+    for name in kernel.pass_env:
+        if not name or "=" in name:
+            problems.append(f'Invalid [kernel].pass_env entry "{name}"; list environment variable names, e.g. pass_env = ["DB_PASSWORD"].')
+    if kernel.runtime != KERNEL_RUNTIME_DOCKER:
+        problems.extend(_pass_env_warnings(config))
+        return problems
+    if kernel.pass_env:
+        problems.append(
+            "Warning: [kernel].pass_env applies to the local runtime only; a docker kernel gets none of your "
+            "environment variables."
+        )
+    if config.marimo_url:
+        problems.append(
+            '[hailer].marimo_url (or HAILER_MARIMO_URL) cannot be used with [kernel] runtime = "docker": '
+            "Hailer starts and finds its own container. Remove marimo_url, or set runtime = \"local\" to use "
+            "that server."
+        )
+    problems.extend(docker_mount_problems(config))
+    return problems
+
+
+def _pass_env_warnings(config: HailerConfig) -> list[str]:
+    """``[kernel].pass_env`` names that hand notebook code Hailer's own secrets: a provider's API key
+    or header variable, or ``HAILER_MARIMO_TOKEN``."""
+    own: dict[str, str] = {"OPENAI_API_KEY": "the API key of the openai provider", "HAILER_MARIMO_TOKEN": "the marimo server token"}
+    for provider in config.providers.values():
+        if provider.env_key:
+            own[provider.env_key] = f'the API key of provider "{provider.id}"'
+        for header, variable in provider.env_http_headers.items():
+            own[variable] = f'the {header} header of provider "{provider.id}"'
+
+    def fold(name: str) -> str:
+        return name.upper() if os.name == "nt" else name
+
+    folded = {fold(name): what for name, what in own.items()}
+    return [
+        f'Warning: [kernel].pass_env lets notebook code read {name} ({folded[fold(name)]}); code the model writes could '
+        "then use or leak it. Remove it from pass_env unless notebooks truly need it."
+        for name in config.kernel.pass_env
+        if fold(name) in folded
+    ]
 
 
 def validate(config: HailerConfig) -> list[str]:
@@ -470,7 +813,7 @@ def validate(config: HailerConfig) -> list[str]:
         folder_is_workspace = root.resolve() == Path(config.workspace).resolve()
     except OSError:
         folder_is_workspace = False
-    if folder_is_workspace:
+    if folder_is_workspace and config.kernel.runtime != KERNEL_RUNTIME_DOCKER:  # docker mode: fatal, reported once below
         problems.append(
             f"Warning: the notebooks folder is the workspace itself ({root}); marimo would scan the whole "
             "workspace (including .venv) for notebooks. Keep notebooks in a subfolder such as notebooks/ and "
@@ -543,6 +886,8 @@ def validate(config: HailerConfig) -> list[str]:
     if config.max_context_bytes <= 0:
         problems.append("[hailer].max_context_bytes must be a positive integer.")
 
+    problems.extend(_kernel_problems(config))
+
     if config.config_path is not None and config.config_path.is_file():
         problems.extend(_unknown_key_warnings(config.config_path))
 
@@ -554,13 +899,27 @@ def validate(config: HailerConfig) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 
-def write_default_config(path: Path, *, overwrite: bool = False) -> None:
-    """Write :data:`DEFAULT_CONFIG_TEMPLATE` to ``path`` (parents created)."""
+_KERNEL_SECTION_OFF = '# [kernel]\n# runtime = "local"'
+
+
+def config_template(kernel: str | None = None) -> str:
+    """:data:`DEFAULT_CONFIG_TEMPLATE`; with ``kernel`` ("local" or "docker") its ``[kernel]`` section
+    is switched on with that runtime (the other keys stay commented out)."""
+    if kernel is None:
+        return DEFAULT_CONFIG_TEMPLATE
+    if kernel not in VALID_KERNEL_RUNTIMES:
+        raise ConfigError(f'Unknown kernel runtime "{kernel}".', hint='Use "local" or "docker".')
+    return DEFAULT_CONFIG_TEMPLATE.replace(_KERNEL_SECTION_OFF, f'[kernel]\nruntime = "{kernel}"', 1)
+
+
+def write_default_config(path: Path, *, overwrite: bool = False, kernel: str | None = None) -> None:
+    """Write :func:`config_template` (``kernel`` sets ``[kernel] runtime``) to ``path`` (parents created)."""
     path = Path(path)
     if path.exists() and not overwrite:
         raise ConfigError(
             f"Config file already exists: {path}",
             hint="Edit it in place, or pass --force to replace it with the default template.",
         )
+    text = config_template(kernel)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(DEFAULT_CONFIG_TEMPLATE, encoding="utf-8", newline="\n")
+    path.write_text(text, encoding="utf-8", newline="\n")

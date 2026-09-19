@@ -6,25 +6,30 @@ import json
 import os
 import socket
 import threading
+from dataclasses import replace
 from pathlib import Path
 from urllib.parse import quote
 
 import pytest
 from fake_marimo import running
 
+from fake_marimo import FakeMarimo
 from hailer import marimo_client as mc
-from hailer.errors import MarimoExecutionError, MarimoUnavailableError, NoSessionError
-from hailer.models import HailerConfig, MarimoServer, MarimoSession
+from hailer.errors import MarimoExecutionError, MarimoUnavailableError, NoSessionError, NotebookPathError
+from hailer.models import HailerConfig, KernelConfig, MarimoServer, MarimoSession
 
 # --------------------------------------------------------------------------- #
-# Fake server
+# Fake server (tests/fake_marimo.py)
 # --------------------------------------------------------------------------- #
 
 
 @pytest.fixture
 def fake():
-    with running() as srv:
+    srv = FakeMarimo().start()
+    try:
         yield srv
+    finally:
+        srv.stop()
 
 
 def _free_port() -> int:
@@ -599,14 +604,205 @@ def test_marimo_server_command_flags(tmp_path):
     cmd = mc.marimo_server_command(tmp_path / "notebooks", tmp_path, 2731)
     assert cmd[0] == mc.sys.executable and cmd[1:4] == ["-m", "marimo", "edit"]
     assert cmd[4] == "notebooks", "marimo is started on the folder"
-    for flag in ("--no-token", "--headless", "--skip-update-check"):
+    for flag in ("--headless", "--skip-update-check"):
         assert flag in cmd
+    assert cmd[cmd.index("--token-password-file") + 1] == "-", "the token is read from stdin, never the command line"
+    assert "--no-token" not in cmd and "--token-password" not in cmd
     assert cmd[cmd.index("--port") + 1] == "2731"
 
 
-def test_marimo_server_command_foreground_lets_marimo_open_the_browser(tmp_path):
+def test_marimo_server_command_without_headless_lets_marimo_open_the_browser(tmp_path):
     cmd = mc.marimo_server_command(tmp_path / "nbs", tmp_path, 2718, headless=False)
-    assert cmd == [mc.sys.executable, "-m", "marimo", "edit", "nbs", "--no-token", "--port", "2718", "--skip-update-check"]
+    assert cmd == [mc.sys.executable, "-m", "marimo", "edit", "nbs", "--token-password-file", "-", "--port", "2718", "--skip-update-check"]
+
+
+# --------------------------------------------------------------------------- #
+# Tokens: signed-in URLs, identifying the server Hailer started
+# --------------------------------------------------------------------------- #
+
+
+def test_open_notebook_url_signs_in_only_when_asked(tmp_path):
+    """Fail safe: the token is only added on request (a URL the user opens), never by default."""
+    nb = tmp_path / "notebooks" / "analysis.py"
+    plain = mc.open_notebook_url(MarimoServer(url="http://127.0.0.1:2718"), nb)
+    server = MarimoServer(url="http://127.0.0.1:2718", token="t0k/en+=")
+    assert mc.open_notebook_url(server, nb) == plain, "no token unless asked"
+    assert mc.open_notebook_url(server, nb, with_token=True) == f"{plain}&access_token=t0k%2Fen%2B%3D"
+    assert mc.open_notebook_url(server, nb, view="edit", with_token=True).endswith("&access_token=t0k%2Fen%2B%3D")
+    assert mc.home_url(server) == mc.home_url(MarimoServer(url="http://127.0.0.1:2718/")) == "http://127.0.0.1:2718/"
+    assert mc.home_url(server, with_token=True) == "http://127.0.0.1:2718/?access_token=t0k%2Fen%2B%3D"
+
+
+def test_server_token_is_not_in_its_repr():
+    server = MarimoServer(url="http://127.0.0.1:2718", token="very-secret-token")
+    assert "very-secret-token" not in repr(server)
+
+
+def test_answers_with_token_identifies_the_server_that_holds_it(fake):
+    fake.token = "right-token"
+    assert mc.answers_with_token(fake.url, "right-token")
+    assert not mc.answers_with_token(fake.url, "wrong-token")
+    assert mc.answers_with_token(fake.url, None), "without a token only /health is checked"
+    fake.token = None  # a --no-token server accepts any bearer token, so it is never taken for Hailer's
+    assert not mc.answers_with_token(fake.url, "right-token")
+    assert not mc.answers_with_token(f"http://127.0.0.1:{_free_port()}", "right-token")
+
+
+def test_client_links_leave_the_token_out_unless_asked(fake, tmp_path):
+    nb = tmp_path / "notebooks" / "analysis.py"
+    fake.token = "right-token"
+    for_model = mc.MarimoClient(fake.url, "right-token", notebook=nb, workspace=tmp_path)
+    with pytest.raises(NoSessionError) as exc:
+        for_model.resolve_session(nb)
+    assert "right-token" not in exc.value.hint and "access_token" not in exc.value.hint
+    for_user = mc.MarimoClient(fake.url, "right-token", notebook=nb, workspace=tmp_path, token_in_links=True)
+    with pytest.raises(NoSessionError) as exc:
+        for_user.resolve_session(nb)
+    assert "&access_token=right-token" in exc.value.hint
+
+
+# --------------------------------------------------------------------------- #
+# Path map at the HTTP boundary (a kernel in a container)
+# --------------------------------------------------------------------------- #
+
+
+def _docker_client(fake, tmp_path, **kw):
+    from hailer.kernel import docker_paths
+
+    config = _config(tmp_path, notebooks_dir=tmp_path / "notebooks")
+    return mc.MarimoClient(fake.url, notebook=config.notebook, workspace=tmp_path, paths=docker_paths(config), **kw)
+
+
+def test_client_maps_kernel_session_paths_back_to_host_paths(fake, tmp_path):
+    nb = tmp_path / "notebooks" / "analysis.py"
+    nested = tmp_path / "notebooks" / "team" / "q2 churn.py"
+    fake.sessions = {
+        "s1": {"filename": "/work/notebooks/analysis.py", "path": "/work/notebooks/analysis.py"},
+        "s2": {"filename": "team/q2 churn.py", "path": "/work/notebooks/team/q2 churn.py"},
+        "s3": {"filename": "/tmp/scratch.py", "path": "/tmp/scratch.py"},
+        "s4": {"filename": None, "path": None},
+    }
+    client = _docker_client(fake, tmp_path)
+    by_id = {s.session_id: s for s in client.sessions()}
+    assert Path(by_id["s1"].path) == nb and Path(by_id["s1"].filename) == nb
+    assert Path(by_id["s2"].path) == nested and by_id["s2"].filename == "team/q2 churn.py", "relative names are left as they are"
+    assert by_id["s3"].path == "/tmp/scratch.py", "outside every mount: kept, so it never matches a host notebook"
+    assert by_id["s4"].path is None
+    assert client.resolve_session(nb).session_id == "s1"
+    assert client.resolve_session(nested).session_id == "s2"
+    assert client.execute("1").success  # the configured notebook's session, found through the map
+    assert fake.requests[-1]["headers"]["Marimo-Session-Id"] == "s1"
+
+
+def test_client_sends_kernel_paths_in_the_file_key(fake, tmp_path):
+    nb = tmp_path / "notebooks" / "team" / "q2 churn.py"
+    client = _docker_client(fake, tmp_path)
+    assert client.notebook_url(nb) == f"{fake.url}/?file=/work/notebooks/team/q2%20churn.py&view-as=present"
+    with pytest.raises(NoSessionError) as exc:
+        client.resolve_session(nb)
+    assert "?file=/work/notebooks/team/q2%20churn.py" in exc.value.hint
+    assert str(tmp_path) not in exc.value.hint.split("Open sessions")[0], "no host path in the URL"
+    # a notebook the container cannot see has no URL of its own; the home page is offered instead
+    assert client.notebook_url(tmp_path / "elsewhere" / "x.py") == f"{fake.url}/"
+    server = MarimoServer(url=fake.url, paths=client.paths)
+    with pytest.raises(NotebookPathError):
+        mc.open_notebook_url(server, tmp_path / "elsewhere" / "x.py")
+
+
+# --------------------------------------------------------------------------- #
+# find_server: marimo_url, then .hailer/kernel.json, then the registry (local only)
+# --------------------------------------------------------------------------- #
+
+
+def _record(tmp_path: Path, url: str, *, runtime: str = "local", token: str = "right-token", **extra):
+    from hailer.kernel import KernelState, write_kernel_state
+
+    port = int(url.rsplit(":", 1)[1])
+    write_kernel_state(tmp_path, KernelState(runtime=runtime, url=url, port=port, token=token, **extra))
+
+
+def _kernel_cfg(tmp_path: Path, runtime: str = "local", **overrides) -> HailerConfig:
+    return _config(tmp_path, notebooks_dir=tmp_path / "notebooks", kernel=KernelConfig(runtime=runtime), **overrides)
+
+
+def _registry_with(tmp_path: Path, fake) -> Path:
+    reg = tmp_path / "servers"
+    _write_entry(reg, "a.json", server_id="a", pid=1, host="127.0.0.1", port=fake.server_address[1], base_url="", started_at="", version="")
+    return reg
+
+
+def test_find_server_prefers_the_server_hailer_started_over_the_registry(fake, tmp_path):
+    fake.token = "right-token"
+    _record(tmp_path, fake.url, pid=4242)
+    other = FakeMarimo().start()  # a --no-token server of the user's own, in the registry
+    try:
+        server = mc.find_server(_kernel_cfg(tmp_path), registry=_registry_with(tmp_path, other))
+    finally:
+        other.stop()
+    assert server is not None and server.url == fake.url
+    assert (server.source, server.token, server.runtime, server.pid, server.paths) == ("kernel", "right-token", "local", 4242, None)
+
+
+def test_find_server_ignores_a_record_whose_server_is_gone_or_not_ours(fake, tmp_path):
+    from hailer.kernel import read_kernel_state
+
+    reg = _registry_with(tmp_path, fake)
+    fake.root = str(_kernel_cfg(tmp_path).notebooks_root)
+    _record(tmp_path, f"http://127.0.0.1:{_free_port()}")  # stale: nothing listens there
+    assert mc.find_server(_kernel_cfg(tmp_path), registry=reg).source == "registry"
+    assert read_kernel_state(tmp_path) is not None, "no pid: it cannot be proven dead, so it is kept"
+    _record(tmp_path, fake.url)  # the port now belongs to a --no-token server: not the one recorded
+    server = mc.find_server(_kernel_cfg(tmp_path), registry=reg)
+    assert server.source == "registry" and server.token is None
+
+
+def test_find_server_drops_a_record_whose_process_is_gone(tmp_path, monkeypatch):
+    """A stale record would cost a health check (about a second on Windows) on every tool call."""
+    from hailer import kernel
+    from hailer.kernel import read_kernel_state
+
+    probes: list[str] = []
+    monkeypatch.setattr(kernel, "answers_with_token", lambda url, token, timeout=1.0: probes.append(url) or False)
+    monkeypatch.setattr(kernel, "process_running", lambda pid: {77: False, 78: None}.get(pid, True))
+    _record(tmp_path, "http://127.0.0.1:9", pid=78)  # the OS cannot say: kept
+    assert mc.find_server(_kernel_cfg(tmp_path), registry=tmp_path / "none") is None
+    assert read_kernel_state(tmp_path) is not None
+    _record(tmp_path, "http://127.0.0.1:9", pid=77)
+    assert mc.find_server(_kernel_cfg(tmp_path), registry=tmp_path / "none") is None
+    assert read_kernel_state(tmp_path) is None, "its process is gone: deleted"
+    assert mc.find_server(_kernel_cfg(tmp_path), registry=tmp_path / "none") is None
+    assert len(probes) == 2, "the next call does not probe again"
+
+
+def test_find_server_marimo_url_takes_the_records_token_and_paths(tmp_path):
+    url = f"http://127.0.0.1:{_free_port()}"
+    _record(tmp_path, url, runtime="docker", mounts=((str(tmp_path / "notebooks"), "/work/notebooks"),))
+    server = mc.find_server(_kernel_cfg(tmp_path, marimo_url=url + "/"), registry=tmp_path / "none")
+    assert server.source == "kernel" and server.token == "right-token" and server.runtime == "docker"
+    assert server.paths is not None and server.paths.to_kernel(tmp_path / "notebooks" / "a.py") == "/work/notebooks/a.py"
+    other = mc.find_server(_kernel_cfg(tmp_path, marimo_url="http://127.0.0.1:9"), registry=tmp_path / "none")
+    assert other == MarimoServer(url="http://127.0.0.1:9", source="config"), "any other URL: as configured, no token"
+
+
+def test_find_server_for_docker_fails_closed(fake, tmp_path):
+    reg = _registry_with(tmp_path, fake)
+    docker = _kernel_cfg(tmp_path, "docker")
+    assert mc.find_server(docker, registry=reg) is None, "never the registry"
+    assert mc.find_server(replace(docker, marimo_url=fake.url), registry=reg) is None, "never a configured local URL"
+    fake.token = "right-token"
+    _record(tmp_path, fake.url, runtime="local")
+    assert mc.find_server(docker, registry=reg) is None, "never a local server Hailer started"
+    assert mc.find_server(replace(docker, marimo_url=fake.url), registry=reg) is None
+    _record(tmp_path, fake.url, runtime="docker", mounts=((str(tmp_path / "notebooks"), "/work/notebooks"),))
+    server = mc.find_server(docker, registry=reg)
+    assert server is not None and server.runtime == "docker" and server.paths is not None
+
+
+def test_find_server_local_request_may_attach_to_a_docker_kernel(fake, tmp_path):
+    fake.token = "right-token"
+    _record(tmp_path, fake.url, runtime="docker", mounts=((str(tmp_path / "notebooks"), "/work/notebooks"),))
+    server = mc.find_server(_kernel_cfg(tmp_path), registry=tmp_path / "none")
+    assert server is not None and server.runtime == "docker" and server.token == "right-token"
 
 
 def test_launch_hint_offers_one_command_route_first():

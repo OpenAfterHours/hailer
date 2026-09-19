@@ -12,7 +12,7 @@ import pytest
 
 from hailer import notebooks
 from hailer.errors import MarimoUnavailableError, NoSessionError
-from hailer.models import ExecResult, HailerConfig, MarimoServer, MarimoSession, WebConfig
+from hailer.models import ExecResult, HailerConfig, KernelConfig, MarimoServer, MarimoSession, WebConfig
 from hailer.tools import TOOL_NAMES, HailerTools, hailer_tools
 
 NOTEBOOK_SOURCE = 'import marimo\n\n__generated_with = "0.24.2"\napp = marimo.App()\n\n\n@app.cell\ndef _():\n    return\n\n\nif __name__ == "__main__":\n    app.run()\n'
@@ -452,6 +452,18 @@ def test_list_periods_names_other_data_files(tmp_path):
     assert text.splitlines()[-1] == "Other data files (load them directly with Polars or DuckDB): customers.csv, Survey 2024.json"
 
 
+def test_list_periods_names_the_data_folder_as_a_docker_kernel_sees_it(tmp_path):
+    """list_periods runs on the host, but the model writes code for the container."""
+    config = make_config(tmp_path, kernel=KernelConfig(runtime="docker"))
+    tools = HailerTools(config, failing_factory)
+    assert tools.list_periods() == "Data directory does not exist: /work/data"
+    config.data_dir.mkdir()
+    text = tools.list_periods()
+    assert text.startswith("No period files found in /work/data.") and str(config.data_dir) not in text
+    local = HailerTools(make_config(tmp_path), failing_factory).list_periods()
+    assert local.startswith(f"No period files found in {config.data_dir}.")
+
+
 def test_list_periods_with_files(tmp_path):
     pytest.importorskip("hailer.periods")
     pl = pytest.importorskip("polars")
@@ -624,6 +636,76 @@ def test_default_client_uses_active_notebook_folder_and_workspace(ws, monkeypatc
     notebooks.save_active_notebook(cfg, other)
     HailerTools(cfg)._default_client()
     assert captured["notebook"] == other
+    assert captured["paths"] is None
+
+
+def test_default_client_uses_the_token_and_paths_of_the_server_hailer_started(ws, monkeypatch):
+    from hailer import marimo_client as mc
+    from hailer.kernel import docker_paths
+
+    config, analysis, other = ws
+    captured: dict = {}
+
+    class CapturingClient:
+        def __init__(self, base_url, token=None, **kw):
+            captured.update(base_url=base_url, token=token, **kw)
+
+    paths = docker_paths(config)
+    started = MarimoServer(url="http://127.0.0.1:2731", source="kernel", token="kernel-token", runtime="docker", paths=paths)
+    monkeypatch.setattr(mc, "find_server", lambda config: started)
+    monkeypatch.setattr(mc, "MarimoClient", CapturingClient)
+    HailerTools(make_config(config.workspace, notebooks_dir=config.notebooks_root, marimo_token="user-token"))._default_client()
+    assert captured["token"] == "kernel-token", "the server's own token wins over HAILER_MARIMO_TOKEN"
+    assert captured["paths"] is paths
+    assert captured.get("token_in_links", False) is False, "hints from this client reach the model"
+
+
+# --------------------------------------------------------------------------- #
+# The server token never reaches the model
+# --------------------------------------------------------------------------- #
+
+SECRET = "kernel-token-never-for-the-model"
+
+
+def signed_factory(client: FakeClient, **server_kw):
+    def factory():
+        return client, MarimoServer(url="http://127.0.0.1:2718", source="kernel", token=SECRET, **server_kw)
+
+    return factory
+
+
+def test_tool_results_carry_token_free_urls_and_the_browser_gets_the_signed_one(ws):
+    config, analysis, other = ws
+    client = FakeClient(open_paths={analysis})
+    opener = Opener(client, grant_session=False)
+    tools = HailerTools(config, signed_factory(client), open_url=opener, session_wait_sec=0)
+    texts = [tools.notebook_create("draft"), tools.notebook_open("other"), tools.marimo_status()]
+    opener_fails = HailerTools(config, signed_factory(client), open_url=Opener(client, succeed=False), session_wait_sec=0)
+    texts.append(opener_fails.notebook_open("other"))
+    for text in texts:
+        assert SECRET not in text and "access_token" not in text, text
+    assert all("/notebook in the chat" in text for text in texts), "the user can get the signed-in link there"
+    assert "http://127.0.0.1:2718/?file=" in texts[0] and "http://127.0.0.1:2718/?file=" in texts[3]
+    assert opener.urls and all(url.endswith(f"&access_token={SECRET}") for url in opener.urls)
+
+
+def test_no_session_errors_point_at_the_notebook_command(ws):
+    config, analysis, other = ws
+    client = FakeClient(raise_on_execute=NoSessionError("The notebook is not open in a browser.", "Open http://127.0.0.1:2718/?file=x in your browser."))
+    text = HailerTools(config, signed_factory(client)).marimo_execute("1")
+    assert text.startswith("ERROR: The notebook is not open") and "/notebook in the chat" in text and SECRET not in text
+
+
+def test_tools_send_kernel_paths_for_a_docker_kernel(ws):
+    from hailer.kernel import docker_paths
+
+    config, analysis, other = ws
+    client = FakeClient(open_paths={analysis})
+    opener = Opener(client, grant_session=False)
+    tools = HailerTools(config, signed_factory(client, runtime="docker", paths=docker_paths(config)), open_url=opener, session_wait_sec=0)
+    text = tools.notebook_open("other")
+    assert opener.urls == [f"http://127.0.0.1:2718/?file=/work/notebooks/other.py&view-as=present&access_token={SECRET}"]
+    assert "?file=/work/notebooks/other.py&view-as=present" in text and SECRET not in text
 
 
 # --------------------------------------------------------------------------- #
@@ -730,3 +812,74 @@ def test_session_wait_that_loses_marimo_is_reported_not_raised(ws):
     assert text.startswith("notebooks/other.py is now the active notebook.")
     assert "timed out" in text and "restart it" in text
     assert len(opener.urls) == 1
+
+
+# --------------------------------------------------------------------------- #
+# The server the chat is pinned to; the kernel the model works in
+# --------------------------------------------------------------------------- #
+
+
+def test_a_pinned_server_is_used_without_discovering_one(ws, monkeypatch):
+    """`hailer notebook` hands its chat the server it started: a kernel.json rewritten or removed
+    underneath (another terminal) cannot take its token and paths away."""
+    from hailer import marimo_client as mc
+    from hailer.kernel import docker_paths
+
+    config, analysis, other = ws
+    captured: dict = {}
+
+    class CapturingClient:
+        def __init__(self, base_url, token=None, **kw):
+            captured.update(base_url=base_url, token=token, **kw)
+
+    def no_discovery(config):
+        raise AssertionError("a pinned chat never discovers a server")
+
+    pinned = MarimoServer(url="http://127.0.0.1:2731", source="kernel", token="pinned-token", runtime="docker", paths=docker_paths(config))
+    monkeypatch.setattr(mc, "find_server", no_discovery)
+    monkeypatch.setattr(mc, "MarimoClient", CapturingClient)
+    _client, server = HailerTools(config, server=pinned)._default_client()
+    assert server is pinned and captured["base_url"] == pinned.url and captured["token"] == "pinned-token"
+    assert captured["paths"] is pinned.paths
+
+
+def test_hailer_tools_pins_every_tool_to_the_server(ws):
+    config, analysis, other = ws
+    pinned = MarimoServer(url="http://127.0.0.1:2731", source="kernel", token="t")
+    tools = hailer_tools(config, server=pinned)
+    status = next(t for t in tools if t.name == "marimo_status")
+    assert status.func.__self__.server is pinned
+
+
+def test_marimo_status_names_the_kernel_in_use_and_its_paths(ws):
+    """A chat whose kernel changed underneath (a docker kernel started in another terminal) still
+    gets the truth: the runtime and where notebook code finds the folders."""
+    from hailer.kernel import docker_paths
+
+    config, analysis, other = ws
+    client = FakeClient(open_paths={analysis})
+    docker = MarimoServer(url="http://127.0.0.1:2731", source="kernel", token="t", runtime="docker", paths=docker_paths(config), network_access=True)
+    text = HailerTools(config, lambda: (client, docker)).marimo_status()
+    assert "kernel: docker (hailer-kernel " in text and "network on: the internet and this machine" in text
+    assert "kernel paths: notebooks folder /work/notebooks (writable), data folder /work/data (read-only)" in text
+    local = HailerTools(config, factory_for(client)).marimo_status()
+    assert "kernel: local (runs as you; not isolated)" in local
+    assert f"kernel paths: notebooks folder {config.notebooks_root}, data folder {config.data_dir}" in local
+
+
+def test_notebook_open_and_close_accept_the_kernels_paths(ws):
+    """The model sees /work/notebooks/... in a docker kernel and may pass such a path back."""
+    from hailer.kernel import docker_paths
+
+    config, analysis, other = ws
+    client = FakeClient(open_paths={analysis, other})
+    docker = MarimoServer(url="http://127.0.0.1:2731", source="kernel", token="t", runtime="docker", paths=docker_paths(config))
+    tools = HailerTools(config, lambda: (client, docker), open_url=Opener(client), session_wait_sec=0)
+    text = tools.notebook_open("/work/notebooks/other.py")
+    assert text.startswith("notebooks/other.py is now the active notebook."), text
+    text = tools.notebook_close("/work/notebooks/other.py")
+    assert text.startswith("Closed the kernel session") and "notebooks/other.py" in text, text
+    text = tools.notebook_open("/work/data/sales.py")
+    assert text.startswith("ERROR:"), "a kernel path outside the notebooks folder is still refused"
+    local = HailerTools(config, factory_for(FakeClient(open_paths={analysis, other})), open_url=Opener(client), session_wait_sec=0)
+    assert local.notebook_open(str(other)).startswith("notebooks/other.py is now the active notebook."), "host paths as before"

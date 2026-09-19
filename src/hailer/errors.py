@@ -39,6 +39,10 @@ class NoSessionError(HailerError):
     """Server is up but the notebook is not open in a browser (no kernel session)."""
 
 
+class KernelRuntimeError(HailerError):
+    """The kernel runtime cannot start or reach marimo (process exited, Docker missing or down, image problems)."""
+
+
 class MarimoExecutionError(HailerError):
     """The execute request failed at the transport level (not a Python error in user code)."""
 

@@ -30,10 +30,12 @@ from hailer import secrets as _secrets
 from hailer.errors import AgentError, ConfigError, CredentialsError, HailerError, ProviderError
 from hailer.log import get_logger, redact
 from hailer.models import (
+    KERNEL_RUNTIME_DOCKER,
     WIRE_API_RESPONSES,
     AgentEvent,
     ContextBundle,
     HailerConfig,
+    MarimoServer,
     ProviderConfig,
     SkillInfo,
     TurnSummary,
@@ -213,16 +215,36 @@ def system_prompt(config: HailerConfig, bundle: ContextBundle) -> str:
             "project context only."
         )
 
-    # The active notebook is deliberately absent: it changes with /notebook and the notebook tools
-    # during a conversation. The model learns it from marimo_status() and from CLI notices.
-    marimo_line = f"- Marimo URL: {config.marimo_url}\n" if config.marimo_url else ""
-    parts.append(
-        "## Workspace\n\n"
-        f"- Workspace: {config.workspace}\n"
-        f"- Notebooks folder: {config.notebooks_root}\n"
-        f"- Data directory: {config.data_dir}\n" + marimo_line
-    )
+    parts.append(_workspace_section(config))
     return "\n\n".join(p.rstrip() for p in parts) + "\n"
+
+
+def _workspace_section(config: HailerConfig) -> str:
+    """Where things are, as the kernel sees them, plus the runtime's notes.
+
+    ``config.kernel`` is the runtime in effect (the CLI applies ``attach_runtime`` first). A docker
+    kernel knows the folders by their mount points, so the model gets those, never host paths it
+    would copy into code that cannot reach them. The active notebook is deliberately absent: it
+    changes with /notebook and the notebook tools during a conversation; the model learns it from
+    marimo_status() and from CLI notices. The Marimo URL never carries the server's token.
+    """
+    from hailer.kernel import KERNEL_DATA_DIR, KERNEL_NOTEBOOKS_DIR, KERNEL_WORKDIR, runtime_prompt_notes
+
+    if config.kernel.runtime == KERNEL_RUNTIME_DOCKER:
+        lines = [
+            f"- Workspace: {KERNEL_WORKDIR} (in the kernel; only the two folders below are mounted)",
+            f"- Notebooks folder: {KERNEL_NOTEBOOKS_DIR} (writable; the only place files persist)",
+            f"- Data directory: {KERNEL_DATA_DIR} (read-only)",
+        ]
+    else:
+        lines = [
+            f"- Workspace: {config.workspace}",
+            f"- Notebooks folder: {config.notebooks_root}",
+            f"- Data directory: {config.data_dir}",
+        ]
+    if config.marimo_url:
+        lines.append(f"- Marimo URL: {config.marimo_url}")
+    return "## Workspace\n\n" + "\n".join(lines) + "\n" + runtime_prompt_notes(config.kernel)
 
 
 # --------------------------------------------------------------------------- #
@@ -408,9 +430,12 @@ class HailerAgent:
         tools: list[Any] | None = None,
         env: Mapping[str, str] | None = None,
         threads_path: Path | None = None,
+        server: MarimoServer | None = None,
     ) -> None:
         self.config = config
         self._bundle = bundle
+        #: The marimo server the tools are pinned to (``hailer notebook``); ``None``: discovered per call.
+        self._server = server
         self._environ: Mapping[str, str] = env if env is not None else os.environ
         self._model_factory = model_factory
         self._tools = tools
@@ -534,7 +559,7 @@ class HailerAgent:
         if self._tools is None:
             from hailer.tools import hailer_tools
 
-            self._tools = hailer_tools(self.config)
+            self._tools = hailer_tools(self.config, server=self._server)
         middleware: list[Any] = []
         after = self.config.model.summarize_after_tokens
         if after > 0:
