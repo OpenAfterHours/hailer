@@ -16,13 +16,13 @@ small module-level factory functions so tests can replace them.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import subprocess
 import sys
 import traceback
-from dataclasses import dataclass, field, replace
-from datetime import datetime
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -33,6 +33,7 @@ from rich.table import Table
 from rich.text import Text
 
 from hailer import __version__, notebooks
+from hailer.chat import ChatController
 from hailer.errors import (
     ConfigError,
     CredentialsError,
@@ -49,17 +50,10 @@ from hailer.models import (
     MarimoServer,
     MarimoSession,
     ProviderConfig,
-    SessionState,
-    SkillInfo,
     TurnSummary,
 )
 from hailer.session import (
     COMMANDS,
-    EXIT_COMMANDS,
-    help_text,
-    load_session,
-    parse_command,
-    save_session,
 )
 from hailer.statedir import ensure_state_dir
 
@@ -86,10 +80,21 @@ class CliOptions:
     config_path: Path | None = None
     workspace: Path | None = None
     new_thread: bool = False
+    plain: bool = False
 
 
 def console_factory() -> Console:
     return Console(highlight=False, soft_wrap=True)
+
+
+def _chat_console(opts: CliOptions) -> Console:
+    console = console_factory()
+    if opts.plain or os.environ.get("TERM", "").lower() in {"dumb", "unknown"}:
+        # Rich live status also emits cursor controls on a TTY. Plain mode must
+        # disable those throughout startup, notebook waits and model turns.
+        return Console(file=console.file, width=console.width, force_terminal=False,
+                       color_system=None, highlight=False, soft_wrap=True)
+    return console
 
 
 def _reconfigure_streams() -> None:
@@ -239,10 +244,12 @@ def _wait_for_health(url: str, timeout: float, should_stop: Callable[[], bool] |
     return wait_for_health(url, timeout, should_stop=should_stop)
 
 
-def _wait_for_session(client: Any, notebook: Path, timeout: float) -> MarimoSession | None:
+def _wait_for_session(
+    client: Any, notebook: Path, timeout: float, *, should_stop: Callable[[], bool] | None = None
+) -> MarimoSession | None:
     from hailer.marimo_client import wait_for_session
 
-    return wait_for_session(client, notebook, timeout)
+    return wait_for_session(client, notebook, timeout, should_stop=should_stop)
 
 
 def _registry_remove(url: str) -> bool:
@@ -629,7 +636,13 @@ class _LineReader:
 
 
 def _make_line_reader(console: Console) -> _LineReader:
-    return _LineReader(console)
+    interactive = _stdio_is_terminal() and os.environ.get("TERM", "").lower() not in {"dumb", "unknown"}
+    return _LineReader(console, interactive=interactive)
+
+
+def _use_composer(opts: CliOptions) -> bool:
+    """Pipes and minimal terminal emulators retain the linear interface."""
+    return not opts.plain and _stdio_is_terminal() and os.environ.get("TERM", "").lower() not in {"dumb", "unknown"}
 
 
 @dataclass
@@ -685,499 +698,16 @@ class _TurnDisplay:
         self.console.print()
 
 
-class ChatLoop:
+class ChatLoop(ChatController):
+    """Bind the shared controller to the CLI's injectable collaborators."""
+
     def __init__(self, console: Console, config: HailerConfig, opts: CliOptions) -> None:
-        self.console = console
-        self.config = config
-        self.opts = opts
-        self.state: SessionState = load_session(config.workspace)
-        self.bundle: ContextBundle = ContextBundle()
-        self.agent: Any = None
-        self.reader = _make_line_reader(console)
-        # One-line notice sent with the next user message after a /notebook switch (the model
-        # learns about switches it made itself from its own tool results).
-        self._pending_preamble: str | None = None
-
-    # -- lifecycle --------------------------------------------------------- #
-
-    def start(self) -> None:
-        self.bundle = _load_context(self.config)
-        self._print_context_warnings()
-        self.agent = _make_agent(self.config, self.bundle)
-        resume = None if self.opts.new_thread else self.state.thread_id
-        forget = self.state.thread_id if self.opts.new_thread else None  # --new: drop the stored conversation
-        thread_id = self.agent.start(resume_thread_id=resume, forget_thread_id=forget)
-        if resume and thread_id != resume:
-            self.console.print(Text("Previous conversation could not be resumed; started a new one.", style="dim"))
-            self.state = SessionState()
-        elif resume:
-            self.console.print(Text(f"Resumed conversation ({self.state.turns} turns so far). /new starts fresh.", style="dim"))
-        elif self.opts.new_thread:
-            self.state = SessionState()
-        self.state.thread_id = thread_id
-        self.state.model = self.state.model or self.config.model.name
-        self.state.provider = self.state.provider or self.config.model.provider
-        save_session(self.config.workspace, self.state)
-
-    def close(self) -> None:
-        if self.agent is not None:
-            try:
-                self.agent.close()
-            except Exception:  # pragma: no cover - best effort
-                pass
-
-    def _print_context_warnings(self) -> None:
-        for warning in self.bundle.warnings:
-            self.console.print(_labelled("warn", "yellow", f"  {warning}"))
-
-    # -- REPL -------------------------------------------------------------- #
-
-    def run(self) -> None:
-        # The plain prompt leaves the cursor after "You > "; prompt_toolkit has ended the line already.
-        bye = "Bye." if self.reader.interactive else "\nBye."
-        while True:
-            try:
-                line = self.reader.read()
-            except (EOFError, KeyboardInterrupt):
-                self.console.print(bye)
-                return
-            text = line.strip()
-            if not text:
-                continue
-            command = parse_command(text)
-            try:
-                if command is None:
-                    self._turn(text)
-                    continue
-                if command.name in EXIT_COMMANDS:
-                    self.console.print("Bye.")
-                    return
-                self._command(command)
-            except HailerError as err:
-                _print_error(self.console, err, verbose=self.opts.verbose)
-            except KeyboardInterrupt:
-                self.console.print("\nInterrupted.")
-            except Exception as exc:  # noqa: BLE001 - keep the loop alive
-                _print_unexpected(self.console, exc, verbose=self.opts.verbose)
-
-    # -- turns ------------------------------------------------------------- #
-
-    def _turn(self, text: str, *, skill: SkillInfo | None = None) -> None:
-        display = _TurnDisplay(self.console)
-        display.start()
-        preamble = self._pending_preamble
-        try:
-            try:
-                summary: TurnSummary = self.agent.run_turn(text, on_event=display, skill=skill, preamble=preamble)
-            except KeyboardInterrupt:  # the agent has already cancelled the turn
-                self._pending_preamble = None  # the notice went out with the interrupted turn
-                display.stop()
-                self.console.print("\nInterrupted.")
-                return
-            except BaseException:
-                display.stop()
-                raise
-            self._pending_preamble = None
-            display.finish(summary)
-            self.state.turns += 1
-            self.state.input_tokens += summary.input_tokens or 0
-            self.state.output_tokens += summary.output_tokens or 0
-            if summary.thread_id:
-                self.state.thread_id = summary.thread_id
-            save_session(self.config.workspace, self.state)
-        finally:
-            # Also after Ctrl+C or a failed turn: a notebook_create/notebook_open tool call may have
-            # completed (and switched the state file) before the turn was cut short.
-            self._sync_active_notebook()
-
-    def _sync_active_notebook(self, *, open_browser: bool = True) -> bool:
-        """Pick up a switch the model made during a turn (its tools write the same state file).
-
-        Returns True when the active notebook changed. With ``open_browser`` the notebook's URL is
-        opened once when it has no kernel session yet.
-        """
-        try:
-            active = notebooks.load_active_notebook(self.config)
-        except Exception:  # noqa: BLE001 - a bad state file must never spoil a finished turn
-            return False
-        if _same_file(active, self.config.notebook):
-            return False
-        self.config = replace(self.config, notebook=active)
-        name = notebooks.notebook_display_name(self.config, active)
-        self.console.print(Text(f"Active notebook is now {name}.", style="dim"))
-        if open_browser:
-            server, session, _err = _marimo_state(self.config)
-            if server is not None and session is None:
-                url = _notebook_url(server, self.config)
-                self.console.print(f"Opening {url} in your browser...", markup=False)
-                _open_browser(url)
-        return True
-
-    # -- slash commands ---------------------------------------------------- #
-
-    def _command(self, command: Any) -> None:
-        name, args = command.name, command.args
-        if name == "help":
-            self.console.print(help_text(), markup=False)
-        elif name == "status":
-            self._status()
-        elif name == "new":
-            self._new_thread(reason="New conversation started.")
-        elif name == "model":
-            self._model(args)
-        elif name == "notebook":
-            self._notebook(args)
-        elif name == "clear":
-            self.console.clear()
-        elif name == "context":
-            self._context()
-        elif name == "skill":
-            self._skill(args)
-        elif name == "prompt":
-            self._prompt(args)
-        elif name == "reload":
-            self._reload()
-        elif name == "":
-            self.console.print("Type /help for commands.", markup=False)
-        else:
-            self.console.print(f"Unknown command /{name}; type /help for commands.", markup=False)
-
-    def _new_thread(self, *, reason: str) -> None:
-        """Start a new thread and reset the counters."""
-        self.state = SessionState(
-            thread_id=self.agent.new_thread(),
-            model=self.state.model,
-            provider=self.state.provider,
-        )
-        save_session(self.config.workspace, self.state)
-        self.console.print(reason, markup=False)
-
-    def _status(self) -> None:
-        self._sync_active_notebook(open_browser=False)  # a late tool call may have switched notebooks
-        server, session, _err = _marimo_state(self.config)
-        if server is None:
-            marimo = "not running"
-        elif session is None:
-            marimo = f"{server.url} (notebook not open in a browser)"
-        else:
-            marimo = f"{server.url} (session {session.session_id})"
-        table = Table.grid(padding=(0, 2))
-        rows = [
-            ("Model", f"{self.state.model or self.config.model.name}"),
-            ("Provider", self._active_provider_line()),
-            ("Credentials", self._credentials_line()),
-            ("Thread", self.state.thread_id or "-"),
-            ("Turns", str(self.state.turns)),
-            ("Tokens", f"{self.state.input_tokens} in / {self.state.output_tokens} out"),
-            ("Marimo", marimo),
-            ("Notebook", _relative(self.config.notebook, self.config.workspace)),
-            ("Notebooks", _relative(self.config.notebooks_root, self.config.workspace)),
-            ("Web access", _web_line(self.config)),
-        ]
-        for label, value in rows:
-            table.add_row(Text(label), Text(value))
-        self.console.print(table)
-
-    def _active_provider(self) -> ProviderConfig | None:
-        provider_id = self.state.provider or self.config.model.provider
-        if provider_id in self.config.providers:
-            return self.config.providers[provider_id]
-        if provider_id == "openai":
-            return ProviderConfig(id="openai", env_key="OPENAI_API_KEY")
-        return None
-
-    def _active_provider_line(self) -> str:
-        provider_id = self.state.provider or self.config.model.provider
-        if provider_id == self.config.model.provider:
-            return _provider_line(self.config)
-        provider = self._active_provider()
-        if provider is None:
-            return f"{provider_id} (not declared in hailer.toml)"
-        return _describe_provider(provider)
-
-    def _credentials_line(self) -> str:
-        provider = self._active_provider()
-        if provider is None:
-            return "unknown provider"
-        source = getattr(self.agent, "key_source", None)
-        if not isinstance(source, str) or not source:
-            try:
-                _value, source = _resolve_key(provider)
-            except HailerError:
-                source = "missing"
-        if source == "missing":
-            return f"{provider.env_key or 'API key'} missing (run: uvx hailer login {provider.id})"
-        return f"{provider.env_key or 'API key'} from {source}"
-
-    def _model(self, args: str) -> None:
-        if not args:
-            self.console.print(f"Model: {self.state.model or self.config.model.name}  Provider: {self.state.provider or self.config.model.provider}")
-            self.console.print("Usage: /model <name>  or  /model <provider>:<name>")
-            return
-        provider: str | None = None
-        name = args.strip()
-        if ":" in name:
-            provider, _, name = name.partition(":")
-            provider = provider.strip()
-            name = name.strip()
-        if not name:
-            self.console.print("Usage: /model <name>  or  /model <provider>:<name>")
-            return
-        if provider is not None and provider != "openai" and provider not in self.config.providers:
-            known = ", ".join(sorted({"openai", *self.config.providers}))
-            self.console.print(f"Unknown provider {provider!r}. Declared providers: {known}.", markup=False)
-            return
-        self.agent.set_model(name, provider)
-        self.state.model = name
-        if provider is not None:
-            self.state.provider = provider
-        self._new_thread(reason=f"Model set to {name}" + (f" ({provider})" if provider else "") + "; started a new thread.")
-
-    # -- /notebook --------------------------------------------------------- #
-
-    def _notebook(self, args: str) -> None:
-        self._sync_active_notebook(open_browser=False)  # act on the current state, not a stale copy
-        sub, _, rest = args.strip().partition(" ")
-        sub, rest = sub.lower(), rest.strip()
-        if not sub:
-            self._notebook_show()
-        elif sub == "list":
-            self._notebook_list()
-        elif sub == "new":
-            self._notebook_new(rest)
-        elif sub == "open":
-            self._notebook_open(rest)
-        elif sub == "close":
-            self._notebook_close(rest)
-        else:
-            self.console.print(f"Unknown /notebook subcommand {sub!r}. {NOTEBOOK_USAGE}", markup=False)
-
-    def _display_name(self, path: Path) -> str:
-        return notebooks.notebook_display_name(self.config, path)
-
-    def _notebook_show(self) -> None:
-        cfg, out = self.config, self.console
-        out.print(f"Notebook:  {self._display_name(cfg.notebook)} (active)", markup=False)
-        count = len(notebooks.list_notebooks(cfg))
-        out.print(f"Notebooks: {self._display_name(cfg.notebooks_root)} ({_plural(count, 'notebook')}; /notebook list)", markup=False)
-        recent = [p for p in notebooks.load_recent(cfg) if not _same_file(p, cfg.notebook)]
-        if recent:
-            out.print("Recent:    " + ", ".join(self._display_name(p) for p in recent[:5]), markup=False)
-        server, session, _err = _marimo_state(cfg)
-        if server is None:
-            out.print("Marimo:    not running", markup=False)
-        else:
-            state = f"session {session.session_id}" if session is not None else "not open in a browser"
-            out.print(f"Marimo:    {server.url} ({state})", markup=False)
-            out.print(f"URL:       {_notebook_url(server, cfg)}", markup=False)
-            out.print("View:      app view (results only); Ctrl+. in the notebook toggles the code editor", markup=False)
-        out.print("Start everything in one go:  uvx hailer notebook", markup=False)
-        out.print(f"Launch:    {' '.join(_launch_command())}", markup=False)
-        out.print(NOTEBOOK_USAGE, markup=False)
-
-    def _server_sessions(self) -> tuple[MarimoServer | None, Any, list[MarimoSession]]:
-        """(server, client, open sessions); server is None when marimo is not running."""
-        try:
-            server = _find_server(self.config)
-        except HailerError:
-            return None, None, []
-        if server is None:
-            return None, None, []
-        client = _make_client(server, self.config)
-        try:
-            if not client.health():
-                return None, None, []
-            return server, client, client.sessions()
-        except HailerError:
-            return server, client, []
-
-    def _notebook_list(self) -> None:
-        infos = notebooks.list_notebooks(self.config)
-        folder = self._display_name(self.config.notebooks_root)
-        if not infos:
-            self.console.print(f"No notebooks in {folder} yet. Create one with /notebook new <name>.", markup=False)
-            return
-        _server, _client, sessions = self._server_sessions()
-        table = Table.grid(padding=(0, 2))
-        for info in infos:
-            markers = []
-            if _same_file(info.path, self.config.notebook):
-                markers.append("active")
-            if _session_for(sessions, info.path, self.config.workspace) is not None:
-                markers.append("open")
-            modified = datetime.fromtimestamp(info.modified).strftime("%Y-%m-%d %H:%M")
-            table.add_row(
-                Text(self._display_name(info.path)),
-                Text(modified),
-                Text(f"{info.size / 1024:.1f} KB"),
-                Text(", ".join(markers)),
-            )
-        self.console.print(table)
-        self.console.print(f"{_plural(len(infos), 'notebook')} in {folder}. /notebook open <name> switches.", markup=False)
-
-    def _notebook_new(self, rest: str) -> None:
-        tokens = rest.split()
-        kind = "empty" if "--empty" in tokens else "starter"
-        name = " ".join(t for t in tokens if t != "--empty")
-        if not name:
-            self.console.print("Usage: /notebook new <name> [--empty]", markup=False)
-            return
-        path = notebooks.create_notebook(self.config, name, kind=kind)
-        self.console.print(f"Created {self._display_name(path)} from the {kind} template.", markup=False)
-        self._switch_notebook(path, how=f"created from the {kind} template")
-
-    def _notebook_open(self, rest: str) -> None:
-        if not rest:
-            self.console.print("Usage: /notebook open <name>", markup=False)
-            return
-        path = notebooks.resolve_notebook(self.config, rest)
-        if _same_file(path, self.config.notebook):
-            self.console.print(f"{self._display_name(path)} is already the active notebook.", markup=False)
-            self._ensure_session()
-            return
-        self._switch_notebook(path, how="reopened")
-
-    def _notebook_close(self, rest: str) -> None:
-        path = notebooks.resolve_notebook(self.config, rest) if rest else self.config.notebook
-        name = self._display_name(path)
-        server, client, _sessions = self._server_sessions()
-        if server is None:
-            self.console.print("Marimo is not running.", markup=False)
-            return
-        try:
-            session = client.resolve_session(path)
-        except NoSessionError:
-            self.console.print(f"{name} is not open (no kernel session).", markup=False)
-            return
-        client.shutdown_session(session.session_id)
-        self.console.print(f"Closed {name} (session {session.session_id}); its browser tab is disconnected.", markup=False)
-        if _same_file(path, self.config.notebook):
-            self.console.print(f"It stays the active notebook; /notebook open {Path(path).stem} reopens it.", markup=False)
-
-    def _switch_notebook(self, path: Path, *, how: str) -> None:
-        """Make ``path`` the active notebook for this chat, the tool server and the next session."""
-        notebooks.save_active_notebook(self.config, path)
-        self.config = replace(self.config, notebook=path)
-        name = self._display_name(path)
-        # Queue the notice first: if the wait for the browser tab is interrupted (Ctrl+C) or marimo
-        # fails, the switch has still happened and the model must hear about it.
-        self._pending_preamble = self._switch_notice(name, f"{how}, not open in a browser yet")
-        try:
-            session, client = self._ensure_session()
-            detail = how
-            if session is not None:
-                count = self._cell_count(client)
-                if count is not None:
-                    detail += f", {_plural(count, 'cell')}"
-            else:
-                detail += ", not open in a browser yet"
-            self._pending_preamble = self._switch_notice(name, detail)
-        finally:
-            self.console.print(f"Active notebook: {name}.", markup=False)
-
-    @staticmethod
-    def _switch_notice(name: str, detail: str) -> str:
-        return f"[Hailer] The active notebook is now {name} ({detail}). Call notebook_cells before editing."
-
-    def _ensure_session(self) -> tuple[MarimoSession | None, Any]:
-        """Open the active notebook in the browser when it has no kernel session; (session, client)."""
-        cfg = self.config
-        server, session, _err = _marimo_state(cfg)
-        if server is None:
-            self.console.print("Marimo is not running; the notebook opens once it is (uvx hailer notebook).", markup=False)
-            return None, None
-        client = _make_client(server, cfg)
-        if session is not None:
-            self.console.print(f"Notebook is open (session {session.session_id}).", markup=False)
-            return session, client
-        url = _notebook_url(server, cfg)
-        self.console.print(f"Opening {url} in your browser...", markup=False)
-        _open_browser(url)
-        with self.console.status("Waiting for the notebook to open..."):
-            session = _wait_for_session(client, cfg.notebook, SWITCH_SESSION_TIMEOUT_SEC)
-        if session is None:
-            self.console.print(f"No kernel session yet. Open {url} in your browser.", style="yellow", markup=False)
-        else:
-            self.console.print(f"Notebook is open (session {session.session_id}).", markup=False)
-        return session, client
-
-    def _cell_count(self, client: Any) -> int | None:
-        """Number of cells in the active notebook, or None when it cannot be determined."""
-        if client is None:
-            return None
-        try:
-            result = client.execute(_list_cells_code(), notebook=self.config.notebook)
-        except Exception:  # noqa: BLE001 - informational only; never fail a switch over it
-            return None
-        if not result.success:
-            return None
-        return sum(1 for line in (result.stdout or "").splitlines() if line.strip())
-
-    def _context(self) -> None:
-        bundle = self.bundle
-        out = self.console
-        if bundle.context_files:
-            out.print("Context files (sent with every session):", markup=False)
-            for path in bundle.context_files:
-                try:
-                    size = path.stat().st_size
-                except OSError:
-                    size = 0
-                out.print(f"  {_relative(path, self.config.workspace)}  ({size} bytes)", markup=False)
-        else:
-            out.print(f"Context files: none ({_relative(self.config.context_dir, self.config.workspace)})", markup=False)
-        if bundle.skills:
-            out.print("Skills:", markup=False)
-            for skill in bundle.skills:
-                out.print(f"  {skill.name}: {skill.description}", markup=False)
-        else:
-            out.print(f"Skills: none ({_relative(self.config.skills_dir, self.config.workspace)})", markup=False)
-        if bundle.prompts:
-            out.print("Prompts: " + ", ".join(sorted(bundle.prompts)), markup=False)
-        else:
-            out.print(f"Prompts: none ({_relative(self.config.prompts_dir, self.config.workspace)})", markup=False)
-        out.print(f"Web access: {_web_line(self.config)}", markup=False)
-        for warning in bundle.warnings:
-            out.print(_labelled("warn", "yellow", f"  {warning}"))
-
-    def _skill(self, args: str) -> None:
-        if not args:
-            names = ", ".join(s.name for s in self.bundle.skills) or "none"
-            self.console.print(f"Usage: /skill <name> [message]. Available: {names}", markup=False)
-            return
-        name, _, message = args.partition(" ")
-        skill = next((s for s in self.bundle.skills if s.name == name), None)
-        if skill is None:
-            names = ", ".join(s.name for s in self.bundle.skills) or "none"
-            self.console.print(f"Unknown skill {name!r}. Available: {names}", markup=False)
-            return
-        message = message.strip() or f"Summarise the '{skill.name}' skill and how you would apply it to this workspace."
-        self._turn(message, skill=skill)
-
-    def _prompt(self, args: str) -> None:
-        if not args:
-            names = ", ".join(sorted(self.bundle.prompts)) or "none"
-            self.console.print(f"Usage: /prompt <name> [args]. Available: {names}", markup=False)
-            return
-        name, _, rest = args.partition(" ")
-        text = _render_prompt(self.config, name, rest.strip())
-        self._turn(text)
-
-    def _reload(self) -> None:
-        self.bundle = _load_context(self.config)
-        self._print_context_warnings()
-        if hasattr(self.agent, "bundle"):
-            self.agent.bundle = self.bundle
-        self.console.print(
-            f"Reloaded {len(self.bundle.context_files)} context file(s), {len(self.bundle.skills)} skill(s), "
-            f"{len(self.bundle.prompts)} prompt(s). Applies from your next message.",
-            markup=False,
-        )
+        super().__init__(console, config, opts, services=sys.modules[__name__])
 
 
 def run_chat(opts: CliOptions) -> None:
     """Bare ``hailer``: the same session as ``hailer notebook`` with its default options."""
-    console = console_factory()
+    console = _chat_console(opts)
     config = _config_or_exit(console, opts)
     _run_session(console, config, opts, port=DEFAULT_MARIMO_PORT, open_browser=True, keep_marimo=False)
 
@@ -1185,6 +715,18 @@ def run_chat(opts: CliOptions) -> None:
 def _run_chat_loop(console: Console, config: HailerConfig, opts: CliOptions) -> None:
     """Start the agent and run the REPL; exit code 1 when the agent cannot start."""
     loop = ChatLoop(console, config, opts)
+    if _use_composer(opts):
+        try:
+            asyncio.run(loop.run_interactive())
+        except HailerError as err:
+            _print_error(console, err, verbose=opts.verbose)
+            raise typer.Exit(code=1)
+        except KeyboardInterrupt:
+            console.print("Bye.")
+        except Exception as exc:  # startup/terminal failures still restore the terminal
+            _print_unexpected(console, exc, verbose=opts.verbose)
+            raise typer.Exit(code=1)
+        return
     try:
         loop.start()
     except HailerError as err:
@@ -1233,10 +775,11 @@ def _main(
     config: Path | None = typer.Option(None, "--config", help="Path to hailer.toml.", show_default=False),
     workspace: Path | None = typer.Option(None, "--workspace", help="Project directory (default: auto-detect).", show_default=False),
     new: bool = typer.Option(False, "--new", help="Start a new conversation instead of resuming."),
+    plain: bool = typer.Option(False, "--plain", help="Use line-oriented chat without the persistent composer."),
     version: bool = typer.Option(False, "--version", callback=_version_callback, is_eager=True, help="Show the version and exit."),
 ) -> None:
     del version
-    ctx.obj = CliOptions(verbose=verbose, config_path=config, workspace=workspace, new_thread=new)
+    ctx.obj = CliOptions(verbose=verbose, config_path=config, workspace=workspace, new_thread=new, plain=plain)
     if ctx.invoked_subcommand is None:
         run_chat(ctx.obj)
 
@@ -1394,12 +937,15 @@ def notebook(
     keep_marimo: bool = typer.Option(False, "--keep-marimo", help="Leave marimo running when the chat ends."),
     foreground: bool = typer.Option(False, "--foreground", help="Run marimo attached to this terminal, without the chat."),
     new: bool = typer.Option(False, "--new", help="Start a new conversation instead of resuming."),
+    plain: bool = typer.Option(False, "--plain", help="Use line-oriented chat without the persistent composer."),
 ) -> None:
     """Start marimo (or reuse this workspace's), open the notebook, and chat here; stop marimo on exit."""
     opts = _opts(ctx)
     if new:
         opts.new_thread = True
-    console = console_factory()
+    if plain:
+        opts.plain = True
+    console = _chat_console(opts)
     config = _config_or_exit(console, opts)
 
     if foreground:
