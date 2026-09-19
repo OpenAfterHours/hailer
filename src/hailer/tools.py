@@ -213,11 +213,7 @@ class HailerTools:
         config = self._active_config()
         server = mc.find_server(config)
         if server is None:
-            cmd = " ".join(mc.launch_command())
-            raise MarimoUnavailableError(
-                "marimo is not running (no server configured or discovered)",
-                f"Start it in another terminal with:\n    {cmd}\nThen open the notebook in your browser.",
-            )
+            raise MarimoUnavailableError("marimo is not running for this workspace (no server configured or found)", mc.launch_hint())
         client = mc.MarimoClient(
             server.url,
             token=config.marimo_token,

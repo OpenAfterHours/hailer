@@ -93,8 +93,10 @@ The notebook lists them when it opens, and you can start asking straight away.
 in the background (log in `.hailer/marimo.log`), opens the active notebook's URL so the kernel gets a
 session, then runs the chat in the same terminal. One server hosts every notebook in the folder, and
 marimo's own home page (the server URL without `?file=`) lists them all. When you leave the chat (`/exit`,
-Ctrl+Z Enter, or Ctrl+C at the prompt) it stops the marimo server it started. If a marimo server is already
-running with a notebook from the folder open, it is reused and left running.
+Ctrl+Z Enter, or Ctrl+C at the prompt) it stops the marimo server it started. If this workspace's marimo
+server is already running (started on this notebooks folder, or with one of its notebooks open), it is
+reused and left running. A server for another folder, such as another git worktree of the same repository,
+is never used, so several workspaces can each run their own.
 
 The notebook opens in marimo's **app view**: you see the results, tables and charts the agent produces,
 not the code behind them (the URL carries `view-as=present`). To see or edit the code, press `Ctrl+.`
@@ -106,12 +108,15 @@ instead of opening it), `--keep-marimo` (leave the server running after the chat
 marimo attached to this terminal, no chat; it opens marimo's home page unless `--no-browser` is given),
 `--new` (start a fresh conversation).
 
-Chat only, when marimo is already running (started by `uvx hailer notebook --keep-marimo`, or by
-`uvx hailer notebook --foreground` in another terminal, with the notebook open in a browser):
+Bare `uvx hailer` does the same as `uvx hailer notebook` with its defaults: it reuses this workspace's
+marimo server or starts one, opens the notebook, chats, and stops only a server it started.
 
 ```bash
 uvx hailer
 ```
+
+A pinned server (`[hailer].marimo_url` in `hailer.toml`, or `HAILER_MARIMO_URL`) is used as is, whichever
+folder it serves. If it does not answer, Hailer says so and exits; it never starts a server in its place.
 
 ```text
 +--------------------- Hailer ----------------------+
@@ -157,6 +162,22 @@ Added a channel comparison below the category chart.
 
 Hailer resumes your previous conversation on the next start; use `uvx hailer --new` or `/new` for a fresh
 thread. `uvx hailer doctor` runs the same startup checks and prints fixes.
+
+## Running inside abeam
+
+[abeam](https://github.com/OpenAfterHours/abeam) runs coding-agent CLIs in a terminal pane beside git status,
+a file viewer and a shell. It starts `hailer` from your `PATH`, so install Hailer as a tool first:
+
+```bash
+uv tool install hailer
+abeam +hailer
+```
+
+abeam forwards every argument, so `abeam +hailer notebook --no-browser` or `abeam +hailer --new` behave as
+they do in a terminal. abeam starts Hailer in a git worktree; commit `hailer.toml` (and your notebooks) so
+each worktree is a workspace of its own, since Hailer uses the nearest folder holding `hailer.toml` or
+`pyproject.toml`. Each workspace then gets its own marimo server, `.hailer/` stays out of the git pane, and a
+pasted block of several lines arrives as one message.
 
 ## Working with several notebooks
 
@@ -387,7 +408,13 @@ credentials, customer names and row-level data out of it.
 | `/prompt <name> [args]` | Send a saved prompt from `.config/hailer/prompts`. |
 | `/reload` | Re-read `.config/hailer`; applies from your next message. |
 | `/clear` | Clear the screen. |
-| `/exit`, `/quit` | Exit Hailer (Ctrl+C at the prompt, or Ctrl+Z then Enter, also exit). |
+| `/exit`, `/quit` | Exit Hailer (Ctrl+C at the prompt, Ctrl+D on an empty line, or Ctrl+Z then Enter, also exit). |
+
+At the `You > ` prompt, pasting a block of several lines sends it as one message, newlines included:
+Hailer turns on the terminal's bracketed paste while it waits for you and turns it off before the agent
+starts. Enter sends; Up and Down recall your earlier messages from this session (they are not saved to disk).
+The prompt does not capture the mouse or switch to an alternate screen, so scrolling and selecting text work
+as usual. When the input is not a terminal (a pipe or a script), Hailer reads plain lines instead.
 
 Ctrl+C while the agent is working cancels that turn, including the request to the model endpoint, and
 returns to the prompt. The conversation carries on: your interrupted message is kept and sent together with
@@ -504,21 +531,26 @@ third party. Set `HAILER_TRACING=1` if you do want the tracing variables in your
 
 **On disk:** the conversation (your messages, the agent's replies, tool calls and their truncated results)
 is stored unencrypted in `.hailer/threads.sqlite` inside the workspace until `/new` or `hailer --new`
-replaces it. `.hailer/` is in the repository's `.gitignore`.
+replaces it. `.hailer/` holds only this local state (the conversation, `session.json`, `notebook.json`,
+`marimo.log`) and carries its own `.gitignore` containing `*`, so git ignores the folder in any repository
+without an entry in yours; Hailer never edits your `.gitignore`.
 
 ## Troubleshooting
 
-`uvx hailer doctor` runs the five startup checks (config, notebook, credentials, marimo, session) and,
-when a session exists, confirms that marimo's code-mode API is available in the kernel.
+`uvx hailer doctor` runs five checks (config, notebook, credentials, marimo, session) and, when a session
+exists, confirms that marimo's code-mode API is available in the kernel. With several marimo servers
+running it checks the one serving this workspace; having none is only a warning, because `uvx hailer`
+starts one.
 
 | Message | Meaning and fix |
 |---|---|
-| `Marimo is not running.` then `Start everything in one go: uvx hailer notebook`, `Or run marimo on its own in another terminal: uvx hailer notebook --foreground`, `Then run Hailer again: uvx hailer` | No server answered at the configured or discovered URL. `uvx hailer notebook` starts one on the notebooks folder and runs the chat in the same terminal; `--foreground` runs only marimo, with Hailer's own Python environment, so the notebook can import Polars, DuckDB and `hailer.periods`. Servers started with `--no-token` register themselves so Hailer finds them; otherwise set `marimo_url` in `hailer.toml`. |
+| `No marimo server is running for this workspace.` (from `doctor` or `exec`; `status` says `none for this workspace`) | No running server serves this workspace's notebooks folder; servers for other folders are ignored. `uvx hailer` (or `uvx hailer notebook`) starts one and runs the chat in the same terminal; `uvx hailer notebook --foreground` runs only marimo, with Hailer's own Python environment, so the notebook can import Polars, DuckDB and `hailer.periods`. Servers started with `--no-token` register themselves so Hailer finds them; otherwise set `marimo_url` in `hailer.toml`. |
+| `Marimo is not running at <url>.` with a hint about `[hailer].marimo_url` | The URL pinned by `marimo_url` or `HAILER_MARIMO_URL` does not answer. Start marimo there, or remove the setting so Hailer starts its own server for this workspace. |
 | `Marimo exited early (code N)` or `Marimo did not answer on http://127.0.0.1:2718 within 60 s`, followed by `Log: .hailer\marimo.log` and its last lines | `hailer notebook` could not start marimo. The log tail usually names the cause (port in use by something else, a syntax error in the notebook, marimo not installed in the environment). |
 | `the notebook is not open in a browser` followed by `Open http://... in your browser.` | The server is up but has no kernel session. Open the URL; Hailer opens it for you once at startup. The URL ends in `&view-as=present` (app view); `Ctrl+.` in the notebook shows the code. |
 | `not found: <path>` for the notebook | The configured notebook (`[hailer].notebook`, or `HAILER_NOTEBOOK`) does not exist. `uvx hailer init` creates it from the starter template (your `hailer.toml` is kept), or fix the path; a deleted *active* notebook is not the cause, because Hailer already falls back to the configured one when the remembered notebook is gone. New notebooks are created from the chat with `/notebook new <name>`. |
 | `No notebook named '...' in notebooks.` or `... is outside the notebooks folder.` | `/notebook open` (or the agent's `notebook_open`) only opens marimo notebooks inside `[hailer].notebooks_dir`; the hint lists the available names. Move the file into the folder or point `notebooks_dir` at it. |
-| `INTERNAL_MODEL_API_KEY is not set (required by provider 'internal')`, or the same for `OPENAI_API_KEY` and provider `'openai'` | Every provider needs a key. Run `uvx hailer login <provider>` or set the variable in this terminal. Releases up to 0.2 could use a ChatGPT login for the `openai` provider; that is gone, so create an API key. |
+| `INTERNAL_MODEL_API_KEY is not set (required by provider 'internal')`, or the same for `OPENAI_API_KEY` and provider `'openai'` | Every provider needs a key. Run `uvx hailer login <provider>` or set the variable in this terminal. Releases up to 0.2.2 could use a ChatGPT login for the `openai` provider; that is gone, so create an API key. |
 | `The model endpoint rejected the API key for provider '...'` | The endpoint returned 401. Re-run `hailer login <provider>`. |
 | `Unknown model '...' for provider '...'` | The endpoint does not know `[model].name` (or the name given to `/model`). Its reply is quoted after `The endpoint said:`. |
 | `Could not reach the model endpoint at <base_url>` | Check `base_url`, VPN or proxy (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`), and that the endpoint is running. |
@@ -527,8 +559,8 @@ when a session exists, confirms that marimo's code-mode API is available in the 
 | `The endpoint at <base_url> refused access (HTTP 403).` | The key was accepted but is not allowed for this model, route or organisation. Check the endpoint's access policy and the provider's `http_headers` / `env_http_headers`. |
 | `The endpoint at <base_url> is unavailable (HTTP 429)` (or 5xx) | Rate limit or an outage on the endpoint's side. Retry in a moment. |
 | `The conversation no longer fits the model's context window.` | Start again with `/new`, and lower `[model].summarize_after_tokens` so older turns are summarised before the model's limit is reached. |
-| `Warning: unknown key [model_providers.x].merge_messages ... is ignored` (also `parallel_tool_calls`, `requires_openai_auth`, `[hailer].codex_home`, `[web].allow_shell_network`) | Settings from releases up to 0.2 that no longer mean anything. The file still loads; delete the keys to silence the warning. |
-| `Previous conversation could not be resumed; started a new one.` after upgrading from 0.2 | Conversations from before 0.3 were stored elsewhere and do not carry over. |
+| `Warning: unknown key [model_providers.x].merge_messages ... is ignored` (also `parallel_tool_calls`, `requires_openai_auth`, `[hailer].codex_home`, `[web].allow_shell_network`) | Settings from releases up to 0.2.2 that no longer mean anything. The file still loads; delete the keys to silence the warning. |
+| `Previous conversation could not be resumed; started a new one.` after upgrading from 0.2.2 or earlier | Conversations from before 0.2.3 (the Codex releases) were stored elsewhere and do not carry over. |
 | A tool result starting with `ERROR:` inside the conversation | The agent hit a marimo or allowlist problem; the text contains the fix (for example the URL to open). |
 | marimo answers 401 or 403 and the hint mentions `HAILER_MARIMO_TOKEN` | The server was started with a token. Export it as `HAILER_MARIMO_TOKEN` (kept in memory only), or restart marimo with `--no-token`. |
 

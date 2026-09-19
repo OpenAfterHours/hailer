@@ -1,8 +1,8 @@
 """Hailer command line: the conversational control plane.
 
-``uvx hailer``            chat with the agent (default; marimo must already be running)
-``uvx hailer notebook``   one-command session: start (or reuse) marimo, open the notebook, chat,
-                          stop marimo on exit
+``uvx hailer``            chat with the agent: reuse this workspace's marimo or start one, open the
+                          notebook, chat, stop the marimo it started on exit
+``uvx hailer notebook``   the same, with options (--port, --no-browser, --keep-marimo, --foreground)
 ``uvx hailer exec``       run code in the live kernel (debugging / scripting)
 ``uvx hailer status``     show configuration, credentials source and marimo state
 ``uvx hailer doctor``     run the preflight checks and print a table
@@ -61,6 +61,7 @@ from hailer.session import (
     parse_command,
     save_session,
 )
+from hailer.statedir import ensure_state_dir
 
 app = typer.Typer(
     add_completion=False,
@@ -70,6 +71,7 @@ app = typer.Typer(
 )
 
 PROMPT = "You > "
+NO_WORKSPACE_SERVER = "No marimo server is running for this workspace."
 ANSWER_HEADER = "Hailer >"
 
 
@@ -250,13 +252,12 @@ def _registry_remove(url: str) -> bool:
 
 
 def _spawn_marimo(cmd: list[str], cwd: Path, log_path: Path) -> subprocess.Popen:
-    """Start marimo as a background child of this process, logging to ``log_path``.
+    """Start marimo as a background child of this process, logging to ``log_path`` (its folder must exist).
 
     No new console window: the chat runs in this terminal and marimo is stopped when it
     ends. On Windows the child gets its own process group so Ctrl+C in the chat is not
     delivered to marimo.
     """
-    log_path.parent.mkdir(parents=True, exist_ok=True)
     log = open(log_path, "ab")  # noqa: SIM115 - handed to the child; closed with it
     flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
     try:
@@ -395,14 +396,6 @@ def _same_file(a: Path, b: Path) -> bool:
         return False
 
 
-def _inside(path: Path, root: Path) -> bool:
-    try:
-        Path(path).resolve().relative_to(Path(root).resolve())
-    except (ValueError, OSError):
-        return False
-    return True
-
-
 def _session_for(sessions: list[MarimoSession], path: Path, workspace: Path | None = None) -> MarimoSession | None:
     """The kernel session for ``path`` among ``sessions``: exact path match only (no filename fallback,
     so two notebooks called ``report.py`` in different folders never share a session)."""
@@ -462,20 +455,27 @@ def _launch_hint() -> str:
 
 
 def preflight(config: HailerConfig) -> list[Check]:
-    """Startup checks. Fatal failures stop the chat; the rest are printed as warnings."""
+    """What ``hailer doctor`` checks: :func:`local_checks` plus the marimo server and session."""
     checks = local_checks(config)
     checks.extend(marimo_checks(config))
     return checks
 
 
 def marimo_checks(config: HailerConfig) -> list[Check]:
-    """The marimo server and kernel-session checks (the part ``hailer notebook`` handles itself)."""
+    """The marimo server and kernel-session checks (the part ``hailer`` and ``hailer notebook`` handle themselves).
+
+    With several servers running, the one serving this workspace is checked. None is a warning, not a
+    failure (starting one is the chat's job); a pinned URL that does not answer is a failure.
+    """
     checks: list[Check] = []
     server, session, err = _marimo_state(config)
-    if server is None:
-        summary = "Marimo is not running." if err is None else str(err)
+    if server is None and config.marimo_url:
+        checks.append(Check("marimo", False, f"not running at {config.marimo_url}", hint=PINNED_URL_HINT))
+    elif server is None:
+        # Not a failure: `hailer` and `hailer notebook` start a server for this workspace.
+        summary = NO_WORKSPACE_SERVER if err is None else str(err)
         hint = err.hint if err is not None and err.hint else _launch_hint()
-        checks.append(Check("marimo", False, summary, hint=hint))
+        checks.append(Check("marimo", False, summary, hint=hint, fatal=False))
     else:
         checks.append(Check("marimo", True, server.url, fatal=False))
         if session is not None:
@@ -565,6 +565,73 @@ def _print_checks(console: Console, checks: list[Check], *, only_failures: bool 
 # --------------------------------------------------------------------------- #
 
 
+CTRL_Z = "\x1a"  # Ctrl+Z then Enter: end of input on Windows, as in Python's own REPL
+
+
+def _stdio_is_terminal() -> bool:
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, ValueError):  # replaced or closed streams
+        return False
+
+
+class _LineReader:
+    """Reads one message at the ``You > `` prompt.
+
+    In a terminal it is a prompt_toolkit prompt. While it waits, bracketed paste is on
+    (``ESC[?2004h``), so a pasted block arrives as one message with its newlines, and it is off
+    again (``ESC[?2004l``) before the prompt returns, so before the turn runs. Up/Down recall this
+    session's messages (in memory only). No mouse capture and no alternate screen, so the
+    terminal's own scrollback and selection keep working. Without a terminal (a pipe, the tests)
+    it is Rich's plain ``Console.input``, as before.
+
+    Ctrl+C at the prompt raises ``KeyboardInterrupt``; Ctrl+D on an empty line, or Ctrl+Z then
+    Enter, raises ``EOFError``. ``pt_input`` / ``pt_output`` replace the terminal (tests).
+    """
+
+    def __init__(self, console: Console, *, interactive: bool | None = None, pt_input: Any = None, pt_output: Any = None) -> None:
+        self.console = console
+        self.interactive = _stdio_is_terminal() if interactive is None else interactive
+        self._pt_input = pt_input
+        self._pt_output = pt_output
+        self._session: Any = None
+
+    def read(self) -> str:
+        if self.interactive:
+            line = self._prompt_session().prompt()
+        else:
+            line = self.console.input(f"[bold cyan]{PROMPT}[/bold cyan]")
+        if line.lstrip().startswith(CTRL_Z):
+            raise EOFError
+        return line
+
+    def _prompt_session(self) -> Any:
+        if self._session is None:
+            from prompt_toolkit import PromptSession
+            from prompt_toolkit.formatted_text import FormattedText
+            from prompt_toolkit.history import InMemoryHistory
+            from prompt_toolkit.output import create_output
+            from prompt_toolkit.output.vt100 import Vt100_Output
+
+            output = self._pt_output or create_output()
+            if isinstance(output, Vt100_Output):
+                # No completion menu needs the cursor row, and a terminal that never answers the
+                # ESC[6n request would get a "does not support CPR" warning printed into it.
+                output.enable_cpr = False
+            self._session = PromptSession(
+                FormattedText([("bold ansicyan", PROMPT)]),
+                history=InMemoryHistory(),
+                mouse_support=False,
+                input=self._pt_input,
+                output=output,
+            )
+        return self._session
+
+
+def _make_line_reader(console: Console) -> _LineReader:
+    return _LineReader(console)
+
+
 @dataclass
 class _TurnDisplay:
     """Drives the progress line for one turn and prints the final answer exactly once.
@@ -626,6 +693,7 @@ class ChatLoop:
         self.state: SessionState = load_session(config.workspace)
         self.bundle: ContextBundle = ContextBundle()
         self.agent: Any = None
+        self.reader = _make_line_reader(console)
         # One-line notice sent with the next user message after a /notebook switch (the model
         # learns about switches it made itself from its own tool results).
         self._pending_preamble: str | None = None
@@ -665,14 +733,13 @@ class ChatLoop:
     # -- REPL -------------------------------------------------------------- #
 
     def run(self) -> None:
+        # The plain prompt leaves the cursor after "You > "; prompt_toolkit has ended the line already.
+        bye = "Bye." if self.reader.interactive else "\nBye."
         while True:
             try:
-                line = self.console.input(f"[bold cyan]{PROMPT}[/bold cyan]")
-            except EOFError:
-                self.console.print("\nBye.")
-                return
-            except KeyboardInterrupt:
-                self.console.print("\nBye.")
+                line = self.reader.read()
+            except (EOFError, KeyboardInterrupt):
+                self.console.print(bye)
                 return
             text = line.strip()
             if not text:
@@ -1109,31 +1176,10 @@ class ChatLoop:
 
 
 def run_chat(opts: CliOptions) -> None:
+    """Bare ``hailer``: the same session as ``hailer notebook`` with its default options."""
     console = console_factory()
-    try:
-        config = _load_config(opts)
-    except ConfigError as err:
-        _print_error(console, err, verbose=opts.verbose)
-        raise typer.Exit(code=1)
-    _setup_logging(config, opts)
-    _startup_panel(console, config)
-
-    checks = preflight(config)
-    _print_checks(console, checks, only_failures=True)
-    if any(not c.ok and c.fatal for c in checks):
-        raise typer.Exit(code=1)
-    session_check = next((c for c in checks if c.name == "session"), None)
-    if session_check is not None and not session_check.ok:
-        server, _s, _e = _marimo_state(config)
-        if server is not None:
-            url = _notebook_url(server, config)
-            console.print(f"Opening {url} in your browser...", markup=False)
-            _open_browser(url)
-            console.print(APP_VIEW_HINT, markup=False)
-    if any(not c.ok for c in checks):
-        console.print()
-
-    _run_chat_loop(console, config, opts)
+    config = _config_or_exit(console, opts)
+    _run_session(console, config, opts, port=DEFAULT_MARIMO_PORT, open_browser=True, keep_marimo=False)
 
 
 def _run_chat_loop(console: Console, config: HailerConfig, opts: CliOptions) -> None:
@@ -1195,48 +1241,48 @@ def _main(
         run_chat(ctx.obj)
 
 
+DEFAULT_MARIMO_PORT = 2718
 MARIMO_LOG_NAME = "marimo.log"
 HEALTH_TIMEOUT_SEC = 60.0
 SESSION_TIMEOUT_SEC = 90.0
 SWITCH_SESSION_TIMEOUT_SEC = 30.0  # how long /notebook new|open waits for the browser tab
 NOTEBOOK_USAGE = "Usage: /notebook [list | new <name> [--empty] | open <name> | close [name]]"
+PINNED_URL_HINT = (
+    "[hailer].marimo_url (or HAILER_MARIMO_URL) pins Hailer to that server, so Hailer does not start "
+    "one in its place. Start marimo there, or remove the setting and Hailer starts its own for this workspace."
+)
 APP_VIEW_HINT = (
     "The notebook opens in app view (results only). "
     "Press Ctrl+. in it, or use Toggle app view, to see and edit the code."
 )
 
 
-def _has_session_under(client: Any, root: Path) -> bool:
-    """True when the server hosts a kernel session for any notebook inside ``root``."""
-    try:
-        sessions = client.sessions()
-    except HailerError:
-        return False
-    return any(_inside(Path(s.path or s.filename or ""), root) for s in sessions if s.path or s.filename)
+def _serves_workspace(client: Any, config: HailerConfig) -> bool:
+    """True when the server was started on the notebooks folder or hosts a notebook inside it."""
+    from hailer.marimo_client import AFFINITY_NONE, workspace_affinity
+
+    return workspace_affinity(client, config) > AFFINITY_NONE
 
 
-def _reusable_server(config: HailerConfig) -> tuple[MarimoServer, MarimoSession | None] | None:
-    """A running server Hailer may attach to: the configured URL, or a live server that already has
-    a kernel session for the active notebook or for another notebook in the notebooks folder (one
-    server hosts them all). Anything else gets a fresh server on its own port."""
+def _reusable_server(config: HailerConfig) -> MarimoServer | None:
+    """The running marimo server this workspace may attach to; ``None`` means start one.
+
+    A pinned URL (``[hailer].marimo_url`` / ``HAILER_MARIMO_URL``) is returned whether or not it
+    answers: the caller reports a pinned server that is down and never starts one in its place.
+    Otherwise it is the server found for this workspace, if it answers and serves the notebooks
+    folder (one server hosts every notebook there). A server for another folder, such as another
+    git worktree of the same repository, is never attached to.
+    """
     try:
         server = _find_server(config)
     except HailerError:
         return None
-    if server is None:
-        return None
+    if server is None or config.marimo_url:
+        return server
     client = _make_client(server, config)
-    try:
-        if not client.health():
-            return None
-        session = client.resolve_session(config.notebook)
-        return server, session
-    except NoSessionError:
-        if config.marimo_url or _has_session_under(client, config.notebooks_root):
-            return server, None
+    if not client.health() or not _serves_workspace(client, config):
         return None
-    except HailerError:
-        return None
+    return server
 
 
 def _start_marimo(console: Console, config: HailerConfig, port: int) -> tuple[MarimoServer, Any, Path]:
@@ -1246,8 +1292,8 @@ def _start_marimo(console: Console, config: HailerConfig, port: int) -> tuple[Ma
         console.print(f"Port {port} is busy; using {chosen}.", markup=False)
     url = f"http://127.0.0.1:{chosen}"
     cmd = _marimo_server_command(config, chosen)
-    log_path = config.workspace / ".hailer" / MARIMO_LOG_NAME
     try:
+        log_path = ensure_state_dir(config.workspace) / MARIMO_LOG_NAME
         proc = _spawn_marimo(cmd, config.workspace, log_path)
     except OSError as err:
         console.print(f"Could not start marimo: {err}", style="red", markup=False)
@@ -1296,16 +1342,60 @@ def _wait_for_notebook(console: Console, config: HailerConfig, server: MarimoSer
         console.print(f"Notebook is open (session {session.session_id}).", markup=False)
 
 
+def _run_session(console: Console, config: HailerConfig, opts: CliOptions, *, port: int, open_browser: bool, keep_marimo: bool) -> None:
+    """Attach to this workspace's marimo or start one, open the notebook, chat, then stop what was started.
+
+    Bare ``hailer`` and ``hailer notebook`` both run this. A pinned URL is used as is; when it does
+    not answer the session ends with an error instead of starting a server in its place.
+    """
+    checks = local_checks(config)
+    _print_checks(console, checks, only_failures=True)
+    if any(not c.ok and c.fatal for c in checks):
+        raise typer.Exit(code=1)
+    config.notebooks_root.mkdir(parents=True, exist_ok=True)  # marimo edit refuses a missing folder
+
+    proc: Any = None
+    log_path: Path | None = None
+    server = _reusable_server(config)
+    if config.marimo_url and (server is None or not _make_client(server, config).health()):
+        console.print(f"Marimo is not running at {config.marimo_url}.", style="red", markup=False)
+        console.print(f"    {PINNED_URL_HINT}", markup=False)
+        raise typer.Exit(code=1)
+    if server is not None:
+        console.print(f"Using the running marimo at {server.url}.", markup=False)
+    else:
+        server, proc, log_path = _start_marimo(console, config, port)
+    # Pin the chat to this server so registry discovery cannot pick another one.
+    config = replace(config, marimo_url=server.url)
+
+    try:
+        _wait_for_notebook(console, config, server, open_browser=open_browser)
+        console.print()
+        _startup_panel(console, config)
+        _run_chat_loop(console, config, opts)
+    finally:
+        if proc is not None:
+            if keep_marimo:
+                console.print(
+                    f"Marimo is still running at {server.url} (stop it by closing its process; log: {log_path}).",
+                    markup=False,
+                )
+            else:
+                _stop_process(proc)
+                _registry_remove(server.url)
+                console.print("Stopped marimo.", markup=False)
+
+
 @app.command()
 def notebook(
     ctx: typer.Context,
-    port: int = typer.Option(2718, "--port", "-p", help="Port for the marimo server (a free one is chosen if busy)."),
+    port: int = typer.Option(DEFAULT_MARIMO_PORT, "--port", "-p", help="Port for the marimo server (a free one is chosen if busy)."),
     no_browser: bool = typer.Option(False, "--no-browser", help="Do not open the notebook in a browser."),
     keep_marimo: bool = typer.Option(False, "--keep-marimo", help="Leave marimo running when the chat ends."),
     foreground: bool = typer.Option(False, "--foreground", help="Run marimo attached to this terminal, without the chat."),
     new: bool = typer.Option(False, "--new", help="Start a new conversation instead of resuming."),
 ) -> None:
-    """Start marimo (or reuse a running one), open the notebook, and chat here; stop marimo on exit."""
+    """Start marimo (or reuse this workspace's), open the notebook, and chat here; stop marimo on exit."""
     opts = _opts(ctx)
     if new:
         opts.new_thread = True
@@ -1328,39 +1418,7 @@ def notebook(
         console.print("Launching: " + " ".join(cmd), markup=False)
         raise typer.Exit(code=_run_foreground(cmd, config.workspace))
 
-    checks = local_checks(config)
-    _print_checks(console, checks, only_failures=True)
-    if any(not c.ok and c.fatal for c in checks):
-        raise typer.Exit(code=1)
-    config.notebooks_root.mkdir(parents=True, exist_ok=True)  # marimo edit refuses a missing folder
-
-    proc: Any = None
-    log_path: Path | None = None
-    reusable = _reusable_server(config)
-    if reusable is not None:
-        server, _session = reusable
-        console.print(f"Using the running marimo at {server.url}.", markup=False)
-    else:
-        server, proc, log_path = _start_marimo(console, config, port)
-    # Pin the chat to this server so registry discovery cannot pick another one.
-    config = replace(config, marimo_url=server.url)
-
-    try:
-        _wait_for_notebook(console, config, server, open_browser=not no_browser)
-        console.print()
-        _startup_panel(console, config)
-        _run_chat_loop(console, config, opts)
-    finally:
-        if proc is not None:
-            if keep_marimo:
-                console.print(
-                    f"Marimo is still running at {server.url} (stop it by closing its process; log: {log_path}).",
-                    markup=False,
-                )
-            else:
-                _stop_process(proc)
-                _registry_remove(server.url)
-                console.print("Stopped marimo.", markup=False)
+    _run_session(console, config, opts, port=port, open_browser=not no_browser, keep_marimo=keep_marimo)
 
 
 @app.command("exec")
@@ -1388,7 +1446,7 @@ def exec_(
     try:
         server = _find_server(config)
         if server is None:
-            raise MarimoUnavailableError("Marimo is not running.", hint=_launch_hint())
+            raise MarimoUnavailableError(NO_WORKSPACE_SERVER, hint=_launch_hint())
         client = _make_client(server, config)
         result = client.execute(
             code,
@@ -1422,8 +1480,10 @@ def status(ctx: typer.Context) -> None:
     except KeyError:
         console.print(f"Credentials: provider {config.model.provider!r} is not declared", markup=False)
     server, session, err = _marimo_state(config)
-    if server is None:
-        console.print("Marimo:      not running", markup=False)
+    if server is None and config.marimo_url:
+        console.print(f"Marimo:      not running at {config.marimo_url} (pinned by marimo_url)", markup=False)
+    elif server is None:
+        console.print("Marimo:      none for this workspace (uvx hailer starts one)", markup=False)
     elif session is None:
         console.print(f"Marimo:      {server.url} (notebook not open in a browser)", markup=False)
         if err is not None and err.hint:

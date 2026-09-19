@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import io
 import json
+import socket
 import sys
+import threading
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import quote
 
 import pytest
+from fake_marimo import running
 from rich.console import Console
 from typer.testing import CliRunner
 
@@ -33,6 +38,9 @@ from hailer.models import (
 from hailer.session import save_session, session_path
 
 runner = CliRunner()
+# The real discovery and client, captured before the harness replaces them.
+REAL_FIND_SERVER = cli._find_server
+REAL_MAKE_CLIENT = cli._make_client
 SERVER = MarimoServer(url="http://127.0.0.1:2718", server_id="127.0.0.1:2718", version="0.24.2", source="config")
 LAUNCH = ["uvx", "hailer", "notebook", "--foreground"]
 
@@ -109,10 +117,13 @@ class FakeAgent:
 
 class FakeClient:
     """Session-aware stand-in for MarimoClient: a notebook has a session only when one was listed
-    for its path (or granted later, the way a browser tab would), matched by the real rule."""
+    for its path (or granted later, the way a browser tab would), matched by the real rule.
+    ``folder`` is what ``root()`` reports: the folder marimo was started on (None: another folder
+    or a single-file server)."""
 
-    def __init__(self, *, healthy=True, session="default", exec_result=None, other_sessions=(), workspace=None):
+    def __init__(self, *, healthy=True, session="default", exec_result=None, other_sessions=(), workspace=None, folder=None):
         self.healthy = healthy
+        self.folder = folder
         self.workspace = workspace  # bound by the harness's _make_client; relative session paths resolve against it
         # the configured notebook's session, relative to the workspace like a hand-written entry
         self.session = MarimoSession("s1", "analysis.py", "notebooks/analysis.py") if session == "default" else session
@@ -127,6 +138,9 @@ class FakeClient:
 
     def sessions(self):
         return ([self.session] if self.session is not None else []) + self.other_sessions
+
+    def root(self):
+        return str(self.folder) if self.folder is not None else None
 
     def grant(self, notebook, session_id="s9"):
         """Give ``notebook`` a session (what happens once its browser tab loads)."""
@@ -269,7 +283,17 @@ def harness(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "_render_prompt", lambda config, name, args: f"PROMPT[{name}]({args})")
     monkeypatch.setattr(cli, "_make_agent", lambda config, bundle: h.agent)
     monkeypatch.setattr(cli, "_open_browser", lambda url: h.opened.append(url))
+
+    def no_spawn(cmd, cwd, log_path):
+        raise AssertionError("marimo was started; use the nb fixture when a test expects that")
+
+    monkeypatch.setattr(cli, "_spawn_marimo", no_spawn)
     return h
+
+
+def owned_client(config: HailerConfig, **kwargs) -> FakeClient:
+    """A client for a server started on this workspace's notebooks folder (reused, not replaced)."""
+    return FakeClient(folder=config.notebooks_root, **kwargs)
 
 
 def chat(args=(), input_text="/exit\n"):
@@ -472,22 +496,15 @@ def test_missing_openai_key_is_fatal_too(harness):
     assert harness.agent.turns == []
 
 
-def test_marimo_down_is_fatal_with_launch_hint(harness):
-    harness.server = None
-    result = chat()
-    assert result.exit_code == 1
-    assert "Marimo is not running." in result.output
-    assert "uvx hailer notebook --foreground" in result.output, "marimo on its own, with Hailer's interpreter"
-    assert "Then run Hailer again" in result.output
-    assert "uv run" not in result.output, "no project .venv is needed"
-
-
-def test_no_session_is_warning_and_opens_browser(harness):
-    harness.client = FakeClient(session=None)
+def test_owned_server_without_session_is_reused_and_the_notebook_opened(harness):
+    """Bare hailer, this workspace's server is up but the notebook tab is not: open it and wait, like hailer notebook."""
+    harness.client = owned_client(harness.config, session=None)
     result = chat()
     assert result.exit_code == 0, result.output
-    assert "not open in a browser" in result.output
+    assert f"Using the running marimo at {SERVER.url}." in result.output
     assert harness.opened == [harness.url]
+    assert harness.session_waits == [harness.config.notebook]
+    assert "Notebook is open (session s9)." in result.output
 
 
 def test_invalid_config_problem_is_fatal(harness, monkeypatch):
@@ -784,10 +801,11 @@ def test_spawn_marimo_uses_background_flags_and_log(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli.subprocess, "Popen", Popen)
     log = tmp_path / ".hailer" / "marimo.log"
+    log.parent.mkdir()  # _start_marimo creates it (with its .gitignore) before spawning
     cli._spawn_marimo(["python", "-m", "marimo"], tmp_path, log)
     cmd, kwargs = calls[0]
     assert cmd == ["python", "-m", "marimo"] and kwargs["cwd"] == str(tmp_path)
-    assert log.parent.is_dir(), "log directory created"
+    assert log.is_file(), "the child logs there"
     assert kwargs["stderr"] == cli.subprocess.STDOUT and kwargs["stdin"] == cli.subprocess.DEVNULL
     expected = getattr(cli.subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if cli.os.name == "nt" else 0
     assert kwargs["creationflags"] == expected, "own process group on Windows so Ctrl+C in the chat is not delivered to marimo"
@@ -812,16 +830,16 @@ def test_stop_process_terminates_then_kills():
     assert stubborn.terminated and stubborn.killed
 
 
-def test_marimo_not_running_hint_offers_one_command_route(harness):
+def test_doctor_and_status_without_a_server_for_this_workspace_point_at_hailer(harness):
+    """No server serves this workspace: a warning that says how to get one, not "Marimo is not running"."""
     harness.server = None
-    result = chat()
-    assert result.exit_code == 1
-    assert "Marimo is not running." in result.output
-    assert "Start everything in one go:" in result.output
-    assert "uvx hailer notebook" in result.output
-    assert "Or run marimo on its own in another terminal:" in result.output
-    assert "uvx hailer notebook --foreground" in result.output
-    assert "Then run Hailer again:" in result.output
+    result = runner.invoke(cli.app, ["doctor"], catch_exceptions=False)
+    assert result.exit_code == 0, "hailer starts a server itself, so this is not a failure"
+    assert "No marimo server is running for this workspace." in result.output and "WARN" in result.output
+    assert "uvx hailer" in result.output and "uvx hailer notebook" in result.output
+    assert "Marimo is not running" not in result.output
+    result = runner.invoke(cli.app, ["status"], catch_exceptions=False)
+    assert "Marimo:      none for this workspace (uvx hailer starts one)" in result.output
 
 
 def init_cmd(ws: Path, *args: str):
@@ -1192,12 +1210,12 @@ def test_notebook_new_existing_name_is_an_error_and_keeps_active(harness):
 
 def test_notebook_open_by_name_opens_browser_and_waits_when_no_session(harness):
     other = write_notebook(harness.config, "other")
-    harness.client = FakeClient(session=None)
+    harness.client = owned_client(harness.config, session=None)
     result = chat(input_text="/notebook open other\nhi\n/exit\n")
     assert result.exit_code == 0, result.output
     # startup opened the (then active) analysis notebook; the switch opened other.py and waited for it
     assert harness.opened == [url_for(harness.config.notebook), url_for(other)]
-    assert harness.session_waits == [other]
+    assert harness.session_waits == [harness.config.notebook, other]
     assert "Notebook is open (session s9)." in result.output
     assert "Active notebook: notebooks/other.py." in result.output
     assert active_state(harness.config) == "notebooks/other.py"
@@ -1208,7 +1226,7 @@ def test_notebook_open_by_name_opens_browser_and_waits_when_no_session(harness):
 
 def test_notebook_open_without_session_after_wait_says_so(harness):
     other = write_notebook(harness.config, "other")
-    harness.client = FakeClient(session=None)
+    harness.client = owned_client(harness.config, session=None)
     harness.waited_session = None
     result = chat(input_text="/notebook open other.py\nhi\n/exit\n")
     assert "No kernel session yet" in result.output
@@ -1242,7 +1260,8 @@ def test_notebook_open_outside_folder_is_refused(harness):
     assert active_state(harness.config) is None
 
 
-def test_notebook_close_shuts_down_the_session(harness):
+def test_notebook_close_shuts_down_the_session(harness, nb):
+    harness.server = SERVER  # nb starts with no server; the second chat below runs without one
     result = chat(input_text="/notebook close\n/notebook close\n/exit\n")
     assert result.exit_code == 0, result.output
     assert harness.client.closed == ["s1"]
@@ -1256,7 +1275,7 @@ def test_notebook_close_shuts_down_the_session(harness):
 
 def test_switch_made_by_the_model_is_detected_after_the_turn(harness):
     other = write_notebook(harness.config, "other")
-    harness.client = FakeClient(session=None)
+    harness.client = owned_client(harness.config, session=None)
     harness.agent.on_turn = lambda: notebooks.save_active_notebook(harness.config, other)
     result = chat(input_text="make a new notebook\n/status\n/exit\n")
     assert result.exit_code == 0, result.output
@@ -1351,7 +1370,7 @@ def test_switch_notice_survives_marimo_error_during_the_wait(harness):
 def test_switch_made_by_the_model_is_detected_after_ctrl_c(harness):
     """A notebook_open tool call that completed before Ctrl+C is picked up straight away."""
     other = write_notebook(harness.config, "other")
-    harness.client = FakeClient(session=None)
+    harness.client = owned_client(harness.config, session=None)
     harness.agent.on_turn = lambda: notebooks.save_active_notebook(harness.config, other)
     harness.agent.fail_with = KeyboardInterrupt()
     result = chat(input_text="open the other notebook\n/notebook\n/exit\n")
@@ -1407,4 +1426,252 @@ def test_session_matching_is_by_path_not_filename(harness):
     assert any("notebooks/a/report.py" in ln and "open" in ln for ln in lines), lines
     assert any("notebooks/b/report.py" in ln and "open" not in ln for ln in lines), lines
     assert harness.opened[-1] == url_for(sub_b), "b/report.py had no session of its own, so it was opened"
-    assert harness.session_waits == [sub_b]
+    assert harness.session_waits == [harness.config.notebook, sub_b]
+
+
+# --------------------------------------------------------------------------- #
+# Bare hailer: reuse this workspace's marimo or start one (the same session as hailer notebook)
+# --------------------------------------------------------------------------- #
+
+
+def free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+@pytest.fixture
+def real_discovery(harness, monkeypatch, tmp_path):
+    """The real find_server and MarimoClient over a private registry folder; returns a function that
+    registers FakeMarimo servers in it the way marimo does."""
+    registry = tmp_path / "registry"
+    monkeypatch.setattr("hailer.marimo_client.registry_dir", lambda: registry)
+    monkeypatch.setattr(cli, "_find_server", REAL_FIND_SERVER)
+    monkeypatch.setattr(cli, "_make_client", REAL_MAKE_CLIENT)
+
+    def register(*servers):
+        registry.mkdir(exist_ok=True)
+        for srv in servers:
+            port = srv.server_address[1]
+            entry = {"server_id": f"127.0.0.1:{port}", "pid": 1, "host": "127.0.0.1", "port": port, "base_url": "", "started_at": "", "version": "0.24.2"}
+            (registry / f"127.0.0.1_{port}.json").write_text(json.dumps(entry), encoding="utf-8")
+
+    return register
+
+
+@pytest.mark.parametrize("args", [[], ["notebook"]], ids=["hailer", "hailer-notebook"])
+def test_zero_servers_starts_one_and_stops_it_on_exit(harness, nb, args):
+    """Bare hailer does exactly what hailer notebook does: start marimo on the notebooks folder, chat, stop it."""
+    result = chat(args=args)
+    assert result.exit_code == 0, result.output
+    assert len(nb.spawned) == 1
+    cmd, cwd, log_path = nb.spawned[0]
+    assert cmd == server_command(2718) and cwd == harness.config.workspace
+    assert log_path == harness.config.workspace / ".hailer" / "marimo.log"
+    assert "Marimo is running at http://127.0.0.1:2718" in result.output
+    assert harness.agent.started == [None], "the chat ran"
+    assert nb.proc.terminated and nb.removed == ["http://127.0.0.1:2718"]
+    assert "Stopped marimo." in result.output
+
+
+def test_two_live_servers_attaches_to_the_one_owned_by_this_workspace(harness, real_discovery):
+    ws = harness.config.workspace
+    with running() as foreign, running() as ours:
+        foreign.root = str(ws.parent / "other-worktree" / "notebooks")  # another worktree of the same repo
+        ours.sessions = {"s1": {"filename": "analysis.py", "path": str(harness.config.notebook)}}
+        real_discovery(foreign, ours)
+        result = chat()
+    assert result.exit_code == 0, result.output
+    assert f"Using the running marimo at {ours.url}." in result.output
+    assert "Notebook is open (session s1)." in result.output
+    assert harness.opened == [], "the notebook was already open there"
+    assert "Stopped marimo." not in result.output, "a server Hailer did not start is left alone"
+
+
+def test_two_live_servers_attaches_to_ours_before_its_tab_is_open(harness, real_discovery):
+    """No session anywhere: the server started on this workspace's notebooks folder is recognised by its root."""
+    ws = harness.config.workspace
+    with running() as foreign, running() as ours:
+        foreign.root = str(ws.parent / "other-worktree" / "notebooks")
+        ours.root = str(harness.config.notebooks_root)
+        real_discovery(foreign, ours)
+        harness.waited_session = MarimoSession("s9", "analysis.py", str(harness.config.notebook))  # the tab loaded
+        result = chat()
+    assert result.exit_code == 0, result.output
+    assert f"Using the running marimo at {ours.url}." in result.output
+    assert harness.session_waits == [harness.config.notebook]
+
+
+def test_one_live_server_owned_by_another_workspace_is_not_attached_to(harness, nb, real_discovery):
+    ws = harness.config.workspace
+    with running() as foreign:
+        foreign.root = str(ws.parent / "other-worktree" / "notebooks")
+        foreign.sessions = {"s1": {"filename": "analysis.py", "path": str(ws.parent / "other-worktree" / "notebooks" / "analysis.py")}}
+        real_discovery(foreign)
+        nb.free_port = free_port()  # the real client must not reach whatever listens on 2718 here
+        result = chat()
+    assert result.exit_code == 0, result.output
+    assert foreign.url not in result.output
+    assert len(nb.spawned) == 1, "this workspace got its own server"
+    assert nb.proc.terminated and "Stopped marimo." in result.output
+
+
+@pytest.mark.parametrize("args", [[], ["notebook"]], ids=["hailer", "hailer-notebook"])
+def test_pinned_url_that_is_down_is_an_error_and_no_server_is_started(harness, nb, real_discovery, args):
+    pinned = f"http://127.0.0.1:{free_port()}"
+    harness.config = replace(harness.config, marimo_url=pinned)
+    result = chat(args=args)
+    assert result.exit_code == 1
+    assert f"Marimo is not running at {pinned}." in result.output
+    assert "does not start one in its place" in result.output
+    assert nb.spawned == [] and harness.agent.started == []
+    if args:
+        return  # doctor once is enough (a refused loopback connection takes ~2 s on Windows)
+    result = runner.invoke(cli.app, ["doctor"], catch_exceptions=False)
+    assert result.exit_code == 1, "a pinned server that is down is a failure"
+    assert f"not running at {pinned}" in result.output
+
+
+def test_pinned_url_that_is_up_is_used_even_when_it_serves_another_folder(harness, nb, real_discovery):
+    with running() as pinned:
+        pinned.root = str(harness.config.workspace.parent / "elsewhere")
+        harness.config = replace(harness.config, marimo_url=pinned.url)
+        result = chat()
+    assert result.exit_code == 0, result.output
+    assert f"Using the running marimo at {pinned.url}." in result.output
+    assert nb.spawned == []
+
+
+# --------------------------------------------------------------------------- #
+# The prompt: prompt_toolkit in a terminal, bracketed paste, plain input otherwise
+# --------------------------------------------------------------------------- #
+
+PASTE_ON, PASTE_OFF = "\x1b[?2004h", "\x1b[?2004l"
+
+
+@contextmanager
+def terminal():
+    """A prompt_toolkit reader on a pipe (what the keyboard or the host types) and a VT100 screen
+    that records every byte written, escape sequences included."""
+    from prompt_toolkit.data_structures import Size
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output.vt100 import Vt100_Output
+
+    with create_pipe_input() as keys:
+        screen = io.StringIO()
+        output = Vt100_Output(screen, lambda: Size(rows=24, columns=100), term="xterm-256color")
+        console = Console(file=io.StringIO(), force_terminal=False, color_system=None)
+        yield cli._LineReader(console, interactive=True, pt_input=keys, pt_output=output), keys, screen
+
+
+def last_paste_mode(screen: io.StringIO) -> str | None:
+    text = screen.getvalue()
+    on, off = text.rfind(PASTE_ON), text.rfind(PASTE_OFF)
+    if on < 0 and off < 0:
+        return None
+    return "on" if on > off else "off"
+
+
+def test_prompt_bracketed_paste_is_one_submission_with_its_newlines():
+    with terminal() as (reader, keys, _screen):
+        keys.send_text("\x1b[200~first line\r\nsecond line\nthird\x1b[201~\r")
+        assert reader.read() == "first line\nsecond line\nthird"
+        keys.send_text("next\r")
+        assert reader.read() == "next", "the paste produced exactly one submission"
+
+
+def test_prompt_turns_bracketed_paste_on_while_waiting_and_off_before_returning():
+    with terminal() as (reader, keys, screen):
+        result: list[str] = []
+        thread = threading.Thread(target=lambda: result.append(reader.read()), daemon=True)
+        thread.start()
+        deadline = time.monotonic() + 10
+        while "You > " not in screen.getvalue() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert "You > " in screen.getvalue(), "the prompt is drawn"
+        assert last_paste_mode(screen) == "on", "waiting at the prompt: DECSET 2004 is on"
+        keys.send_text("hello\r")
+        thread.join(10)
+        assert result == ["hello"]
+        assert last_paste_mode(screen) == "off", "DECRST 2004 is written before read() returns"
+        out = screen.getvalue()
+        assert "\x1b[?1049h" not in out, "no alternate screen"
+        assert "\x1b[?1000h" not in out and "\x1b[?1003h" not in out, "no mouse capture"
+        assert "\x1b[6n" not in out, "no cursor position request"
+
+
+def test_prompt_ctrl_c_ctrl_d_and_ctrl_z_enter():
+    with terminal() as (reader, keys, _screen):
+        keys.send_text("\x03")
+        with pytest.raises(KeyboardInterrupt):
+            reader.read()
+        keys.send_text("\x04")
+        with pytest.raises(EOFError):
+            reader.read()
+        keys.send_text("\x1a\r")  # Ctrl+Z then Enter: end of input on Windows
+        with pytest.raises(EOFError):
+            reader.read()
+
+
+def type_at_prompt(reader, keys, screen, text: str) -> str:
+    """read() with ``text`` typed once the prompt is on screen, as a person would type it."""
+    shown = screen.getvalue().count("You > ")
+    result: list[str] = []
+    thread = threading.Thread(target=lambda: result.append(reader.read()), daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while screen.getvalue().count("You > ") <= shown and time.monotonic() < deadline:
+        time.sleep(0.02)
+    time.sleep(0.1)  # history loads in the background when the prompt starts
+    keys.send_text(text)
+    thread.join(10)
+    return result[0]
+
+
+def test_prompt_up_arrow_recalls_earlier_messages():
+    with terminal() as (reader, keys, screen):
+        assert type_at_prompt(reader, keys, screen, "first\r") == "first"
+        assert type_at_prompt(reader, keys, screen, "second\r") == "second"
+        assert type_at_prompt(reader, keys, screen, "\x1b[A\x1b[A\r") == "first"  # Up, Up, Enter
+
+
+def test_prompt_falls_back_to_plain_input_without_a_terminal(monkeypatch):
+    monkeypatch.setattr(cli, "_stdio_is_terminal", lambda: False)
+    monkeypatch.setattr(Console, "input", lambda self, prompt="", **kw: "typed")
+    reader = cli._LineReader(Console(file=io.StringIO()))
+    assert reader.interactive is False
+    assert reader.read() == "typed"
+    assert reader._session is None, "prompt_toolkit is never started on a pipe"
+
+
+def test_chat_with_the_prompt_sends_a_pasted_block_as_one_turn(harness, monkeypatch):
+    with terminal() as (reader, keys, screen):
+        monkeypatch.setattr(cli, "_make_line_reader", lambda console: reader)
+        modes_at_turn: list[str | None] = []
+        harness.agent.on_turn = lambda: modes_at_turn.append(last_paste_mode(screen))
+        keys.send_text("\x1b[200~sum revenue\nby region\x1b[201~\r/exit\r")
+        result = chat(input_text="")
+    assert result.exit_code == 0, result.output
+    assert harness.agent.turns == [("sum revenue\nby region", None)]
+    assert modes_at_turn == ["off"], "bracketed paste is off while the turn runs"
+    assert "Bye." in result.output
+
+
+def test_chat_with_the_prompt_ctrl_c_in_a_turn_cancels_only_that_turn(harness, monkeypatch):
+    with terminal() as (reader, keys, _screen):
+        monkeypatch.setattr(cli, "_make_line_reader", lambda console: reader)
+        harness.agent.fail_with = KeyboardInterrupt()  # the agent cancels the turn and re-raises
+        keys.send_text("long question\r/exit\r")
+        result = chat(input_text="")
+    assert result.exit_code == 0, result.output
+    assert "Interrupted." in result.output and "Bye." in result.output
+
+
+def test_chat_with_the_prompt_ctrl_c_at_the_prompt_exits(harness, monkeypatch):
+    with terminal() as (reader, keys, _screen):
+        monkeypatch.setattr(cli, "_make_line_reader", lambda console: reader)
+        keys.send_text("\x03")
+        result = chat(input_text="")
+    assert result.exit_code == 0, result.output
+    assert "Bye." in result.output and harness.agent.turns == []
+    assert harness.agent.closed
