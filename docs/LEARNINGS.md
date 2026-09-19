@@ -122,3 +122,16 @@ The migration recorded live Responses API, strict chat gateway, marimo execution
 coverage. Changes to transport or cancellation need relevant live checks as well as fakes; record the
 OS, dependency versions, scenarios tested and any remaining gaps. Promote useful experimental checks
 into the maintained suite so future cleanups do not depend on throwaway prototypes.
+
+## 9. Keep browser time aligned with real kernel startup in integration tests
+
+The v0.2.7 release's Docker integration test failed with `DATA_DIR` undefined while the same commit's
+main-branch run passed. Its screenshot showed "kernel not found": Chrome was launched with
+`--virtual-time-budget=25000`, which fast-forwards JavaScript timers rather than waiting for the real
+marimo kernel. A session appearing in `/api/sessions` does not prove its notebook cells have run.
+
+Keep headless Chrome connected on a real clock until fixture teardown. Capture diagnostic screenshots
+from that existing page through DevTools; do not use a screenshot command that can exit during startup.
+`test_notebook_code_runs_in_the_container_on_the_mounted_data` checks both browser liveness and the
+starter notebook's initialized globals. Preserve the auto-run assertion: manually running the cells
+would hide a broken startup. Verify with `HAILER_DOCKER_TESTS=strict` and a freshly built kernel image.
