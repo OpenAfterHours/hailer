@@ -1,97 +1,107 @@
 # Hailer
 
-Hailer lets you chat with your data. Put CSV, Parquet or JSON files in a folder, ask questions in plain
-English in the terminal, and the agent explores the data with Polars and DuckDB inside a live marimo
-notebook, putting tables, charts and summaries in the notebook open in your browser. It is built for
-analysts who want to go from a file to a chart in minutes, whatever the data is about: sales, operations,
-finance, survey results, logs. Datasets stay on your machine: the model endpoint receives your messages,
-code, and compact results, never the raw files. The notebook code runs in Hailer's own Python by default,
-or, if you choose, in a Docker container that sees only your notebooks and data and has no network.
-
-## Architecture
-
-```
-                   Model endpoint
-                (OpenAI, or your own endpoint:
-                 Responses API or Chat Completions)
-                         ▲
-                         │ HTTPS
-                ┌────────┴────────┐
-                │  Hailer         │   one Python process: a LangChain agent
-Terminal ─────► │  conversation   │   (create_agent + ChatOpenAI), Hailer's system
- uvx hailer     │  + tools        │   prompt, the conversation kept in .hailer/
-                │                 │
-                │  marimo_execute, marimo_status, notebook_cells, notebook_list,
-                │  notebook_create, notebook_open, notebook_close,
-                │  list_periods, load_skill, read_skill_file, fetch_page
-                └────────┬────────┘
-                         │ HTTP + SSE  (/api/sessions, /api/kernel/execute),
-                         │ with the server's token
-                ┌────────▼────────┐
-                │ Marimo runtime  │   scratchpad over the kernel globals +
-                │ Polars · DuckDB │   marimo._code_mode for durable cells
-                │ Python          │
-                └────────┬────────┘   local (default): Hailer's own Python, as you
-                         │            docker: a Linux container that sees only the
-                    Browser UI        notebooks folder and, read-only, the data folder
-```
-
-The CLI runs the agent in its own process, with the model and provider taken from `hailer.toml`. The agent
-has exactly the eleven tools above and nothing else: no shell, no file editing. The tools talk to the
-running marimo server over plain HTTP. Code from the agent runs in marimo's *scratchpad*, a temporary
-namespace that can read every notebook variable, and durable changes (new cells, edits, runs) go through
-marimo's code-mode API so they appear immediately in the browser. The notebook file on disk is written by
-marimo itself, never edited behind the kernel's back.
-
-Where marimo and its kernel run is the *kernel runtime*, set by `[kernel] runtime`: `local` (the default)
-starts marimo in Hailer's own Python, `docker` starts it in a container (see
-[Isolated kernel (Docker)](#isolated-kernel-docker)). The agent, the conversation and the API key stay in
-the Hailer process either way.
-
-## Requirements
-
-- Windows 11 is the primary target; macOS and Linux work too. No Git Bash, curl, jq or WSL is needed.
-- [uv](https://docs.astral.sh/uv/). Hailer runs with `uvx`, so no project or virtual environment is needed;
-  uv fetches Python 3.12 or newer if the machine has none.
-- A web browser. **A kernel session only exists while the notebook is open in a browser tab**; Hailer
-  tells you the URL to open when it is not.
-- An API key for the provider you configure: OpenAI, or your own OpenAI-compatible endpoint.
-- Optional: Docker Desktop (Windows, macOS) or Docker Engine (Linux), only if you want notebook code to
-  run in an isolated container (see [Isolated kernel (Docker)](#isolated-kernel-docker)). The default
-  needs no Docker.
-- Pinned dependency: `marimo==0.24.2` (Hailer drives its private `marimo._code_mode` API, which has no
-  stability guarantee). The agent uses `langchain`, `langchain-openai` and `langgraph-checkpoint-sqlite`
-  within their current major versions. Upgrade deliberately and re-run the tests. Nothing Hailer installs
-  is a standalone executable; it is all Python packages.
-
-## Installation
-
-Nothing to install beyond uv. `uvx hailer ...` fetches Hailer from PyPI the first time, keeps it in uv's
-cache with an environment of its own (marimo, Polars, DuckDB and the rest), and runs it from there. No
-`pyproject.toml` or `.venv` is needed in your folder, which suits ad-hoc analysis. `uvx hailer@latest ...`
-picks up a newer release; `uvx hailer@X.Y.Z ...` pins one.
-
-For a permanent `hailer` command instead, `uv tool install hailer` (or `pip install hailer` into an
-environment of your own) and drop the `uvx` from the commands below.
-
-Working on Hailer itself: from a checkout of this repository, `uv sync` and then `uv run hailer ...`, so
-the code you are changing is what runs. The checkout also has optional sample data (six months of
-synthetic sales orders, later months gain a column):
-
-```bash
-uv run python scripts/make_sample_data.py          # writes data/25-01 sales.parquet ... 25-06
-uv run python scripts/make_sample_data.py --help   # --out, --months, --rows, --start, --seed, --dataset
-```
+Hailer is a Python command-line package for chatting with your data. Ask questions about local CSV,
+Parquet or JSON files in plain English, and it explores the data and adds tables, charts and summaries
+to a live [marimo](https://marimo.io/) notebook in your browser. You chat in the terminal; the notebook
+keeps the analysis and its Python code.
 
 ## Quick start
 
-In an empty folder, or the one that holds your data, one terminal is enough:
+You'll need:
+
+- [uv](https://docs.astral.sh/uv/getting-started/installation/), which provides the `uvx` command.
+  Install it, then reopen your terminal.
+- An [OpenAI API key](https://platform.openai.com/api-keys) for the default setup.
+- A web browser.
+
+These steps work in PowerShell on Windows and in a terminal on macOS or Linux. `uvx` downloads Hailer,
+its dependencies and a suitable Python version when needed. You do not need to clone this repository
+or install Docker.
+
+### 1. Create a workspace and sign in
+
+Run these commands in your terminal:
 
 ```bash
-uvx hailer init           # hailer.toml, .config/hailer/{context,skills,prompts}, notebooks/analysis.py, data/
-uvx hailer login openai   # stores your API key in the OS credential store (or set OPENAI_API_KEY)
-uvx hailer notebook       # starts marimo, opens the notebook in your browser, and chats right here
+mkdir my-analysis
+cd my-analysis
+uvx hailer init
+uvx hailer login openai
 ```
+
+`init` creates your settings (`hailer.toml`), a starter notebook and a `data/` folder. At the login prompt,
+paste your API key; input is hidden and the key is saved in your operating system's credential store.
+The starter settings use OpenAI with `gpt-5.5`.
+
+For a company or another model endpoint, follow [custom endpoint setup](#a-custom-or-internal-endpoint)
+after `init`, using that provider's login command, then continue below.
+
+### 2. Add your data
+
+Copy the CSV, Parquet or JSON files you want to analyse into the `data/` folder inside `my-analysis`.
+Any filenames work.
+
+For a small example, save this as `data/sales.csv` in your workspace:
+
+```csv
+month,region,revenue
+2026-01,North,1200
+2026-01,South,900
+2026-02,North,1500
+2026-02,South,1100
+```
+
+### 3. Start chatting
+
+From the same terminal, run:
+
+```bash
+uvx hailer
+```
+
+Hailer opens the notebook in your browser and starts the chat in your terminal. **Keep the notebook tab
+open while you work**; it provides the live session that runs the analysis.
+
+Ask a question in the terminal, for example:
+
+```text
+What data do I have? Summarise the columns and any missing values.
+```
+
+With the sample CSV, try:
+
+```text
+Chart total revenue by month, split by region.
+```
+
+Tables and charts appear in the notebook. Type `/exit` to finish. To continue later, open a terminal
+in `my-analysis` and run `uvx hailer` again; it resumes your conversation and active notebook.
+Use `/new` for a fresh conversation, or `/help` to see the chat commands.
+
+If startup fails, run `uvx hailer doctor` for checks and suggested fixes, or see
+[Troubleshooting](#troubleshooting). A missing marimo server before your first session is expected:
+`uvx hailer` starts it for you.
+
+**Data and code:** files are read locally, but your messages, code and notebook tool outputs (which can
+include data samples) go to the configured model endpoint. By default, notebook code runs with your
+account's file and network access. See [Security](#security) and the optional
+[Docker runtime](#isolated-kernel-docker) for details.
+
+## Next steps
+
+The sections below are reference material; the quick start above is enough for a first analysis.
+
+- **Everyday use:** [notebooks and sessions](#notebooks-and-sessions),
+  [chat and CLI commands](#slash-commands), [several notebooks](#working-with-several-notebooks).
+- **Make it your own:** [model configuration](#model-configuration),
+  [project context, skills and prompts](#project-context-skills-and-prompts),
+  [data conventions](#data-conventions).
+- **Setup options:** [installation and upgrades](#installation),
+  [Docker](#isolated-kernel-docker), [abeam](#running-inside-abeam).
+- **Reference:** [troubleshooting](#troubleshooting), [security](#security),
+  [architecture](#architecture), [development](#development).
+
+## Notebooks and sessions
 
 `hailer init` creates the starter notebook (`[hailer].notebook`) and the data folder (`[hailer].data_dir`)
 that `hailer.toml` names. It never overwrites anything except `hailer.toml` itself, and only with
@@ -140,67 +150,59 @@ uvx hailer
 A pinned server (`[hailer].marimo_url` in `hailer.toml`, or `HAILER_MARIMO_URL`) is used as is, whichever
 folder it serves. If it does not answer, Hailer says so and exits; it never starts a server in its place.
 
-```text
-+--------------------- Hailer ----------------------+
-| Model:      gpt-5.5                               |
-| Provider:   openai                                |
-| Notebook:   notebooks\analysis.py                 |
-| Notebooks:  notebooks                             |
-| Workspace:  C:\projects\hailer                    |
-| Kernel:     local (runs as you; not isolated)     |
-| Web access: none                                  |
-+---------------------------------------------------+
-Type /help for commands.
+## Slash commands
 
-You > what data do I have?
+| Command | What it does |
+|---|---|
+| `/help` | Show the command list. |
+| `/status` | Model, provider, credentials source, thread id, token usage, marimo state, kernel runtime, web allowlist. |
+| `/new` | Start a new conversation thread (context files are re-read). |
+| `/model <name>` or `/model <provider>:<name>` | Switch model (and provider); starts a new thread. |
+| `/notebook`, `/notebook list`, `/notebook new <name> [--empty]`, `/notebook open <name>`, `/notebook close [name]` | Show or switch the active notebook (see *Working with several notebooks*). |
+| `/context` | List loaded context files, skills, prompts and the web allowlist. |
+| `/skill <name> [message]` | Run a turn with a project skill attached. |
+| `/prompt <name> [args]` | Send a saved prompt from `.config/hailer/prompts`. |
+| `/reload` | Re-read `.config/hailer`; applies from your next message. |
+| `/clear` | Clear the screen. |
+| `/exit`, `/quit` | Exit Hailer (Ctrl+C at the prompt, Ctrl+D on an empty line, or Ctrl+Z then Enter, also exit). |
 
-Hailer >
-Six monthly sales files, 2025-01 to 2025-06, 400 orders each (discount appears from 2025-04).
-I loaded them into one table, df, with a period column and added a summary to the notebook.
+Interactive chat keeps a framed input box below the conversation. Your submitted messages, Hailer's
+replies and command results appear above it. The context line shows the active notebook, model and
+number of loaded context files; the activity line shows what Hailer is doing.
 
-You > chart revenue by month and region
+Enter sends; Alt+Enter inserts a newline. Pasting several lines keeps them in one editable message.
+Up and Down move through multiline input and recall earlier messages at its boundaries (history stays
+in memory for this session). You can draft your next message while Hailer works; Enter preserves that
+draft until the current operation finishes or is cancelled. Requests are not queued.
 
-Hailer >
-Revenue grew 8% from January to June, almost all of it in the North (+33%); the other regions are flat.
-Added: revenue_by_month (table) and a line chart by region.
+The interface uses normal terminal scrollback and text selection. It does not capture the mouse or
+switch to an alternate screen. Use `hailer --plain` or `hailer notebook --plain` for the line-oriented
+`You >` interface. Pipes and terminals reporting `TERM=dumb` or `TERM=unknown` use plain input automatically.
 
-You > what is behind the North's growth?
+Ctrl+C during a turn cancels the model request and keeps the composer open. A notebook command already
+performing a blocking operation finishes its cleanup before another command can start. Cancellation does
+not undo tool actions that have already happened. Ctrl+C while idle exits; Ctrl+D on empty input or
+Ctrl+Z then Enter also exits. The conversation is stored in `.hailer/threads.sqlite`, which is how
+`hailer` resumes it after a restart; `/new` (or `hailer --new`) discards it and starts another.
+Completed replies are displayed once, with Markdown formatting; live activity does not print interim
+model commentary. `/clear` clears the display without resetting the conversation.
 
-Hailer >
-Home (+101%) and Sports (+85%); Electronics fell 12%.
-Added a category breakdown for the North with a bar chart.
+Other subcommands:
 
-You > exclude returns
+| Command | What it does |
+|---|---|
+| `hailer` | Start or reuse this workspace's notebook server, open the notebook and chat in the terminal. |
+| `hailer notebook [--port N] [--no-browser] [--keep-marimo] [--foreground] [--new] [--plain] [--kernel RUNTIME]` | The same session with extra startup options; marimo runs on the notebooks folder. `RUNTIME` is `local` or `docker`. |
+| `hailer exec -c "code"` (or `hailer exec script.py`, `hailer exec -` for stdin) | Run Python in the active notebook's kernel yourself. |
+| `hailer status`, `hailer doctor` | Configuration and state; the startup checks with fixes. |
+| `hailer login <provider>`, `hailer logout <provider>` | Store or remove a provider's API key. |
+| `hailer init [--force] [--kernel RUNTIME]` | Set up a workspace (see Quick start); `--kernel` writes `[kernel] runtime`. |
+| `hailer kernel pull` | Download the kernel image for this Hailer (or `[kernel].image`). |
+| `hailer kernel build [--tag <name>]` | Build the kernel image on this machine. |
+| `hailer kernel stop` | Stop this workspace's kernel (local or docker) and remove its containers and network. |
 
-Hailer >
-Done. Returns were 2.7% of orders; the North is still up 29% without them.
-The table and both charts now exclude returned orders.
-
-You > which channel sells more?
-
-Hailer >
-Online: 55% of orders and 55% of revenue.
-Added a channel comparison below the category chart.
-```
-
-Hailer resumes your previous conversation on the next start; use `uvx hailer --new` or `/new` for a fresh
-thread. `uvx hailer doctor` runs the same startup checks and prints fixes.
-
-## Running inside abeam
-
-[abeam](https://github.com/OpenAfterHours/abeam) runs coding-agent CLIs in a terminal pane beside git status,
-a file viewer and a shell. It starts `hailer` from your `PATH`, so install Hailer as a tool first:
-
-```bash
-uv tool install hailer
-abeam +hailer
-```
-
-abeam forwards every argument, so `abeam +hailer notebook --no-browser` or `abeam +hailer --new` behave as
-they do in a terminal. abeam starts Hailer in a git worktree; commit `hailer.toml` (and your notebooks) so
-each worktree is a workspace of its own, since Hailer uses the nearest folder holding `hailer.toml` or
-`pyproject.toml`. Each workspace then gets its own marimo server, `.hailer/` stays out of the git pane, and a
-pasted block of several lines arrives as one message.
+Global options go before the subcommand: `--verbose`, `--config <path>`, `--workspace <path>`, `--new`,
+`--plain`, `--version` (for example `uvx hailer --workspace C:\projects\sales kernel stop`).
 
 ## Working with several notebooks
 
@@ -256,6 +258,197 @@ Where things live:
 notebook      = "notebooks/analysis.py"   # the default (and first) notebook
 notebooks_dir = "notebooks"               # where /notebook new and the agent's notebook_create put files
 ```
+
+## Data conventions
+
+Any CSV, Parquet or JSON file in `data/` can be analysed, whatever it is called: the starter notebook lists
+them in `data_files`, and the agent loads them with Polars or queries them with DuckDB when you ask.
+
+One naming convention is optional. When the same dataset arrives every month, name the files
+`YY-MM <dataset>.parquet`, for example `25-03 sales.parquet` for March 2025. The data itself then needs no
+period column; Hailer derives it from the filename, combines the months into one table and copes with
+columns that only appear in later months.
+
+`hailer.periods` (imported by the starter notebook, so the agent reuses it):
+
+| Function | Purpose |
+|---|---|
+| `list_data_files(data_dir)` | Every data file (CSV, Parquet, JSON, ...) directly in the folder, whatever its name, sorted by name. |
+| `parse_period(name)` | `"25-03 sales.parquet"` → `Period(2025, 3)`; `None` if the name does not match. |
+| `scan_period_files(data_dir, name=None)` | Sorted `PeriodFile`s for one dataset (or all) in a folder. |
+| `load_periods(files, columns=None)` | One Polars DataFrame with a leading `period` column (`YYYY-MM`); schema evolution handled with a relaxed diagonal concat. |
+| `scan_periods(files)` | Lazy variant of `load_periods`. |
+| `duckdb_periods_view(con, files, view_name="periods")` | Registers a DuckDB view over all files (`union_by_name`) with `period` derived from the filename. |
+| `describe_periods(files)` | Compact text: months found, common columns, columns present only in some months. |
+
+A monthly file that cannot be read raises `MalformedParquetError` naming the file. The starter notebook
+(`notebooks/analysis.py`) defines `WORKSPACE`, `DATA_DIR`, `data_files` and `period_files` and shows a
+table of the data files it found.
+
+## Model configuration
+
+All model settings live in `hailer.toml` (repo root, or `.config/hailer/hailer.toml`). `uvx hailer init`
+writes a commented starter file.
+
+### OpenAI
+
+```toml
+[model]
+name = "gpt-5.5"
+provider = "openai"
+```
+
+Store an API key once with `uvx hailer login openai`, or set `OPENAI_API_KEY` in the terminal. Hailer
+talks to `https://api.openai.com/v1` over the Responses API. To use Chat Completions instead, or to turn
+streaming off, declare the provider without a `base_url`:
+
+```toml
+[model_providers.openai]
+wire_api = "chat"
+```
+
+### A custom or internal endpoint
+
+Hailer supports endpoints that implement the OpenAI Responses API or Chat Completions with function
+calling, including compatible internal gateways and local model servers. Use the model name, URL and
+protocol required by your endpoint.
+
+```toml
+[model]
+name     = "analyst-v3"               # whatever model id the endpoint expects
+provider = "internal"
+# reasoning_effort = "medium"         # minimal | low | medium | high | xhigh; "" sends no reasoning effort
+# summarize_after_tokens = 100000     # summarise older turns past this size; lower it for small context windows
+
+[model_providers.internal]
+base_url         = "https://llm.example.internal/v1"
+wire_api         = "responses"               # or "chat" for a Chat Completions endpoint
+env_key          = "INTERNAL_MODEL_API_KEY"  # env var name; value from `hailer login internal` or the terminal
+# stream         = true                      # false if the endpoint rejects stream = true
+# stream_options = true                      # false omits stream_options (token counts may be lost)
+# name             = "Internal"
+# http_headers     = { "X-Team" = "data-analytics" }
+# env_http_headers = { "X-Client-Id" = "INTERNAL_CLIENT_ID" }
+# query_params     = { "api-version" = "2025-04-01-preview" }
+```
+
+Then:
+
+```bash
+uvx hailer login internal     # stores the key in the OS credential store (hidden prompt)
+uvx hailer doctor             # config / notebook / credentials / marimo / session, with fixes
+uvx hailer
+```
+
+Or set `INTERNAL_MODEL_API_KEY` in the terminal instead of logging in; an environment variable always wins
+over the credential store. The startup panel and `status` show the provider with its base URL; `doctor` and
+`status` show where the key came from (`from keyring` or `from env`), never the value.
+
+**`wire_api` chooses the protocol the endpoint speaks:**
+
+| `wire_api` | What Hailer sends | Use it when |
+|---|---|---|
+| `"responses"` (default) | `POST {base_url}/responses` | The endpoint implements the OpenAI Responses API. |
+| `"chat"` | `POST {base_url}/chat/completions` | The endpoint implements Chat Completions (vLLM, Ollama, LiteLLM, most internal gateways). |
+
+Hailer uses LangChain's `ChatOpenAI` client to send requests to `base_url`: the key as
+`Authorization: Bearer ...`, your `http_headers`, each `env_http_headers` entry whose variable is set,
+and your `query_params`. The body follows the selected protocol: Chat Completions uses `messages`,
+while Responses uses `input`. Both carry the configured model, conversation and Hailer's tool definitions.
+Every request names the model you configured; there are no side requests under other model names.
+`HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` are honoured.
+
+Two per-provider switches help with strict endpoints; both default to `true` and apply to either
+`wire_api`:
+
+- `stream = false` sends `stream: false` and reads one JSON reply, for endpoints that reject streamed
+  requests or cannot deliver server-sent events (some gateways and proxies buffer or refuse them). The
+  answer then appears when the turn finishes rather than as it is generated. It is also the workaround
+  for an endpoint that streams tool calls in a shape the client does not understand. The provider shows
+  as `internal (https://..., chat completions, no streaming)` in the startup panel and `/status`.
+- `stream_options = false` omits the `stream_options` field from streamed requests (some Azure API
+  versions and proxies reject it). Token counts are then whatever the final chunk carries, often nothing.
+
+Independently of the provider, `reasoning_effort = ""` under `[model]` stops the reasoning effort being
+sent at all, for endpoints or models that reject it.
+
+Long conversations are kept inside the model's context window by summarising older turns once the
+conversation passes `[model].summarize_after_tokens` (default 100000; the last 20 messages are always kept
+as they are). The summary is written by the model you configured. Lower the number for a model with a
+small context window; `0` turns summarising off.
+
+Several providers can be declared; switch inside a session with `/model <name>` or
+`/model <provider>:<name>` (this starts a new thread). One-off overrides: `HAILER_MODEL`,
+`HAILER_MODEL_PROVIDER`.
+
+## Project context, skills and prompts
+
+`.config/hailer/` holds what the agent knows about *this* project. Commit it with the notebook.
+
+```
+.config/hailer/
+├── context/      always-on: every *.md here is sent to the model at the start of each session
+├── skills/       on-demand: <name>/SKILL.md (+ reference/, scripts/) in the Agent Skills format
+└── prompts/      reusable prompts: /prompt <name> [args]   ({{args}} is substituted)
+```
+
+- **context/**: short Markdown files with column meanings, conventions and house style, loaded in filename
+  order and concatenated up to `max_context_bytes`. Hailer warns at startup if a file looks like it contains
+  a key or token.
+- **skills/**: only the `name` and `description` from each `SKILL.md` frontmatter go into the agent's
+  instructions; the body and bundled files are loaded when the task matches (the agent calls `load_skill`
+  and `read_skill_file`) or when you type `/skill <name> [message]`.
+- **prompts/**: `/prompt first-look customers.csv` sends `prompts/first-look.md` with `{{args}}` replaced.
+- `/context` lists what is loaded; `/reload` re-reads the folder and applies from your next message, in the
+  same conversation.
+
+Everything in `context/`, and any skill you load, is sent to the configured model endpoint. Keep
+credentials, customer names and row-level data out of it.
+
+## Installation
+
+`uvx hailer ...` fetches Hailer from PyPI the first time, keeps it in uv's cache with an environment of
+its own (marimo, Polars, DuckDB and the rest), and runs it from there. No `pyproject.toml` or `.venv`
+is needed in your analysis folder.
+
+To use the latest release, run `uvx hailer@latest`. Use `uvx hailer@X.Y.Z` to select a specific version.
+
+For a permanent `hailer` command:
+
+```bash
+uv tool install hailer
+```
+
+Then use `hailer` wherever these instructions say `uvx hailer`. Upgrade that installation with
+`uv tool upgrade hailer`. You can also use `pip install hailer` in your own Python 3.12+ environment.
+See [uv's tools guide](https://docs.astral.sh/uv/guides/tools/) for more installation options.
+
+### Requirements
+
+- Windows 11 is the primary target; macOS and Linux work too.
+- Hailer needs Python 3.12 or newer; uv can download it automatically.
+- Keep the notebook open in a web browser while using Hailer.
+- Every model provider needs an API key (see [Model configuration](#model-configuration)).
+- Docker Desktop (Windows, macOS) or Docker Engine (Linux) is needed only for the
+  [optional Docker runtime](#isolated-kernel-docker).
+
+For source checkouts and sample data generation, see [Development](#development).
+
+## Running inside abeam
+
+[abeam](https://github.com/OpenAfterHours/abeam) runs coding-agent CLIs in a terminal pane beside git status,
+a file viewer and a shell. It starts `hailer` from your `PATH`, so install Hailer as a tool first:
+
+```bash
+uv tool install hailer
+abeam +hailer
+```
+
+abeam forwards every argument, so `abeam +hailer notebook --no-browser` or `abeam +hailer --new` behave as
+they do in a terminal. abeam starts Hailer in a git worktree; commit `hailer.toml` (and your notebooks) so
+each worktree is a workspace of its own, since Hailer uses the nearest folder holding `hailer.toml` or
+`pyproject.toml`. Each workspace then gets its own marimo server, `.hailer/` stays out of the git pane, and a
+pasted block of several lines arrives as one message.
 
 ## Isolated kernel (Docker)
 
@@ -422,127 +615,13 @@ row, and every start stops on it, `--foreground` included (the same rules, in on
 - **Linux**: the integration test passes in WSL Ubuntu, and a CI job runs it on Ubuntu (Docker Engine)
   for every pull request.
 - **macOS**: Docker Desktop. The release publishes the image for `linux/amd64` and `linux/arm64` (Apple
-  Silicon), but the arm64 image is untested until the first release that publishes it.
+  Silicon). The CI integration test runs on amd64; it does not cover arm64.
 - **Podman** is not supported.
-
-## Model configuration
-
-All model settings live in `hailer.toml` (repo root, or `.config/hailer/hailer.toml`). `uvx hailer init`
-writes a commented starter file.
-
-### OpenAI
-
-```toml
-[model]
-name = "gpt-5.5"
-provider = "openai"
-```
-
-Store an API key once with `uvx hailer login openai`, or set `OPENAI_API_KEY` in the terminal. Hailer
-talks to `https://api.openai.com/v1` over the Responses API. To use Chat Completions instead, or to turn
-streaming off, declare the provider without a `base_url`:
-
-```toml
-[model_providers.openai]
-wire_api = "chat"
-```
-
-### A custom or internal endpoint
-
-Any endpoint that speaks the OpenAI Responses API or Chat Completions works: an internal gateway, Azure
-OpenAI, LiteLLM, vLLM, Ollama and so on.
-
-```toml
-[model]
-name     = "analyst-v3"               # whatever model id the endpoint expects
-provider = "internal"
-# reasoning_effort = "medium"         # minimal | low | medium | high | xhigh; "" sends no reasoning effort
-# summarize_after_tokens = 100000     # summarise older turns past this size; lower it for small context windows
-
-[model_providers.internal]
-base_url         = "https://llm.example.internal/v1"
-wire_api         = "responses"               # or "chat" for a Chat Completions endpoint
-env_key          = "INTERNAL_MODEL_API_KEY"  # env var name; value from `hailer login internal` or the terminal
-# stream         = true                      # false if the endpoint rejects stream = true
-# stream_options = true                      # false omits stream_options (token counts may be lost)
-# name             = "Internal"
-# http_headers     = { "X-Team" = "data-analytics" }
-# env_http_headers = { "X-Client-Id" = "INTERNAL_CLIENT_ID" }
-# query_params     = { "api-version" = "2025-04-01-preview" }
-```
-
-Then:
-
-```bash
-uvx hailer login internal     # stores the key in the OS credential store (hidden prompt)
-uvx hailer doctor             # config / notebook / credentials / marimo / session, with fixes
-uvx hailer
-```
-
-Or set `INTERNAL_MODEL_API_KEY` in the terminal instead of logging in; an environment variable always wins
-over the credential store. The startup panel and `status` show the provider with its base URL; `doctor` and
-`status` show where the key came from (`from keyring` or `from env`), never the value.
-
-**`wire_api` chooses the protocol the endpoint speaks:**
-
-| `wire_api` | What Hailer sends | Use it when |
-|---|---|---|
-| `"responses"` (default) | `POST {base_url}/responses` | The endpoint implements the OpenAI Responses API. |
-| `"chat"` | `POST {base_url}/chat/completions` | The endpoint implements Chat Completions (vLLM, Ollama, LiteLLM, most internal gateways). |
-
-Hailer sends the request itself, straight to `base_url`, so what the endpoint sees is small and predictable:
-the key as `Authorization: Bearer ...`, your `http_headers`, each `env_http_headers` entry whose variable is
-set, your `query_params`, and a body with `model`, `messages` (one system message with Hailer's
-instructions, then the conversation), `tools` (Hailer's eleven tools as ordinary functions) and `stream`.
-Every request names the model you configured; there are no side requests under other model names. The
-endpoint must support function calling. `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` are honoured, and TLS uses
-the operating system's certificate store, so a company root certificate installed on the machine works.
-
-Two per-provider switches help with strict endpoints; both default to `true` and apply to either
-`wire_api`:
-
-- `stream = false` sends `stream: false` and reads one JSON reply, for endpoints that reject streamed
-  requests or cannot deliver server-sent events (some gateways and proxies buffer or refuse them). The
-  answer then appears when the turn finishes rather than as it is generated. It is also the workaround
-  for an endpoint that streams tool calls in a shape the client does not understand. The provider shows
-  as `internal (https://..., chat completions, no streaming)` in the startup panel and `/status`.
-- `stream_options = false` omits the `stream_options` field from streamed requests (some Azure API
-  versions and proxies reject it). Token counts are then whatever the final chunk carries, often nothing.
-
-Independently of the provider, `reasoning_effort = ""` under `[model]` stops the reasoning effort being
-sent at all, for endpoints or models that reject it.
-
-Long conversations are kept inside the model's context window by summarising older turns once the
-conversation passes `[model].summarize_after_tokens` (default 100000; the last 20 messages are always kept
-as they are). The summary is written by the model you configured. Lower the number for a model with a
-small context window; `0` turns summarising off.
-
-Several providers can be declared; switch inside a session with `/model <name>` or
-`/model <provider>:<name>` (this starts a new thread). One-off overrides: `HAILER_MODEL`,
-`HAILER_MODEL_PROVIDER`.
-
-## Secrets
-
-`uvx hailer login <provider>` stores the API key in the operating system's credential store through
-`keyring` (Windows Credential Manager on Windows) under the service name `hailer`. Hailer reads it when the
-agent starts and hands it to the HTTP client inside its own process, which sends it only as the
-`Authorization` header of requests to that provider's endpoint. It is never written to `hailer.toml`, the
-session file, command history or logs, and never passed on a command line or to another process.
-`uvx hailer logout <provider>` removes it.
-
-An environment variable named by `env_key` takes precedence over the credential store, which keeps scripted
-and CI use simple. Hailer leaves that variable (and other secret-looking ones) out of the environment of the
-marimo server it starts, so it is not in notebook code's environment (see [Security](#security)). Note that any
-process running as the same user can read both credential-store entries and environment variables; the
-gain is keeping the key out of files and history, not isolation from your own account.
-
-Every provider needs a key, including the built-in `openai` one. A missing key stops `hailer` at startup
-with the `login` command to run.
 
 ## Allowed web domains
 
-By default the agent has **no internet access**: it has no shell, and its `fetch_page` tool refuses every
-URL. To let it read specific sites for context:
+By default the agent's **`fetch_page` tool is disabled**: it refuses every URL. To let that tool read
+specific sites for context:
 
 ```toml
 [web]
@@ -563,202 +642,23 @@ agent's own web tool, not what notebook code can do: with the default local kern
 in the notebook is ordinary Python on your machine with your network access; with the docker kernel it
 has no network at all unless `[kernel] network = true` (see [Security](#security)).
 
-## Project context, skills and prompts
+## Secrets
 
-`.config/hailer/` holds what the agent knows about *this* project. Commit it with the notebook.
+`uvx hailer login <provider>` stores the API key in the operating system's credential store through
+`keyring` (Windows Credential Manager on Windows) under the service name `hailer`. Hailer reads it when the
+agent starts and hands it to the HTTP client inside its own process, which sends it only as the
+`Authorization` header of requests to that provider's endpoint. It is never written to `hailer.toml`, the
+session file, command history or logs, and never passed on a command line or to another process.
+`uvx hailer logout <provider>` removes it.
 
-```
-.config/hailer/
-├── context/      always-on: every *.md here is sent to the model at the start of each session
-├── skills/       on-demand: <name>/SKILL.md (+ reference/, scripts/) in the Agent Skills format
-└── prompts/      reusable prompts: /prompt <name> [args]   ({{args}} is substituted)
-```
+An environment variable named by `env_key` takes precedence over the credential store, which keeps scripted
+and CI use simple. Hailer leaves that variable (and other secret-looking ones) out of the environment of the
+marimo server it starts, so it is not in notebook code's environment (see [Security](#security)). Note that any
+process running as the same user can read both credential-store entries and environment variables; the
+gain is keeping the key out of files and history, not isolation from your own account.
 
-- **context/**: short Markdown files with column meanings, conventions and house style, loaded in filename
-  order and concatenated up to `max_context_bytes`. Hailer warns at startup if a file looks like it contains
-  a key or token.
-- **skills/**: only the `name` and `description` from each `SKILL.md` frontmatter go into the agent's
-  instructions; the body and bundled files are loaded when the task matches (the agent calls `load_skill`
-  and `read_skill_file`) or when you type `/skill <name> [message]`.
-- **prompts/**: `/prompt first-look customers.csv` sends `prompts/first-look.md` with `{{args}}` replaced.
-- `/context` lists what is loaded; `/reload` re-reads the folder and applies from your next message, in the
-  same conversation.
-
-Everything in `context/`, and any skill you load, is sent to the configured model endpoint. Keep
-credentials, customer names and row-level data out of it.
-
-## Slash commands
-
-| Command | What it does |
-|---|---|
-| `/help` | Show the command list. |
-| `/status` | Model, provider, credentials source, thread id, token usage, marimo state, kernel runtime, web allowlist. |
-| `/new` | Start a new conversation thread (context files are re-read). |
-| `/model <name>` or `/model <provider>:<name>` | Switch model (and provider); starts a new thread. |
-| `/notebook`, `/notebook list`, `/notebook new <name> [--empty]`, `/notebook open <name>`, `/notebook close [name]` | Show or switch the active notebook (see *Working with several notebooks*). |
-| `/context` | List loaded context files, skills, prompts and the web allowlist. |
-| `/skill <name> [message]` | Run a turn with a project skill attached. |
-| `/prompt <name> [args]` | Send a saved prompt from `.config/hailer/prompts`. |
-| `/reload` | Re-read `.config/hailer`; applies from your next message. |
-| `/clear` | Clear the screen. |
-| `/exit`, `/quit` | Exit Hailer (Ctrl+C at the prompt, Ctrl+D on an empty line, or Ctrl+Z then Enter, also exit). |
-
-Interactive chat keeps a framed input box below the conversation. Your submitted messages, Hailer's
-replies and command results appear above it. The context line shows the active notebook, model and
-number of loaded context files; the activity line shows what Hailer is doing.
-
-Enter sends; Alt+Enter inserts a newline. Pasting several lines keeps them in one editable message.
-Up and Down move through multiline input and recall earlier messages at its boundaries (history stays
-in memory for this session). You can draft your next message while Hailer works; Enter preserves that
-draft until the current operation finishes or is cancelled. Requests are not queued.
-
-The interface uses normal terminal scrollback and text selection. It does not capture the mouse or
-switch to an alternate screen. Use `hailer --plain` or `hailer notebook --plain` for the line-oriented
-`You >` interface. Pipes and terminals reporting `TERM=dumb` or `TERM=unknown` use plain input automatically.
-
-Ctrl+C during a turn cancels the model request and keeps the composer open. A notebook command already
-performing a blocking operation finishes its cleanup before another command can start. Cancellation does
-not undo tool actions that have already happened. Ctrl+C while idle exits; Ctrl+D on empty input or
-Ctrl+Z then Enter also exits. The conversation is stored in `.hailer/threads.sqlite`, which is how
-`hailer` resumes it after a restart; `/new` (or `hailer --new`) discards it and starts another.
-Completed replies are displayed once, with Markdown formatting; live activity does not print interim
-model commentary. `/clear` clears the display without resetting the conversation.
-
-Other subcommands:
-
-| Command | What it does |
-|---|---|
-| `hailer notebook [--port N] [--no-browser] [--keep-marimo] [--foreground] [--new] [--plain] [--kernel RUNTIME]` | The one-command session described in Quick start; marimo runs on the notebooks folder. `RUNTIME` is `local` or `docker`. |
-| `hailer exec -c "code"` (or `hailer exec script.py`, `hailer exec -` for stdin) | Run Python in the active notebook's kernel yourself. |
-| `hailer status`, `hailer doctor` | Configuration and state; the startup checks with fixes. |
-| `hailer login <provider>`, `hailer logout <provider>` | Store or remove a provider's API key. |
-| `hailer init [--force] [--kernel RUNTIME]` | Set up a workspace (see Quick start); `--kernel` writes `[kernel] runtime`. |
-| `hailer kernel pull` | Download the kernel image for this Hailer (or `[kernel].image`). |
-| `hailer kernel build [--tag <name>]` | Build the kernel image on this machine. |
-| `hailer kernel stop` | Stop this workspace's kernel (local or docker) and remove its containers and network. |
-
-Global options go before the subcommand: `--verbose`, `--config <path>`, `--workspace <path>`, `--new`,
-`--plain`, `--version` (for example `uvx hailer --workspace C:\projects\sales kernel stop`).
-
-## Data conventions
-
-Any CSV, Parquet or JSON file in `data/` can be analysed, whatever it is called: the starter notebook lists
-them in `data_files`, and the agent loads them with Polars or queries them with DuckDB when you ask.
-
-One naming convention is optional. When the same dataset arrives every month, name the files
-`YY-MM <dataset>.parquet`, for example `25-03 sales.parquet` for March 2025. The data itself then needs no
-period column; Hailer derives it from the filename, combines the months into one table and copes with
-columns that only appear in later months.
-
-`hailer.periods` (imported by the starter notebook, so the agent reuses it):
-
-| Function | Purpose |
-|---|---|
-| `list_data_files(data_dir)` | Every data file (CSV, Parquet, JSON, ...) directly in the folder, whatever its name, sorted by name. |
-| `parse_period(name)` | `"25-03 sales.parquet"` → `Period(2025, 3)`; `None` if the name does not match. |
-| `scan_period_files(data_dir, name=None)` | Sorted `PeriodFile`s for one dataset (or all) in a folder. |
-| `load_periods(files, columns=None)` | One Polars DataFrame with a leading `period` column (`YYYY-MM`); schema evolution handled with a relaxed diagonal concat. |
-| `scan_periods(files)` | Lazy variant of `load_periods`. |
-| `duckdb_periods_view(con, files, view_name="periods")` | Registers a DuckDB view over all files (`union_by_name`) with `period` derived from the filename. |
-| `describe_periods(files)` | Compact text: months found, common columns, columns present only in some months. |
-
-A monthly file that cannot be read raises `MalformedParquetError` naming the file. The starter notebook
-(`notebooks/analysis.py`) defines `WORKSPACE`, `DATA_DIR`, `data_files` and `period_files` and shows a
-table of the data files it found.
-
-## Logging
-
-Normal runs print only warnings. `uvx hailer --verbose` (or `HAILER_LOG_LEVEL=DEBUG`) logs provider,
-session, marimo and tool activity and shows full tracebacks. Log output passes through a redaction filter
-that masks bearer tokens and the values of environment variables whose names end in `_KEY`, `_TOKEN`,
-`_SECRET` or `_PASSWORD`.
-
-## Tests
-
-```bash
-uv run pytest
-```
-
-The suite is offline: it needs no API key, no marimo server, no model endpoint, no network and no Docker.
-The marimo protocol is exercised against a local fake server (`tests/fake_marimo.py`, token-checked like a
-server Hailer starts), the agent against a scripted chat model and against a strict Chat-Completions-only
-fake gateway on loopback (`tests/fake_gateway.py`, which rejects unknown request fields and model names the
-way internal gateways do), and the credential store against an in-memory backend. The kernel runtimes are
-tested without starting anything: `tests/test_kernel.py` (path map, `kernel.json`, the kernel's
-environment, the local runtime with its processes faked), `tests/test_kernel_docker.py` (the docker runtime
-against `tests/fake_docker.py`, a scripted `docker` CLI that keeps containers and networks with ids,
-labels and `--filter`, like Docker 29), `tests/test_kernel_image.py`, `tests/test_forward.py` (the forwarder
-on real loopback sockets) and `tests/test_build_kernel_image.py`. `tests/fake_kernel.py` holds the shared
-pieces.
-
-`tests/test_docker_integration.py` drives the real docker runtime: it starts a kernel for a temporary
-workspace with sample sales data, opens the notebook in headless Chrome, and checks that code runs as a
-non-root user in `/work`, a code-mode cell lands in the host notebook, writes to the data folder and the
-network are refused, no host secret or the server token is visible, and stopping leaves nothing behind.
-It is opt-in and never pulls the image:
-
-```bash
-uv run python -m scripts.build_kernel_image --load     # the image for this checkout, into local Docker
-HAILER_DOCKER_TESTS=1 uv run pytest tests/test_docker_integration.py -rs
-```
-
-(In PowerShell, set the variable first: `$env:HAILER_DOCKER_TESTS = "1"`.)
-`HAILER_DOCKER_TESTS=1` skips, with the reason, when Docker, the image or a browser is missing;
-`HAILER_DOCKER_TESTS=strict` fails instead. `HAILER_TEST_CHROME` picks the browser (otherwise
-`google-chrome` or `chromium` on PATH, or Chrome's usual install folder on Windows and macOS), and
-`HAILER_KERNEL_IMAGE` another image.
-
-`.github/workflows/test.yml` runs the suite on Ubuntu and Windows with Python 3.12 and 3.13 for every
-push to `main` and every pull request; the repository requires those four checks by name. A fifth job,
-*Docker kernel*, builds the image from the checkout on Ubuntu and runs the integration test with
-`HAILER_DOCKER_TESTS=strict` (Linux only: GitHub's Windows runners only run Windows containers). It is
-not a required check, but the release waits for it.
-
-## Releasing
-
-```bash
-uv run python -m scripts.release            # patch bump: 0.1.0 -> 0.1.1
-uv run python -m scripts.release minor      # 0.1.0 -> 0.2.0
-uv run python -m scripts.release major      # 0.1.0 -> 1.0.0
-uv run python -m scripts.release --dry-run  # preflight checks and the plan, nothing changed
-```
-
-Run it from a clean `main` that matches `origin/main`. The script writes the new version to `pyproject.toml`,
-`src/hailer/__init__.py` and `uv.lock`, then runs the test suite. If the tests fail, the version files are
-restored and nothing is committed. If they pass, it commits `Release vX.Y.Z`, tags `vX.Y.Z` and pushes the
-branch and tag atomically. The tag triggers `.github/workflows/release.yml`, which:
-
-1. runs every job in `test.yml` again (the four platforms and the Docker kernel job) and builds the sdist
-   and wheel;
-2. builds the kernel image for `linux/amd64` and `linux/arm64` with `scripts/build_kernel_image.py` and
-   pushes it as `ghcr.io/openafterhours/hailer-kernel:X.Y.Z` (the job checks that the tag, `pyproject.toml`
-   and `hailer.__version__` agree, since the image's version label must match the package);
-3. only when all of that succeeds, publishes to PyPI through the `pypi` environment (trusted publishing,
-   no token to store) and creates the GitHub release with the files attached. The image goes first so no
-   released Hailer points at a missing image.
-
-`--no-push` stops after the local commit and tag, `--version X.Y.Z` releases an exact version (pre-releases
-such as `1.2.0rc1` are accepted), and arguments after `--` are passed to pytest.
-
-**One-time step for the kernel image.** GHCR creates the `hailer-kernel` package as private on the first
-push. After the first release, make it public in the organisation's package settings
-(github.com/orgs/OpenAfterHours/packages, `hailer-kernel`, *Package settings*, *Change visibility*);
-otherwise `uvx hailer kernel pull` and the first docker start fail for everyone outside the organisation
-(they see `The kernel image for Hailer X.Y.Z is not published (or not visible to you)`). If a
-`hailer-kernel` package was ever pushed by hand, also give this repository the *Write* role under *Manage
-Actions access* on the same page, or the workflow's push is refused.
-
-**Development versions have no published image.** Build one for the checkout into your local Docker with
-`uv run python -m scripts.build_kernel_image --load`. It uses the build context `hailer kernel build` and
-the release use (the packaged Dockerfile and the `hailer` package this checkout runs); `--dry-run` prints
-the `docker buildx build` command, `--tag` renames the image, and `--help` lists the rest.
-
-Repository rulesets restrict this: `main` cannot be force-pushed or deleted and changes to it must come
-through a pull request with the test checks green, and `v*` tags can only be created by repository admins,
-who also bypass the pull-request rule so the release script can push directly. The `pypi` environment only
-deploys from `v*` tags, and `.github/workflows/members-only.yml` closes pull requests opened from forks by
-people outside the OpenAfterHours organization. Open your own pull requests from a branch in this repository;
-those are always kept.
+Every provider needs a key, including the built-in `openai` one. A missing key stops `hailer` at startup
+with the `login` command to run.
 
 ## Security
 
@@ -918,8 +818,8 @@ available in the kernel.
   may still finish and switch the active notebook a moment later. Hailer re-reads the state after every
   turn and before `/notebook` and `/status`, so the next command shows the right notebook; a `/notebook
   new` typed in that instant can still be overtaken by the late switch.
-- `uvx hailer notebook` starts and stops marimo for you; plain `uvx hailer` expects a running server
-  and tells you how to start one.
+- Both `uvx hailer` and `uvx hailer notebook` start or reuse this workspace's marimo server and stop only
+  a server they started. An explicitly pinned server must already be running.
 - Every request carries about 10 KB of instructions and 5 KB of tool definitions (measured with an empty
   project context) plus the conversation; an endpoint with a strict request-size limit needs room for that.
 - The endpoint must support function calling in the standard OpenAI shape. An endpoint that streams tool
@@ -932,9 +832,171 @@ available in the kernel.
   and fully supported.
 - Reading large files through a Windows bind mount is slower than reading them from a local folder; how
   much slower for large Parquet files has not been measured yet.
-- The `linux/arm64` kernel image (Apple Silicon, ARM Linux) is built by the release workflow but untested
-  until the first release that publishes it. Podman is not supported.
+- The release workflow builds the `linux/arm64` kernel image (Apple Silicon, ARM Linux), but the CI
+  integration test only covers amd64. Podman is not supported.
 - The docker kernel has only the packages in the image (marimo, Polars, DuckDB, altair, plotly); anything
   else needs an image of your own, built `FROM` Hailer's (so it keeps the version label) and named in
   `[kernel].image`. There is one kernel per workspace, and
   changing `[kernel]` settings while one is kept running needs `uvx hailer kernel stop` first.
+
+## Architecture
+
+```
+                   Model endpoint
+                (OpenAI, or your own endpoint:
+                 Responses API or Chat Completions)
+                         ▲
+                         │ HTTPS
+                ┌────────┴────────┐
+                │  Hailer         │   one Python process: a LangChain agent
+Terminal ─────► │  conversation   │   (create_agent + ChatOpenAI), Hailer's system
+ uvx hailer     │  + tools        │   prompt, the conversation kept in .hailer/
+                │                 │
+                │  marimo_execute, marimo_status, notebook_cells, notebook_list,
+                │  notebook_create, notebook_open, notebook_close,
+                │  list_periods, load_skill, read_skill_file, fetch_page
+                └────────┬────────┘
+                         │ HTTP + SSE  (/api/sessions, /api/kernel/execute),
+                         │ with the server's token
+                ┌────────▼────────┐
+                │ Marimo runtime  │   scratchpad over the kernel globals +
+                │ Polars · DuckDB │   marimo._code_mode for durable cells
+                │ Python          │
+                └────────┬────────┘   local (default): Hailer's own Python, as you
+                         │            docker: a Linux container that sees only the
+                    Browser UI        notebooks folder and, read-only, the data folder
+```
+
+The CLI runs the agent in its own process, with the model and provider taken from `hailer.toml`. The agent
+has exactly the eleven tools above and nothing else: no shell, no file editing. The tools talk to the
+running marimo server over plain HTTP. Code from the agent runs in marimo's *scratchpad*, a temporary
+namespace that can read every notebook variable, and durable changes (new cells, edits, runs) go through
+marimo's code-mode API so they appear immediately in the browser. The notebook file on disk is written by
+marimo itself, never edited behind the kernel's back.
+
+Where marimo and its kernel run is the *kernel runtime*, set by `[kernel] runtime`: `local` (the default)
+starts marimo in Hailer's own Python, `docker` starts it in a container (see
+[Isolated kernel (Docker)](#isolated-kernel-docker)). The agent, the conversation and the API key stay in
+the Hailer process either way.
+
+## Logging
+
+Normal runs print only warnings. `uvx hailer --verbose` (or `HAILER_LOG_LEVEL=DEBUG`) logs provider,
+session, marimo and tool activity and shows full tracebacks. Log output passes through a redaction filter
+that masks bearer tokens and the values of environment variables whose names end in `_KEY`, `_TOKEN`,
+`_SECRET` or `_PASSWORD`.
+
+## Development
+
+To work on Hailer itself:
+
+```bash
+git clone https://github.com/OpenAfterHours/hailer.git
+cd hailer
+uv sync --locked
+uv run hailer login openai
+uv run hailer
+```
+
+Use `uv run hailer ...` in the checkout so you run the code you are changing. The repository already
+includes `hailer.toml`, a starter notebook and the data folder. Configure another provider in
+`hailer.toml` before logging in if needed.
+
+The checkout also has optional sample data: six months of synthetic sales orders, with an extra column
+in later months. Generate it before starting Hailer:
+
+```bash
+uv run python scripts/make_sample_data.py          # writes data/25-01 sales.parquet ... 25-06
+uv run python scripts/make_sample_data.py --help   # --out, --months, --rows, --start, --seed, --dataset
+```
+
+Hailer pins `marimo==0.24.2` because it drives the private `marimo._code_mode` API, which has no stability
+guarantee. The agent uses `langchain`, `langchain-openai` and `langgraph-checkpoint-sqlite` within their
+declared major-version bounds. Upgrade deliberately and re-run the tests.
+
+## Tests
+
+```bash
+uv run pytest
+```
+
+The suite is offline: it needs no API key, no marimo server, no model endpoint, no network and no Docker.
+The marimo protocol is exercised against a local fake server (`tests/fake_marimo.py`, token-checked like a
+server Hailer starts), the agent against a scripted chat model and against a strict Chat-Completions-only
+fake gateway on loopback (`tests/fake_gateway.py`, which rejects unknown request fields and model names the
+way internal gateways do), and the credential store against an in-memory backend. The kernel runtimes are
+tested without starting anything: `tests/test_kernel.py` (path map, `kernel.json`, the kernel's
+environment, the local runtime with its processes faked), `tests/test_kernel_docker.py` (the docker runtime
+against `tests/fake_docker.py`, a scripted `docker` CLI that keeps containers and networks with ids,
+labels and `--filter`, like Docker 29), `tests/test_kernel_image.py`, `tests/test_forward.py` (the forwarder
+on real loopback sockets) and `tests/test_build_kernel_image.py`. `tests/fake_kernel.py` holds the shared
+pieces.
+
+`tests/test_docker_integration.py` drives the real docker runtime: it starts a kernel for a temporary
+workspace with sample sales data, opens the notebook in headless Chrome, and checks that code runs as a
+non-root user in `/work`, a code-mode cell lands in the host notebook, writes to the data folder and the
+network are refused, no host secret or the server token is visible, and stopping leaves nothing behind.
+It is opt-in and never pulls the image:
+
+```bash
+uv run python -m scripts.build_kernel_image --load     # the image for this checkout, into local Docker
+HAILER_DOCKER_TESTS=1 uv run pytest tests/test_docker_integration.py -rs
+```
+
+(In PowerShell, set the variable first: `$env:HAILER_DOCKER_TESTS = "1"`.)
+`HAILER_DOCKER_TESTS=1` skips, with the reason, when Docker, the image or a browser is missing;
+`HAILER_DOCKER_TESTS=strict` fails instead. `HAILER_TEST_CHROME` picks the browser (otherwise
+`google-chrome` or `chromium` on PATH, or Chrome's usual install folder on Windows and macOS), and
+`HAILER_KERNEL_IMAGE` another image.
+
+`.github/workflows/test.yml` runs the suite on Ubuntu and Windows with Python 3.12 and 3.13 for every
+push to `main` and every pull request; the repository requires those four checks by name. A fifth job,
+*Docker kernel*, builds the image from the checkout on Ubuntu and runs the integration test with
+`HAILER_DOCKER_TESTS=strict` (Linux only: GitHub's Windows runners only run Windows containers). It is
+not a required check, but the release waits for it.
+
+## Releasing
+
+```bash
+uv run python -m scripts.release            # patch bump: 0.1.0 -> 0.1.1
+uv run python -m scripts.release minor      # 0.1.0 -> 0.2.0
+uv run python -m scripts.release major      # 0.1.0 -> 1.0.0
+uv run python -m scripts.release --dry-run  # preflight checks and the plan, nothing changed
+```
+
+Run it from a clean `main` that matches `origin/main`. The script writes the new version to `pyproject.toml`,
+`src/hailer/__init__.py` and `uv.lock`, then runs the test suite. If the tests fail, the version files are
+restored and nothing is committed. If they pass, it commits `Release vX.Y.Z`, tags `vX.Y.Z` and pushes the
+branch and tag atomically. The tag triggers `.github/workflows/release.yml`, which:
+
+1. runs every job in `test.yml` again (the four platforms and the Docker kernel job) and builds the sdist
+   and wheel;
+2. builds the kernel image for `linux/amd64` and `linux/arm64` with `scripts/build_kernel_image.py` and
+   pushes it as `ghcr.io/openafterhours/hailer-kernel:X.Y.Z` (the job checks that the tag, `pyproject.toml`
+   and `hailer.__version__` agree, since the image's version label must match the package);
+3. only when all of that succeeds, publishes to PyPI through the `pypi` environment (trusted publishing,
+   no token to store) and creates the GitHub release with the files attached. The image goes first so no
+   released Hailer points at a missing image.
+
+`--no-push` stops after the local commit and tag, `--version X.Y.Z` releases an exact version (pre-releases
+such as `1.2.0rc1` are accepted), and arguments after `--` are passed to pytest.
+
+**One-time step for the kernel image.** GHCR creates the `hailer-kernel` package as private on the first
+push. After the first release, make it public in the organisation's package settings
+(github.com/orgs/OpenAfterHours/packages, `hailer-kernel`, *Package settings*, *Change visibility*);
+otherwise `uvx hailer kernel pull` and the first docker start fail for everyone outside the organisation
+(they see `The kernel image for Hailer X.Y.Z is not published (or not visible to you)`). If a
+`hailer-kernel` package was ever pushed by hand, also give this repository the *Write* role under *Manage
+Actions access* on the same page, or the workflow's push is refused.
+
+**Development versions have no published image.** Build one for the checkout into your local Docker with
+`uv run python -m scripts.build_kernel_image --load`. It uses the build context `hailer kernel build` and
+the release use (the packaged Dockerfile and the `hailer` package this checkout runs); `--dry-run` prints
+the `docker buildx build` command, `--tag` renames the image, and `--help` lists the rest.
+
+Repository rulesets restrict this: `main` cannot be force-pushed or deleted and changes to it must come
+through a pull request with the test checks green, and `v*` tags can only be created by repository admins,
+who also bypass the pull-request rule so the release script can push directly. The `pypi` environment only
+deploys from `v*` tags, and `.github/workflows/members-only.yml` closes pull requests opened from forks by
+people outside the OpenAfterHours organization. Open your own pull requests from a branch in this repository;
+those are always kept.
