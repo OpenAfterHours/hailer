@@ -128,3 +128,27 @@ def test_no_docker_is_a_clear_error(monkeypatch, capsys):
     monkeypatch.setattr(script.shutil, "which", lambda name: None)
     assert script.main(["--load"]) == 1
     assert "docker is not on PATH" in capsys.readouterr().err
+
+
+def test_corporate_dry_run_passes_secrets_without_copying_or_printing_contents(tmp_path, capsys):
+    config = tmp_path / "pip.ini"
+    config.write_text("[global]\nindex-url = https://user:private-token@packages.example/simple\n")
+    cert = tmp_path / "company.pem"
+    cert.write_text("test-ca")
+    ctx = tmp_path / "context"
+    assert script.main([
+        "--dry-run", "--load", "--context", str(ctx), "--base-image", "company/python:3.13",
+        "--pip-config", str(config), "--pip-cert", str(cert), "--no-cache",
+    ]) == 0
+    printed = capsys.readouterr().out
+    assert "BASE_IMAGE=company/python:3.13" in printed and "id=pip_config" in printed and "id=pip_cert" in printed
+    assert "--no-cache" in printed
+    assert "private-token" not in printed
+    assert {p.name for p in ctx.iterdir()} == {"Dockerfile", "hailer"}
+
+
+def test_corporate_missing_config_does_not_prepare_a_context(tmp_path, capsys):
+    ctx = tmp_path / "context"
+    assert script.main(["--dry-run", "--context", str(ctx), "--pip-config", str(tmp_path / "missing.ini")]) == 1
+    assert "Cannot read --pip-config file" in capsys.readouterr().err
+    assert not ctx.exists()

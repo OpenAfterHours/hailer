@@ -3,12 +3,16 @@ the docker commands for building and pulling (a fake runner: nothing is run)."""
 
 from __future__ import annotations
 
+import csv
 import importlib.metadata
 import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from hailer import __version__, kernel_image
+from hailer.errors import KernelRuntimeError
 from hailer.models import KernelConfig
 
 
@@ -44,10 +48,10 @@ def test_prepare_context_holds_the_dockerfile_and_the_package_without_bytecode(t
 def test_the_dockerfile_pins_the_base_image_and_runs_as_a_plain_user():
     text = (Path(kernel_image.__file__).parent / "docker" / "Dockerfile").read_text(encoding="utf-8")
     assert "ARG BASE_IMAGE=python:3.12-slim@sha256:" in text and "FROM ${BASE_IMAGE}" in text
-    assert "COPY hailer/ /usr/local/lib/python3.12/site-packages/hailer/" in text
-    assert "useradd --create-home --uid 1000 analyst" in text and "touch /work/hailer.toml" in text
+    assert "sysconfig.get_path" in text and "python3.12/site-packages" not in text
+    assert "python3 -m venv /opt/hailer-venv" in text and "touch /work/hailer.toml" in text
     assert "> /work/.marimo.toml" in text and "auto_instantiate = true" in text, "a notebook's cells run when it opens"
-    assert "USER analyst" in text and "WORKDIR /work" in text
+    assert "USER 1000:1000" in text and "HOME=/home/analyst" in text and "WORKDIR /work" in text
     assert "org.opencontainers.image.version=${HAILER_VERSION}" in text
     for package in ("marimo", "polars", "duckdb", "altair", "plotly"):
         assert f"{package}==${{{package.upper()}_VERSION}}" in text
@@ -73,6 +77,49 @@ def test_build_streams_docker_build_with_the_context_and_its_args():
     assert recorder.args[3:-1] == expected
     assert not Path(recorder.args[-1]).exists(), "the temporary context is removed afterwards"
     assert kernel_image.build_command("t", Path("ctx"), {"A": "1"}) == ["build", "--tag", "t", "--build-arg", "A=1", "ctx"]
+
+
+def test_corporate_build_keeps_secret_contents_out_of_context_and_command(tmp_path):
+    config = tmp_path / "pip, company.ini"
+    config.write_text("[global]\nindex-url = https://build:private-token@packages.example/simple\n")
+    cert = tmp_path / "company ca.pem"
+    cert.write_text("private-test-certificate")
+
+    class Recorder:
+        def stream(self, args):
+            assert "--no-cache" in args
+            assert "BASE_IMAGE=registry.example/python:3.13" in args
+            secrets = [next(csv.reader([args[i + 1]])) for i, arg in enumerate(args) if arg == "--secret"]
+            assert secrets == [
+                ["type=file", "id=pip_config", f"src={config.resolve()}"],
+                ["type=file", "id=pip_cert", f"src={cert.resolve()}"],
+            ]
+            assert "private-token" not in str(args) and "private-test-certificate" not in str(args)
+            context = Path(args[-1])
+            assert {p.name for p in context.iterdir()} == {"Dockerfile", "hailer"}
+            for path in context.rglob("*"):
+                if path.is_file():
+                    assert b"private-token" not in path.read_bytes()
+                    assert b"private-test-certificate" not in path.read_bytes()
+            return subprocess.CompletedProcess(args, 0)
+
+    assert kernel_image.build(
+        "company/hailer:dev", Recorder(), base_image="registry.example/python:3.13", pip_config=config, pip_cert=cert,
+        no_cache=True,
+    ) == 0
+
+
+@pytest.mark.parametrize("option", ["pip_config", "pip_cert"])
+@pytest.mark.parametrize("kind", ["missing", "directory"])
+def test_invalid_secret_file_fails_before_docker(tmp_path, option, kind):
+    source = tmp_path / "missing" if kind == "missing" else tmp_path
+    with pytest.raises(KernelRuntimeError, match="Cannot read"):
+        kernel_image.build("test", None, **{option: source})
+
+
+def test_empty_base_image_is_rejected():
+    with pytest.raises(KernelRuntimeError, match="must not be empty"):
+        kernel_image.build("test", None, base_image="  ")
 
 
 class Runner:
