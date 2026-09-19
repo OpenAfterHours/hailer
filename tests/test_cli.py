@@ -1964,6 +1964,39 @@ def test_kernel_build(harness, docker):
     assert result.exit_code == 1 and "Docker is not running." in result.output and len(docker.streams) == streams
 
 
+def test_kernel_build_with_corporate_mirrors(harness, docker, tmp_path):
+    import csv
+
+    config = tmp_path / "pip.ini"
+    config.write_text("[global]\nindex-url = https://user:private-token@packages.example/simple\n")
+    cert = tmp_path / "company.pem"
+    cert.write_text("test-ca")
+    result = runner.invoke(cli.app, [
+        "kernel", "build", "--tag", "company/hailer:dev", "--base-image", "company/python:3.13",
+        "--pip-config", str(config), "--pip-cert", str(cert), "--no-cache",
+    ], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    build = docker.streams[-1]
+    assert "BASE_IMAGE=company/python:3.13" in build
+    assert "--no-cache" in build
+    secrets = [next(csv.reader([build[i + 1]])) for i, arg in enumerate(build) if arg == "--secret"]
+    assert secrets == [
+        ["type=file", "id=pip_config", f"src={config.resolve()}"],
+        ["type=file", "id=pip_cert", f"src={cert.resolve()}"],
+    ]
+    assert "private-token" not in result.output and "private-token" not in str(build)
+    assert 'set image = "company/hailer:dev"' in result.output
+
+
+@pytest.mark.parametrize("option", ["--pip-config", "--pip-cert"])
+@pytest.mark.parametrize("kind", ["missing", "directory"])
+def test_kernel_build_rejects_invalid_secret_files(harness, docker, tmp_path, option, kind):
+    path = tmp_path / "missing.ini" if kind == "missing" else tmp_path
+    result = runner.invoke(cli.app, ["kernel", "build", option, str(path)], catch_exceptions=False)
+    assert result.exit_code == 2
+    assert not docker.streams
+
+
 def test_kernel_stop(harness, docker):
     from hailer.kernel import KernelState, read_kernel_state, write_kernel_state
     from hailer.kernel_docker import docker_names
