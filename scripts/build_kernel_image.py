@@ -10,7 +10,7 @@ Usage (from the repository root)::
 
 The build context is the one ``uvx hailer kernel build`` uses (``hailer.kernel_image.prepare_context``):
 the packaged Dockerfile and the installed ``hailer`` package (this checkout, under ``uv run``) in a
-temporary folder, with one ``--build-arg`` per pinned version (marimo, Polars, DuckDB and Hailer's own,
+temporary folder, with one ``--build-arg`` per pinned version (marimo, Polars, fastexcel, DuckDB and Hailer's own,
 which becomes the image's version label). Users build their own image with ``uvx hailer kernel build``;
 this script adds what a release needs: several platforms and ``--push``.
 

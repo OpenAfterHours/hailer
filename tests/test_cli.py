@@ -896,7 +896,7 @@ def test_init_writes_config_and_skeleton(harness, tmp_path, monkeypatch):
     for sub in ("context", "skills", "prompts"):
         assert (ws / ".config" / "hailer" / sub / "README.md").exists()
     assert "Next steps" in result.output
-    assert "Put the files you want to analyse in data/ (CSV, Parquet or JSON, any name)." in result.output
+    assert "Put the files you want to analyse in data/ (CSV, Parquet, JSON or Excel, any name)." in result.output
     result = init_cmd(ws)
     assert "already exists" in result.output
 

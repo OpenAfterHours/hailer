@@ -11,7 +11,8 @@ without agreement (report a needed change instead).
 - **Windows first.** No bash, curl, jq, or POSIX-only assumptions. Use `pathlib`, `subprocess` with argument
   lists, `os.name`/`sys.platform` checks where needed. Paths in user output use the OS separator.
 - **Standard library where practical.** HTTP to marimo and the web via `urllib.request`/`http.client`, TOML
-  via `tomllib`, SSE parsing by hand, HTML-to-text via `html.parser`. Third-party allowed: `polars`, `duckdb`,
+  via `tomllib`, SSE parsing by hand, HTML-to-text via `html.parser`. Third-party allowed: `polars[calamine]`
+  (including `fastexcel` for Excel reading), `duckdb`,
   `typer`, `rich`, `keyring`, `langchain`, `langchain-openai`, `langgraph-checkpoint-sqlite` (and what they
   install: `langchain_core`, `langgraph`, `openai`, `aiosqlite`; imported only inside functions of `agent.py`
   and `tools.py`, so `hailer --help` stays fast), `marimo` (only in the notebook / `hailer exec` snippets,
@@ -494,10 +495,10 @@ def stop_workspace_kernels(config, runner=None, *, procs=None, probe=None) -> St
 
 ```python
 VERSION_LABEL = "org.opencontainers.image.version"     # must equal hailer.__version__
-PINNED_DISTRIBUTIONS = {"MARIMO_VERSION": "marimo", "POLARS_VERSION": "polars", "DUCKDB_VERSION": "duckdb"}
+PINNED_DISTRIBUTIONS = {"MARIMO_VERSION": "marimo", "POLARS_VERSION": "polars", "FASTEXCEL_VERSION": "fastexcel", "DUCKDB_VERSION": "duckdb"}
 def default_image() -> str                  # ghcr.io/openafterhours/hailer-kernel:<hailer version> (models.KERNEL_IMAGE_REPOSITORY)
 def package_dir() -> Path                   # the installed hailer package
-def build_args() -> dict[str, str]          # the installed marimo, Polars, DuckDB versions + HAILER_VERSION
+def build_args() -> dict[str, str]          # the installed marimo, Polars, fastexcel, DuckDB versions + HAILER_VERSION
 def prepare_context(dest: Path) -> dict[str, str]   # dest gets Dockerfile (LF endings) and hailer/ (no __pycache__); returns build_args(); dest must not hold hailer/
 def build_command(tag, context, args) -> list[str]  # ["build", "--tag", tag, "--build-arg", ..., context]
 def build(tag: str, runner: DockerRunner) -> int     # prepare_context in a temp folder, docker build streamed; the exit code
@@ -506,7 +507,7 @@ def image_version(image: str, runner: DockerRunner) -> str | None    # the label
 ```
 
 `src/hailer/docker/Dockerfile` is package data: `python:3.12-slim` pinned by digest, `pip install` of
-marimo, Polars and DuckDB at the build args plus altair and plotly at pinned defaults, the `hailer`
+marimo, Polars, fastexcel and DuckDB at the build args plus altair and plotly at pinned defaults, the `hailer`
 package copied into site-packages without dependencies, user `analyst` (uid 1000), `/work/.marimo.toml`
 (`[runtime] auto_instantiate = true`) and an empty `/work/hailer.toml`, `WORKDIR /work`, and the version
 label. `scripts/build_kernel_image.py` builds the same context with `docker buildx` (`--platform`, `--tag`,
@@ -581,7 +582,7 @@ stdio discarded, because a launcher that inherited the terminal would write into
 
 ```python
 PERIOD_RE: re.Pattern            # ^(?P<yy>\d{2})-(?P<mm>\d{2})\s+(?P<stem>.+)$ on the file stem
-DATA_SUFFIXES: tuple[str, ...]   # .csv .tsv .parquet .json .jsonl .ndjson .xlsx .xls .arrow .feather .ipc
+DATA_SUFFIXES: tuple[str, ...]   # .csv .tsv .parquet .json .jsonl .ndjson .xlsx .xls .xlsb .arrow .feather .ipc
 def list_data_files(data_dir: Path) -> list[Path]  # every data file directly in data_dir, any name, sorted by name; [] when missing
 def parse_period(name: str | Path) -> Period | None
 def parse_period_file(path: Path) -> PeriodFile | None

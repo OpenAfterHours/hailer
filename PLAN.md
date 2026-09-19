@@ -468,7 +468,7 @@ hailer/
                            fake_docker.py, fake_kernel.py; test_docker_integration.py is opt-in (HAILER_DOCKER_TESTS)
 ```
 
-Dependencies: `marimo` (pinned `==0.24.2`, `_code_mode` is private), `langchain>=1.4,<2`, `langchain-openai>=1.6,<2`, `langgraph-checkpoint-sqlite>=3.1,<4`, `polars`, `duckdb`, `typer`, `rich`, `keyring`; dev: `pytest`. Standard library for TOML, the marimo HTTP/SSE client, page fetching, logging, subprocess.
+Dependencies: `marimo` (pinned `==0.24.2`, `_code_mode` is private), `langchain>=1.4,<2`, `langchain-openai>=1.6,<2`, `langgraph-checkpoint-sqlite>=3.1,<4`, `polars[calamine]` (includes `fastexcel` for Excel reading in local and Docker kernels), `duckdb`, `typer`, `rich`, `keyring`; dev: `pytest`. Standard library for TOML, the marimo HTTP/SSE client, page fetching, logging, subprocess.
 
 ## 5. Data conventions (`periods.py`)
 

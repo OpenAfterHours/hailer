@@ -91,7 +91,7 @@ def _(DATA_DIR, WORKSPACE, data_files, describe_periods, mo, period_files, pl):
         _parts.append(
             mo.callout(
                 mo.md(
-                    "No data files yet. Put the files you want to analyse (CSV, Parquet or JSON, any "
+                    "No data files yet. Put the files you want to analyse (CSV, Parquet, JSON or Excel, any "
                     "name) in the data folder above, or run `uv run python scripts/make_sample_data.py` "
                     "for six months of synthetic sales data."
                 ),
