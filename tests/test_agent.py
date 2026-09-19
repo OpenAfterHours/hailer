@@ -8,6 +8,7 @@ import asyncio
 import signal
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -304,15 +305,32 @@ def test_system_prompt_names_the_notebooks_folder_not_the_notebook(tmp_path):
     assert str(cfg.notebook) not in text  # the active notebook changes mid-conversation; it must not be baked in
 
 
-def test_system_prompt_never_carries_a_marimo_token(tmp_path):
-    """The prompt goes to the model endpoint: the pinned URL is there, the server's token is not."""
-    from hailer.kernel import KernelState, write_kernel_state
+def test_nothing_the_model_sees_carries_the_marimo_token(tmp_path):
+    """The system prompt and every tool result go to the model endpoint. The agent is pinned to a
+    server that holds a token (what `hailer notebook` hands it), and its tool really talks to that
+    server with the token; the model sees the server's URL and never the token."""
+    from fake_marimo import serving
+    from hailer.models import MarimoServer
 
-    cfg = make_config(tmp_path, marimo_url="http://127.0.0.1:2718", marimo_token="user-marimo-token-123")
-    write_kernel_state(cfg.workspace, KernelState(runtime="local", url="http://127.0.0.1:2718", port=2718, token="kernel-token-456"))
-    text = system_prompt(cfg, ContextBundle())
-    assert "http://127.0.0.1:2718" in text
-    assert "user-marimo-token-123" not in text and "kernel-token-456" not in text and "access_token" not in text
+    secret = "kernel-token-never-for-the-model-456"
+    with serving(token=secret) as srv:
+        cfg = make_config(tmp_path, marimo_url=srv.url, marimo_token="user-marimo-token-123")
+        model = ScriptedModel(script=[call("marimo_status", {}), say("done")])
+        agent = HailerAgent(
+            cfg, ContextBundle(), model_factory=lambda provider, name, key: model, env=KEY_ENV,
+            server=MarimoServer(url=srv.url, source="kernel", token=secret),
+        )  # fmt: skip
+        try:
+            agent.start()
+            agent.run_turn("Is marimo up?")
+        finally:
+            agent.close()
+    seen = "\n".join(str(getattr(message, "content", message)) for batch in model.seen for message in batch)
+    assert f"marimo: running at {srv.url}" in seen, "the tool reached the pinned server (a missing token gets HTTP 401)"
+    assert "- Marimo URL: " + srv.url in seen, "the system prompt names the server"
+    assert secret not in seen and "user-marimo-token-123" not in seen and "access_token" not in seen
+    leaky = system_prompt(replace(cfg, marimo_url=f"{srv.url}/?access_token={secret}"), ContextBundle())
+    assert secret in leaky, "the check is sensitive: a signed-in URL in the prompt would carry the token"
 
 
 def test_system_prompt_folder_falls_back_to_the_notebook_parent(tmp_path):
@@ -347,7 +365,8 @@ def test_system_prompt_for_a_docker_kernel_gives_kernel_paths_and_its_limits(tmp
         "- Data directory: /work/data (read-only)\n"
         "- Marimo URL: http://127.0.0.1:2731\n"
     )
-    assert "No internet access from notebook code" in workspace and "/tmp is writable but wiped" in workspace
+    assert "No internet access from notebook code" in workspace
+    assert "/tmp is scratch space in memory, shared by every notebook in the container and wiped when the kernel stops" in workspace
     assert str(cfg.workspace) not in text and str(cfg.data_dir) not in text, "no host paths"
     assert "ctx.packages.add()" not in text, "never told to install packages"
     assert "user-marimo-token-123" not in text and "kernel-token-456" not in text and "access_token" not in text
@@ -356,7 +375,8 @@ def test_system_prompt_for_a_docker_kernel_gives_kernel_paths_and_its_limits(tmp
 def test_system_prompt_for_a_docker_kernel_with_network(tmp_path):
     cfg = make_config(tmp_path, kernel=KernelConfig(runtime="docker", network=True))
     text = system_prompt(cfg, ContextBundle())
-    assert "- Data directory: /work/data (read-only)" in text and "can reach the internet" in text
+    assert "- Data directory: /work/data (read-only)" in text
+    assert "the internet, and also services on the user's machine and in other containers" in text
 
 
 def test_packaged_prompt_covers_the_tools_the_agent_has():

@@ -10,8 +10,8 @@ workflow reuses it for the published multi-arch image, with the same arguments::
     # docker buildx build --platform linux/amd64,linux/arm64 --tag <image>
     #     --build-arg MARIMO_VERSION=... (one per entry of args) ctx
 
-Every ``docker`` call goes through a :class:`~hailer.kernel.DockerRunner`, so tests can check
-the argument lists without Docker.
+Every ``docker`` call goes through a :class:`~hailer.kernel_docker.DockerRunner`, so tests can
+check the argument lists without Docker.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ import importlib.metadata
 import importlib.resources
 import json
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -27,8 +28,8 @@ from typing import TYPE_CHECKING
 from hailer import __version__
 from hailer.models import KERNEL_IMAGE_REPOSITORY
 
-if TYPE_CHECKING:  # pragma: no cover - annotations only; hailer.kernel imports this module
-    from hailer.kernel import DockerRunner
+if TYPE_CHECKING:  # pragma: no cover - annotations only; hailer.kernel_docker imports this module
+    from hailer.kernel_docker import DockerRunner
 
 #: The image label that must equal ``hailer.__version__`` (a different marimo would break code mode).
 VERSION_LABEL = "org.opencontainers.image.version"
@@ -83,20 +84,19 @@ def build(tag: str, runner: DockerRunner) -> int:
     with tempfile.TemporaryDirectory(prefix="hailer-kernel-") as tmp:
         context = Path(tmp)
         args = prepare_context(context)
-        return runner.stream(build_command(tag, context, args))
+        return runner.stream(build_command(tag, context, args)).returncode
 
 
-def pull(image: str, runner: DockerRunner) -> int:
-    """Download ``image``, docker's progress in this terminal; the exit code."""
-    return runner.stream(["pull", image])
+def pull(image: str, runner: DockerRunner) -> subprocess.CompletedProcess[str]:
+    """Download ``image``, docker's progress in this terminal. The result's ``returncode`` is
+    docker's exit code and its ``stderr`` docker's last error lines (why a pull failed)."""
+    return runner.stream(["pull", image], keep_errors=True)
 
 
 def image_version(image: str, runner: DockerRunner) -> str | None:
     """The Hailer version ``image`` was built for (``""`` without the label); ``None`` when the image
     is not on this machine."""
-    result = runner.run(
-        ["image", "inspect", "--format", "{{json .Config.Labels}}", image], check=False, timeout=_IMAGE_TIMEOUT_SEC
-    )
+    result = runner.run(["image", "inspect", "--format", "{{json .Config.Labels}}", image], timeout=_IMAGE_TIMEOUT_SEC)
     if result.returncode != 0:
         return None
     try:

@@ -29,9 +29,18 @@ RUN test -n "$MARIMO_VERSION" && test -n "$POLARS_VERSION" && test -n "$DUCKDB_V
 
 COPY hailer/ /usr/local/lib/python3.12/site-packages/hailer/
 
-# An empty hailer.toml marks /work as the workspace, so the starter notebook finds
-# WORKSPACE = /work and DATA_DIR = /work/data without changes.
-RUN useradd --create-home --uid 1000 analyst && mkdir -p /work && touch /work/hailer.toml
+# /work is the kernel's working directory (read-only, like the rest of the image):
+# - .marimo.toml is marimo's user configuration (marimo looks in its working directory first):
+#   a notebook's cells run when it opens, so the starter notebook's globals (DATA_DIR,
+#   data_files, ...) are there before anyone runs a cell. marimo 0.24's editor takes this
+#   setting from the user configuration; a pyproject.toml [tool.marimo] section does not make it
+#   run the cells. The user's own marimo configuration is never mounted (it can hold API keys).
+# - An empty hailer.toml marks /work as the workspace, so the starter notebook finds
+#   WORKSPACE = /work and DATA_DIR = /work/data.
+RUN useradd --create-home --uid 1000 analyst \
+    && mkdir -p /work \
+    && printf '[runtime]\nauto_instantiate = true\n' > /work/.marimo.toml \
+    && touch /work/hailer.toml
 
 USER analyst
 WORKDIR /work

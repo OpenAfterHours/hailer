@@ -72,6 +72,8 @@ class MarimoServer:
     runtime: str = "local"
     #: Host <-> kernel paths; ``None`` means identity (the kernel sees the host's paths).
     paths: PathMap | None = None
+    #: Docker only: whether the kernel was started with ``[kernel] network = true``.
+    network_access: bool = False
 
 
 @dataclass(frozen=True)
@@ -179,9 +181,11 @@ class KernelConfig:
 
     runtime: str = KERNEL_RUNTIME_LOCAL  # one of VALID_KERNEL_RUNTIMES (validate() reports others)
     image: str | None = None  # None: the image for this Hailer version
-    memory: str = "4g"  # docker --memory format: <number>[b|k|m|g]
+    memory: str = "4g"  # docker --memory format: <number>[b|k|m|g], as written (any case)
     cpus: float = 2.0
     network: bool = False  # docker only: True puts the kernel on the default bridge network
+    #: Local only: environment variables the kernel gets even though their names look secret.
+    pass_env: tuple[str, ...] = ()
 
     @property
     def effective_image(self) -> str:

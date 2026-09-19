@@ -35,6 +35,7 @@ from hailer.models import (
     AgentEvent,
     ContextBundle,
     HailerConfig,
+    MarimoServer,
     ProviderConfig,
     SkillInfo,
     TurnSummary,
@@ -429,9 +430,12 @@ class HailerAgent:
         tools: list[Any] | None = None,
         env: Mapping[str, str] | None = None,
         threads_path: Path | None = None,
+        server: MarimoServer | None = None,
     ) -> None:
         self.config = config
         self._bundle = bundle
+        #: The marimo server the tools are pinned to (``hailer notebook``); ``None``: discovered per call.
+        self._server = server
         self._environ: Mapping[str, str] = env if env is not None else os.environ
         self._model_factory = model_factory
         self._tools = tools
@@ -528,7 +532,7 @@ class HailerAgent:
         if self._tools is None:
             from hailer.tools import hailer_tools
 
-            self._tools = hailer_tools(self.config)
+            self._tools = hailer_tools(self.config, server=self._server)
         middleware: list[Any] = []
         after = self.config.model.summarize_after_tokens
         if after > 0:

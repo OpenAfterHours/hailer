@@ -20,7 +20,7 @@ One module-scoped kernel serves every test: :class:`~hailer.kernel.DockerRuntime
 temporary workspace holding sample sales data, headless Chrome opens the notebook (marimo keeps the
 session after the browser exits), and the tests talk to it through
 :class:`~hailer.marimo_client.MarimoClient` with host paths, as the agent's tools do. The last test
-stops it and checks that nothing is left behind.
+stops it and checks that nothing is left behind (by the ids kernel.json records).
 """
 
 from __future__ import annotations
@@ -40,12 +40,8 @@ import pytest
 from hailer import __version__, kernel_image
 from hailer.config import load_config
 from hailer.errors import KernelRuntimeError
-from hailer.kernel import (
-    LABEL_WORKSPACE,
-    DockerKernel,
-    DockerRuntime,
-    kernel_state_path,
-)
+from hailer.kernel import kernel_state_path
+from hailer.kernel_docker import LABEL_WORKSPACE, DockerKernel, DockerRuntime
 from hailer.marimo_client import (
     MarimoClient,
     answers_with_token,
@@ -74,13 +70,6 @@ PREFERRED_PORT = 2791
 SESSION_TIMEOUT_SEC = 90.0
 SAVE_TIMEOUT_SEC = 30.0
 EXEC_TIMEOUT_SEC = 120.0
-
-RUN_ALL_CELLS_CODE = (
-    "import marimo._code_mode as cm\n"
-    "async with cm.get_context() as ctx:\n"
-    "    for cell in ctx.cells:\n"
-    "        ctx.run_cell(cell.id)\n"
-)
 
 _ROOT = Path(__file__).resolve().parents[1]
 _CHROME_NAMES = ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome")
@@ -248,7 +237,7 @@ def docker_kernel(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Kernel]:
             client = MarimoClient(
                 server.url, server.token, paths=server.paths, notebook=config.notebook, workspace=workspace, timeout=30
             )
-            chrome_proc = open_in_browser(chrome, open_notebook_url(server, config.notebook), scratch)
+            chrome_proc = open_in_browser(chrome, open_notebook_url(server, config.notebook, with_token=True), scratch)
             if wait_for_session(client, config.notebook, timeout=SESSION_TIMEOUT_SEC) is None:
                 tail = "\n".join(kernel.log_tail(30))
                 pytest.fail(f"no marimo session for {config.notebook.name} within {SESSION_TIMEOUT_SEC:.0f} s\n{tail}")
@@ -258,7 +247,7 @@ def docker_kernel(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Kernel]:
                 _end(chrome_proc)
             kernel.stop()
             try:
-                runtime.remove_leftovers()
+                runtime.remove_leftovers(running=True)
             except KernelRuntimeError:
                 pass
 
@@ -276,16 +265,15 @@ def test_notebook_code_runs_in_the_container_on_the_mounted_data(docker_kernel: 
     assert result.success, result.stderr
     assert result.stdout.split() == [str(SAMPLE_ROWS), "True"]
 
-    # The starter notebook runs in the kernel: hailer.periods is in the image, and WORKSPACE / DATA_DIR
-    # are the container's folders. Its cells are run here because marimo's default (the container has
-    # no user marimo config) does not run a notebook's cells when it opens.
-    result = docker_kernel.run(RUN_ALL_CELLS_CODE)
-    assert result.success, result.stderr
-
+    # The starter notebook ran when the browser opened it, without anyone running a cell (the image's
+    # /work/.marimo.toml turns marimo's auto_instantiate on): hailer.periods is in the image, and
+    # WORKSPACE / DATA_DIR are the container's folders, which is what the agent relies on.
     def started() -> bool:
-        return docker_kernel.run("print(DATA_DIR, len(period_files))").stdout.split() == ["/work/data", str(SAMPLE_MONTHS)]
+        return docker_kernel.run("print(DATA_DIR, len(data_files), len(period_files))").stdout.split() == [
+            "/work/data", str(SAMPLE_MONTHS), str(SAMPLE_MONTHS),
+        ]  # fmt: skip
 
-    assert _poll(started, 60), docker_kernel.run("print(DATA_DIR, len(period_files))").stderr + docker_kernel.diagnostics()
+    assert _poll(started, 60), docker_kernel.run("print(DATA_DIR)").stderr + docker_kernel.diagnostics()
 
 
 def test_a_code_mode_cell_is_saved_in_the_host_notebook(docker_kernel: Kernel):
@@ -344,10 +332,20 @@ def test_notebook_code_has_no_network(docker_kernel: Kernel):
 
 def test_host_secrets_are_not_in_the_kernel(docker_kernel: Kernel):
     assert os.environ.get(SECRET_NAME) == SECRET_VALUE, "set in Hailer's environment by the fixture"
-    result =docker_kernel.run("import os\nprint(sorted(os.environ))\nprint(repr(dict(os.environ)))")
+    result = docker_kernel.run("import os\nprint(sorted(os.environ))\nprint(repr(dict(os.environ)))")
     assert result.success, result.stderr
     assert SECRET_NAME not in result.stdout and SECRET_VALUE not in result.stdout
     assert docker_kernel.kernel.server.token not in result.stdout, "the server token is not in the kernel's environment"
+
+
+def test_the_record_holds_the_ids_docker_gave_the_kernel(docker_kernel: Kernel):
+    """Stopping removes by id, so an old handle can never remove a newer kernel with the same names."""
+    from hailer.kernel import read_kernel_state
+
+    state = read_kernel_state(docker_kernel.config.workspace)
+    assert state is not None and len(state.container_ids) == 2 and state.network_id
+    running = docker_kernel.docker("ps", "--no-trunc", "--format", "{{.ID}}")
+    assert all(ident in running for ident in state.container_ids), running
 
 
 def test_stop_leaves_no_containers_network_or_record(docker_kernel: Kernel):

@@ -46,6 +46,7 @@ def test_the_dockerfile_pins_the_base_image_and_runs_as_a_plain_user():
     assert "ARG BASE_IMAGE=python:3.12-slim@sha256:" in text and "FROM ${BASE_IMAGE}" in text
     assert "COPY hailer/ /usr/local/lib/python3.12/site-packages/hailer/" in text
     assert "useradd --create-home --uid 1000 analyst" in text and "touch /work/hailer.toml" in text
+    assert "> /work/.marimo.toml" in text and "auto_instantiate = true" in text, "a notebook's cells run when it opens"
     assert "USER analyst" in text and "WORKDIR /work" in text
     assert "org.opencontainers.image.version=${HAILER_VERSION}" in text
     for package in ("marimo", "polars", "duckdb", "altair", "plotly"):
@@ -59,11 +60,11 @@ def test_build_streams_docker_build_with_the_context_and_its_args():
         args: list[str] = []
         context_ready = False
 
-        def stream(self, args):
+        def stream(self, args, *, keep_errors=False):
             self.args = list(args)
             context = Path(args[-1])
             self.context_ready = (context / "Dockerfile").is_file() and (context / "hailer" / "_forward.py").is_file()
-            return 0
+            return subprocess.CompletedProcess(args, 0, None, "")
 
     recorder = Recorder()
     assert kernel_image.build("hailer-kernel:dev", recorder) == 0
@@ -81,14 +82,15 @@ class Runner:
         self.reply = reply
         self.calls: list[list[str]] = []
 
-    def run(self, args, *, input=None, timeout=None, check=True, capture=True):
+    def run(self, args, *, timeout=None, check=False):
         self.calls.append(list(args))
         code, out = self.reply
         return subprocess.CompletedProcess(args, code, out, "Error: No such image" if code else "")
 
-    def stream(self, args):
+    def stream(self, args, *, keep_errors=False):
         self.calls.append(list(args))
-        return 0
+        self.kept = keep_errors
+        return subprocess.CompletedProcess(args, 1, None, "denied" if keep_errors else "")
 
 
 def test_image_version_reads_the_label():
@@ -103,5 +105,6 @@ def test_image_version_reads_the_label():
 
 def test_pull_streams_docker_pull():
     runner = Runner()
-    assert kernel_image.pull("registry.example/hailer-kernel:0.2.5", runner) == 0
+    result = kernel_image.pull("registry.example/hailer-kernel:0.2.5", runner)
     assert runner.calls == [["pull", "registry.example/hailer-kernel:0.2.5"]]
+    assert runner.kept and (result.returncode, result.stderr) == (1, "denied"), "docker's error is kept to explain the failure"

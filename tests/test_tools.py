@@ -812,3 +812,74 @@ def test_session_wait_that_loses_marimo_is_reported_not_raised(ws):
     assert text.startswith("notebooks/other.py is now the active notebook.")
     assert "timed out" in text and "restart it" in text
     assert len(opener.urls) == 1
+
+
+# --------------------------------------------------------------------------- #
+# The server the chat is pinned to; the kernel the model works in
+# --------------------------------------------------------------------------- #
+
+
+def test_a_pinned_server_is_used_without_discovering_one(ws, monkeypatch):
+    """`hailer notebook` hands its chat the server it started: a kernel.json rewritten or removed
+    underneath (another terminal) cannot take its token and paths away."""
+    from hailer import marimo_client as mc
+    from hailer.kernel import docker_paths
+
+    config, analysis, other = ws
+    captured: dict = {}
+
+    class CapturingClient:
+        def __init__(self, base_url, token=None, **kw):
+            captured.update(base_url=base_url, token=token, **kw)
+
+    def no_discovery(config):
+        raise AssertionError("a pinned chat never discovers a server")
+
+    pinned = MarimoServer(url="http://127.0.0.1:2731", source="kernel", token="pinned-token", runtime="docker", paths=docker_paths(config))
+    monkeypatch.setattr(mc, "find_server", no_discovery)
+    monkeypatch.setattr(mc, "MarimoClient", CapturingClient)
+    _client, server = HailerTools(config, server=pinned)._default_client()
+    assert server is pinned and captured["base_url"] == pinned.url and captured["token"] == "pinned-token"
+    assert captured["paths"] is pinned.paths
+
+
+def test_hailer_tools_pins_every_tool_to_the_server(ws):
+    config, analysis, other = ws
+    pinned = MarimoServer(url="http://127.0.0.1:2731", source="kernel", token="t")
+    tools = hailer_tools(config, server=pinned)
+    status = next(t for t in tools if t.name == "marimo_status")
+    assert status.func.__self__.server is pinned
+
+
+def test_marimo_status_names_the_kernel_in_use_and_its_paths(ws):
+    """A chat whose kernel changed underneath (a docker kernel started in another terminal) still
+    gets the truth: the runtime and where notebook code finds the folders."""
+    from hailer.kernel import docker_paths
+
+    config, analysis, other = ws
+    client = FakeClient(open_paths={analysis})
+    docker = MarimoServer(url="http://127.0.0.1:2731", source="kernel", token="t", runtime="docker", paths=docker_paths(config), network_access=True)
+    text = HailerTools(config, lambda: (client, docker)).marimo_status()
+    assert "kernel: docker (hailer-kernel " in text and "network on: the internet and this machine" in text
+    assert "kernel paths: notebooks folder /work/notebooks (writable), data folder /work/data (read-only)" in text
+    local = HailerTools(config, factory_for(client)).marimo_status()
+    assert "kernel: local (runs as you; not isolated)" in local
+    assert f"kernel paths: notebooks folder {config.notebooks_root}, data folder {config.data_dir}" in local
+
+
+def test_notebook_open_and_close_accept_the_kernels_paths(ws):
+    """The model sees /work/notebooks/... in a docker kernel and may pass such a path back."""
+    from hailer.kernel import docker_paths
+
+    config, analysis, other = ws
+    client = FakeClient(open_paths={analysis, other})
+    docker = MarimoServer(url="http://127.0.0.1:2731", source="kernel", token="t", runtime="docker", paths=docker_paths(config))
+    tools = HailerTools(config, lambda: (client, docker), open_url=Opener(client), session_wait_sec=0)
+    text = tools.notebook_open("/work/notebooks/other.py")
+    assert text.startswith("notebooks/other.py is now the active notebook."), text
+    text = tools.notebook_close("/work/notebooks/other.py")
+    assert text.startswith("Closed the kernel session") and "notebooks/other.py" in text, text
+    text = tools.notebook_open("/work/data/sales.py")
+    assert text.startswith("ERROR:"), "a kernel path outside the notebooks folder is still refused"
+    local = HailerTools(config, factory_for(FakeClient(open_paths={analysis, other})), open_url=Opener(client), session_wait_sec=0)
+    assert local.notebook_open(str(other)).startswith("notebooks/other.py is now the active notebook."), "host paths as before"

@@ -11,6 +11,9 @@ The *active notebook* (the one every kernel tool acts on) lives in
 ``<workspace>/.hailer/notebook.json`` and is re-read on every call: both the model
 (``notebook_create`` / ``notebook_open``) and the CLI (``/notebook`` commands) may switch it.
 
+The marimo server is the one the chat was pinned to (``hailer notebook`` hands over the server it
+started or reused, kept in memory), else it is discovered anew on every call.
+
 Tool results go to the model endpoint, so they never carry the marimo server's token: URLs in
 them are token-free (the user gets a signed-in link from ``/notebook`` in the chat), while the
 browser Hailer opens itself gets the signed-in URL.
@@ -211,10 +214,13 @@ class HailerTools:
         config: HailerConfig,
         client_factory: ClientFactory | None = None,
         *,
+        server: MarimoServer | None = None,
         open_url: UrlOpener | None = None,
         session_wait_sec: float = DEFAULT_SESSION_WAIT_SEC,
     ) -> None:
         self.config = config
+        #: The server this chat is pinned to (``hailer notebook``); ``None``: discover it per call.
+        self.server = server
         self._client_factory = client_factory or self._default_client
         #: Opens a URL in the user's browser; injectable so tests never launch one.
         self.open_url: UrlOpener = open_url or _default_open_url
@@ -231,7 +237,7 @@ class HailerTools:
         from . import marimo_client as mc  # lazy
 
         config = self._active_config()
-        server = mc.find_server(config)
+        server = self.server if self.server is not None else mc.find_server(config)
         if server is None:
             cmd = " ".join(mc.launch_command())
             raise MarimoUnavailableError(
@@ -269,6 +275,45 @@ class HailerTools:
             return mc.open_notebook_url(server, notebook, with_token=with_token)
         except Exception:  # noqa: BLE001 - best effort
             return server.url
+
+    def _host_notebook(self, config: HailerConfig, ref: str) -> str:
+        """``ref`` as the host knows it: the model sees the kernel's paths (``/work/notebooks/...``
+        in a container) and may pass one back; anything else is returned unchanged."""
+        text = (ref or "").strip().strip("\"'").strip()
+        if not text.startswith("/"):
+            return ref
+        try:
+            _client, server = self._client_factory()
+            paths = server.paths
+        except HailerError:
+            paths = None
+        if paths is None and config.kernel.runtime == KERNEL_RUNTIME_DOCKER:
+            from .kernel import docker_paths  # lazy: keeps import-time coupling low
+
+            paths = docker_paths(config)
+        if paths is None or paths.identity:
+            return ref
+        host = paths.to_host(text)
+        return host if host is not None else ref
+
+    def _kernel_lines(self, server: MarimoServer) -> list[str]:
+        """Where notebook code runs and where it finds the folders, from the server in use (a chat
+        whose kernel changed underneath still gets the truth)."""
+        from .kernel import KERNEL_DATA_DIR, KERNEL_NOTEBOOKS_DIR, describe_runtime  # lazy
+
+        config = self.config
+        if server.runtime == KERNEL_RUNTIME_DOCKER:
+            kernel = dataclasses.replace(config.kernel, runtime=KERNEL_RUNTIME_DOCKER, network=server.network_access)
+            return [
+                f"kernel: {describe_runtime(kernel)}",
+                f"kernel paths: notebooks folder {KERNEL_NOTEBOOKS_DIR} (writable), data folder {KERNEL_DATA_DIR} "
+                "(read-only); use these in code",
+            ]
+        kernel = dataclasses.replace(config.kernel, runtime="local")
+        return [
+            f"kernel: {describe_runtime(kernel)}",
+            f"kernel paths: notebooks folder {config.notebooks_root}, data folder {config.data_dir}",
+        ]
 
     def _display(self, config: HailerConfig, path: Path) -> str:
         return notebooks.notebook_display_name(config, path)
@@ -395,6 +440,7 @@ class HailerTools:
                 # surface here as well as from the factory; the active notebook is named either way.
                 return f"marimo: not running\nactive notebook: {active_name}\n{err}\n{err.hint}".rstrip()
             lines = [f"marimo: running at {server.url}" + (f" (version {server.version})" if server.version else "")]
+            lines += self._kernel_lines(server)
             if active_session is not None:
                 lines.append(f"active notebook: {active_name} -> session {active_session.session_id} (ready)")
             else:
@@ -514,7 +560,7 @@ class HailerTools:
 
         def go() -> str:
             config = self._active_config()
-            path = notebooks.resolve_notebook(config, notebook)
+            path = notebooks.resolve_notebook(config, self._host_notebook(config, notebook))
             notebooks.save_active_notebook(config, path)
             display = self._display(config, path)
             outcome = self._bring_up(path)
@@ -539,7 +585,8 @@ class HailerTools:
 
         def go() -> str:
             config = self._active_config()
-            path = notebooks.resolve_notebook(config, notebook) if (notebook or "").strip() else config.notebook
+            ref = self._host_notebook(config, notebook) if (notebook or "").strip() else ""
+            path = notebooks.resolve_notebook(config, ref) if ref else config.notebook
             display = self._display(config, path)
             try:
                 client, _ = self._client_factory()
@@ -665,14 +712,16 @@ def _in_daemon_thread(fn: Callable[..., str]) -> Callable[..., Any]:
 def hailer_tools(
     config: HailerConfig,
     *,
+    server: MarimoServer | None = None,
     client_factory: ClientFactory | None = None,
     open_url: UrlOpener | None = None,
     session_wait_sec: float = DEFAULT_SESSION_WAIT_SEC,
 ) -> list[Any]:
-    """Hailer's tools as LangChain tools (``TOOL_NAMES`` order), bound to ``config``."""
+    """Hailer's tools as LangChain tools (``TOOL_NAMES`` order), bound to ``config`` (and pinned to
+    ``server`` when given)."""
     from langchain_core.tools import StructuredTool  # lazy: keeps `hailer --help` and friends fast
 
-    impl = HailerTools(config, client_factory, open_url=open_url, session_wait_sec=session_wait_sec)
+    impl = HailerTools(config, client_factory, server=server, open_url=open_url, session_wait_sec=session_wait_sec)
     out: list[Any] = []
     for name in TOOL_NAMES:
         method = getattr(impl, name)

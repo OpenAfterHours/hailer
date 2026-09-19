@@ -170,20 +170,51 @@ def _signed_in(server: MarimoServer, config: HailerConfig) -> MarimoServer:
 
 
 def _notebook_url(server: MarimoServer, config: HailerConfig) -> str:
-    """The active notebook's URL for the user (printed or opened here, never sent to the model)."""
+    """The active notebook's URL for the user (printed or opened here, never sent to the model);
+    marimo's home page when the kernel cannot see the notebook (:func:`_outside_kernel_note` says why)."""
+    from hailer.errors import NotebookPathError
     from hailer.marimo_client import open_notebook_url
 
-    return open_notebook_url(_signed_in(server, config), config.notebook, config.workspace)
+    try:
+        return open_notebook_url(_signed_in(server, config), config.notebook, config.workspace, with_token=True)
+    except NotebookPathError:
+        return _home_url(server, config)
+
+
+def _outside_kernel_note(server: MarimoServer, config: HailerConfig) -> str | None:
+    """Why the notebook's link is marimo's home page: the running (docker) kernel does not mount
+    the folder the notebook is in. ``None`` when the kernel sees it."""
+    paths = server.paths
+    if paths is None or paths.identity:
+        return None
+    try:
+        paths.to_kernel(config.notebook)
+    except ValueError:
+        return (
+            f"The running kernel cannot see {config.notebook}: it mounts other folders. The link opens marimo's "
+            "home page instead. Keep notebooks in the notebooks folder, or stop the kernel (uvx hailer kernel stop) "
+            "so the next start mounts the folders in hailer.toml."
+        )
+    return None
+
+
+def _notebook_link(console: Console, server: MarimoServer, config: HailerConfig) -> str:
+    """:func:`_notebook_url`, with a note printed when it had to fall back to the home page."""
+    note = _outside_kernel_note(server, config)
+    if note is not None:
+        console.print(note, style="yellow", markup=False)
+    return _notebook_url(server, config)
 
 
 def _home_url(server: MarimoServer, config: HailerConfig) -> str:
     from hailer.marimo_client import home_url
 
-    return home_url(_signed_in(server, config))
+    return home_url(_signed_in(server, config), with_token=True)
 
 
 def _runtime_for(config: HailerConfig) -> Any:
-    """The kernel runtime ``[kernel] runtime`` asks for (``KernelRuntimeError`` when it cannot be used)."""
+    """The kernel runtime ``[kernel] runtime`` asks for (``ConfigError`` for an unknown one). Nothing
+    is checked until its ``check``, ``prepare`` or ``start`` runs."""
     from hailer.kernel import runtime_for
 
     return runtime_for(config)
@@ -191,9 +222,23 @@ def _runtime_for(config: HailerConfig) -> Any:
 
 def _docker_runner() -> Any:
     """What ``hailer kernel ...`` runs ``docker`` with (the CLI on PATH)."""
-    from hailer.kernel import SubprocessDockerRunner
+    from hailer.kernel_docker import SubprocessDockerRunner
 
     return SubprocessDockerRunner()
+
+
+def _kernel_mismatch(config: HailerConfig, server: MarimoServer | None) -> list[str]:
+    """How the docker kernel ``server`` (found through ``.hailer/kernel.json``) was started
+    differently from what ``config`` asks for now; empty for any other server."""
+    if server is None or server.source != "kernel" or server.runtime != KERNEL_RUNTIME_DOCKER:
+        return []
+    from hailer.kernel import read_kernel_state
+    from hailer.kernel_docker import settings_mismatch
+
+    state = read_kernel_state(config.workspace)
+    if state is None or state.token != server.token:
+        return []
+    return settings_mismatch(state, config)
 
 
 def _docker_on_path() -> bool:
@@ -264,10 +309,11 @@ def _render_prompt(config: HailerConfig, name: str, args: str) -> str:
     return render_prompt(config, name, args)
 
 
-def _make_agent(config: HailerConfig, bundle: ContextBundle) -> Any:
+def _make_agent(config: HailerConfig, bundle: ContextBundle, server: MarimoServer | None = None) -> Any:
+    """The agent; ``server`` pins its tools to the server ``hailer notebook`` started or reused."""
     from hailer.agent import HailerAgent
 
-    return HailerAgent(config, bundle)
+    return HailerAgent(config, bundle, server=server)
 
 
 def _open_browser(url: str) -> None:
@@ -408,12 +454,18 @@ def _startup_panel(console: Console, config: HailerConfig) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _marimo_state(config: HailerConfig) -> tuple[MarimoServer | None, MarimoSession | None, HailerError | None]:
-    """(server, session, error) without raising."""
-    try:
-        server = _find_server(config)
-    except HailerError as err:
-        return None, None, err
+def _marimo_state(
+    config: HailerConfig, pinned: MarimoServer | None = None
+) -> tuple[MarimoServer | None, MarimoSession | None, HailerError | None]:
+    """(server, session, error) without raising. ``pinned``: the server this chat was started
+    with (``hailer notebook``), used instead of discovering one."""
+    if pinned is not None:
+        server: MarimoServer | None = pinned
+    else:
+        try:
+            server = _find_server(config)
+        except HailerError as err:
+            return None, None, err
     if server is None:
         return None, None, None
     try:
@@ -441,13 +493,17 @@ def _launch_hint() -> str:
     return launch_hint()
 
 
-def kernel_checks(config: HailerConfig) -> list[Check]:
+def kernel_checks(config: HailerConfig, *, starting: bool = False) -> list[Check]:
     """The kernel runtime's rows (``hailer doctor``, ``hailer notebook``); a runtime that cannot be
-    used is one failed ``kernel`` row."""
+    used is one failed ``kernel`` row. ``starting``: a start follows, which downloads a missing
+    image itself, so that warning is left out."""
     try:
-        return list(_runtime_for(config).check())
+        checks = list(_runtime_for(config).check())
     except HailerError as err:
         return [Check("kernel", False, str(err), hint=err.hint)]
+    if starting:
+        checks = [c for c in checks if not (c.name == "image" and not c.ok and not c.fatal)]
+    return checks
 
 
 def preflight(config: HailerConfig) -> list[Check]:
@@ -472,22 +528,33 @@ def marimo_checks(config: HailerConfig) -> list[Check]:
         else:
             url = _notebook_url(server, config)
             hint = err.hint if err is not None and err.hint else f"Open {url} in your browser."
-            checks.append(Check("session", False, "the notebook is not open in a browser", hint=hint, fatal=False))
+            note = _outside_kernel_note(server, config)
+            checks.append(Check("session", False, "the notebook is not open in a browser", hint=f"{note}\n{hint}" if note else hint, fatal=False))
     return checks
+
+
+CONFIG_FIX_HINT = "Fix hailer.toml (uvx hailer init writes a starter file and creates a missing notebook)."
+
+
+def _config_check(problems: list[str]) -> Check:
+    """The ``config`` row, each problem on a line of its own. Warnings make it a warning row, so
+    they show when a session starts too (a setting in the wrong table must not go unnoticed)."""
+    fatal = [p for p in problems if not p.lower().startswith("warning")]
+    warnings = [p for p in problems if p.lower().startswith("warning")]
+    if fatal:
+        summary = fatal[0] if len(fatal) == 1 else f"{len(fatal)} problems in the configuration:"
+        listed = [] if len(fatal) == 1 else [f"- {p}" for p in fatal]
+        return Check("config", False, summary, hint="\n".join([*listed, *warnings, CONFIG_FIX_HINT]), fatal=True)
+    if not warnings:
+        return Check("config", True, "ok", fatal=False)
+    if len(warnings) == 1:
+        return Check("config", False, warnings[0], fatal=False)
+    return Check("config", False, f"{len(warnings)} warnings:", hint="\n".join(f"- {w}" for w in warnings), fatal=False)
 
 
 def local_checks(config: HailerConfig) -> list[Check]:
     """Config, notebook and credential checks (everything except the marimo server)."""
-    checks: list[Check] = []
-
-    problems = _validate_config(config)
-    fatal = [p for p in problems if not p.lower().startswith("warning")]
-    warnings = [p for p in problems if p.lower().startswith("warning")]
-    if fatal:
-        checks.append(Check("config", False, "; ".join(fatal), hint="Fix hailer.toml (uvx hailer init writes a starter file and creates a missing notebook).", fatal=True))
-    else:
-        summary = "ok" if not warnings else "; ".join(warnings)
-        checks.append(Check("config", True, summary, fatal=False))
+    checks: list[Check] = [_config_check(_validate_config(config))]
 
     if config.notebook.exists():
         checks.append(Check("notebook", True, f"{_relative(config.notebook, config.workspace)} (active)"))
@@ -608,10 +675,16 @@ class _TurnDisplay:
 
 
 class ChatLoop:
-    def __init__(self, console: Console, config: HailerConfig, opts: CliOptions) -> None:
+    """The REPL. ``server`` pins the chat to the server ``hailer notebook`` started or reused: the
+    chat and the agent's tools keep its URL, token and paths in memory, so a ``kernel.json``
+    rewritten or removed underneath (another terminal) cannot take them away. Without it every
+    call discovers the server anew (chat-only ``uvx hailer`` follows a restarted kernel)."""
+
+    def __init__(self, console: Console, config: HailerConfig, opts: CliOptions, server: MarimoServer | None = None) -> None:
         self.console = console
         self.config = config
         self.opts = opts
+        self.server = server
         self.state: SessionState = load_session(config.workspace)
         self.bundle: ContextBundle = ContextBundle()
         self.agent: Any = None
@@ -624,7 +697,7 @@ class ChatLoop:
     def start(self) -> None:
         self.bundle = _load_context(self.config)
         self._print_context_warnings()
-        self.agent = _make_agent(self.config, self.bundle)
+        self.agent = _make_agent(self.config, self.bundle, self.server)
         resume = None if self.opts.new_thread else self.state.thread_id
         forget = self.state.thread_id if self.opts.new_thread else None  # --new: drop the stored conversation
         thread_id = self.agent.start(resume_thread_id=resume, forget_thread_id=forget)
@@ -728,9 +801,9 @@ class ChatLoop:
         name = notebooks.notebook_display_name(self.config, active)
         self.console.print(Text(f"Active notebook is now {name}.", style="dim"))
         if open_browser:
-            server, session, _err = _marimo_state(self.config)
+            server, session, _err = _marimo_state(self.config, self.server)
             if server is not None and session is None:
-                url = _notebook_url(server, self.config)
+                url = _notebook_link(self.console, server, self.config)
                 self.console.print(f"Opening {url} in your browser...", markup=False)
                 _open_browser(url)
         return True
@@ -776,7 +849,7 @@ class ChatLoop:
 
     def _status(self) -> None:
         self._sync_active_notebook(open_browser=False)  # a late tool call may have switched notebooks
-        server, session, _err = _marimo_state(self.config)
+        server, session, _err = _marimo_state(self.config, self.server)
         if server is None:
             marimo = "not running"
         elif session is None:
@@ -886,13 +959,13 @@ class ChatLoop:
         recent = [p for p in notebooks.load_recent(cfg) if not _same_file(p, cfg.notebook)]
         if recent:
             out.print("Recent:    " + ", ".join(self._display_name(p) for p in recent[:5]), markup=False)
-        server, session, _err = _marimo_state(cfg)
+        server, session, _err = _marimo_state(cfg, self.server)
         if server is None:
             out.print("Marimo:    not running", markup=False)
         else:
             state = f"session {session.session_id}" if session is not None else "not open in a browser"
             out.print(f"Marimo:    {server.url} ({state})", markup=False)
-            out.print(f"URL:       {_notebook_url(server, cfg)}", markup=False)
+            out.print(f"URL:       {_notebook_link(out, server, cfg)}", markup=False)
             out.print("View:      app view (results only); Ctrl+. in the notebook toggles the code editor", markup=False)
         out.print("Start everything in one go:  uvx hailer notebook", markup=False)
         out.print(f"Launch:    {' '.join(_launch_command())}", markup=False)
@@ -901,7 +974,7 @@ class ChatLoop:
     def _server_sessions(self) -> tuple[MarimoServer | None, Any, list[MarimoSession]]:
         """(server, client, open sessions); server is None when marimo is not running."""
         try:
-            server = _find_server(self.config)
+            server = self.server if self.server is not None else _find_server(self.config)
         except HailerError:
             return None, None, []
         if server is None:
@@ -1005,7 +1078,7 @@ class ChatLoop:
     def _ensure_session(self) -> tuple[MarimoSession | None, Any]:
         """Open the active notebook in the browser when it has no kernel session; (session, client)."""
         cfg = self.config
-        server, session, _err = _marimo_state(cfg)
+        server, session, _err = _marimo_state(cfg, self.server)
         if server is None:
             self.console.print("Marimo is not running; the notebook opens once it is (uvx hailer notebook).", markup=False)
             return None, None
@@ -1013,7 +1086,7 @@ class ChatLoop:
         if session is not None:
             self.console.print(f"Notebook is open (session {session.session_id}).", markup=False)
             return session, client
-        url = _notebook_url(server, cfg)
+        url = _notebook_link(self.console, server, cfg)
         self.console.print(f"Opening {url} in your browser...", markup=False)
         _open_browser(url)
         with self.console.status("Waiting for the notebook to open..."):
@@ -1108,10 +1181,14 @@ def run_chat(opts: CliOptions) -> None:
     _setup_logging(config, opts)
     requested = config
     # A docker kernel Hailer started for this workspace makes this session docker (see attach_runtime).
-    config = _attach_runtime(config, _discovered_server(config))
+    discovered = _discovered_server(config)
+    config = _attach_runtime(config, discovered)
     _startup_panel(console, config)
 
     checks = preflight(requested)  # the settings as written; the attached kernel is checked by marimo_checks
+    diffs = _kernel_mismatch(requested, discovered)
+    if diffs:
+        checks.append(_mismatch_check(diffs))
     _print_checks(console, checks, only_failures=True)
     if any(not c.ok and c.fatal for c in checks):
         raise typer.Exit(code=1)
@@ -1119,7 +1196,7 @@ def run_chat(opts: CliOptions) -> None:
     if session_check is not None and not session_check.ok:
         server, _s, _e = _marimo_state(config)
         if server is not None:
-            url = _notebook_url(server, config)
+            url = _notebook_link(console, server, config)
             console.print(f"Opening {url} in your browser...", markup=False)
             _open_browser(url)
             console.print(APP_VIEW_HINT, markup=False)
@@ -1129,9 +1206,21 @@ def run_chat(opts: CliOptions) -> None:
     _run_chat_loop(console, config, opts)
 
 
-def _run_chat_loop(console: Console, config: HailerConfig, opts: CliOptions) -> None:
-    """Start the agent and run the REPL; exit code 1 when the agent cannot start."""
-    loop = ChatLoop(console, config, opts)
+def _mismatch_check(diffs: list[str]) -> Check:
+    """A warning row: the kernel this chat attaches to was started with other settings."""
+    return Check(
+        "kernel",
+        False,
+        f"the running kernel was started with other settings ({'; '.join(diffs)}); the chat uses it as it is",
+        hint="uvx hailer kernel stop, then uvx hailer notebook, starts one with the settings in hailer.toml.",
+        fatal=False,
+    )
+
+
+def _run_chat_loop(console: Console, config: HailerConfig, opts: CliOptions, server: MarimoServer | None = None) -> None:
+    """Start the agent and run the REPL (pinned to ``server`` when given); exit code 1 when the
+    agent cannot start."""
+    loop = ChatLoop(console, config, opts, server)
     try:
         loop.start()
     except HailerError as err:
@@ -1211,10 +1300,19 @@ def _reusable_server(config: HailerConfig) -> tuple[MarimoServer, MarimoSession 
     (``.hailer/kernel.json``, verified with its token; any runtime ``find_server`` allows), the
     configured URL, or (local runtime) a live registry server that already has a kernel session for
     the active notebook or for another notebook in the notebooks folder (one server hosts them all).
-    Anything else gets a fresh server on its own port."""
+    Anything else gets a fresh server on its own port.
+
+    A docker kernel started with other settings (folders, network, image, memory, cpus) than
+    ``config`` asks for is refused with ``KernelRuntimeError``: attaching would silently ignore
+    hailer.toml."""
     server = _discovered_server(config)
     if server is None:
         return None
+    diffs = _kernel_mismatch(config, server)
+    if diffs:
+        from hailer.kernel_docker import mismatch_error
+
+        raise mismatch_error(diffs)
     client = _make_client(server, config)
     try:
         if not client.health():
@@ -1299,14 +1397,17 @@ def _run_foreground(console: Console, config: HailerConfig, runtime: Any, port: 
             _open_browser(home)
         else:
             console.print(f"Open {home} in your browser.", markup=False)
-        return running.wait()
+        code = running.wait()
+        if running.ended:
+            console.print(running.ended, style="yellow", markup=False)
+        return code
     finally:
         running.stop()
 
 
 def _wait_for_notebook(console: Console, config: HailerConfig, server: MarimoServer, *, open_browser: bool) -> None:
     client = _make_client(server, config)
-    url = _notebook_url(server, config)
+    url = _notebook_link(console, server, config)
     try:
         session = client.resolve_session(config.notebook)
     except HailerError:
@@ -1343,7 +1444,7 @@ def notebook(
     kernel: str | None = typer.Option(
         None,
         "--kernel",
-        help='Where notebook code runs for this run: "local" (as you) or "docker" (an isolated container). Default: [kernel] runtime.',
+        help='Where notebook code runs for this run: "local" (as you) or "docker" (an isolated container). Default: \\[kernel] runtime.',
         show_default=False,
     ),
 ) -> None:
@@ -1368,21 +1469,25 @@ def notebook(
                     "it, create another in the chat with /notebook new <name>, or fix [hailer].notebook in hailer.toml.",
                 )
             )
-        checks = kernel_checks(config)
+        checks = kernel_checks(config, starting=True)
         _print_checks(console, checks, only_failures=True)
         if any(not c.ok and c.fatal for c in checks):
             raise typer.Exit(code=1)
         runtime = _runtime_for(config)
         raise typer.Exit(code=_run_foreground(console, config, runtime, port, open_browser=not no_browser, verbose=opts.verbose))
 
-    checks = local_checks(config) + kernel_checks(config)
+    checks = local_checks(config) + kernel_checks(config, starting=True)
     _print_checks(console, checks, only_failures=True)
     if any(not c.ok and c.fatal for c in checks):
         raise typer.Exit(code=1)
     config.notebooks_root.mkdir(parents=True, exist_ok=True)  # marimo edit refuses a missing folder
 
     running: Any = None
-    reusable = _reusable_server(config)
+    try:
+        reusable = _reusable_server(config)
+    except HailerError as err:  # a kernel started with other settings
+        _print_error(console, err, verbose=opts.verbose)
+        raise typer.Exit(code=1)
     if reusable is not None:
         server, _session = reusable
         console.print(f"Using the running marimo at {server.url}.", markup=False)
@@ -1390,15 +1495,15 @@ def notebook(
     else:
         running = _start_kernel(console, _runtime_for(config), port, verbose=opts.verbose)
         server = running.server
-    # Pin the chat to this server so registry discovery cannot pick another one; find_server gives it
-    # its token and path map back from .hailer/kernel.json.
+    # The chat and the agent's tools keep this server (URL, token, paths) in memory: a kernel.json
+    # rewritten or removed underneath cannot take it away. marimo_url names it in the prompt.
     config = replace(config, marimo_url=server.url)
 
     try:
         _wait_for_notebook(console, config, server, open_browser=not no_browser)
         console.print()
         _startup_panel(console, config)
-        _run_chat_loop(console, config, opts)
+        _run_chat_loop(console, config, opts, server)
     finally:
         if running is not None:
             if keep_marimo:
@@ -1503,7 +1608,15 @@ def doctor(ctx: typer.Context) -> None:
     opts = _opts(ctx)
     console = console_factory()
     config = _config_or_exit(console, opts)
-    checks = local_checks(config) + kernel_checks(config) + marimo_checks(config)
+    # Like status: a docker kernel Hailer started for this workspace is the kernel in use.
+    discovered = _discovered_server(config)
+    attached = _attach_runtime(config, discovered)
+    checks = local_checks(config) + kernel_checks(attached)
+    diffs = _kernel_mismatch(config, discovered)
+    if diffs:
+        checks.append(_mismatch_check(diffs))
+    checks += marimo_checks(attached)
+    config = attached
     table = Table(title="Hailer doctor", show_lines=False)
     table.add_column("Check")
     table.add_column("Result")
@@ -1554,14 +1667,14 @@ app.add_typer(kernel_app, name="kernel")
 
 
 def _docker_runtime(config: HailerConfig) -> Any:
-    from hailer.kernel import DockerRuntime
+    from hailer.kernel_docker import DockerRuntime
 
     return DockerRuntime(config, runner=_docker_runner())
 
 
 @kernel_app.command("pull")
 def kernel_pull(ctx: typer.Context) -> None:
-    """Download the kernel image for this Hailer version ([kernel].image) ahead of the first start."""
+    """Download the kernel image for this Hailer version (or \\[kernel].image) ahead of the first start."""
     opts = _opts(ctx)
     console = console_factory()
     config = _config_or_exit(console, opts)
@@ -1580,7 +1693,7 @@ def kernel_build(
     tag: str | None = typer.Option(
         None,
         "--tag",
-        help="Name and tag for the image (default: [kernel].image, else ghcr.io/openafterhours/hailer-kernel:<version>).",
+        help="Name and tag for the image (default: \\[kernel].image, else ghcr.io/openafterhours/hailer-kernel:<version>).",
         show_default=False,
     ),
 ) -> None:
@@ -1618,18 +1731,22 @@ def kernel_build(
 @kernel_app.command("stop")
 def kernel_stop(ctx: typer.Context) -> None:
     """Stop this workspace's kernel (local or docker) and remove its Docker containers and network."""
-    from hailer.kernel import stop_workspace_kernels
+    from hailer.kernel_docker import stop_workspace_kernels
 
     opts = _opts(ctx)
     console = console_factory()
     config = _config_or_exit(console, opts)
     try:
-        done = stop_workspace_kernels(config, runner=_docker_runner())
+        report = stop_workspace_kernels(config, runner=_docker_runner())
     except HailerError as err:
         _print_error(console, err, verbose=opts.verbose)
         raise typer.Exit(code=1)
-    for line in done or ["No kernel is running for this workspace."]:
+    for line in report.done or ([] if report.failed else ["No kernel is running for this workspace."]):
         console.print(line, markup=False)
+    for line in report.failed:
+        console.print(line, style="red", markup=False)
+    if report.failed:
+        raise typer.Exit(code=1)
 
 
 def _provider_for(config: HailerConfig, provider_id: str) -> ProviderConfig:
@@ -1744,7 +1861,7 @@ def init(
     kernel: str | None = typer.Option(
         None,
         "--kernel",
-        help='Write [kernel] runtime = "local" or "docker" into hailer.toml (docker: notebook code runs in an isolated container).',
+        help='Write \\[kernel] runtime = "local" or "docker" into hailer.toml (docker: notebook code runs in an isolated container).',
         show_default=False,
     ),
 ) -> None:
@@ -1796,10 +1913,12 @@ def init(
 
     config = _init_notebook_and_data(console, workspace, config_path, verbose=opts.verbose)
     runtime = config.kernel.runtime if config is not None else (choice or "local")
-    if choice is not None and config is not None and runtime != choice:
+    kept = choice is not None and config is not None and runtime != choice
+    if kept:
         console.print(
             f'hailer.toml was kept, so [kernel] runtime is still "{runtime}". To change it, set '
-            f'runtime = "{choice}" under [kernel] in hailer.toml.',
+            f'runtime = "{choice}" under [kernel] in hailer.toml (uncomment the [kernel] line too), or run '
+            f"uvx hailer init --kernel {choice} --force to rewrite the file.",
             markup=False,
         )
     provider = config.model.provider if config is not None else "<provider>"
@@ -1813,25 +1932,28 @@ def init(
         '     then ask, for example: "what is in my data?" or "chart revenue by month"',
         markup=False,
     )
-    for line in _kernel_next_steps(runtime):
+    for line in _kernel_next_steps(runtime, kept=kept):
         console.print(line, markup=False)
 
 
-def _kernel_next_steps(runtime: str) -> list[str]:
-    """What ``init`` adds to the next steps about where notebook code runs."""
+def _kernel_next_steps(runtime: str, *, kept: bool = False) -> list[str]:
+    """What ``init`` adds to the next steps about where notebook code runs (nothing more after the
+    "hailer.toml was kept" advice, which already says how to switch)."""
     docker_found = _docker_on_path()
     if runtime == KERNEL_RUNTIME_DOCKER:
         lines = [
             "\nNotebook code runs in a Docker container (no network; the data folder is read-only).",
-            "The first uvx hailer notebook downloads the kernel image; uvx hailer kernel pull does it now.",
+            "The first uvx hailer notebook downloads the kernel image (uvx hailer kernel pull does it now); where "
+            "it cannot be downloaded, uvx hailer kernel build builds it on this machine.",
         ]
         if not docker_found:
             lines.append("Docker was not found on this machine: install Docker Desktop (or Docker Engine) first.")
         return lines
-    if docker_found:
+    if docker_found and not kept:
         return [
-            '\nOptional: to isolate notebook code in a container, set runtime = "docker" under [kernel] in '
-            "hailer.toml (Docker was found on this machine)."
+            "\nOptional: to isolate notebook code in a container (Docker was found on this machine), uncomment the "
+            '[kernel] and runtime lines in hailer.toml and set runtime = "docker", or try it once with '
+            "uvx hailer notebook --kernel docker."
         ]
     return []
 

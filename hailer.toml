@@ -48,11 +48,13 @@ provider = "openai"                  # "openai" = api.openai.com with OPENAI_API
 # Where notebook code runs. "local" (the default): marimo runs in Hailer's own Python, as you,
 # with your files and network (not isolated). "docker": marimo runs in a container that sees only
 # the notebooks folder and, read-only, the data folder, with no network; it needs Docker Desktop
-# or Docker Engine. HAILER_KERNEL overrides runtime for one run.
+# or Docker Engine. HAILER_KERNEL overrides runtime for one run. To switch it on, uncomment both
+# the section line, [kernel], and the settings under it.
 #
 # [kernel]
 # runtime = "local"                  # "local" or "docker"
 # image   = ""                       # docker: default ghcr.io/openafterhours/hailer-kernel:<hailer version>
-# memory  = "4g"                     # docker: container memory limit
+# memory  = "4g"                     # docker: container memory limit (no swap on top)
 # cpus    = 2                        # docker: container CPU limit
-# network = false                    # docker: true lets notebook code reach the internet
+# network = false                    # docker: true lets notebook code reach the internet and this machine
+# pass_env = []                      # local: variables with secret-looking names notebook code may read

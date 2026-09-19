@@ -7,134 +7,28 @@ import os
 import socket
 import threading
 from dataclasses import replace
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote
 
 import pytest
 
+from fake_marimo import FakeMarimo
 from hailer import marimo_client as mc
 from hailer.errors import MarimoExecutionError, MarimoUnavailableError, NoSessionError, NotebookPathError
 from hailer.models import HailerConfig, KernelConfig, MarimoServer, MarimoSession
 
 # --------------------------------------------------------------------------- #
-# Fake server
+# Fake server (tests/fake_marimo.py)
 # --------------------------------------------------------------------------- #
-
-
-def _sse(events: list[tuple[str, dict]], newline: str = "\n") -> bytes:
-    return "".join(f"event: {name}{newline}data: {json.dumps(data)}{newline}{newline}" for name, data in events).encode()
-
-
-class _Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def log_message(self, *args):  # noqa: D401 - silence
-        pass
-
-    def _send(self, code: int, body: bytes, ctype: str = "application/json") -> None:
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _authorised(self) -> bool:
-        srv = self.server
-        if not srv.token:
-            return True
-        return self.headers.get("Authorization") == f"Bearer {srv.token}"
-
-    def do_GET(self):
-        if self.path == "/health":
-            self._send(200, b'{"status":"healthy"}')
-        elif self.path == "/":
-            self.server.page_hits += 1
-            if self.server.mode == "no_token_tag":
-                self._send(200, b"<html><body>not marimo</body></html>", "text/html")
-                return
-            html = f'<html><head><marimo-server-token data-token="{self.server.server_token}"></marimo-server-token></head></html>'
-            self._send(200, html.encode(), "text/html")
-        elif self.path == "/api/sessions":
-            if not self._authorised():
-                self._send(401, b'{"detail":"unauthorised"}')
-                return
-            if self.server.mode == "sessions_500":
-                self._send(500, b'{"detail":"kernel manager exploded"}')
-                return
-            self._send(200, json.dumps(self.server.sessions).encode())
-        else:
-            self._send(404, b"")
-
-    def do_POST(self):
-        n = int(self.headers.get("Content-Length") or 0)
-        body = self.rfile.read(n) if n else b""
-        self.server.requests.append({"path": self.path, "headers": dict(self.headers.items()), "body": json.loads(body or b"{}")})
-        if not self._authorised():
-            self._send(401, b'{"detail":"unauthorised"}')
-            return
-        if self.path == "/api/home/shutdown_session":
-            # every POST except /api/kernel/execute needs the skew-protection token
-            if self.headers.get("Marimo-Server-Token") != self.server.server_token or self.server.mode == "stale_token":
-                self._send(401, b'{"error":"Invalid server token"}')
-                return
-            sid = self.server.requests[-1]["body"].get("sessionId")
-            if sid not in self.server.sessions:
-                self._send(500, b'{"detail":"Session not found"}')
-                return
-            del self.server.sessions[sid]
-            self._send(200, b'{"files":[]}')
-            return
-        if self.path != "/api/kernel/execute":
-            self._send(404, b"")
-            return
-        mode = self.server.mode
-        if mode == "json_error":
-            self._send(400, b'{"detail":"Session not found: stale"}')
-            return
-        if mode == "plain_json_200":
-            self._send(200, b'{"detail":"not a stream"}')
-            return
-        newline = "\r\n" if mode == "crlf" else "\n"
-        events: list[tuple[str, dict]]
-        if mode in ("success", "crlf"):
-            events = [("stdout", {"data": "hello "}), ("stdout", {"data": "world\n"}), ("done", {"success": True, "output": {"mimetype": "text/plain", "data": "42"}})]
-        elif mode == "stderr":
-            events = [("stderr", {"data": "Traceback: boom\n"}), ("done", {"success": False, "output": {"mimetype": "text/plain", "data": ""}})]
-        elif mode == "nodone":
-            events = [("stdout", {"data": "partial"})]
-        else:
-            raise AssertionError(mode)
-        self._send(200, _sse(events, newline), "text/event-stream")
-
-
-class FakeMarimo(ThreadingHTTPServer):
-    daemon_threads = True
-
-    def __init__(self):
-        super().__init__(("127.0.0.1", 0), _Handler)
-        self.sessions: dict[str, dict] = {}
-        self.mode = "success"
-        self.token: str | None = None
-        self.server_token = "skew-token-123"
-        self.page_hits = 0
-        self.requests: list[dict] = []
-
-    @property
-    def url(self) -> str:
-        return f"http://127.0.0.1:{self.server_address[1]}"
 
 
 @pytest.fixture
 def fake():
-    srv = FakeMarimo()
-    thread = threading.Thread(target=srv.serve_forever, daemon=True)
-    thread.start()
+    srv = FakeMarimo().start()
     try:
         yield srv
     finally:
-        srv.shutdown()
-        srv.server_close()
+        srv.stop()
 
 
 def _free_port() -> int:
@@ -598,14 +492,15 @@ def test_marimo_server_command_without_headless_lets_marimo_open_the_browser(tmp
 
 
 def test_open_notebook_url_signs_in_only_when_asked(tmp_path):
+    """Fail safe: the token is only added on request (a URL the user opens), never by default."""
     nb = tmp_path / "notebooks" / "analysis.py"
     plain = mc.open_notebook_url(MarimoServer(url="http://127.0.0.1:2718"), nb)
     server = MarimoServer(url="http://127.0.0.1:2718", token="t0k/en+=")
-    assert mc.open_notebook_url(server, nb) == f"{plain}&access_token=t0k%2Fen%2B%3D"
-    assert mc.open_notebook_url(server, nb, with_token=False) == plain
-    assert mc.open_notebook_url(server, nb, view="edit").endswith("&access_token=t0k%2Fen%2B%3D")
-    assert mc.home_url(server) == "http://127.0.0.1:2718/?access_token=t0k%2Fen%2B%3D"
-    assert mc.home_url(server, with_token=False) == mc.home_url(MarimoServer(url="http://127.0.0.1:2718/")) == "http://127.0.0.1:2718/"
+    assert mc.open_notebook_url(server, nb) == plain, "no token unless asked"
+    assert mc.open_notebook_url(server, nb, with_token=True) == f"{plain}&access_token=t0k%2Fen%2B%3D"
+    assert mc.open_notebook_url(server, nb, view="edit", with_token=True).endswith("&access_token=t0k%2Fen%2B%3D")
+    assert mc.home_url(server) == mc.home_url(MarimoServer(url="http://127.0.0.1:2718/")) == "http://127.0.0.1:2718/"
+    assert mc.home_url(server, with_token=True) == "http://127.0.0.1:2718/?access_token=t0k%2Fen%2B%3D"
 
 
 def test_server_token_is_not_in_its_repr():
@@ -709,24 +604,43 @@ def _registry_with(tmp_path: Path, fake) -> Path:
 def test_find_server_prefers_the_server_hailer_started_over_the_registry(fake, tmp_path):
     fake.token = "right-token"
     _record(tmp_path, fake.url, pid=4242)
-    other = FakeMarimo()  # a --no-token server of the user's own, in the registry
-    threading.Thread(target=other.serve_forever, daemon=True).start()
+    other = FakeMarimo().start()  # a --no-token server of the user's own, in the registry
     try:
         server = mc.find_server(_kernel_cfg(tmp_path), registry=_registry_with(tmp_path, other))
     finally:
-        other.shutdown()
-        other.server_close()
+        other.stop()
     assert server is not None and server.url == fake.url
     assert (server.source, server.token, server.runtime, server.pid, server.paths) == ("kernel", "right-token", "local", 4242, None)
 
 
 def test_find_server_ignores_a_record_whose_server_is_gone_or_not_ours(fake, tmp_path):
+    from hailer.kernel import read_kernel_state
+
     reg = _registry_with(tmp_path, fake)
     _record(tmp_path, f"http://127.0.0.1:{_free_port()}")  # stale: nothing listens there
     assert mc.find_server(_kernel_cfg(tmp_path), registry=reg).source == "registry"
+    assert read_kernel_state(tmp_path) is not None, "no pid: it cannot be proven dead, so it is kept"
     _record(tmp_path, fake.url)  # the port now belongs to a --no-token server: not the one recorded
     server = mc.find_server(_kernel_cfg(tmp_path), registry=reg)
     assert server.source == "registry" and server.token is None
+
+
+def test_find_server_drops_a_record_whose_process_is_gone(tmp_path, monkeypatch):
+    """A stale record would cost a health check (about a second on Windows) on every tool call."""
+    from hailer import kernel
+    from hailer.kernel import read_kernel_state
+
+    probes: list[str] = []
+    monkeypatch.setattr(kernel, "answers_with_token", lambda url, token, timeout=1.0: probes.append(url) or False)
+    monkeypatch.setattr(kernel, "process_running", lambda pid: {77: False, 78: None}.get(pid, True))
+    _record(tmp_path, "http://127.0.0.1:9", pid=78)  # the OS cannot say: kept
+    assert mc.find_server(_kernel_cfg(tmp_path), registry=tmp_path / "none") is None
+    assert read_kernel_state(tmp_path) is not None
+    _record(tmp_path, "http://127.0.0.1:9", pid=77)
+    assert mc.find_server(_kernel_cfg(tmp_path), registry=tmp_path / "none") is None
+    assert read_kernel_state(tmp_path) is None, "its process is gone: deleted"
+    assert mc.find_server(_kernel_cfg(tmp_path), registry=tmp_path / "none") is None
+    assert len(probes) == 2, "the next call does not probe again"
 
 
 def test_find_server_marimo_url_takes_the_records_token_and_paths(tmp_path):
