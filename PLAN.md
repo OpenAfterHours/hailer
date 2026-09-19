@@ -1,5 +1,90 @@
 # Hailer: implementation plan
 
+## 2026-09-19: the notebook kernel can run in Docker
+
+Where marimo and its kernel run is now a setting, `[kernel] runtime`: `local` (the default, as before) or
+`docker`, a Linux container that sees only the notebooks folder (read-write) and the data folder
+(read-only), with no network and none of the host's environment. The agent, the conversation and the API
+key stay in the Hailer process either way. Built on branch `worktree-docker-kernel`; the design, the spikes
+behind it and where the build departs from it are in `docs/DOCKER_KERNEL_PLAN.md`.
+
+Why:
+
+- `marimo_execute` runs the model's Python in the kernel, and a local kernel runs as the user, with the
+  user's files, network and environment. The prompt's rules were the only thing between a bad turn and the
+  user's files. Docker gives users who have it a boundary that is enforced, without changing how Hailer is
+  used.
+- The local runtime had avoidable gaps of its own: servers Hailer started had no token, so any local
+  program could POST code to `/api/kernel/execute` (it skips marimo's skew check), and the kernel inherited
+  every API key in Hailer's environment.
+
+What changed for everyone (the local runtime):
+
+- Servers Hailer starts get a random token, passed with `--token-password-file -` on stdin, never on a
+  command line. It is recorded in `.hailer/kernel.json` so chat-only `hailer`, `hailer exec` and a second
+  `hailer notebook` can attach. Links Hailer opens or prints carry `access_token`; tool results and the
+  system prompt never do.
+- The marimo server's environment withholds provider keys, `env_http_headers` variables,
+  `HAILER_MARIMO_TOKEN` and secret-looking names; `[kernel] pass_env` lets named ones through.
+- `.hailer/marimo.log` is emptied at each start (owner-only on POSIX); log tails Hailer prints mask the token.
+- A `Kernel:` line in the startup panel, `status`, `/status` and `doctor`; `uvx hailer kernel stop` stops a
+  kept server of either runtime.
+
+What users must do: nothing, to keep working as before. A notebook that reads a secret-looking variable
+needs `[kernel] pass_env`. A marimo server started by hand with `--no-token` still works in the local
+runtime. A notebook URL without the token (one the agent quoted) shows marimo's sign-in page; `/notebook`
+prints the signed-in link. Docker mode is opt-in: `uvx hailer init --kernel docker`, `[kernel] runtime =
+"docker"`, `HAILER_KERNEL=docker` or `uvx hailer notebook --kernel docker`.
+
+Verified:
+
+- Live on Windows 11 with marimo 0.24.2 (local runtime): unauthenticated `/api/kernel/execute` and
+  `/api/sessions` get 401, `Authorization: Bearer` works, the signed URL opens a session in headless
+  Chrome, notebook code sees no `*_KEY` / `*_TOKEN` variable, and a second terminal attaches through
+  `kernel.json`.
+- Live on Windows 11 with Docker Desktop 29.4.3 (docker runtime): `hailer kernel build`, `doctor`, a start
+  in 4.3 s with the image present, a notebook session through the forwarder, `WORKSPACE = /work` and
+  `DATA_DIR = /work/data` in the starter notebook, data writes and the network refused, cells saved to the
+  host file, and `hailer kernel stop` leaving nothing behind.
+- `tests/test_docker_integration.py` (real containers, headless Chrome) passes 7/7 with
+  `HAILER_DOCKER_TESTS=strict` on Windows with Docker Desktop 29.4.3 and in WSL Ubuntu. The offline suite:
+  698 passed, 9 skipped on Windows; 697 and 10 on WSL Ubuntu. actionlint is clean on both workflows.
+- Three adversarial reviews (security, lifecycle, UX) followed the first build; every confirmed finding was
+  fixed, and the high ones were re-proven live after the fix (commit d98f5ec).
+- 2026-09-19, with the real CLI in throwaway workspaces (the docs pass): `init --kernel docker`, `doctor`
+  in both runtimes, `notebook --foreground` in docker mode, reuse refused after `memory` changed
+  (`The running kernel was started with other settings (memory 4g, hailer.toml: 2g).`), the chat-only
+  warning for the same, the start guard over a running kernel, `kernel stop` for a docker and a local
+  kernel, the local-after-docker warning, a refused layout (`notebooks_dir = "."`), the misplaced
+  `[model].runtime` warning and a missing image tag (`kernel pull` of an unpublished tag: GHCR answers
+  `denied`, Hailer reports it as not published). The image is 195 MB to download and 875 MB on disk
+  (amd64).
+
+Findings that shaped the build (beyond the plan's spikes):
+
+- **A record must prove it is still ours.** A port can be reused by another server, and a `--no-token`
+  server accepts any token. `answers_with_token` requires `/api/sessions` to refuse the request without
+  the token and accept it with it; `live_kernel_state` is the one liveness check every caller uses, and it
+  deletes a record only when its process or container is provably gone.
+- **Remove by id, never by name.** Container names are fixed per workspace, so an old handle (a chat
+  started before a restart) removing by name could destroy a newer kernel. `kernel.json` records the ids
+  Docker printed, and a start never removes a *running* kernel container it has no record of.
+- **The mounts are part of the boundary.** A notebooks folder equal to the workspace let notebook code
+  rewrite `hailer.toml` back to `local`; the layout rules in `config.docker_mount_problems` refuse that and
+  the similar cases (home folder, drive root, `.hailer`, the config file, context, skills, prompts).
+- **marimo 0.24's edit page ignores `[tool.marimo]` in a project `pyproject.toml` for auto-run;** it reads
+  the user configuration, first in its working directory. The image writes `/work/.marimo.toml`
+  (`auto_instantiate = true`), so the starter notebook's globals exist when the browser opens it.
+- **The chat keeps its server in memory.** `hailer notebook` hands the chat and the tools the server it
+  started, so a `kernel.json` rewritten by another terminal cannot redirect them; chat-only `hailer`
+  rediscovers on every call and follows a restarted kernel.
+
+Still owed: read time for a large Parquet file through a Windows bind mount compared with a local read; the
+`linux/arm64` image (checked by wheel availability only; the first release builds it, and stops before
+PyPI if that fails); the first pull from GHCR, and one through a corporate proxy or registry mirror; macOS;
+a real mapped network drive. After the first release the GHCR package must be made public once (README,
+*Releasing*). Podman is out of scope.
+
 ## 2026-09-18: the agent moves from the Codex SDK to LangChain
 
 The agent is now `langchain.agents.create_agent` with `langchain_openai.ChatOpenAI`, running inside the Hailer
@@ -62,7 +147,8 @@ The user (or the agent) can create new notebooks and reopen old ones without lea
 ## Status
 
 All milestones M0 to M7 are implemented in this repository (`https://github.com/OpenAfterHours/hailer`); the
-agent path (M2, M3) was rebuilt on LangChain on 2026-09-18. The offline test suite (`uv run pytest`) needs no
+agent path (M2, M3) was rebuilt on LangChain on 2026-09-18, and the kernel runtimes (local with a token,
+docker) were added on 2026-09-19 (see the section above). The offline test suite (`uv run pytest`) needs no
 API key, no marimo and no network beyond loopback. The new agent was verified live on 2026-09-18 with the
 real CLI, a running marimo server and a kernel session (§1a has the details): a custom Chat Completions
 endpoint, resume after a restart, and one `gpt-5.5` turn over the Responses API with a real key. A physical
@@ -223,7 +309,9 @@ Later options (not v1): per-domain auth headers from keyring for internal wikis 
 
 ## 2. Architecture
 
-One Python process holds the CLI, the agent loop and the tools. marimo is the only other process.
+One Python process holds the CLI, the agent loop and the tools. marimo is the only other process: a child
+of Hailer in the local runtime, or a container (plus a forwarder container) in the docker runtime
+(`hailer.kernel`, `hailer.kernel_docker`).
 
 ```
 Terminal  (Typer + Rich)                                   cli.py / session.py
@@ -238,10 +326,13 @@ tools.py   marimo_execute, marimo_status, notebook_cells, notebook_list,
     │      notebook_create, notebook_open, notebook_close, list_periods,
     │      load_skill, read_skill_file, fetch_page (allow-listed domains only)
     ▼
-marimo_client.py  (pure-Python HTTP + SSE)
+marimo_client.py  (pure-Python HTTP + SSE; Bearer token; host <-> kernel paths via kernel.PathMap)
     │
     ▼
-marimo edit notebooks --no-token   (live kernel; the folder since 2026-09-16)
+marimo edit notebooks   (live kernel on the folder; a token since 2026-09-19)
+    local:  Hailer's own Python, token on stdin, secrets withheld from its environment
+    docker: hailer-kernel-<id> on an internal network, reached through hailer-fwd-<id> on 127.0.0.1;
+            /work/notebooks read-write, /work/data read-only, no network
     scratchpad  +  marimo._code_mode  →  Polars / DuckDB / charts
     │
     ▼
@@ -318,7 +409,7 @@ How each part is wired:
   wire_api = "responses"                     # or "chat"
   env_key  = "INTERNAL_MODEL_API_KEY"
   ```
-  Env overrides: `HAILER_MODEL`, `HAILER_MODEL_PROVIDER`, `HAILER_NOTEBOOK`, `HAILER_NOTEBOOKS_DIR`, `HAILER_DATA_DIR`, `HAILER_MARIMO_URL`, `HAILER_LOG_LEVEL`, `HAILER_CONFIG`, `HAILER_WORKSPACE`; `HAILER_MARIMO_TOKEN` and `HAILER_TRACING` exist only as environment variables. No secret goes in the file: the API key comes from the `env_key` variable or the credential store (§1b), and secret-looking or unknown keys are ignored with a warning.
+  Env overrides: `HAILER_MODEL`, `HAILER_MODEL_PROVIDER`, `HAILER_NOTEBOOK`, `HAILER_NOTEBOOKS_DIR`, `HAILER_DATA_DIR`, `HAILER_MARIMO_URL`, `HAILER_LOG_LEVEL`, `HAILER_CONFIG`, `HAILER_WORKSPACE`, `HAILER_KERNEL` (`[kernel].runtime`; `hailer notebook --kernel` beats it), `HAILER_KERNEL_IMAGE` (`[kernel].image`); `HAILER_MARIMO_TOKEN` and `HAILER_TRACING` exist only as environment variables. The `[kernel]` table (`runtime`, `image`, `memory`, `cpus`, `network`, `pass_env`) is documented in the README, *Isolated kernel (Docker)*. No secret goes in the file: the API key comes from the `env_key` variable or the credential store (§1b), and secret-looking or unknown keys are ignored with a warning.
 
 A global `~/.config/hailer/` layer (same structure, loaded before the project one) is a natural v1.1 addition; not in v1.
 
@@ -329,14 +420,22 @@ hailer/
 ├── pyproject.toml         [project.scripts] hailer = "hailer.cli:main"
 ├── hailer.toml            example project config
 ├── README.md, .gitignore, PLAN.md, uv.lock
-├── docs/                  INTERFACES.md, LANGCHAIN_MIGRATION.md (the proposal behind the 2026-09-18 change)
+├── docs/                  INTERFACES.md, LANGCHAIN_MIGRATION.md (the proposal behind the 2026-09-18 change),
+│                          DOCKER_KERNEL_PLAN.md (the plan behind the 2026-09-19 change)
 ├── spikes/langchain/      the spike behind that proposal (throwaway; not packaged, not collected by pytest)
 ├── .config/hailer/        example context/, skills/, prompts/ with a short README
 ├── notebooks/analysis.py  valid marimo notebook: imports (mo, pl, duckdb), paths, welcome cell
 ├── data/                  .gitkeep, README.md
-├── scripts/               make_sample_data.py ("25-01 pra101.parquet" ... for demos/tests), release.py
+├── scripts/               make_sample_data.py ("25-01 pra101.parquet" ... for demos/tests), release.py,
+│                          build_kernel_image.py (docker buildx for CI and the release)
 ├── src/hailer/
-│   ├── cli.py             Typer app: chat REPL (default), `notebook`, `exec`, `status`, `doctor`, `login`, `logout`, `init`
+│   ├── cli.py             Typer app: chat REPL (default), `notebook`, `exec`, `status`, `doctor`, `login`, `logout`, `init`,
+│   │                      `kernel pull|build|stop`
+│   ├── kernel.py          kernel runtimes: PathMap, .hailer/kernel.json, the liveness check, LocalRuntime, runtime_for
+│   ├── kernel_docker.py   DockerRuntime (the docker CLI through an injectable runner), kernel stop
+│   ├── kernel_image.py    the kernel image: default name, build context, build, pull, version label
+│   ├── _forward.py        the asyncio TCP forwarder the docker kernel is reached through
+│   ├── docker/Dockerfile  the kernel image (package data)
 │   ├── agent.py           build_model (provider → ChatOpenAI), HailerAgent (threads, streamed turns, Ctrl+C),
 │   │                      system prompt, error mapping
 │   ├── tools.py           HailerTools (the 11 tools in §2) and hailer_tools(config) → LangChain tools
@@ -354,8 +453,10 @@ hailer/
 │   ├── log.py             logging setup, secret-redaction filter
 │   └── prompts/system.md  agent system prompt (package data, loaded with importlib.resources)
 └── tests/                 test_<module>.py for agent, tools, cli, config, session, secrets, marimo_client, notebooks,
-                           browser, web, context, periods, log; test_release  (no key, no marimo, loopback only);
-                           fake_gateway.py is a test helper: the strict Chat-Completions-only gateway of §1a
+                           browser, web, context, periods, log, kernel, kernel_docker, kernel_image, forward;
+                           test_release, test_build_kernel_image (no key, no marimo, no Docker, loopback only);
+                           helpers: fake_gateway.py (the strict Chat-Completions-only gateway of §1a), fake_marimo.py,
+                           fake_docker.py, fake_kernel.py; test_docker_integration.py is opt-in (HAILER_DOCKER_TESTS)
 ```
 
 Dependencies: `marimo` (pinned `==0.24.2`, `_code_mode` is private), `langchain>=1.4,<2`, `langchain-openai>=1.6,<2`, `langgraph-checkpoint-sqlite>=3.1,<4`, `polars`, `duckdb`, `typer`, `rich`, `keyring`; dev: `pytest`. Standard library for TOML, the marimo HTTP/SSE client, page fetching, logging, subprocess.
@@ -395,7 +496,10 @@ Slash commands: `/help /status /new /exit /quit /model /notebook /clear /context
 - **The checkpoint file grows** → LangGraph writes a checkpoint per step and never prunes. Only the latest thread is kept (`/new` and `/model` delete the previous one); one long conversation still grows until then.
 - **Long Polars/DuckDB jobs** → `marimo_execute` waits up to 600 s and the client streams SSE. Ctrl+C cancels the turn, not the kernel: the next turn tells the model that the call's effect is unknown.
 - **Large outputs into model context** → tool results capped (head/tail with a "truncated" marker), rich HTML/JSON outputs replaced by a placeholder, and the prompt tells the agent to aggregate locally and inspect summaries.
-- **What leaves the machine** (README security section): user turns, system prompt + `.config` context, skill bodies when loaded, tool call arguments (code) and truncated results, and pages fetched from allowed domains, all to the configured endpoint only. Raw datasets stay local unless code prints them. `marimo_execute` runs the model's Python unsandboxed in the user's kernel, so the prompt's safety rules are instructions, not an enforcement boundary. Secrets are never placed in prompts; logs redact `Authorization` headers and values of any env var named `*_KEY`/`*_TOKEN`/`*_SECRET`/`*_PASSWORD`.
+- **What leaves the machine** (README security section): user turns, system prompt + `.config` context, skill bodies when loaded, tool call arguments (code) and truncated results, and pages fetched from allowed domains, all to the configured endpoint only. Raw datasets stay local unless code prints them. With the default local runtime `marimo_execute` runs the model's Python unsandboxed in a kernel that runs as the user (secret-looking variables withheld, the server behind a token), so the prompt's safety rules are instructions, not an enforcement boundary; the docker runtime is the enforced one (two folders, data read-only, no network, no host environment). Secrets are never placed in prompts; logs redact `Authorization` headers and values of any env var named `*_KEY`/`*_TOKEN`/`*_SECRET`/`*_PASSWORD`.
+- **Docker is not always available** (Docker Desktop's licence for larger organisations, managed machines that block it, WSL2 or Hyper-V) → `local` stays the default and fully supported; docker is opt-in and fails closed, never falling back to local.
+- **Notebooks written in a container are code** that runs on the host if later opened in local mode → a warning on the first local start after a docker kernel used the folder (`.hailer/last-kernel.json`); the README tells users to keep the notebooks folder in git.
+- **The kernel image is part of every release** → the release pushes it to GHCR before PyPI, so no released Hailer points at a missing image; `hailer kernel build` removes the dependency on the registry; the image's version label must match Hailer's version.
 
 ## 8. Assumptions made (say if any should change)
 
@@ -405,3 +509,5 @@ Slash commands: `/help /status /new /exit /quit /model /notebook /clear /context
 - Tools are Hailer's own in-process functions (`hailer.tools`), not the upstream bash scripts and not an MCP server.
 - Hailer resumes only the latest conversation of a workspace.
 - Git Bash / WSL are not required by anything in Hailer.
+- The notebook kernel runs locally unless the user chooses docker; Docker is never required, and the docker
+  runtime drives the `docker` CLI (Docker Desktop or Docker Engine), not Podman.

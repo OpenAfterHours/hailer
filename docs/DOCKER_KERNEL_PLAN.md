@@ -1,9 +1,91 @@
 # Plan: let users choose whether the notebook kernel runs in Docker
 
-Status: **proposal, 2026-09-18; nothing is implemented.** Line references are to `main` at v0.2.4
-(7e7f746). The evidence is two throwaway spikes run the same day on Windows 11 with Docker Desktop 29.4.3,
-which drove a containerised marimo with Hailer's own `MarimoClient` (section 3). The decisions this plan
-needs are in section 9.
+Status: **implemented on 2026-09-19** (branch `worktree-docker-kernel`, phases 0 to 4). The decisions in
+section 9 were taken as recommended: `local` stays the default and docker is opt-in; the image is published
+to GHCR by the release workflow, with `uvx hailer kernel build` as the fallback; `[kernel].network = true`
+is offered, off by default and shown in the `Kernel:` line; servers Hailer starts get a token, while
+servers users start themselves with `--no-token` keep working in the local runtime; Podman is out of
+scope. The text below is the proposal as written on 2026-09-18, kept as the record of why; line references
+are to `main` at v0.2.4 (7e7f746). The evidence is two throwaway spikes run that day on Windows 11 with
+Docker Desktop 29.4.3, which drove a containerised marimo with Hailer's own `MarimoClient` (section 3). The
+user-facing description is the README's *Isolated kernel (Docker)* section; the module contracts are in
+`docs/INTERFACES.md`; the verified findings are in `PLAN.md`.
+
+Where the implementation differs from the plan:
+
+- **Three modules, not one.** `hailer.kernel` holds what both runtimes share (`PathMap`, `kernel.json`,
+  the one liveness check `live_kernel_state`, the start guard, `LocalRuntime`, `runtime_for`);
+  `hailer.kernel_docker` holds `DockerRuntime` and `hailer kernel stop` and is imported only when docker is
+  asked for; `hailer.kernel_image` builds and pulls the image. The forwarder ships in the package as
+  `hailer._forward`, as planned.
+- **The runtime protocol changed shape.** `prompt_notes()` became a function of the settings in effect
+  (`kernel.runtime_prompt_notes`), so building the prompt never touches Docker. A `prepare(say)` step was
+  added: the image download (with docker's progress) and any warning print before the start's spinner.
+- **Cells run when a notebook opens.** The image writes `/work/.marimo.toml` with
+  `auto_instantiate = true`. marimo 0.24's edit page takes that setting from the user configuration in its
+  working directory, not from a project `pyproject.toml`, and the user's own marimo configuration is never
+  mounted (it can hold API keys).
+- **Mount-layout rules (new).** Section 4.4's "never mounted" list assumed the default layout. A notebooks
+  folder equal to the workspace let notebook code rewrite `hailer.toml` back to `local`, so docker mode now
+  refuses a notebooks or data folder that is, or contains, a drive root, the home folder, the workspace,
+  `.hailer`, the config file or the context, skills and prompts folders; the notebooks folder may not sit
+  inside those either, and the data folder may not sit inside the notebooks folder. UNC paths are an error
+  (mapped network drives stay a warning), and `marimo_url` cannot be combined with docker. Checked by
+  `validate` and again before every start (`config.docker_mount_problems`).
+- **`kernel.json` records ids and settings.** Besides names and the image it holds the container and
+  network ids Docker printed, and the settings the kernel was started with (network, mounts, memory,
+  cpus). Everything is removed and inspected by id, so an old handle cannot remove a newer kernel that
+  reuses the names.
+- **Leftovers are never removed while running.** Section 4.5 had a start remove containers that fail the
+  health and token check and start fresh. A start now refuses instead when a kernel container it has no
+  working record of is still running (a probe that got it wrong must not destroy a kernel in use), and
+  points at `uvx hailer kernel stop`. Stopped leftovers are still cleaned up.
+- **Reuse only with the same settings.** `uvx hailer notebook` refuses a kept kernel started with other
+  folders, network, image, memory or cpus (`The running kernel was started with other settings (...)`,
+  with the stop hint); chat-only `uvx hailer` attaches with a warning. The network setting the prompt and
+  the `Kernel:` line show always comes from the kernel in use (`kernel.attach_runtime`), and asking for
+  `local` attaches to a running docker kernel, the more isolated of the two.
+- **The chat keeps its server in memory.** `hailer notebook` hands the chat and the agent's tools the
+  server it started or reused, so a `kernel.json` rewritten by another terminal cannot redirect them;
+  chat-only `uvx hailer` rediscovers the server on every call.
+- **More withheld from the local kernel, and a way back.** Beyond the four suffixes of section 4.7, the
+  local server's environment also drops `_PASSWD`, `_PWD`, `_CREDENTIALS`, `_CONNECTION_STRING` and `APIKEY`
+  suffixes, the names `PASSWORD`, `SECRET`, `TOKEN`, `PGPASSWORD` and `MYSQL_PWD`, and the provider
+  `env_http_headers` variables. `[kernel] pass_env` (new, local only) lets named variables through, and
+  `doctor` shows how many are withheld.
+- **Notebooks are still code (section 8), now with a warning.** `.hailer/last-kernel.json` (new) records
+  which runtime last started a server on the notebooks folder; the first local start after a docker kernel
+  warns that the notebooks' code will now run on this machine.
+- **Tokens and logs.** Model-visible URLs (tool results, the system prompt) never carry the token; the CLI
+  opens and prints signed-in ones, and tools that ask the user to open a URL add "run /notebook for the
+  link". `.hailer/marimo.log` is emptied and owner-only (POSIX) at each start, because marimo prints its
+  signed-in URL, and the tails Hailer prints mask the token.
+- **More run flags.** `--memory-swap` equals `--memory` (no swap on top), `--pull never` on the containers,
+  `--cpus` lowered to what the engine has (with a note), the forwarder limited to 64 MB and 64 processes,
+  and the engine must run Linux containers (Docker Desktop in Windows-containers mode is refused).
+- **`network = true` reaches more than the internet.** It also reaches services on the host
+  (`host.docker.internal`) and other containers; the `Kernel:` line says `network on: the internet and this
+  machine`, and the prompt tells the model so.
+- **Doctor and init.** An image that is not downloaded yet is a warning, not a failure (the start downloads
+  it); a `notebooks` row warns about a notebooks folder on a network drive; the `data` row scans for links
+  leaving the folder (first 5,000 entries). A `runtime` key that lands under `[model]` or `[hailer]` (the
+  `[kernel]` line still commented out) is a warning naming the fix, and `init --kernel` says so when it
+  kept an existing `hailer.toml`.
+- **`--foreground` says why it ended**: out of memory, removed from outside, or the exit code.
+  `uvx hailer kernel stop` stops a kept server of either runtime, reports what it removed, says when Docker
+  is not running, and exits 1 when a removal failed.
+- **The agent's tools know the kernel.** `marimo_status` reports the runtime and the kernel paths, and
+  `notebook_open` / `notebook_close` accept the `/work/...` paths the model sees.
+- **`GPG_KEY` stays in the image** (a public signing-key fingerprint): the integration test plants a secret
+  in Hailer's environment and checks that it is absent, instead of scanning for secret-looking names.
+- **Building.** `uvx hailer kernel build` runs `docker build` for this machine; the release and CI use
+  `scripts/build_kernel_image.py` (`docker buildx`, both platforms for the release) on the same build context
+  (`kernel_image.prepare_context`). The integration test also runs on Windows when opted in
+  (`HAILER_DOCKER_TESTS`); the CI Docker job is not a required check, but the release waits for it.
+- **Measured:** a start takes 4.3 s on Windows 11 with the image present; the amd64 image is 195 MB to
+  download and 875 MB on disk. Not yet measured: the first pull from GHCR (nothing is published before the
+  first release) and read time for a large Parquet file through a Windows bind mount. The arm64 image is
+  checked only by wheel availability until the first release builds it.
 
 ## 1. Summary
 
