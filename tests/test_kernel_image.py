@@ -26,6 +26,7 @@ def test_build_args_come_from_the_versions_hailer_runs_with():
     assert args == {
         "MARIMO_VERSION": importlib.metadata.version("marimo"),
         "POLARS_VERSION": importlib.metadata.version("polars"),
+        "FASTEXCEL_VERSION": importlib.metadata.version("fastexcel"),
         "DUCKDB_VERSION": importlib.metadata.version("duckdb"),
         "HAILER_VERSION": __version__,
     }
@@ -53,7 +54,7 @@ def test_the_dockerfile_pins_the_base_image_and_runs_as_a_plain_user():
     assert "> /work/.marimo.toml" in text and "auto_instantiate = true" in text, "a notebook's cells run when it opens"
     assert "USER 1000:1000" in text and "HOME=/home/analyst" in text and "WORKDIR /work" in text
     assert "org.opencontainers.image.version=${HAILER_VERSION}" in text
-    for package in ("marimo", "polars", "duckdb", "altair", "plotly"):
+    for package in ("marimo", "polars", "fastexcel", "duckdb", "altair", "plotly"):
         assert f"{package}==${{{package.upper()}_VERSION}}" in text
     instructions = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#")).lower()
     assert "langchain" not in instructions and "keyring" not in instructions, "no agent and no credential store in the image"

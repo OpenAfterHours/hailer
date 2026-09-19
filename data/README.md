@@ -1,6 +1,6 @@
 # Data folder
 
-Put the files you want to analyse here: CSV, Parquet or JSON files, with any names. The starter
+Put the files you want to analyse here: CSV, Parquet, JSON or Excel (`.xlsx`, `.xls`, `.xlsb`) files, with any names. The starter
 notebook lists them, and the agent loads them with Polars or DuckDB when you ask about them. Files are ignored by git (only this README and `.gitkeep` are tracked),
 so datasets stay local.
 

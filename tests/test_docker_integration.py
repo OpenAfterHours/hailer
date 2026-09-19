@@ -37,6 +37,7 @@ from pathlib import Path
 
 import pytest
 
+from fake_excel import write_workbook
 from hailer import __version__, kernel_image
 from hailer.config import load_config
 from hailer.errors import KernelRuntimeError
@@ -211,6 +212,7 @@ def docker_kernel(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Kernel]:
         '[hailer]\nnotebook = "notebooks/analysis.py"\ndata_dir = "data"\n\n[kernel]\nruntime = "docker"\n', encoding="utf-8"
     )
     write_sales_data(workspace / "data")
+    write_workbook(workspace / "data" / "Regional sales.xlsx")
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv(SECRET_NAME, SECRET_VALUE)  # in Hailer's environment, and so in docker's
@@ -270,10 +272,23 @@ def test_notebook_code_runs_in_the_container_on_the_mounted_data(docker_kernel: 
     # WORKSPACE / DATA_DIR are the container's folders, which is what the agent relies on.
     def started() -> bool:
         return docker_kernel.run("print(DATA_DIR, len(data_files), len(period_files))").stdout.split() == [
-            "/work/data", str(SAMPLE_MONTHS), str(SAMPLE_MONTHS),
+            "/work/data", str(SAMPLE_MONTHS + 1), str(SAMPLE_MONTHS),
         ]  # fmt: skip
 
     assert _poll(started, 60), docker_kernel.run("print(DATA_DIR)").stderr + docker_kernel.diagnostics()
+
+
+def test_excel_can_be_read_in_the_container_without_installing_packages(docker_kernel: Kernel):
+    result = docker_kernel.run(
+        "import fastexcel, polars as pl\n"
+        "path = '/work/data/Regional sales.xlsx'\n"
+        "print(fastexcel.read_excel(path).sheet_names)\n"
+        "sales = pl.read_excel(path, sheet_name='Sales', schema_overrides={'customer_id': pl.String})\n"
+        "print(sales.height, sales['revenue'].sum(), sales['customer_id'][0])\n"
+        "print(pl.read_excel(path, sheet_name='Budget')['target'].sum())\n"
+    )
+    assert result.success, result.stderr + docker_kernel.diagnostics()
+    assert result.stdout.splitlines() == ["['Sales', 'Budget']", "3 200.5 001", "250"]
 
 
 def test_a_code_mode_cell_is_saved_in_the_host_notebook(docker_kernel: Kernel):

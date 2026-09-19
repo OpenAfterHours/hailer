@@ -100,13 +100,13 @@ _DOCKER_TMP_NOTE = (
 DOCKER_PROMPT_NOTES = (
     _DOCKER_ISOLATION_NOTE
     + "- No internet access from notebook code: packages cannot be installed (ctx.packages.add is "
-    "unavailable) and DuckDB cannot download extensions (INSTALL fails). marimo, Polars, DuckDB, altair "
+    "unavailable) and DuckDB cannot download extensions (INSTALL fails). marimo, Polars, fastexcel, DuckDB, altair "
     "and plotly are installed; work with those.\n" + _DOCKER_TMP_NOTE
 )
 DOCKER_NETWORK_PROMPT_NOTES = (
     _DOCKER_ISOLATION_NOTE
     + "- Notebook code has network access: the internet, and also services on the user's machine and in "
-    "other containers. marimo, Polars, DuckDB, altair and plotly are installed. Do not install packages "
+    "other containers. marimo, Polars, fastexcel, DuckDB, altair and plotly are installed. Do not install packages "
     "unless the task truly needs it; if so use `ctx.packages.add()` and say so (installs last only until "
     "the kernel stops).\n" + _DOCKER_TMP_NOTE
 )

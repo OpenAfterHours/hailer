@@ -1,7 +1,7 @@
 # Hailer
 
 Hailer is a Python command-line package for chatting with your data. Ask questions about local CSV,
-Parquet or JSON files in plain English, and it explores the data and adds tables, charts and summaries
+Parquet, JSON or Excel files in plain English, and it explores the data and adds tables, charts and summaries
 to a live [marimo](https://marimo.io/) notebook in your browser. You chat in the terminal; the notebook
 keeps the analysis and its Python code.
 
@@ -38,7 +38,7 @@ after `init`, using that provider's login command, then continue below.
 
 ### 2. Add your data
 
-Copy the CSV, Parquet or JSON files you want to analyse into the `data/` folder inside `my-analysis`.
+Copy the CSV, Parquet, JSON or Excel files you want to analyse into the `data/` folder inside `my-analysis`.
 Any filenames work.
 
 For a small example, save this as `data/sales.csv` in your workspace:
@@ -106,7 +106,7 @@ The sections below are reference material; the quick start above is enough for a
 `hailer init` creates the starter notebook (`[hailer].notebook`) and the data folder (`[hailer].data_dir`)
 that `hailer.toml` names. It never overwrites anything except `hailer.toml` itself, and only with
 `--force`, so running it again just fills in what is missing (a deleted notebook, say). Put the files you
-want to analyse in `data/`: CSV, Parquet or JSON, with any names (see [Data conventions](#data-conventions)).
+want to analyse in `data/`: CSV, Parquet, JSON or Excel, with any names (see [Data conventions](#data-conventions)).
 The notebook lists them when it opens, and you can start asking straight away.
 
 `hailer notebook` runs the startup checks, starts a marimo server on the **notebooks folder** in the
@@ -261,8 +261,21 @@ notebooks_dir = "notebooks"               # where /notebook new and the agent's 
 
 ## Data conventions
 
-Any CSV, Parquet or JSON file in `data/` can be analysed, whatever it is called: the starter notebook lists
+Any CSV, Parquet, JSON or Excel file in `data/` can be analysed, whatever it is called: the starter notebook lists
 them in `data_files`, and the agent loads them with Polars or queries them with DuckDB when you ask.
+
+Excel reading is included in both the local installation and the Docker kernel through
+[Polars' Calamine engine (`fastexcel`)](https://docs.pola.rs/api/python/stable/reference/api/polars.read_excel.html).
+Put an `.xlsx`, `.xls` or `.xlsb` workbook in `data/` and ask, for example, *Explore the Sales worksheet in
+sales.xlsx and chart revenue by region*. The agent can inspect worksheet names and load the relevant sheet:
+
+```python
+sales = pl.read_excel(DATA_DIR / "sales.xlsx", sheet_name="Sales")
+```
+
+`pl.read_excel(path, sheet_id=0)` reads all sheets into a dictionary keyed by worksheet name. Check
+inferred column types before analysing; `schema_overrides` can keep identifiers as text. Formula cells
+use results saved in the workbook; reading does not recalculate formulas.
 
 One naming convention is optional. When the same dataset arrives every month, name the files
 `YY-MM <dataset>.parquet`, for example `25-03 sales.parquet` for March 2025. The data itself then needs no
@@ -273,7 +286,7 @@ columns that only appear in later months.
 
 | Function | Purpose |
 |---|---|
-| `list_data_files(data_dir)` | Every data file (CSV, Parquet, JSON, ...) directly in the folder, whatever its name, sorted by name. |
+| `list_data_files(data_dir)` | Every data file (CSV, Parquet, JSON, Excel, ...) directly in the folder, whatever its name, sorted by name. |
 | `parse_period(name)` | `"25-03 sales.parquet"` → `Period(2025, 3)`; `None` if the name does not match. |
 | `scan_period_files(data_dir, name=None)` | Sorted `PeriodFile`s for one dataset (or all) in a folder. |
 | `load_periods(files, columns=None)` | One Polars DataFrame with a leading `period` column (`YYYY-MM`); schema evolution handled with a relaxed diagonal concat. |
@@ -509,7 +522,7 @@ in the terminal. After that a start takes a few seconds (4.3 s measured on Windo
 Desktop). `uvx hailer kernel pull` downloads it ahead of time.
 
 - `uvx hailer kernel build` builds the image on this machine instead, from the Dockerfile that ships inside
-  Hailer, with the marimo, Polars and DuckDB versions this Hailer runs. By default it uses Docker Hub
+  Hailer, with the marimo, Polars, fastexcel and DuckDB versions this Hailer runs. By default it uses Docker Hub
   (the base image) and PyPI (the packages); [corporate mirrors](#building-with-corporate-mirrors) work too.
   Use it where the registry is out of reach, or for a Hailer version that has
   no published image (development versions never do). `--tag <name>` builds under another name; Hailer
@@ -593,7 +606,7 @@ context; the command refers to their original paths.
   in place through the mount, never copied. The starter notebook finds `WORKSPACE = /work` and
   `DATA_DIR = /work/data`, the model is told those paths, and notebooks need no changes.
 - **No network.** No internet, no DNS, no route to this machine. Installing packages (`ctx.packages.add()`)
-  and DuckDB's `INSTALL` fail. The image has marimo, Polars, DuckDB, altair and plotly; anything else
+  and DuckDB's `INSTALL` fail. The image has marimo, Polars, fastexcel, DuckDB, altair and plotly; anything else
   needs an image of your own (see [Known limitations](#known-limitations)).
 - **No secrets.** None of your environment variables reach the container, and nothing of Hailer's own
   runs in it but the notebook helpers (`hailer.periods`) and the forwarder: no LangChain, no keyring, no
@@ -792,7 +805,7 @@ and press Ctrl+C if a turn goes somewhere you did not intend.
 - *The token is on the container's command line*, so `docker inspect` shows it. Anyone who can use Docker
   on the machine can already `docker exec` into the container, so hiding it would gain nothing.
 - *The image is trusted by name.* Hailer checks its tag and version label, not a signature, and runs
-  whatever `[kernel].image` names. The image pins marimo, Polars, DuckDB, altair, plotly and its base
+  whatever `[kernel].image` names. The image pins marimo, Polars, fastexcel, DuckDB, altair, plotly and its base
   image, but not their dependencies.
 - *It is a choice, not a policy.* Anyone can switch back to `local`. An organisation that must enforce
   isolation should run Hailer itself in a managed virtual machine or dev container.
@@ -901,7 +914,7 @@ available in the kernel.
   much slower for large Parquet files has not been measured yet.
 - The release workflow builds the `linux/arm64` kernel image (Apple Silicon, ARM Linux), but the CI
   integration test only covers amd64. Podman is not supported.
-- The docker kernel has only the packages in the image (marimo, Polars, DuckDB, altair, plotly); anything
+- The docker kernel has only the packages in the image (marimo, Polars, fastexcel, DuckDB, altair, plotly); anything
   else needs an image of your own, built `FROM` Hailer's (so it keeps the version label) and named in
   `[kernel].image`. There is one kernel per workspace, and
   changing `[kernel]` settings while one is kept running needs `uvx hailer kernel stop` first.

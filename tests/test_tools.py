@@ -446,10 +446,15 @@ def test_list_periods_names_other_data_files(tmp_path):
     config.data_dir.mkdir()
     (config.data_dir / "customers.csv").write_text("id,name\n1,a\n", encoding="utf-8")
     (config.data_dir / "Survey 2024.json").write_text("[]", encoding="utf-8")
+    (config.data_dir / "Sales.xlsx").touch()
+    (config.data_dir / "Budget.xlsb").touch()
     (config.data_dir / "notes.txt").write_text("not data", encoding="utf-8")
     text = HailerTools(config, failing_factory).list_periods()
     assert text.startswith("No period files found")
-    assert text.splitlines()[-1] == "Other data files (load them directly with Polars or DuckDB): customers.csv, Survey 2024.json"
+    assert text.splitlines()[-1] == (
+        "Other data files (load them directly with Polars or DuckDB): "
+        "Budget.xlsb, customers.csv, Sales.xlsx, Survey 2024.json"
+    )
 
 
 def test_list_periods_names_the_data_folder_as_a_docker_kernel_sees_it(tmp_path):

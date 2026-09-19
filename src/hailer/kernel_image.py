@@ -37,7 +37,12 @@ if TYPE_CHECKING:  # pragma: no cover - annotations only; hailer.kernel_docker i
 #: The image label that must equal ``hailer.__version__`` (a different marimo would break code mode).
 VERSION_LABEL = "org.opencontainers.image.version"
 #: Distributions whose installed versions the image pins (build arg -> distribution name).
-PINNED_DISTRIBUTIONS = {"MARIMO_VERSION": "marimo", "POLARS_VERSION": "polars", "DUCKDB_VERSION": "duckdb"}
+PINNED_DISTRIBUTIONS = {
+    "MARIMO_VERSION": "marimo",
+    "POLARS_VERSION": "polars",
+    "FASTEXCEL_VERSION": "fastexcel",
+    "DUCKDB_VERSION": "duckdb",
+}
 _SKIPPED = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo")
 _IMAGE_TIMEOUT_SEC = 30.0
 
@@ -53,7 +58,7 @@ def package_dir() -> Path:
 
 
 def build_args() -> dict[str, str]:
-    """The Dockerfile's build args: the installed marimo, Polars and DuckDB, and this Hailer."""
+    """The Dockerfile's build args: the installed kernel dependencies and this Hailer."""
     args = {arg: importlib.metadata.version(dist) for arg, dist in PINNED_DISTRIBUTIONS.items()}
     args["HAILER_VERSION"] = __version__
     return args

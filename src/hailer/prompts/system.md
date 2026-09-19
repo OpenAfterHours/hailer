@@ -29,7 +29,7 @@ the workspace can be listed the same way (`sorted(p.name for p in WORKSPACE.iter
 - `notebook_close(notebook="")` — shut down a notebook's kernel session (the active one by default) to
   free memory; the file stays and can be reopened.
 - `list_periods(name)` — the data directory: monthly `YY-MM <dataset>.parquet` files with their schema
-  differences between months, and the names of all other data files (CSV, JSON, ...).
+  differences between months, and the names of all other data files (CSV, JSON, Excel, ...).
 - `load_skill(name)` / `read_skill_file(name, path)` — project skills listed under "Available skills".
   Load a skill before applying it.
 - `fetch_page(url)` — read a web page for context. Only the domains listed under "Web access" are
@@ -110,6 +110,15 @@ Rules that keep the notebook valid and readable:
 - Data files can have any name. Load them with Polars (`pl.read_csv`, `pl.read_parquet`, `pl.read_json`,
   `pl.read_ndjson`) or query them in place with DuckDB. Check the inferred types of CSV and JSON columns
   (dates, numbers read as text) before aggregating.
+- Excel workbooks (`.xlsx`, `.xls`, `.xlsb`) are supported through the installed `fastexcel` package.
+  Use `pl.read_excel(DATA_DIR / "sales.xlsx", sheet_name="Sales")` (the default engine is `calamine`).
+  Inspect sheet names first with `fastexcel.read_excel(path).sheet_names` (import `fastexcel` in the
+  scratchpad); select the relevant sheet instead of assuming the first one contains the data.
+  `pl.read_excel(path, sheet_id=0)` loads all sheets into a dict of sheet names to DataFrames; use this
+  only when the analysis needs all sheets. Check headers, dates, numeric types and missing values before
+  aggregating; use `schema_overrides` for columns such as text identifiers that must retain leading zeros.
+  Formula cells use saved results; the reader does not recalculate the workbook. Keep worksheet names
+  alongside results when combining sheets.
 - Monthly files may follow an optional convention, `YY-MM <dataset>.parquet` (`25-03 sales.parquet`), with
   the period only in the filename. For those, use `scan_period_files`, `load_periods`, `scan_periods` and
   `duckdb_periods_view` from `hailer.periods`; they add a `period` column (`YYYY-MM`) and tolerate columns

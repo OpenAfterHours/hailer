@@ -23,9 +23,9 @@ PERIOD_RE = re.compile(r"^(?P<yy>\d{2})-(?P<mm>\d{2})\s+(?P<stem>.+)$")
 
 _READ_ERRORS: tuple[type[BaseException], ...] = (pl.exceptions.PolarsError, OSError, ValueError, TypeError)
 
-#: File types :func:`list_data_files` reports: what Polars or DuckDB reads (Excel needs an extra package).
+#: File types :func:`list_data_files` reports (Excel is read by Polars with the bundled fastexcel).
 DATA_SUFFIXES: tuple[str, ...] = (
-    ".csv", ".tsv", ".parquet", ".json", ".jsonl", ".ndjson", ".xlsx", ".xls", ".arrow", ".feather", ".ipc",
+    ".csv", ".tsv", ".parquet", ".json", ".jsonl", ".ndjson", ".xlsx", ".xls", ".xlsb", ".arrow", ".feather", ".ipc",
 )
 
 
