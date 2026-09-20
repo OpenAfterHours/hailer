@@ -57,6 +57,9 @@ uvx hailer
 Hailer opens the notebook in your browser and starts the chat in your terminal. **Keep the notebook tab
 open while you work**; it provides the live session that runs the analysis.
 
+You can type or paste your first question while chat preparation continues. Pressing Enter keeps one
+message waiting and sends it when preparation finishes; you can keep editing your next draft meanwhile.
+
 Ask a question in the terminal, for example:
 
 ```text

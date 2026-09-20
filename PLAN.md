@@ -370,6 +370,13 @@ Agent design rules and the finding behind each ([docs/LEARNINGS.md](docs/LEARNIN
 - **`SummarizationMiddleware` with an absolute token trigger**: `[model].summarize_after_tokens`, default 100000, 0 = off. The fractional trigger needs a model profile, which no custom deployment name has. The configured model writes the summary, so no request goes out under another model name.
 - **The system prompt is sent on every model call**, so `/reload` applies from the next message of the same conversation.
 - **LangSmith tracing is forced off** at start-up unless `HAILER_TRACING` is set (§7).
+- **Interactive startup enables typing before agent and notebook preparation.** Dependency-only
+  imports warm on a daemon worker while the CLI finds or starts the kernel. After server health is
+  established, the composer renders immediately; agent setup and browser-session waiting overlap.
+  One early submission waits for preparation without blocking editing. HTTP and SQLite resources
+  remain on the agent's loop, and startup cancellation settles owned work before cleanup. Separate
+  input/dispatch milestones and the offline `scripts/benchmark_startup.py` expose both perceived and
+  total startup time; see [docs/LEARNINGS.md](docs/LEARNINGS.md) §10.
 
 ## 3. The `.config` folder: user-supplied context and skills
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -37,6 +38,7 @@ class ChatController:
         self.state: SessionState = load_session(config.workspace)
         self.bundle: ContextBundle = ContextBundle()
         self.agent: Any = None
+        self.startup_failed = False
         self.reader = (
             self._cli._LineReader(console, interactive=False)
             if opts.plain
@@ -132,16 +134,70 @@ class ChatController:
         model = self.state.model or self.config.model.name
         return f"Notebook: {notebook} | Model: {model} | Context: {len(self.bundle.context_files)} files"
 
-    async def run_interactive(self, ui_factory: Any = None) -> None:
+    async def run_interactive(
+        self,
+        ui_factory: Any = None,
+        *,
+        prepare_notebook: Callable[[], Awaitable[None]] | None = None,
+        timings: Any = None,
+    ) -> None:
         if ui_factory is None:
             from hailer.chat_ui import ChatUI
 
             ui_factory = ChatUI
         original_console = self.console
+        self.startup_failed = False
         self.ui = ui_factory(original_console, self.ahandle, self.context_line)
         self.console = self.ui.console
+
+        async def prepare() -> bool:
+            async def agent_ready() -> None:
+                await self.astart()
+                if timings is not None:
+                    timings.mark("agent_ready")
+
+            async def notebook_ready() -> None:
+                if prepare_notebook is not None:
+                    await prepare_notebook()
+                if timings is not None:
+                    timings.mark("notebook_wait_complete")
+
+            tasks = [asyncio.create_task(agent_ready()), asyncio.create_task(notebook_ready())]
+            try:
+                await asyncio.gather(*tasks)
+                if timings is not None:
+                    timings.mark("ready_to_answer")
+                return True
+            except HailerError as err:
+                self.startup_failed = True
+                self._cli._print_error(self.console, err, verbose=self.opts.verbose)
+                return False
+            except Exception as exc:
+                self.startup_failed = True
+                self._cli._print_unexpected(self.console, exc, verbose=self.opts.verbose)
+                return False
+            finally:
+                # gather does not cancel siblings after a failure. Settle both
+                # resource owners before a failed startup or exit closes agent.
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                cleanup = asyncio.gather(*tasks, return_exceptions=True)
+                interrupted = False
+                while not cleanup.done():
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        interrupted = True
+                cleanup.result()
+                if interrupted:
+                    raise asyncio.CancelledError
+
+        self.ui.configure_startup(
+            prepare,
+            on_input_ready=(lambda: timings.mark("input_ready")) if timings is not None else None,
+        )
         try:
-            await self.astart()
             await self.ui.run()
         finally:
             try:

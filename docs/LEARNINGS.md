@@ -135,3 +135,33 @@ from that existing page through DevTools; do not use a screenshot command that c
 `test_notebook_code_runs_in_the_container_on_the_mounted_data` checks both browser liveness and the
 starter notebook's initialized globals. Preserve the auto-run assertion: manually running the cells
 would hide a broken startup. Verify with `HAILER_DOCKER_TESTS=strict` and a freshly built kernel image.
+
+## 10. Input readiness must not wait for agent imports or a browser session
+
+The startup investigation on Windows / Python 3.13.7 found a 2.6–4.5 second pause after the startup
+panel: `ChatController.run_interactive` awaited agent initialization before running the composer.
+Most of that time was importing LangChain/OpenAI and constructing dependency model classes. Merely
+creating an async startup task still blocked the UI loop for seconds. Keep dependency-only imports
+on the daemon warmup worker, with tracing disabled first, and create HTTP/SQLite/model resources on
+the agent's original event loop. A cancelled wait must neither cancel shared imports nor make loop
+shutdown wait for them; failed imports must produce an actionable error without re-importing them
+on the UI thread.
+
+Start warmup before kernel discovery/start. Once the server is healthy, render the interactive
+composer before preparing the agent and waiting for the notebook in parallel. A user can type and
+paste while either is pending; one first submission may wait for preparation and must run at most
+once. Preserve both that message and any next draft on failure. Ordinary busy-turn submissions
+remain unqueued. Startup shutdown must settle notebook work before stopping the owned kernel and
+settle agent startup before closing its resources. Notebook preparation owns a separate stop flag
+from other blocking controller work.
+
+Measure `input_ready` at the first render and `ready_to_answer` when dispatch is allowed. A completed
+notebook wait is only `notebook_wait_complete`: it may have timed out, and even an existing session
+does not prove its cells have run. `scripts/benchmark_startup.py` measures fresh processes with the
+real agent and recorded terminal, a dummy credential, forbidden network connections, temporary
+state and a simulated notebook wait. It reports input, paste, readiness and UI-loop pause timings;
+it does not measure uvx installation, Docker or browser startup. `hailer --verbose` reports actual
+session milestones. Keep event-controlled startup tests in `test_chat.py`, `test_chat_ui.py`,
+`test_cli.py` and `test_agent_warmup.py` alongside the agent lifecycle checks; do not turn a passing
+recorded-terminal test into a claim about physical Windows Ctrl+C. The measurements, live-check
+scope and reproduction commands are in [STARTUP_PERFORMANCE.md](STARTUP_PERFORMANCE.md).

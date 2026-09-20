@@ -523,6 +523,50 @@ def test_start_creates_the_store_and_a_thread(harness):
     assert h.agent.key_source == "env"
 
 
+def test_cancelled_startup_waits_for_imports_before_creating_resources(harness, monkeypatch):
+    h = harness([])
+    entered: asyncio.Event
+    ready: asyncio.Event
+    model_loops: list[asyncio.AbstractEventLoop] = []
+
+    async def prepare() -> None:
+        entered.set()
+        await ready.wait()
+
+    original_factory = h.agent._model_factory
+
+    def model_factory(*args):
+        model_loops.append(asyncio.get_running_loop())
+        return original_factory(*args)
+
+    monkeypatch.setattr(agent_mod, "await_dependency_warmup", prepare)
+    h.agent._model_factory = model_factory
+
+    async def exercise() -> None:
+        nonlocal entered, ready
+        entered, ready = asyncio.Event(), asyncio.Event()
+        startup = asyncio.create_task(h.agent.astart())
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            assert not h.factory_calls
+            assert h.agent._conn is None and h.agent._http is None
+            assert not (h.config.workspace / ".hailer" / "threads.sqlite").exists()
+            startup.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await startup
+            await h.agent.aclose()
+            ready.set()
+            await h.agent.astart()
+            assert model_loops == [asyncio.get_running_loop()]
+            assert (h.config.workspace / ".hailer" / "threads.sqlite").is_file()
+        finally:
+            startup.cancel()
+            await asyncio.gather(startup, return_exceptions=True)
+            await h.agent.aclose()
+
+    asyncio.run(exercise())
+
+
 def test_missing_key_is_a_credentials_error_for_every_provider(tmp_path, harness):
     h = harness([], env={})
     assert h.agent.key_source == "missing"
