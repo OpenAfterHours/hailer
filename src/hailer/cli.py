@@ -21,10 +21,12 @@ import asyncio
 import os
 import shutil
 import sys
+import threading
 import traceback
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 import typer
 from rich.console import Console
@@ -54,6 +56,7 @@ from hailer.models import (
     ProviderConfig,
     TurnSummary,
 )
+from hailer.startup import StartupTimings
 
 app = typer.Typer(
     add_completion=False,
@@ -326,6 +329,13 @@ def _make_agent(config: HailerConfig, bundle: ContextBundle, server: MarimoServe
     from hailer.agent import HailerAgent
 
     return HailerAgent(config, bundle, server=server)
+
+
+def _start_dependency_warmup() -> None:
+    """Start dependency imports without creating provider, HTTP or database resources."""
+    from hailer.agent import start_dependency_warmup
+
+    start_dependency_warmup()
 
 
 def _open_browser(url: str) -> None:
@@ -787,12 +797,24 @@ def run_chat(opts: CliOptions) -> None:
     _run_session(console, config, opts, port=DEFAULT_MARIMO_PORT, open_browser=True, keep_marimo=False)
 
 
-def _run_chat_loop(console: Console, config: HailerConfig, opts: CliOptions, server: MarimoServer | None = None) -> None:
+def _run_chat_loop(
+    console: Console,
+    config: HailerConfig,
+    opts: CliOptions,
+    server: MarimoServer | None = None,
+    *,
+    prepare_notebook: Callable[[Console], Awaitable[None]] | None = None,
+    timings: StartupTimings | None = None,
+) -> None:
     """Start the agent and run the REPL; exit code 1 when the agent cannot start."""
     loop = ChatLoop(console, config, opts, server)
     if _use_composer(opts):
+        async def prepare() -> None:
+            if prepare_notebook is not None:
+                await prepare_notebook(loop.console)
+
         try:
-            asyncio.run(loop.run_interactive())
+            asyncio.run(loop.run_interactive(prepare_notebook=prepare, timings=timings))
         except HailerError as err:
             _print_error(console, err, verbose=opts.verbose)
             raise typer.Exit(code=1)
@@ -801,9 +823,17 @@ def _run_chat_loop(console: Console, config: HailerConfig, opts: CliOptions, ser
         except Exception as exc:  # startup/terminal failures still restore the terminal
             _print_unexpected(console, exc, verbose=opts.verbose)
             raise typer.Exit(code=1)
+        if loop.startup_failed:
+            # The composer keeps the draft available until the user exits, but
+            # a preparation error remains a failed CLI invocation.
+            raise typer.Exit(code=1)
         return
     try:
         loop.start()
+        if timings is not None:
+            timings.mark("agent_ready")
+            timings.mark("input_ready")
+            timings.mark("ready_to_answer")
     except HailerError as err:
         _print_error(console, err, verbose=opts.verbose)
         loop.close()
@@ -1000,13 +1030,34 @@ def _warn_about_planted_files(console: Console, running: Any) -> None:
         console.print(planted_warning(running.notebooks_folder, names), style="bold red", markup=False)
 
 
-def _wait_for_notebook(console: Console, config: HailerConfig, server: MarimoServer, *, open_browser: bool) -> None:
+def _wait_for_notebook(
+    console: Console,
+    config: HailerConfig,
+    server: MarimoServer,
+    *,
+    open_browser: bool,
+    should_stop: Callable[[], bool] | None = None,
+    show_status: bool = True,
+) -> None:
+    """Open the notebook and poll its session, stopping between blocking operations.
+
+    The live composer owns its activity display, so its background preparation
+    suppresses the Rich spinner. Cancellation never leaves a later browser open
+    or session message racing the next session or kernel shutdown.
+    """
+    stopped = should_stop or (lambda: False)
+    if stopped():
+        return
     client = _make_client(server, config)
     url = _notebook_link(console, server, config)
+    if stopped():
+        return
     try:
         session = client.resolve_session(config.notebook)
     except HailerError:
         session = None
+    if stopped():
+        return
     if session is not None:
         console.print(f"Notebook is open (session {session.session_id}).", markup=False)
         return
@@ -1015,9 +1066,14 @@ def _wait_for_notebook(console: Console, config: HailerConfig, server: MarimoSer
         _open_browser(url)
     else:
         console.print(f"Open {url} in your browser.", markup=False)
+    if stopped():
+        return
     console.print(APP_VIEW_HINT, markup=False)
-    with console.status("Waiting for the notebook to open..."):
-        session = _wait_for_session(client, config.notebook, SESSION_TIMEOUT_SEC)
+    status = console.status("Waiting for the notebook to open...") if show_status else nullcontext()
+    with status:
+        session = _wait_for_session(client, config.notebook, SESSION_TIMEOUT_SEC, should_stop=should_stop)
+    if stopped():
+        return
     if session is None:
         console.print(
             f"No kernel session yet. Open {url} in your browser; the agent reports the notebook state when asked.",
@@ -1028,12 +1084,45 @@ def _wait_for_notebook(console: Console, config: HailerConfig, server: MarimoSer
         console.print(f"Notebook is open (session {session.session_id}).", markup=False)
 
 
+async def _prepare_notebook(
+    console: Console, config: HailerConfig, server: MarimoServer, *, open_browser: bool
+) -> None:
+    """Wait off the UI loop and settle the worker before the kernel may be stopped.
+
+    Cancelling ``to_thread`` alone abandons its work. The stop flag ends polling
+    promptly; an in-flight request or browser launcher must still finish before
+    cleanup proceeds.
+    """
+    stop = threading.Event()
+    task = asyncio.create_task(asyncio.to_thread(
+        _wait_for_notebook, console, config, server,
+        open_browser=open_browser, should_stop=stop.is_set, show_status=False,
+    ))
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        stop.set()
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not task.cancelled():
+            task.exception()  # consume a worker error while preserving cancellation
+        raise
+
+
 def _run_session(console: Console, config: HailerConfig, opts: CliOptions, *, port: int, open_browser: bool, keep_marimo: bool) -> None:
     """Reuse or start this workspace's kernel, pin the chat to it, and stop what we started."""
+    timings = StartupTimings()
     checks = local_checks(config) + kernel_checks(config, starting=True)
     _print_checks(console, checks, only_failures=True)
     if any(not c.ok and c.fatal for c in checks):
         raise typer.Exit(code=1)
+    timings.mark("checks_complete")
+    _start_dependency_warmup()
     config.notebooks_root.mkdir(parents=True, exist_ok=True)  # marimo edit refuses a missing folder
 
     running: Any = None
@@ -1056,12 +1145,24 @@ def _run_session(console: Console, config: HailerConfig, opts: CliOptions, *, po
     # The chat and the agent's tools keep this server (URL, token, paths) in memory: a kernel.json
     # rewritten or removed underneath cannot take it away. marimo_url names it in the prompt.
     config = replace(config, marimo_url=server.url)
+    timings.mark("kernel_ready")
 
     try:
-        _wait_for_notebook(console, config, server, open_browser=open_browser)
+        interactive = _use_composer(opts)
+        if not interactive:
+            _wait_for_notebook(console, config, server, open_browser=open_browser)
+            timings.mark("notebook_wait_complete")
         console.print()
         _startup_panel(console, config)
-        _run_chat_loop(console, config, opts, server)
+        timings.mark("panel_shown")
+
+        async def prepare_notebook(chat_console: Console) -> None:
+            await _prepare_notebook(chat_console, config, server, open_browser=open_browser)
+
+        _run_chat_loop(
+            console, config, opts, server,
+            prepare_notebook=prepare_notebook if interactive else None, timings=timings,
+        )
     finally:
         if running is not None:
             if keep_marimo:

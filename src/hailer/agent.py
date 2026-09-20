@@ -20,9 +20,11 @@ from __future__ import annotations
 import asyncio
 import importlib.resources
 import os
+import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping
+from concurrent.futures import Future
 from pathlib import Path
 from typing import Any
 
@@ -167,6 +169,75 @@ def disable_tracing_unless_opted_in(environ: Any = None) -> bool:
     for name in _TRACING_ENV_VARS:
         env[name] = "false"
     return False
+
+
+# --------------------------------------------------------------------------- #
+# Dependency preparation (imports only; resources belong to the caller's loop)
+# --------------------------------------------------------------------------- #
+
+_dependency_warmup: Future[None] | None = None
+_dependency_warmup_lock = threading.Lock()
+
+
+def _load_agent_dependencies() -> None:
+    # Explicitly load OpenAI's lazy resource package too: otherwise constructing ChatOpenAI
+    # does that expensive work on the UI loop even after langchain_openai was imported.
+    for module in (
+        "langchain.agents",
+        "langchain.agents.middleware",
+        "langgraph.checkpoint.sqlite.aio",
+        "langchain_openai",
+        "openai.resources",
+    ):
+        importlib.import_module(module)
+
+
+def start_dependency_warmup() -> Future[None]:
+    """Start process-wide dependency imports, without opening clients or a conversation store.
+
+    CLI startup can overlap this work with kernel preparation. The daemon thread is separate
+    from asyncio's default executor, so quitting never waits for imports to finish. Its running
+    future cannot be cancelled: each event loop may stop waiting without affecting other users.
+    An import failure is retained and reported by :func:`await_dependency_warmup`.
+    """
+    global _dependency_warmup
+    with _dependency_warmup_lock:
+        if _dependency_warmup is not None:
+            return _dependency_warmup
+        disable_tracing_unless_opted_in()
+        completion: Future[None] = Future()
+        completion.set_running_or_notify_cancel()
+        _dependency_warmup = completion
+
+        def prepare() -> None:
+            started = time.monotonic()
+            try:
+                _load_agent_dependencies()
+            except BaseException as exc:
+                completion.set_exception(exc)
+            else:
+                log.debug("startup dependency imports ready in %.3fs", time.monotonic() - started)
+                completion.set_result(None)
+
+        try:
+            threading.Thread(target=prepare, name="hailer-dependency-warmup", daemon=True).start()
+        except Exception as exc:
+            completion.set_exception(exc)
+        return completion
+
+
+async def await_dependency_warmup() -> None:
+    """Await imports without blocking this loop or transferring ownership of runtime resources."""
+    try:
+        # A fresh wrapper belongs to this loop; cancelling it cannot cancel the running source
+        # future. Unlike shielding the wrapper, this also avoids an abandoned asyncio exception
+        # when a cancelled startup's imports subsequently fail.
+        await asyncio.wrap_future(start_dependency_warmup())
+    except Exception as exc:
+        raise AgentError(
+            "Could not prepare chat dependencies.",
+            hint=f"Check the Hailer installation and retry ({type(exc).__name__}).",
+        ) from exc
 
 
 # --------------------------------------------------------------------------- #
@@ -541,6 +612,7 @@ class HailerAgent:
     async def _ensure_graph(self) -> Any:
         if self._graph is not None:
             return self._graph
+        await await_dependency_warmup()
         from langchain.agents import create_agent
         from langchain.agents.middleware import SummarizationMiddleware
         from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver

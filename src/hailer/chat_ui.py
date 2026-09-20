@@ -30,6 +30,7 @@ from rich.text import Text
 
 from hailer.log import redact
 from hailer.models import AgentEvent
+from hailer.session import EXIT_COMMANDS, parse_command
 
 
 def _single_line(text: str) -> str:
@@ -170,6 +171,13 @@ class ChatUI:
         self._writer: asyncio.Task[None] | None = None
         self._writer_error: BaseException | None = None
         self._active_task: asyncio.Task[None] | None = None
+        self._startup_task: asyncio.Task[None] | None = None
+        self._prepare: Callable[[], Awaitable[bool]] | None = None
+        self._on_input_ready: Callable[[], None] | None = None
+        self._preparing = False
+        self._startup_failed = False
+        self._pending_submission: str | None = None
+        self._input_ready = False
         self._executing = False
         self._cancelling = False
         self._exit_requested = False
@@ -206,6 +214,7 @@ class ChatUI:
             erase_when_done=True,
             input=pt_input,
             output=self._output,
+            after_render=self._after_render,
             style=Style.from_dict({
                 "context": "ansibrightblack",
                 "activity": "ansicyan",
@@ -216,7 +225,64 @@ class ChatUI:
 
     @property
     def busy(self) -> bool:
-        return self._active_task is not None and not self._active_task.done()
+        return (
+            self._active_task is not None and not self._active_task.done()
+        ) or (self._preparing and self._pending_submission is not None)
+
+    def configure_startup(
+        self,
+        prepare: Callable[[], Awaitable[bool]],
+        *,
+        on_input_ready: Callable[[], None] | None = None,
+    ) -> None:
+        """Prepare after rendering, while the composer accepts drafts and one message.
+
+        The callback reports startup errors and returns false on failure. The UI
+        owns its lifetime so it settles before the controller closes resources.
+        """
+        self._prepare = prepare
+        self._on_input_ready = on_input_ready
+        self._preparing = True
+        self.set_activity("Preparing chat...")
+
+    def _after_render(self, _application: Any) -> None:
+        if self._input_ready:
+            return
+        self._input_ready = True
+        if self._on_input_ready is not None:
+            self._on_input_ready()
+        if self._prepare is not None:
+            self._startup_task = asyncio.create_task(self._prepare_chat())
+
+    async def _prepare_chat(self) -> None:
+        assert self._prepare is not None
+        ready = False
+        try:
+            ready = await self._prepare()
+        except asyncio.CancelledError:
+            # A startup operation can itself be cancelled; do not leave the
+            # composer waiting forever for a readiness signal that cannot come.
+            if not self._exit_requested:
+                self.console.print("Chat preparation cancelled.", markup=False)
+                self.exit()
+            raise
+        except Exception as exc:
+            self.console.print(f"Unexpected error: {type(exc).__name__}: {exc}", style="red", markup=False)
+        finally:
+            self._preparing = False
+        if self._exit_requested:
+            return
+        self._startup_failed = not ready
+        if not ready:
+            self.set_activity("Chat preparation failed. Your draft is kept; /exit to leave.")
+            if self._pending_submission is not None:
+                self.console.print("Your queued message was not sent and is kept in history (Up to recall).", markup=False)
+            return
+        if self._pending_submission is not None:
+            text, self._pending_submission = self._pending_submission, None
+            self._launch_submission(text)
+        else:
+            self.set_activity("Ready")
 
     def _key_bindings(self) -> KeyBindings:
         bindings = KeyBindings()
@@ -248,7 +314,7 @@ class ChatUI:
         @bindings.add("c-d")
         def eof(event: Any) -> None:
             if not event.current_buffer.text:
-                if not self.busy:
+                if not self.busy or self._preparing:
                     self.console.print("Bye.", markup=False)
                     self.exit()
             else:
@@ -262,10 +328,23 @@ class ChatUI:
 
     def submit(self) -> None:
         """Submit the draft once, retaining it unchanged if work is still active."""
-        if self.busy:
-            self.set_activity("Still working. Ctrl+C cancels; your draft is kept.")
-            return
         text = self.buffer.text.strip()
+        command = parse_command(text)
+        if (self._preparing or self._startup_failed) and (
+            text.startswith("\x1a") or command is not None and command.name in EXIT_COMMANDS
+        ):
+            self.console.print("Bye.", markup=False)
+            self.exit()
+            return
+        if self.busy:
+            self.set_activity(
+                "Preparing chat. First message queued; your draft is kept."
+                if self._preparing else "Still working. Ctrl+C cancels; your draft is kept."
+            )
+            return
+        if self._startup_failed:
+            self.set_activity("Chat preparation failed. Your draft is kept; /exit to leave.")
+            return
         if text.startswith("\x1a"):
             self.console.print("Bye.", markup=False)
             self.exit()
@@ -276,6 +355,13 @@ class ChatUI:
         self.console.print(Text("You", style="bold cyan"))
         self.console.print(text, markup=False)
         self.console.print()
+        if self._preparing:
+            self._pending_submission = text
+            self.set_activity("Preparing chat. First message queued; you can keep typing.")
+            return
+        self._launch_submission(text)
+
+    def _launch_submission(self, text: str) -> None:
         self._cancelling = False
         self._executing = True
         self.set_activity("Thinking..." if not text.startswith("/") else "Working...")
@@ -297,6 +383,13 @@ class ChatUI:
                 self._exit_application()
 
     def cancel(self) -> None:
+        if self._preparing and self._pending_submission is not None:
+            text, self._pending_submission = self._pending_submission, None
+            if not self.buffer.text:
+                self.buffer.insert_text(text)
+            self.console.print("Queued message cancelled before sending; kept in history (Up to recall).", markup=False)
+            self.set_activity("Preparing chat...")
+            return
         if self.busy and self._executing and not self._cancelling:
             self._cancelling = True
             self.set_activity("Cancelling...")
@@ -322,7 +415,7 @@ class ChatUI:
         if self._exit_requested:
             return
         self._exit_requested = True
-        if not self.busy:
+        if not self.busy or self._preparing:
             # The writer calls this after all preceding transcript output.
             # Keeping exit in the queue avoids an unowned flush task if the
             # terminal fails while writing the farewell.
@@ -481,6 +574,16 @@ class ChatUI:
 
     async def _shutdown(self) -> None:
         failure: BaseException | None = None
+        self._exit_requested = True
+        if self._startup_task is not None:
+            if not self._startup_task.done():
+                self._startup_task.cancel()
+            try:
+                await self._startup_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                failure = exc
         if self._active_task is not None:
             if self.busy:
                 self.cancel()

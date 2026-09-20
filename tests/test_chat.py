@@ -88,8 +88,17 @@ class StubUI:
         self.activities: list[str] = []
         self.exited = False
         self.flushed = False
+        self.prepare: Any = None
+
+    def configure_startup(self, prepare: Any, *, on_input_ready: Any = None) -> None:
+        self.prepare = prepare
+        self.on_input_ready = on_input_ready
 
     async def run(self) -> None:
+        if self.on_input_ready is not None:
+            self.on_input_ready()
+        if not await self.prepare():
+            return
         await self.scenario(self)
 
     def finish(self, text: str) -> None:
@@ -342,8 +351,12 @@ def test_interactive_start_failure_or_cancellation_closes_agent_and_flushes(harn
     console = Console(file=output)
     controller = cli.ChatLoop(console, harness.config, cli.CliOptions())
     ui = StubUI(console, controller.ahandle, controller.context_line, None)
-    with pytest.raises(type(failure)):
+    if isinstance(failure, asyncio.CancelledError):
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(controller.run_interactive(ui_factory=lambda *_args: ui))
+    else:
         asyncio.run(controller.run_interactive(ui_factory=lambda *_args: ui))
+        assert "startup failed" in output.getvalue()
     assert harness.agent.closed and ui.flushed and controller.console is console
 
 
@@ -365,6 +378,182 @@ def test_failed_final_flush_still_restores_controller_console_and_closes_agent(h
         asyncio.run(controller.run_interactive(ui_factory=lambda *_args: ui))
     assert harness.agent.closed
     assert controller.console is original
+
+
+def test_first_message_waits_for_both_startups_while_composer_accepts_paste_and_draft(harness):
+    from test_chat_ui import terminal, until
+    from hailer.startup import StartupTimings
+
+    async def scenario():
+        agent_entered, notebook_entered = asyncio.Event(), asyncio.Event()
+        release_agent, release_notebook = asyncio.Event(), asyncio.Event()
+
+        class SlowAgent(AsyncFakeAgent):
+            async def astart(self, **kwargs: Any) -> str:
+                agent_entered.set()
+                await release_agent.wait()
+                return await super().astart(**kwargs)
+
+        async def prepare_notebook():
+            notebook_entered.set()
+            await release_notebook.wait()
+
+        harness.agent = SlowAgent()
+        controller = cli.ChatLoop(Console(file=io.StringIO()), harness.config, cli.CliOptions())
+        timings = StartupTimings()
+        with terminal(controller.ahandle, controller.context_line) as (ui, keys, screen, transcript, _size):
+            running = asyncio.create_task(controller.run_interactive(
+                ui_factory=lambda *_args: ui, prepare_notebook=prepare_notebook, timings=timings,
+            ))
+            await asyncio.wait_for(agent_entered.wait(), 5)
+            await asyncio.wait_for(notebook_entered.wait(), 5)
+            assert ui.application.is_running and ui.application.render_counter > 0
+            assert set(timings.milestones) == {"input_ready"}
+            assert ui.activity == "Preparing chat..."
+            keys.send_text("\x1b[200~first line\r\nsecond line\x1b[201~\r")
+            await until(lambda: ui._pending_submission is not None)
+            keys.send_text("next draft\r\r")
+            await until(lambda: "draft is kept" in ui.activity)
+            assert ui.buffer.text == "next draft"
+            assert harness.agent.turns == []
+            release_agent.set()
+            await until(lambda: "agent_ready" in timings.milestones)
+            assert harness.agent.turns == []
+            release_notebook.set()
+            await until(lambda: len(harness.agent.turns) == 1 and not ui.busy)
+            assert harness.agent.turns == [("first line\nsecond line", None)]
+            assert ui.buffer.text == "next draft"
+            assert transcript.getvalue().count("You") == 1
+            assert "\x1b[?2004l" not in screen.getvalue()
+            assert timings.milestones["ready_to_answer"] >= timings.milestones["notebook_wait_complete"]
+            assert timings.milestones["agent_ready"] > timings.milestones["input_ready"]
+            ui.exit()
+            await asyncio.wait_for(running, 5)
+            assert harness.agent.closed
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failed_part", ["agent", "notebook"])
+def test_startup_failure_retains_queued_message_and_new_draft_and_settles_sibling(harness, failed_part):
+    from test_chat_ui import terminal, until
+
+    async def scenario():
+        entered = {name: asyncio.Event() for name in ("agent", "notebook")}
+        settled = {name: asyncio.Event() for name in ("agent", "notebook")}
+        fail = asyncio.Event()
+
+        async def preparation(name):
+            entered[name].set()
+            try:
+                if name == failed_part:
+                    await fail.wait()
+                    raise HailerError("startup failed", hint="check configuration")
+                await asyncio.Event().wait()
+            finally:
+                settled[name].set()
+
+        class FailedAgent(AsyncFakeAgent):
+            async def astart(self, **_kwargs: Any) -> str:
+                await preparation("agent")
+                raise AssertionError("unreachable")
+
+            async def aclose(self) -> None:
+                assert all(event.is_set() for event in settled.values())
+                await super().aclose()
+
+        harness.agent = FailedAgent()
+        controller = cli.ChatLoop(Console(file=io.StringIO()), harness.config, cli.CliOptions())
+        with terminal(controller.ahandle, controller.context_line) as (ui, keys, _screen, transcript, _size):
+            running = asyncio.create_task(controller.run_interactive(
+                ui_factory=lambda *_args: ui, prepare_notebook=lambda: preparation("notebook"),
+            ))
+            await asyncio.wait_for(asyncio.gather(*(event.wait() for event in entered.values())), 5)
+            keys.send_text("keep queued message\r")
+            await until(lambda: ui._pending_submission is not None)
+            keys.send_text("keep next draft")
+            await until(lambda: ui.buffer.text == "keep next draft")
+            fail.set()
+            await until(lambda: ui._startup_failed)
+            await ui.flush()
+            assert ui._pending_submission == "keep queued message"
+            assert ui.buffer.text == "keep next draft"
+            assert "keep queued message" in ui.buffer.history.get_strings()
+            assert "startup failed" in transcript.getvalue()
+            assert "was not sent" in transcript.getvalue()
+            assert harness.agent.turns == []
+            assert all(event.is_set() for event in settled.values())
+            assert controller.startup_failed
+            keys.send_text("\r")
+            await asyncio.sleep(0)
+            assert ui.buffer.text == "keep next draft"
+            ui.buffer.text = "/exit"
+            keys.send_text("\r")
+            await asyncio.wait_for(running, 5)
+            assert harness.agent.closed
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("gesture", ["interrupt", "double_interrupt", "exit", "eof", "input_closed", "external_cancel"])
+def test_exit_during_startup_settles_preparation_before_closing_agent(harness, gesture):
+    from test_chat_ui import terminal, until
+
+    async def scenario():
+        entered, cleanup_started, release_cleanup, settled = (
+            asyncio.Event(), asyncio.Event(), asyncio.Event(), asyncio.Event()
+        )
+
+        class SlowAgent(AsyncFakeAgent):
+            async def astart(self, **_kwargs: Any) -> str:
+                entered.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cleanup_started.set()
+                    await release_cleanup.wait()
+                    settled.set()
+
+            async def aclose(self) -> None:
+                assert settled.is_set()
+                await super().aclose()
+
+        harness.agent = SlowAgent()
+        original = Console(file=io.StringIO())
+        controller = cli.ChatLoop(original, harness.config, cli.CliOptions())
+        with terminal(controller.ahandle, controller.context_line) as (ui, keys, screen, transcript, _size):
+            running = asyncio.create_task(controller.run_interactive(ui_factory=lambda *_args: ui))
+            await asyncio.wait_for(entered.wait(), 5)
+            if gesture != "interrupt":
+                keys.send_text("queued\r")
+                await until(lambda: ui._pending_submission == "queued")
+            if gesture == "input_closed":
+                keys.close()
+            elif gesture == "external_cancel":
+                running.cancel()
+            else:
+                keys.send_text({"interrupt": "\x03", "double_interrupt": "\x03\x03", "exit": "/exit\r", "eof": "\x04"}[gesture])
+            await asyncio.wait_for(cleanup_started.wait(), 5)
+            if gesture == "external_cancel":
+                running.cancel()
+            await asyncio.sleep(0)
+            assert not running.done() and not harness.agent.closed
+            release_cleanup.set()
+            if gesture == "external_cancel":
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(running, 5)
+            else:
+                await asyncio.wait_for(running, 5)
+            assert harness.agent.closed and settled.is_set()
+            assert not controller.startup_failed
+            assert harness.agent.turns == []
+            assert controller.console is original
+            assert screen.getvalue().count("\x1b[?2004h") == screen.getvalue().count("\x1b[?2004l") == 1
+            if gesture == "double_interrupt":
+                assert transcript.getvalue().count("Queued message cancelled") == 1
+                assert ui.buffer.text == "queued"
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("args", [["--plain"], ["notebook", "--plain"], ["--plain", "notebook"]])

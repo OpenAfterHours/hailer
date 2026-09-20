@@ -716,6 +716,8 @@ def provider_by_id(config: HailerConfig, provider_id: str | None = None) -> Prov
 def provider_base_url(provider: ProviderConfig) -> str    # base_url or OPENAI_BASE_URL, no trailing slash
 def request_headers(provider: ProviderConfig, environ: Mapping[str, str]) -> dict[str, str]   # http_headers + every env_http_headers entry whose variable is set and not empty
 def build_model(provider: ProviderConfig, model: str, api_key: str | None, *, reasoning_effort: str | None = None, environ: Mapping[str, str] | None = None, http_async_client: Any = None) -> Any   # a ChatOpenAI, see below
+def start_dependency_warmup() -> concurrent.futures.Future[None]  # start/reuse daemon imports; no clients, keys or conversation state
+async def await_dependency_warmup() -> None  # await from this loop; cancellation does not cancel shared imports
 def disable_tracing_unless_opted_in(environ: Any = None) -> bool   # sets LANGSMITH_TRACING, LANGSMITH_TRACING_V2, LANGCHAIN_TRACING and LANGCHAIN_TRACING_V2 to "false" (in os.environ by default) unless HAILER_TRACING is 1/true/yes/on; True when tracing was left alone. Run when the agent creates its event loop, so a variable left over from another project cannot send prompts and tool results to LangSmith
 def system_prompt(config: HailerConfig, bundle: ContextBundle) -> str  # prompts/system.md (importlib.resources; a built-in fallback persona when missing or empty) + project context + skills index + web allowlist statement + workspace section. Invariant: the text does NOT depend on config.notebook, which changes mid-conversation (the model learns it from marimo_status() and CLI notices). Sent with every model call, never stored in the conversation
     # Workspace section (_workspace_section), for config.kernel as in effect (the CLI applies kernel.attach_runtime first):
@@ -741,6 +743,10 @@ class HailerAgent:
     model: str; provider_id: str; started: bool    # read-only properties
     thread_id: str | None; key_source: str         # "env" | "keyring" | "missing", refreshed whenever the model is built
 ```
+- Dependency preparation imports LangChain, its SQLite saver and the OpenAI resource package on a
+  daemon worker after disabling tracing unless opted in. `_ensure_graph` awaits this before creating
+  loop-owned resources. The process-wide completion survives cancellation and event-loop closure;
+  import failures become `AgentError` without repeating heavy imports on the UI thread.
 - `build_model`: one `ChatOpenAI` covers both wire APIs. Always passed: `model`, `api_key`,
   `base_url=provider_base_url(provider)`, `use_responses_api=(wire_api == "responses")`,
   `stream_usage=(stream and stream_options)`, `http_socket_options=()`. When configured: `default_headers`
@@ -817,8 +823,10 @@ stored: the system prompt is sent with every turn, so `/reload` applies from the
 ## `cli.py`  (owner: wave 2 / E)
 
 Typer app; `main()` is the console entry. Bare `hailer` and `hailer notebook` both call `_run_session`:
-load config, run local and kernel checks, reuse a matching server or prepare and start the chosen runtime,
-wait for the notebook, show the startup panel, then run the chat. `--kernel local|docker` overrides the
+load config, run local and kernel checks, begin dependency-only warmup, then reuse a matching server or
+prepare and start the chosen runtime. Interactive mode shows the startup panel and editable composer
+before agent preparation and browser-session waiting run concurrently. Plain/piped mode retains the
+notebook wait before its prompt. `--kernel local|docker` overrides the
 runtime for `notebook`; `--keep-marimo` leaves a newly started kernel running. Reused servers are always
 left running. A pinned `marimo_url` is never replaced by a fresh server when it is down.
 
@@ -866,6 +874,21 @@ retaining redaction. Bracketed paste stays enabled throughout the live composer 
 Enter submits once; Alt+Enter inserts a newline; history is in memory. A busy submission leaves the draft
 intact and does not enqueue a request. Ctrl+C cancels active work and awaits cleanup, or exits while idle;
 Ctrl+D exits only empty and idle; Ctrl+Z then Enter exits while idle. `/exit` and `/quit` also exit.
+
+Startup is a separate preparation gate: typing and paste work from the first render, and one early
+submission waits until both agent and notebook preparation settle. Repeated Enter cannot submit it
+twice. Startup failure retains the pending message and next draft instead of dispatching them. The UI
+settles its startup task on shutdown before the controller closes the agent. Notebook waiting uses
+its own cooperative stop flag and must finish before the CLI stops a kernel it owns.
+`ChatController.startup_failed` records an actual preparation error, so leaving the retained-draft
+interface still returns exit code 1; intentional startup cancellation does not set it.
+
+`startup.StartupTimings` records idempotent monotonic milestones in seconds and debug-logs them without
+user content. `input_ready` is the first composer render; `ready_to_answer` is when the first message
+may be dispatched. `notebook_wait_complete` includes a nonfatal timeout, not proof of cell execution.
+The CLI also records `checks_complete`, `kernel_ready` and `panel_shown`; the controller records
+`agent_ready`. `scripts/benchmark_startup.py` measures fresh processes offline, including paste latency
+and the longest input-loop pause.
 
 The interactive controller awaits `astart`, `arun_turn`, `anew_thread` and `aclose` on one event loop.
 Blocking notebook operations run off the UI loop. Cancellation sets a cooperative stop flag, stops

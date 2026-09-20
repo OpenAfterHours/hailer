@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import os
@@ -251,6 +252,7 @@ class Harness:
     session_waits: list = field(default_factory=list)
     waited_session: object = "default"  # what _wait_for_session returns ("default" -> session s9)
     agent_servers: list = field(default_factory=list)  # the server each agent was pinned to (None: discovered)
+    warmups: list = field(default_factory=list)
 
     @property
     def url(self) -> str:
@@ -296,6 +298,7 @@ def harness(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "_load_context", load_context)
     monkeypatch.setattr(cli, "_render_prompt", lambda config, name, args: f"PROMPT[{name}]({args})")
     monkeypatch.setattr(cli, "_make_agent", lambda config, bundle, server=None: (h.agent_servers.append(server) or h.agent))
+    monkeypatch.setattr(cli, "_start_dependency_warmup", lambda: h.warmups.append("started"))
     monkeypatch.setattr(cli, "_open_browser", lambda url: h.opened.append(url))
 
     def no_spawn(*args, **kwargs):
@@ -331,6 +334,118 @@ def test_startup_panel_then_exit(harness):
     assert "Type /help for commands." in out
     assert "Bye." in out
     assert harness.agent.closed
+
+
+def test_interactive_session_enters_composer_before_waiting_for_browser(harness, monkeypatch):
+    """The CLI defers notebook preparation and sends its output through the UI console."""
+    harness.client = owned_client(harness.config, session=None)
+    ui_output = io.StringIO()
+    ui_console = Console(file=ui_output, force_terminal=False, color_system=None)
+    milestones = {}
+
+    def no_status(*args, **kwargs):
+        raise AssertionError("a background Rich spinner would fight the composer")
+
+    async def run_interactive(self, ui_factory=None, *, prepare_notebook=None, timings=None):
+        assert harness.opened == [] and harness.session_waits == []
+        assert self.server is SERVER
+        assert set(timings.milestones) == {"checks_complete", "kernel_ready", "panel_shown"}
+        self.console = ui_console
+        timings.mark("input_ready")
+        assert prepare_notebook is not None
+        await prepare_notebook()
+        milestones.update(timings.milestones)
+
+    monkeypatch.setattr(ui_console, "status", no_status)
+    monkeypatch.setattr(cli, "_use_composer", lambda opts: True)
+    monkeypatch.setattr(cli.ChatLoop, "run_interactive", run_interactive)
+    result = chat()
+    assert result.exit_code == 0, result.output
+    assert harness.opened == [harness.url]
+    assert harness.session_waits == [harness.config.notebook]
+    assert "Notebook is open (session s9)." in ui_output.getvalue()
+    assert "Notebook is open" not in result.output
+    assert milestones["input_ready"] >= milestones["panel_shown"]
+
+
+def test_interactive_startup_failure_exits_one_without_reporting_twice(harness, monkeypatch):
+    async def failed_startup(self, ui_factory=None, *, prepare_notebook=None, timings=None):
+        self.startup_failed = True
+        self.console.print("Could not prepare chat dependencies.")
+        self.console.print("Bye.")
+
+    monkeypatch.setattr(cli, "_use_composer", lambda opts: True)
+    monkeypatch.setattr(cli.ChatLoop, "run_interactive", failed_startup)
+    result = chat()
+    assert result.exit_code == 1, result.output
+    assert result.output.count("Could not prepare chat dependencies.") == 1
+    assert "Unexpected error" not in result.output
+    assert "Bye." in result.output
+
+
+def test_notebook_preparation_cancel_during_resolve_does_not_open_browser(harness, monkeypatch):
+    """A request already in flight settles before cancellation finishes, with no later side effects."""
+    entered, release = threading.Event(), threading.Event()
+    output = io.StringIO()
+
+    def resolve(notebook):
+        entered.set()
+        assert release.wait(5), "test did not release session resolution"
+        raise NoSessionError("not open")
+
+    monkeypatch.setattr(harness.client, "resolve_session", resolve)
+
+    async def scenario():
+        task = asyncio.create_task(cli._prepare_notebook(
+            Console(file=output), harness.config, SERVER, open_browser=True,
+        ))
+        try:
+            async with asyncio.timeout(5):
+                while not entered.is_set():
+                    await asyncio.sleep(0.01)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done(), "the in-flight worker must settle before shutdown"
+            task.cancel()  # repeated Ctrl+C cannot abandon the worker either
+            await asyncio.sleep(0)
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+
+    asyncio.run(scenario())
+    assert harness.opened == []
+    assert harness.session_waits == []
+    assert output.getvalue() == ""
+
+
+def test_notebook_preparation_cancel_stops_real_session_poll(harness, monkeypatch):
+    from hailer.marimo_client import wait_for_session
+
+    harness.client = FakeClient(session=None, workspace=harness.config.workspace)
+    polling = threading.Event()
+    output = io.StringIO()
+
+    def wait_session(client, notebook, timeout, *, should_stop=None):
+        polling.set()
+        return wait_for_session(client, notebook, timeout, interval=30, should_stop=should_stop)
+
+    monkeypatch.setattr(cli, "_wait_for_session", wait_session)
+
+    async def scenario():
+        task = asyncio.create_task(cli._prepare_notebook(
+            Console(file=output), harness.config, SERVER, open_browser=True,
+        ))
+        async with asyncio.timeout(5):
+            while not polling.is_set():
+                await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 2)
+
+    asyncio.run(scenario())
+    assert harness.opened == [harness.url]
+    assert "No kernel session yet" not in output.getvalue(), "cancellation is not a timeout"
 
 
 def test_turn_prints_answer_and_persists_session(harness):
@@ -505,6 +620,7 @@ def test_missing_openai_key_is_fatal_too(harness):
     harness.key_source = (None, "missing")
     result = chat()
     assert result.exit_code == 1
+    assert harness.warmups == []
     assert "OPENAI_API_KEY is not set" in result.output
     assert "uvx hailer login openai" in result.output
     assert harness.agent.turns == []
@@ -757,6 +873,63 @@ def test_notebook_no_browser_still_waits_and_continues_without_session(harness, 
     assert "No kernel session yet" in result.output
     assert harness.agent.started == [None], "chat still starts; the agent reports the notebook state"
     assert nb.proc.terminated
+
+
+def test_dependency_warmup_starts_before_kernel_start(harness, nb, monkeypatch):
+    order = []
+    start_kernel = cli._start_kernel
+
+    def start(*args, **kwargs):
+        order.append("kernel")
+        return start_kernel(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "_start_dependency_warmup", lambda: order.append("dependencies"))
+    monkeypatch.setattr(cli, "_start_kernel", start)
+    result = notebook_cmd()
+    assert result.exit_code == 0, result.output
+    assert order == ["dependencies", "kernel"]
+
+
+def test_startup_exit_settles_notebook_worker_before_stopping_owned_kernel(harness, nb, monkeypatch):
+    harness.client = FakeClient(session=None)
+    polling, cleanup_started, release = threading.Event(), threading.Event(), threading.Event()
+
+    def wait_session(client, notebook, timeout, *, should_stop=None):
+        assert should_stop is not None
+        polling.set()
+        deadline = time.monotonic() + 5
+        while not should_stop():
+            assert time.monotonic() < deadline, "startup cancellation did not stop polling"
+            time.sleep(0.01)
+        cleanup_started.set()
+        assert release.wait(5), "test did not release cleanup"
+        assert not nb.proc.terminated, "the kernel must outlive its startup worker"
+        return None
+
+    async def run_interactive(self, ui_factory=None, *, prepare_notebook=None, timings=None):
+        task = asyncio.create_task(prepare_notebook())
+        try:
+            async with asyncio.timeout(5):
+                while not polling.is_set():
+                    await asyncio.sleep(0.01)
+            task.cancel()
+            async with asyncio.timeout(5):
+                while not cleanup_started.is_set():
+                    await asyncio.sleep(0.01)
+            assert not task.done() and not nb.proc.terminated
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+
+    monkeypatch.setattr(cli, "_use_composer", lambda opts: True)
+    monkeypatch.setattr(cli, "_wait_for_session", wait_session)
+    monkeypatch.setattr(cli.ChatLoop, "run_interactive", run_interactive)
+    result = notebook_cmd()
+    assert result.exit_code == 0, result.output
+    assert nb.proc.terminated
+    assert "Stopped marimo." in result.output
+    assert "No kernel session yet" not in result.output
 
 
 def test_notebook_keep_marimo_leaves_server_running(harness, nb):
