@@ -34,7 +34,7 @@ RUN --mount=type=secret,id=pip_config --mount=type=secret,id=pip_cert \
     test -n "$MARIMO_VERSION" && test -n "$POLARS_VERSION" && test -n "$FASTEXCEL_VERSION" && test -n "$DUCKDB_VERSION" && test -n "$HAILER_VERSION" \
     || { echo "Missing build args: build with uvx hailer kernel build (see hailer.kernel_image)." >&2; exit 1; }; \
     if [ -f /run/secrets/pip_config ]; then \
-        unset PIP_INDEX_URL PIP_EXTRA_INDEX_URL PIP_TRUSTED_HOST; \
+        unset PIP_INDEX_URL PIP_EXTRA_INDEX_URL PIP_TRUSTED_HOST PIP_NO_INDEX PIP_FIND_LINKS PIP_PROXY PIP_CERT PIP_TIMEOUT PIP_RETRIES; \
         export PIP_CONFIG_FILE=/run/secrets/pip_config; \
     fi; \
     if [ -f /run/secrets/pip_cert ]; then export PIP_CERT=/run/secrets/pip_cert; fi; \

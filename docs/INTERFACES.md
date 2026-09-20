@@ -501,7 +501,8 @@ def package_dir() -> Path                   # the installed hailer package
 def build_args() -> dict[str, str]          # the installed marimo, Polars, fastexcel, DuckDB versions + HAILER_VERSION
 def prepare_context(dest: Path) -> dict[str, str]   # dest gets Dockerfile (LF endings) and hailer/ (no __pycache__); returns build_args(); dest must not hold hailer/
 def build_command(tag, context, args) -> list[str]  # ["build", "--tag", tag, "--build-arg", ..., context]
-def build(tag: str, runner: DockerRunner) -> int     # prepare_context in a temp folder, docker build streamed; the exit code
+def build(tag: str, runner: DockerRunner, *, base_image=None, pip_config=None, pip_cert=None, no_cache=False, no_host_config=False, say=None) -> int
+def configured_build_options(*, base_image=None, pip_config=None, pip_cert=None, no_cache=False, no_host_config=False, say=None, dry_run=False)  # context manager yielding Docker options; owns temporary secrets
 def pull(image: str, runner: DockerRunner) -> CompletedProcess[str]   # docker pull streamed, errors kept
 def image_version(image: str, runner: DockerRunner) -> str | None    # the label; "" when absent; None when the image is not on this machine
 ```
@@ -512,6 +513,16 @@ package copied into site-packages without dependencies, user `analyst` (uid 1000
 (`[runtime] auto_instantiate = true`) and an empty `/work/hailer.toml`, `WORKDIR /work`, and the version
 label. `scripts/build_kernel_image.py` builds the same context with `docker buildx` (`--platform`, `--tag`,
 `--push` / `--load`, `--context`, `--dry-run`, arguments after `--` passed on) for CI and the release.
+
+`kernel_packages.discover()` reads portable pip settings (environment over merged global/user/site
+files), falling back to a single uv default index (environment over system/user/nearest-project
+configuration). Returns `PackageSettings(options, cert)` with sensitive fields excluded from repr.
+No subprocess or third-party dependency is required. Invalid configuration raises a sanitized
+`KernelRuntimeError`; local wheel paths and uv routing that pip cannot preserve require an explicit
+configuration. Only selected package settings cross into the build, as temporary BuildKit secrets
+outside its context. Explicit `pip_config` or `no_host_config` bypasses discovery; explicit `pip_cert`
+overrides the discovered CA. CLI and buildx share this lifetime. Dry-run commands use a placeholder
+for generated secrets: rerun the script without `--dry-run` to execute them.
 
 ## `_forward.py`  (owner: docker kernel, 2026-09-19)
 

@@ -16,6 +16,8 @@ import pytest
 
 from hailer import kernel_image
 
+pytestmark = pytest.mark.usefixtures("isolated_package_settings")
+
 _ROOT = Path(__file__).resolve().parents[1]
 _SCRIPT = _ROOT / "scripts" / "build_kernel_image.py"
 _spec = importlib.util.spec_from_file_location("hailer_build_kernel_image_script", _SCRIPT)
@@ -152,3 +154,32 @@ def test_corporate_missing_config_does_not_prepare_a_context(tmp_path, capsys):
     assert script.main(["--dry-run", "--context", str(ctx), "--pip-config", str(tmp_path / "missing.ini")]) == 1
     assert "Cannot read --pip-config file" in capsys.readouterr().err
     assert not ctx.exists()
+
+
+def test_discovered_settings_dry_run_and_opt_out(monkeypatch, capsys):
+    monkeypatch.setenv("UV_DEFAULT_INDEX", "https://build:private-token@mirror/simple")
+    assert script.main(["--dry-run", "--load"]) == 0
+    output = capsys.readouterr().out
+    assert "<discovered-pip-config>" in output and "private-token" not in output
+    assert script.main(["--dry-run", "--no-host-config"]) == 0
+    assert "--secret" not in capsys.readouterr().out
+
+
+def test_buildx_discovered_secret_exists_only_during_build(monkeypatch):
+    import csv
+
+    monkeypatch.setenv("PIP_INDEX_URL", "https://build:private-token@mirror/simple")
+    seen = []
+
+    def run(cmd, **kwargs):
+        fields = dict(item.split("=", 1) for item in next(csv.reader([cmd[cmd.index("--secret") + 1]])))
+        secret = Path(fields["src"])
+        assert "private-token" in secret.read_text()
+        assert "private-token" not in str(cmd)
+        seen.append(secret)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(script.shutil, "which", lambda name: "docker")
+    monkeypatch.setattr(script.subprocess, "run", run)
+    assert script.main(["--load"]) == 0
+    assert seen and not seen[0].exists()
