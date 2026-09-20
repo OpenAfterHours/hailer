@@ -46,7 +46,7 @@ Other subcommands:
 | `hailer login <provider>`, `hailer logout <provider>` | Store or remove a provider's API key. |
 | `hailer init [--force] [--kernel RUNTIME]` | Set up a workspace (see Quick start); `--kernel` writes `[kernel] runtime`. |
 | `hailer kernel pull` | Download the kernel image for this Hailer (or `[kernel].image`). |
-| `hailer kernel build [--tag <name>]` | Build the kernel image on this machine. |
+| `hailer kernel build [--tag <name>]` | Build the kernel image, discovering host pip/uv mirror settings. `--pip-config FILE` overrides discovery; `--no-host-config` disables it. See [corporate mirrors](../security/docker.md#building-with-corporate-mirrors). |
 | `hailer kernel stop` | Stop this workspace's kernel (local or docker) and remove its containers and network. |
 
 Global options go before the subcommand: `--verbose`, `--config <path>`, `--workspace <path>`, `--new`,

@@ -1943,7 +1943,7 @@ def test_kernel_pull_of_an_image_that_is_not_published(harness, docker):
     assert "Build it on this machine with: uvx hailer kernel build" in result.output
 
 
-def test_kernel_build(harness, docker):
+def test_kernel_build(harness, docker, isolated_package_settings):
     from hailer.kernel_image import build_args
 
     result = runner.invoke(cli.app, ["kernel", "build"], catch_exceptions=False)
@@ -1964,7 +1964,7 @@ def test_kernel_build(harness, docker):
     assert result.exit_code == 1 and "Docker is not running." in result.output and len(docker.streams) == streams
 
 
-def test_kernel_build_with_corporate_mirrors(harness, docker, tmp_path):
+def test_kernel_build_with_corporate_mirrors(harness, docker, tmp_path, isolated_package_settings):
     import csv
 
     config = tmp_path / "pip.ini"
@@ -1986,6 +1986,18 @@ def test_kernel_build_with_corporate_mirrors(harness, docker, tmp_path):
     ]
     assert "private-token" not in result.output and "private-token" not in str(build)
     assert 'set image = "company/hailer:dev"' in result.output
+
+
+def test_kernel_build_discovers_mirror_and_can_opt_out(harness, docker, isolated_package_settings, monkeypatch):
+    monkeypatch.setenv("PIP_INDEX_URL", "https://user:private-token@mirror/simple")
+    result = runner.invoke(cli.app, ["kernel", "build"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    assert "Using discovered host package settings" in result.output
+    assert "--secret" in docker.streams[-1]
+    assert "private-token" not in result.output and "private-token" not in str(docker.streams[-1])
+    result = runner.invoke(cli.app, ["kernel", "build", "--no-host-config"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    assert "--secret" not in docker.streams[-1]
 
 
 @pytest.mark.parametrize("option", ["--pip-config", "--pip-cert"])

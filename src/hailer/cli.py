@@ -1316,7 +1316,7 @@ def kernel_build(
         None, "--base-image", help="Python base image, e.g. registry.company/python:3.13 (Python 3.12+ with venv).",
     ),
     pip_config: Path | None = typer.Option(
-        None, "--pip-config", help="Pip configuration file for the build (mirror/authentication); mounted as a build secret.",
+        None, "--pip-config", help="Pip configuration build secret; overrides automatic host pip/uv discovery.",
         exists=True, file_okay=True, dir_okay=False, readable=True, resolve_path=True,
     ),
     pip_cert: Path | None = typer.Option(
@@ -1325,6 +1325,9 @@ def kernel_build(
     ),
     no_cache: bool = typer.Option(
         False, "--no-cache", help="Reinstall packages without cached build layers (use after changing mirror settings).",
+    ),
+    no_host_config: bool = typer.Option(
+        False, "--no-host-config", help="Disable automatic discovery of host pip/uv package settings.",
     ),
 ) -> None:
     """Build the kernel image on this machine, for machines that cannot download it."""
@@ -1346,6 +1349,7 @@ def kernel_build(
         )
         code = kernel_image.build(
             image, runtime.runner, base_image=base_image, pip_config=pip_config, pip_cert=pip_cert, no_cache=no_cache,
+            no_host_config=no_host_config, say=lambda message: console.print(message, markup=False),
         )
         if code != 0:
             raise KernelRuntimeError(

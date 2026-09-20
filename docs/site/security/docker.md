@@ -72,10 +72,41 @@ Desktop). `uvx hailer kernel pull` downloads it ahead of time.
 You can build from an approved Python image and install the kernel packages from your company's PyPI
 mirror. No source checkout is needed. Install Hailer itself through your normal corporate Python
 package setup first (for example, `python -m pip install hailer` with your host pip configuration).
-The host's pip/uv configuration is separate from the Docker build: pass the build's pip configuration
-explicitly, or use one already provided by the base image.
+`hailer kernel build` automatically discovers the host's pip mirror settings, falling back to uv
+when pip has no index settings. The same discovery runs in `scripts.build_kernel_image`. For an
+existing mirror setup, you can normally run:
 
-Create a pip configuration file, for example `company-pip.ini` (the same format on every platform):
+```text
+hailer kernel build
+```
+
+Hailer reads the standard system, user and virtual-environment pip configuration files, including
+`PIP_CONFIG_FILE`, and applies `PIP_*` environment overrides. It copies only index URLs, trusted
+hosts, proxy, CA certificate, no-index, HTTP(S) find-links, timeout and retry settings. Within pip
+files, `[install]` settings override `[global]`. `PIP_CONFIG_FILE` follows pip's user-file suppression
+and null-device rules. See [pip configuration](https://pip.pypa.io/en/stable/topics/configuration/).
+
+If pip has no index settings, Hailer checks uv's system and user configuration and the nearest
+`uv.toml` or `[tool.uv]` in `pyproject.toml` from the current directory upwards. `uv.toml` wins
+over `pyproject.toml` in the same folder. It also reads `[pip]` / `[tool.uv.pip]`, `UV_CONFIG_FILE`,
+`UV_NO_CONFIG`, `UV_DEFAULT_INDEX`, `UV_INDEX_URL` and `UV_NO_INDEX`. A single default `[[index]]`
+is supported, including `UV_INDEX_<NAME>_USERNAME` / `UV_INDEX_<NAME>_PASSWORD`. Environment settings
+override file settings within each tool; pip index settings take precedence over uv index settings.
+This build discovery includes project configuration even when Hailer was launched with `uvx`.
+
+uv's additional or explicit indexes and package-specific source routing cannot be translated to
+pip's resolution rules automatically; Hailer reports an error asking for `--pip-config` instead.
+Local wheel paths and automatic client-certificate mounts also need explicit build configuration.
+Host credential stores, keyring helpers, arbitrary environment variables and installation settings
+are not copied. See [uv index resolution](https://docs.astral.sh/uv/concepts/indexes/).
+
+`--pip-config FILE` overrides discovery entirely. `--pip-cert FILE` overrides the discovered CA
+bundle (`PIP_CERT` / pip's `cert`, then `REQUESTS_CA_BUNDLE`, then `SSL_CERT_FILE`). The CA file is
+mounted at its container path automatically. `--no-host-config` disables discovery while retaining
+explicit build options, so a base image's own package configuration can be used.
+
+To select settings explicitly, reuse an existing pip file or create one, for example
+`company-pip.ini` (the same format on every platform):
 
 ```ini
 [global]
@@ -114,9 +145,10 @@ image = "hailer-kernel:company"
 - **Configuration and authentication:** `--pip-config` and `--pip-cert` are optional. They use
   [BuildKit secret mounts](https://docs.docker.com/build/building/secrets/); their contents are not
   copied into the build context or image. An authenticated index URL can go in the pip file; keep
-  that file outside version control. Host environment variables are not automatically forwarded.
-  An explicit pip file overrides the base's `PIP_INDEX_URL`, `PIP_EXTRA_INDEX_URL` and
-  `PIP_TRUSTED_HOST` variables during installation. Other settings follow
+  that file outside version control. Discovered settings are written to a temporary secret outside
+  the build context and removed even when the build fails or is interrupted. Hailer reports that
+  discovery was used without printing URLs or credentials. The selected pip file overrides the
+  base's environment variables for the supported package settings during installation. Other settings follow
   [pip's configuration rules](https://pip.pypa.io/en/stable/topics/configuration/); the empty
   `extra-index-url` above clears inherited extra indexes. Paths inside the pip file refer to the
   build container, so use `--pip-cert` for a CA file on your host.

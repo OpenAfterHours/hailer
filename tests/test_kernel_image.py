@@ -15,6 +15,8 @@ from hailer import __version__, kernel_image
 from hailer.errors import KernelRuntimeError
 from hailer.models import KernelConfig
 
+pytestmark = pytest.mark.usefixtures("isolated_package_settings")
+
 
 def test_default_image_is_the_published_one_for_this_version():
     assert kernel_image.default_image() == f"ghcr.io/openafterhours/hailer-kernel:{__version__}"

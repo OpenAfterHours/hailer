@@ -16,18 +16,22 @@ check the argument lists without Docker.
 
 from __future__ import annotations
 
+import configparser
 import csv
 import importlib.metadata
 import importlib.resources
 import io
 import json
+import os
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from hailer import __version__
+from hailer import __version__, kernel_packages
 from hailer.errors import KernelRuntimeError
 from hailer.models import KERNEL_IMAGE_REPOSITORY
 
@@ -119,16 +123,64 @@ def build_command(tag: str, context: Path, args: dict[str, str], *, options: lis
     return cmd + (options or []) + [str(context)]
 
 
+@contextmanager
+def configured_build_options(
+    *, base_image: str | None = None, pip_config: Path | None = None, pip_cert: Path | None = None,
+    no_cache: bool = False, no_host_config: bool = False, say: Callable[[str], None] | None = None,
+    dry_run: bool = False,
+) -> Iterator[list[str]]:
+    """Keep discovered credentials in a temporary secret outside the build context.
+
+    Explicit pip config disables discovery. A dry run uses a placeholder instead of
+    creating a secret whose path would be invalid when the printed command is used.
+    """
+    settings = kernel_packages.PackageSettings()
+    if pip_config is None and not no_host_config:
+        settings = kernel_packages.discover()
+    options = build_options(
+        base_image=base_image, pip_config=pip_config, pip_cert=pip_cert or settings.cert, no_cache=no_cache,
+    )
+    if not settings.options:
+        if settings.cert is not None and say:
+            say("Using the host package CA bundle for this build.")
+        yield options
+        return
+    if say:
+        say("Using discovered host package settings for this build (credentials are not displayed).")
+    if dry_run:
+        if say:
+            say("<discovered-pip-config> is temporary; rerun this script without --dry-run to build.")
+        yield [*options, "--secret", "type=file,id=pip_config,src=<discovered-pip-config>"]
+        return
+    with tempfile.TemporaryDirectory(prefix="hailer-build-secrets-") as secret_dir:
+        path = Path(secret_dir) / "pip.ini"
+        parser = configparser.RawConfigParser()
+        # pip's command section beats [global], even in an earlier base-image
+        # config file. Preserve the host's effective values at install scope.
+        parser["install"] = settings.options
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                parser.write(stream)
+        except OSError:
+            raise KernelRuntimeError("Cannot prepare the package configuration build secret.") from None
+        yield [*options, *build_options(pip_config=path)]
+
+
 def build(
     tag: str, runner: DockerRunner, *, base_image: str | None = None,
     pip_config: Path | None = None, pip_cert: Path | None = None, no_cache: bool = False,
+    no_host_config: bool = False, say: Callable[[str], None] | None = None,
 ) -> int:
     """Build the image as ``tag`` on this machine, docker's output in this terminal; the exit code."""
-    options = build_options(base_image=base_image, pip_config=pip_config, pip_cert=pip_cert, no_cache=no_cache)
-    with tempfile.TemporaryDirectory(prefix="hailer-kernel-") as tmp:
-        context = Path(tmp)
-        args = prepare_context(context)
-        return runner.stream(build_command(tag, context, args, options=options)).returncode
+    with configured_build_options(
+        base_image=base_image, pip_config=pip_config, pip_cert=pip_cert, no_cache=no_cache,
+        no_host_config=no_host_config, say=say,
+    ) as options:
+        with tempfile.TemporaryDirectory(prefix="hailer-kernel-") as tmp:
+            context = Path(tmp)
+            args = prepare_context(context)
+            return runner.stream(build_command(tag, context, args, options=options)).returncode
 
 
 def pull(image: str, runner: DockerRunner) -> subprocess.CompletedProcess[str]:
@@ -159,6 +211,7 @@ __all__ = [
     "build_args",
     "build_command",
     "build_options",
+    "configured_build_options",
     "default_image",
     "image_version",
     "package_dir",

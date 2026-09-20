@@ -87,6 +87,15 @@ and fractional triggers required model profiles that custom deployment names lac
 Variables inherited from another project must not silently export prompts or tool results. Preserve
 the explicit endpoint URL and the tests for tracing opt-in.
 
+Docker builds discover host pip/uv package settings by default (`--no-host-config` opts out;
+`--pip-config` overrides discovery). This is limited to package download configuration, never the
+whole host environment or provider credentials. Keep synthesized settings in temporary BuildKit
+secrets outside the build context and clean them up on failures and interrupts. Discovery errors
+must not include parser input, URLs or chained exceptions containing credentials. uv's multi-index
+resolution is not pip's resolution: require an explicit pip configuration when it cannot be
+translated faithfully. Evidence: `tests/test_kernel_packages.py`, `tests/test_kernel_image.py`,
+`tests/test_build_kernel_image.py` and the kernel-build tests in `tests/test_cli.py`.
+
 Keep credentials out of prompts, logs and errors. Use Hailer's credential resolution and redaction
 helpers; do not move keys into subprocess arguments or new plaintext config files.
 
