@@ -1,5 +1,8 @@
 # Plan: let users choose whether the notebook kernel runs in Docker
 
+> Historical record: this describes the design at the time it was written (2026-09-18/19). The current
+> architecture is in [PLAN.md](../../PLAN.md).
+
 Status: **implemented on 2026-09-19** (branch `worktree-docker-kernel`, phases 0 to 4). The decisions in
 section 9 were taken as recommended: `local` stays the default and docker is opt-in; the image is published
 to GHCR by the release workflow, with `uvx hailer kernel build` as the fallback; `[kernel].network = true`

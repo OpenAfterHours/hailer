@@ -131,7 +131,7 @@ initial UI mode differs. The reader switches to edit mode with Ctrl+. / Cmd+. ("
 
 
 def notebook_file_key(notebook: Path) -> str:
-    """A host path as marimo knows it: absolute, with forward slashes (the local runtime's notebooks
+    """A host path as marimo knows it: absolute, with forward slashes (the unsafe-local runtime's notebooks
     folder is ``notebook_file_key(config.notebooks_root)``).
 
     An absolute ``?file=`` key works whether the server was started on the notebooks folder (keys would
@@ -161,7 +161,7 @@ def name_in_folder(folder: str | None, path: object, *, native: bool) -> str | N
     """``path`` (a path marimo reported) relative to ``folder`` as a POSIX name; ``None`` when it is
     empty, relative or outside the folder.
 
-    ``native``: the kernel's paths are this machine's (the local runtime), so both are compared with
+    ``native``: the kernel's paths are this machine's (the unsafe-local runtime), so both are compared with
     links and junctions resolved (``os.path.realpath``; case-insensitive on Windows, either
     separator): a file reached through a link that leaves the folder is outside it, and the name
     has the file's own spelling where it exists (Windows returns the on-disk case). Otherwise they

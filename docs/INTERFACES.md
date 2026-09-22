@@ -1,7 +1,8 @@
 # Hailer module contracts
 
-This is the contract every module is built against. `PLAN.md` explains *why* (for the agent:
-[LEARNINGS.md](LEARNINGS.md); for the kernel runtimes: `docs/DOCKER_KERNEL_PLAN.md`); this file says *what*
+This is the contract every module is built against. [PLAN.md](../PLAN.md) describes the architecture and
+[LEARNINGS.md](LEARNINGS.md) the lessons behind it (the history, including the Docker kernel's plan and
+review, is in [history/](history/PLAN_HISTORY.md)); this file says *what*
 each module exposes so work can proceed in parallel.
 Shared types live in `src/hailer/models.py`, errors in `src/hailer/errors.py`. Do not change those two files
 without agreement (report a needed change instead).
@@ -46,10 +47,8 @@ without agreement (report a needed change instead).
   `session.json`) records which notebook the chat is working in, as a *name* relative to the notebooks folder.
   It has two writers in one process: the CLI between turns (slash commands) and the agent's tools during a turn.
   Every reader re-reads it before use through `hailer.notebooks.load_active_notebook` and never caches it.
-  `load_active_notebook` reads **only the file**: `HAILER_NOTEBOOK` stays set for the whole session, so an
-  env-wins rule would make the tools ignore every switch. Instead the CLI's `_load_config` writes an explicit
-  `HAILER_NOTEBOOK` to the file at startup (`save_active_notebook`), so the CLI, the tools and later sessions
-  agree. Residual race: a tool call still running after Ctrl+C (it finishes on its daemon thread) may write the
+  `load_active_notebook` reads **only the file** (no environment variable names a notebook), so the CLI, the
+  tools and later sessions agree. Residual race: a tool call still running after Ctrl+C (it finishes on its daemon thread) may write the
   file later; the CLI re-reads it after every turn (finished, failed or interrupted) and before `/notebook` and
   `/status`.
 - **Files belong to the sandbox.** Everything above the runtime layer (the tools, the chat, the CLI's session
@@ -61,7 +60,7 @@ without agreement (report a needed change instead).
 
 ## Runtime facts
 
-For marimo verification, see PLAN.md §1. For LangChain lessons and maintained regression checks, see
+For the original marimo verification, see [PLAN_HISTORY.md](history/PLAN_HISTORY.md) §1. For LangChain lessons and maintained regression checks, see
 [LEARNINGS.md](LEARNINGS.md) and `tests/test_agent.py`.
 
 - Multi-notebook (verified live on marimo 0.24.2, both `marimo edit <file>` and `marimo edit <dir>`): one
@@ -141,7 +140,7 @@ For marimo verification, see PLAN.md §1. For LangChain lessons and maintained r
   /api/kernel/execute` answer 401; `Authorization: Bearer <t>` is accepted by the API, and
   `access_token=<t>` in a page URL signs a browser in (marimo prints that URL in its banner, so the log
   holds the token). `/health` needs no token.
-- Docker (Docker Desktop 29.4.3 with the WSL2 engine on Windows 11, and WSL Ubuntu; `docs/DOCKER_KERNEL_PLAN.md`
+- Docker (Docker Desktop 29.4.3 with the WSL2 engine on Windows 11, and WSL Ubuntu; [DOCKER_KERNEL_PLAN.md](history/DOCKER_KERNEL_PLAN.md)
   §3 has the spike): Docker silently drops `-p` for a container on an `--internal` (or `none`) network, so
   the kernel is reached through a forwarder container published on `127.0.0.1` and joined to both
   networks. Inside the container marimo must bind `--host 0.0.0.0`. The `?file=` key must be the kernel
@@ -172,8 +171,10 @@ Rules: missing file → defaults (not an error); unparsable → `ConfigError` na
 keys are warnings returned by `validate`, not errors, including the keys removed with the Codex SDK
 (`[hailer].codex_home`, `[web].allow_shell_network`, provider `merge_messages`, `parallel_tool_calls`,
 `requires_openai_auth`), so an old file still loads. Relative paths resolve against the workspace. Env
-overrides: `HAILER_CONFIG`, `HAILER_WORKSPACE`, `HAILER_NOTEBOOK`, `HAILER_DATA_DIR`, `HAILER_MODEL`,
-`HAILER_MODEL_PROVIDER`, `HAILER_LOG_LEVEL`, `HAILER_NOTEBOOKS_DIR`, `HAILER_KERNEL`, `HAILER_KERNEL_IMAGE`. Provider tables `[model_providers.<id>]` map 1:1 to
+overrides (the complete list): `HAILER_CONFIG`, `HAILER_WORKSPACE`, `HAILER_MODEL`, `HAILER_MODEL_PROVIDER`,
+`HAILER_LOG_LEVEL`, `HAILER_KERNEL`, `HAILER_KERNEL_IMAGE`; `HAILER_TRACING` is read by `hailer.agent` only.
+Folders and the notebook come from the file alone (`HAILER_NOTEBOOK`, `HAILER_NOTEBOOKS_DIR` and
+`HAILER_DATA_DIR` were removed on 2026-09-23 and are not read). Provider tables `[model_providers.<id>]` map 1:1 to
 `ProviderConfig`: `base_url`, `wire_api`, `stream`, `stream_options` (both default `true`, valid with either
 `wire_api`), `env_key` (a declared `[model_providers.openai]` without one gets `OPENAI_API_KEY`), `name`,
 `http_headers`, `env_http_headers`, `query_params`. `[web]` maps to `WebConfig` (`allowed_domains` list,
@@ -257,14 +258,14 @@ def request_deadline(seconds) -> ContextManager   # thread-local: every request 
                                            # and nothing more is sent. Kernel code can replace the server, so a reply may be forged or trickled
 def answers_with_token(url: str, token: str | None, timeout: float = 1.0) -> bool
     # /health answers AND /api/sessions is refused (401/403) without the token AND accepted (200) with it; a
-    # --no-token server accepts anything and never passes, so the local orphan cleanup only ever ends the server
-    # a record describes. token=None: /health only
+    # --no-token server accepts anything and never passes, so a start only ever accepts the server it started,
+    # even when another one listens on that port. token=None: /health only
 class MarimoClient:
     def __init__(self, base_url: str, token: str | None = None, *, timeout: float = 10.0,
                  notebooks_path: str | None = None, native_paths: bool = False,
                  notebook: str | None = None, token_in_links: bool = False) -> None
                  # notebooks_path: the kernel's path of the notebooks folder; notebooks are names relative to it.
-                 # native_paths: the kernel's paths are this machine's (local runtime), else POSIX paths in a container.
+                 # native_paths: the kernel's paths are this machine's (unsafe-local runtime), else POSIX paths in a container.
                  # notebook: the name resolve_session()/execute() default to; token: sent as Authorization: Bearer;
                  # token_in_links: notebook links in error hints carry the token (the CLI sets it, the tools never)
     def file_key(self, name: str) -> str        # kernel_path(notebooks_path, name); ValueError without a notebooks folder
@@ -295,7 +296,7 @@ def match_session(sessions: Sequence[MarimoSession], notebook: str, *, fold: boo
     # the session whose name is notebook (ignoring case with fold); untitled sessions and files outside the folder never match; NO bare-filename
     # fallback (a/report.py never matches b/report.py); several matches → the last one listed. Used by
     # resolve_session, the CLI (/notebook list) and the test fakes.
-def notebook_file_key(notebook: Path) -> str          # a host path as marimo knows it: absolute, normalised, forward slashes, symlinks/junctions NOT resolved; the local runtime's notebooks_path is notebook_file_key(notebooks_root)
+def notebook_file_key(notebook: Path) -> str          # a host path as marimo knows it: absolute, normalised, forward slashes, symlinks/junctions NOT resolved; the unsafe-local runtime's notebooks_path is notebook_file_key(notebooks_root)
 def kernel_path(folder: str, name: str) -> str        # folder + "/" + name: the ?file= key of a notebook
 def name_in_folder(folder: str | None, path: object, *, native: bool) -> str | None
     # a reported kernel path as a name in folder; None when empty, relative or outside. native: both resolved
@@ -382,7 +383,7 @@ def notebook_digest(source: str) -> str   # sha256 with \r\n normalised to \n (u
 ```
 Every name goes through `notebooks.check_notebook_name` before any request (`test_names_are_checked_before_any_request`),
 and `test_hailer_never_sends_a_path_outside_the_notebooks_folder` checks every path `fake_marimo.py` was asked about.
-A docker kernel's paths cannot be resolved from the host, so the link check covers the local runtime only; a docker
+A docker kernel's paths cannot be resolved from the host, so the link check covers the unsafe-local runtime only; a docker
 kernel's notebooks folder is the container's own, and what comes back passes `notebook_sync.sync_refusal`.
 
 ## `notebook_sync.py`  (2026-09-22)
@@ -923,7 +924,7 @@ class HailerAgent:
   `SummarizationMiddleware(model=model, trigger=("tokens", N), keep=("messages", SUMMARY_KEEP_MESSAGES))`.
 - `run_turn` sends ONE user message: the skill notice (`[Hailer] The user attached the skill '<name>' to this
   request. Follow its instructions:` + `context.read_skill`), the preamble (blank counts as none; the CLI's
-  `[Hailer] ...` notices, see cli.py), then the text, joined by blank lines. First `_settle_history` makes the
+  `[Hailer] ...` notices, see `hailer.chat`), then the text, joined by blank lines. First `_settle_history` makes the
   stored conversation valid: every tool call without a result gets a `ToolMessage(INTERRUPTED_TOOL_RESULT)`,
   and when the last stored message is the user's (the turn died before the model answered) the new text is
   appended to it under the same message id, because strict chat templates refuse two user messages in a row.
@@ -976,9 +977,22 @@ def help_text() -> str
 to resume and carries the counters; the conversation itself is in `.hailer/threads.sqlite`. No prompt hash is
 stored: the system prompt is sent with every turn, so `/reload` applies from the next message.
 
-## `cli.py`  (owner: wave 2 / E)
+## `cli/`  (owner: wave 2 / E)
 
-Typer app; `main()` is the console entry. Bare `hailer` and `hailer notebook` both call `_run_session`:
+The `hailer.cli` package: `__init__.py` holds the Typer `app` (global options, command registration) and
+`main()`, the console entry (`hailer = "hailer.cli:main"`). `chat.py` has bare `hailer`, `notebook` and the
+session code (`_run_session`, `_start_kernel`, `_run_foreground`, `_wait_for_notebook`, `ChatLoop`);
+`kernel.py` the `kernel pull|build|stop` sub-app; `setup.py` `init`, `login`, `logout`, `doctor` and `status`.
+`common.py` holds what they share: `CliOptions`, the injectable collaborators (`console_factory`,
+`_load_config`, `_runtime_for`, `_make_agent`, `_resolve_key`, `_wait_for_session`, `_open_browser`, ...),
+output helpers, the preflight checks (`local_checks`, `kernel_checks`) and the chat's terminal pieces
+(`_LineReader`, `_TurnDisplay`). The command modules call a collaborator as `common.<name>(...)` and
+`ChatLoop` hands `common` to `ChatController` as its `services`, so a test replaces one with
+`monkeypatch.setattr(common, "<name>", ...)` and every caller sees it; a name defined in `chat.py` or
+`setup.py` is replaced on that module. The modules import only `common` (and `__init__` imports all four), so
+there is no import cycle.
+
+Bare `hailer` and `hailer notebook` both call `_run_session`:
 load config, run local and kernel checks, begin dependency-only warmup, then prepare and start this
 session's own kernel through the chosen runtime (`_start_kernel`; nothing is looked for or reused).
 Interactive mode shows the startup panel and editable composer before agent preparation and
@@ -1027,11 +1041,11 @@ Agent start (`ChatLoop.start`):
 a resume means the thread was gone, the CLI says so and resets the counters. Credentials: a `"missing"` key is
 a fatal preflight failure for every provider, the built-in `openai` included; `status` and `/status` show
 `<env_key> from env|keyring` or `<env_key> missing (run: uvx hailer login <id>)`; both also show the `Kernel:` line,
-in yellow (`cli._kernel_style`) for unsafe-local, as the startup panel and `--foreground` do. Interactive chat is selected when stdin/stdout are terminals, unless `--plain` is set or
+in yellow (`common._kernel_style`) for unsafe-local, as the startup panel and `--foreground` do. Interactive chat is selected when stdin/stdout are terminals, unless `--plain` is set or
 `TERM` is `dumb`/`unknown`. `--plain` is a global option and also an option on `notebook`.
 
-`chat.py:ChatController` holds shared session, slash-command and notebook operations; `cli.ChatLoop`
-binds its injectable CLI collaborators. Plain mode uses `_LineReader`/`_TurnDisplay`. Explicit plain and
+`hailer/chat.py:ChatController` holds shared session, slash-command and notebook operations;
+`hailer.cli.chat.ChatLoop` binds it to `hailer.cli.common`, its injectable collaborators. Plain mode uses `_LineReader`/`_TurnDisplay`. Explicit plain and
 unsupported terminals use `Console.input` without starting prompt_toolkit; their Rich console also
 disables live status/cursor controls, including during startup and notebook waits.
 

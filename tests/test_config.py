@@ -263,23 +263,28 @@ def test_wrong_types_raise_config_error(tmp_path: Path, text: str, fragment: str
 
 def test_every_env_override(tmp_path: Path) -> None:
     ws = _make_workspace(tmp_path, FULL_CONFIG)
-    other_nb = _write(tmp_path / "other.py", "import marimo\n")
     env = {
-        "HAILER_NOTEBOOK": str(other_nb),
-        "HAILER_NOTEBOOKS_DIR": "envnbs",
-        "HAILER_DATA_DIR": "envdata",
         "HAILER_MODEL": "gpt-5.5",
         "HAILER_MODEL_PROVIDER": "openai",
         "HAILER_LOG_LEVEL": "debug",
+        "HAILER_KERNEL": "unsafe-local",
+        "HAILER_KERNEL_IMAGE": "example/kernel:dev",
     }
     cfg = load_config(workspace=ws, env=env)
-    assert cfg.notebook == other_nb.resolve()
-    assert cfg.notebooks_dir == (ws / "envnbs").resolve()
-    assert cfg.data_dir == (ws / "envdata").resolve()
+    assert cfg.kernel.runtime == "unsafe-local" and cfg.kernel.image == "example/kernel:dev"
     assert cfg.model.name == "gpt-5.5"
     assert cfg.model.provider == "openai"
     assert cfg.model.reasoning_effort == "high"  # not overridden by env
     assert cfg.log_level == "DEBUG"
+
+
+def test_folder_and_notebook_settings_come_only_from_the_file(tmp_path: Path) -> None:
+    """HAILER_NOTEBOOK, HAILER_NOTEBOOKS_DIR and HAILER_DATA_DIR were removed: they are not read."""
+    ws = _make_workspace(tmp_path)
+    env = {"HAILER_NOTEBOOK": "other.py", "HAILER_NOTEBOOKS_DIR": "envnbs", "HAILER_DATA_DIR": "envdata"}
+    cfg = load_config(workspace=ws, env=env)
+    assert cfg.notebook == load_config(workspace=ws, env={}).notebook
+    assert cfg.notebooks_dir != (ws / "envnbs").resolve() and cfg.data_dir == (ws / "data").resolve()
 
 
 def test_env_config_and_workspace_override(tmp_path: Path) -> None:
@@ -319,21 +324,22 @@ def test_validate_notebooks_dir_missing_is_warning(tmp_path: Path) -> None:
     ws = _make_workspace(tmp_path, notebook=False)
     problems = validate(load_config(workspace=ws, env={}))
     assert any(p.startswith("Warning:") and "notebooks folder not found" in p for p in problems)
-    # an env override may point at a folder that does not exist yet: warning, not fatal
+    # the setting may point at a folder that does not exist yet: warning, not fatal
     (tmp_path / "second").mkdir()
-    ws2 = _make_workspace(tmp_path / "second")
-    problems = validate(load_config(workspace=ws2, env={"HAILER_NOTEBOOKS_DIR": "nbs"}))
+    ws2 = _make_workspace(tmp_path / "second", '[hailer]\nnotebooks_dir = "nbs"\n')
+    problems = validate(load_config(workspace=ws2, env={}))
     assert any("notebooks folder not found" in p for p in problems)
     assert any("not inside [hailer].notebooks_dir" in p for p in _errors(problems))
 
 
 def test_validate_notebooks_dir_equal_to_workspace_is_warning(tmp_path: Path) -> None:
-    ws = _make_workspace(tmp_path)
+    ws = _make_workspace(tmp_path, '[hailer]\nnotebook = "root_nb.py"\nnotebooks_dir = "."\n')
     (ws / "root_nb.py").write_text("import marimo\napp = marimo.App()\n", encoding="utf-8")
-    problems = validate(load_config(workspace=ws, env={"HAILER_NOTEBOOK": "root_nb.py", "HAILER_NOTEBOOKS_DIR": "."}))
+    problems = validate(load_config(workspace=ws, env={}))
     assert _errors(problems) == []
     assert any(p.startswith("Warning:") and "workspace itself" in p and ".venv" in p for p in problems)
     # the normal layout does not warn
+    (ws / "hailer.toml").unlink()
     assert not any("workspace itself" in p for p in validate(load_config(workspace=ws, env={})))
 
 
@@ -726,18 +732,26 @@ def test_docker_refuses_mounts_that_expose_hailers_own_files(tmp_path: Path, tex
     assert not any("With [kernel] runtime" in e for e in local), "the unsafe-local runtime mounts nothing"
 
 
-def test_docker_refuses_a_data_folder_moved_by_the_environment(tmp_path: Path) -> None:
-    ws = _make_workspace(tmp_path, '[kernel]\nruntime = "docker"\n')
-    errors = _errors(validate(load_config(workspace=ws, env={"HAILER_DATA_DIR": str(ws)})))
+def _docker_data(ws: Path, data: Path | str) -> None:
+    """Point the workspace's hailer.toml at ``data`` as its data folder, with the docker runtime."""
+    _write(ws / "hailer.toml", f"[hailer]\ndata_dir = '{data}'\n[kernel]\nruntime = \"docker\"\n")
+
+
+def test_docker_refuses_the_workspace_as_the_data_folder(tmp_path: Path) -> None:
+    ws = _make_workspace(tmp_path)
+    _docker_data(ws, ws)
+    errors = _errors(validate(load_config(workspace=ws, env={})))
     assert any("The data folder" in e and "is the workspace folder" in e for e in errors), errors
 
 
 def test_docker_refuses_the_home_folder_and_a_whole_drive(tmp_path: Path, monkeypatch) -> None:
-    ws = _make_workspace(tmp_path, '[kernel]\nruntime = "docker"\n')
+    ws = _make_workspace(tmp_path)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
-    errors = _errors(validate(load_config(workspace=ws, env={"HAILER_DATA_DIR": str(tmp_path)})))
+    _docker_data(ws, tmp_path)
+    errors = _errors(validate(load_config(workspace=ws, env={})))
     assert any("The data folder" in e and "is your home folder" in e for e in errors), errors
-    errors = _errors(validate(load_config(workspace=ws, env={"HAILER_DATA_DIR": ws.anchor})))
+    _docker_data(ws, ws.anchor)
+    errors = _errors(validate(load_config(workspace=ws, env={})))
     assert any("is a whole drive" in e for e in errors), errors
 
 
@@ -786,9 +800,10 @@ def test_docker_refuses_credential_folders_under_home(tmp_path: Path, monkeypatc
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     monkeypatch.setattr(config_module, "_in_temp", lambda folder: False)  # tmp_path stands in for a real home
     (home / name / "sub").mkdir(parents=True)
-    ws = _make_workspace(tmp_path, '[kernel]\nruntime = "docker"\n')
+    ws = _make_workspace(tmp_path)
     for data, relation in ((home / name, "is"), (home / name / "sub", "is inside")):
-        errors = _errors(validate(load_config(workspace=ws, env={"HAILER_DATA_DIR": str(data)})))
+        _docker_data(ws, data)
+        errors = _errors(validate(load_config(workspace=ws, env={})))
         expected = f"The data folder ({data.resolve()}) {relation} {(home / name).resolve()}, a folder that holds credentials."
         assert any(e.startswith(expected) for e in errors), errors
 
@@ -801,8 +816,9 @@ def test_docker_refuses_appdata_on_windows_but_not_the_temporary_folder(tmp_path
     roaming = tmp_path / "Roaming"
     (roaming / "Tool").mkdir(parents=True)
     monkeypatch.setenv("APPDATA", str(roaming))
-    ws = _make_workspace(tmp_path, '[kernel]\nruntime = "docker"\n')
-    config = load_config(workspace=ws, env={"HAILER_DATA_DIR": str(roaming / "Tool")})
+    ws = _make_workspace(tmp_path)
+    _docker_data(ws, roaming / "Tool")
+    config = load_config(workspace=ws, env={})
     in_temp = config_module._in_temp
     monkeypatch.setattr(config_module, "_in_temp", lambda folder: False)  # tmp_path stands in for %APPDATA%
     problems = docker_mount_problems(config, windows=True)
@@ -810,6 +826,7 @@ def test_docker_refuses_appdata_on_windows_but_not_the_temporary_folder(tmp_path
     monkeypatch.setattr(config_module, "_in_temp", in_temp)
     monkeypatch.setenv("APPDATA", str(tmp_path / "elsewhere"))
     monkeypatch.setenv("LOCALAPPDATA", str(Path(tempfile.gettempdir()).parent))
+    (ws / "hailer.toml").unlink()
     assert docker_mount_problems(load_config(workspace=ws, env={}), windows=True) == [], "a workspace in the temporary folder is fine"
     assert not any("credentials" in p for p in docker_mount_problems(config, windows=False)), "Windows only"
 

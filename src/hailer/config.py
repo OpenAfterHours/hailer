@@ -358,9 +358,9 @@ def load_config(
     web_tbl = _section(data, "web", path)
     kernel_tbl = _section(data, "kernel", path)
 
-    notebook = env.get("HAILER_NOTEBOOK") or _str(hailer_tbl, "notebook", "hailer", path, DEFAULT_NOTEBOOK)
-    notebooks_dir = env.get("HAILER_NOTEBOOKS_DIR") or _str(hailer_tbl, "notebooks_dir", "hailer", path)
-    data_dir = env.get("HAILER_DATA_DIR") or _str(hailer_tbl, "data_dir", "hailer", path, DEFAULT_DATA_DIR)
+    notebook = _str(hailer_tbl, "notebook", "hailer", path, DEFAULT_NOTEBOOK)
+    notebooks_dir = _str(hailer_tbl, "notebooks_dir", "hailer", path)
+    data_dir = _str(hailer_tbl, "data_dir", "hailer", path, DEFAULT_DATA_DIR)
     context_dir = _str(hailer_tbl, "context_dir", "hailer", path, DEFAULT_CONTEXT_DIR)
     skills_dir = _str(hailer_tbl, "skills_dir", "hailer", path, DEFAULT_SKILLS_DIR)
     prompts_dir = _str(hailer_tbl, "prompts_dir", "hailer", path, DEFAULT_PROMPTS_DIR)
@@ -582,8 +582,7 @@ def docker_mount_problems(config: HailerConfig, *, windows: bool | None = None) 
     """Every reason, in docker mode, not to mount the data folder (at most one; empty when it is
     fine). The one place for these rules: ``validate()`` reports them and
     :class:`~hailer.kernel_docker.DockerRuntime` refuses to start on them, on every start path
-    (``--foreground`` never runs ``validate()``, and environment variables can move the folder
-    after hailer.toml was read). The data folder is the only folder of this machine a docker kernel
+    (``--foreground`` never runs ``validate()``). The data folder is the only folder of this machine a docker kernel
     sees (read-only); its notebooks folder is the container's own, copied to and from the
     workspace's (:mod:`hailer.notebook_sync`).
 
@@ -680,7 +679,7 @@ def validate(config: HailerConfig) -> list[str]:
     if not config.notebook.is_file():
         problems.append(
             f"Notebook not found: {config.notebook}. "
-            "Set [hailer].notebook (or HAILER_NOTEBOOK) to an existing marimo notebook, "
+            "Set [hailer].notebook to an existing marimo notebook, "
             "or run `uvx hailer init` to create the default one."
         )
     root = config.notebooks_root

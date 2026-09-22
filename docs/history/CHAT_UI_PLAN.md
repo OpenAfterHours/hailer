@@ -1,5 +1,8 @@
 # Persistent terminal chat interface
 
+> Historical record: this describes the design at the time it was written (2026-09-18/19). The current
+> architecture is in [PLAN.md](../../PLAN.md).
+
 Implementation plan, 2026-09-19. Steps 1-4 are implemented in the persistent composer change; optional streaming remains a follow-up. See the pull request for validation results and remaining manual terminal checks.
 
 ## Intended experience

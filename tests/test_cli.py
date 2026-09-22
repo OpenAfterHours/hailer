@@ -20,6 +20,9 @@ from rich.console import Console
 from typer.testing import CliRunner
 
 import hailer.cli as cli
+from hailer.cli import chat as cli_chat
+from hailer.cli import common
+from hailer.cli import setup as cli_setup
 from fake_sandbox import FolderSandbox, folder_sandbox, with_folder_files
 from hailer import __version__, kernel_image, notebooks
 from hailer.errors import ConfigError, CredentialsError, HailerError, NoSessionError
@@ -42,7 +45,7 @@ from hailer.session import save_session, session_path
 
 runner = CliRunner()
 # The real kernel start, captured before the harness replaces it.
-REAL_START_KERNEL = cli._start_kernel
+REAL_START_KERNEL = cli_chat._start_kernel
 SERVER = MarimoServer(url="http://127.0.0.1:2718", runtime="unsafe-local")  # the kernel the harness's fake start hands the chat
 TOKEN = "test-token-0123456789"  # what the nb fixture's runtime hands the servers it starts
 
@@ -285,7 +288,6 @@ class Harness:
 def harness(tmp_path, monkeypatch):
     monkeypatch.setenv("NO_COLOR", "1")
     monkeypatch.setenv("COLUMNS", "120")
-    monkeypatch.delenv("HAILER_NOTEBOOK", raising=False)
     h = Harness(config=make_config(tmp_path), agent=FakeAgent(), client=FakeClient())
 
     def load_context(config):
@@ -300,20 +302,20 @@ def harness(tmp_path, monkeypatch):
             raise h.waited_session  # e.g. Ctrl+C while waiting
         return h.waited_session
 
-    monkeypatch.setattr(cli, "console_factory", lambda: Console(force_terminal=False, width=120, highlight=False, soft_wrap=True, color_system=None))
-    monkeypatch.setattr(cli, "_load_config", lambda opts: h.config)
-    monkeypatch.setattr(cli, "_validate_config", lambda config: [])
-    monkeypatch.setattr(cli, "_setup_logging", lambda config, opts: None)
-    monkeypatch.setattr(cli, "_wait_for_session", wait_session)
-    monkeypatch.setattr(cli, "_workspace_kernels", lambda config: h.kernels)
-    monkeypatch.setattr(cli, "_resolve_key", lambda provider: h.key_source)
-    monkeypatch.setattr(cli, "_store_key", lambda provider, value: h.stored.append((provider.id, value)))
-    monkeypatch.setattr(cli, "_delete_key", lambda provider: (h.deleted.append(provider.id) or True))
-    monkeypatch.setattr(cli, "_load_context", load_context)
-    monkeypatch.setattr(cli, "_render_prompt", lambda config, name, args: f"PROMPT[{name}]({args})")
-    monkeypatch.setattr(cli, "_make_agent", lambda config, bundle, sandbox=None: (h.agent_sandboxes.append(sandbox) or h.agent))
-    monkeypatch.setattr(cli, "_start_dependency_warmup", lambda: h.warmups.append("started"))
-    monkeypatch.setattr(cli, "_open_browser", lambda url: h.opened.append(url))
+    monkeypatch.setattr(common, "console_factory", lambda: Console(force_terminal=False, width=120, highlight=False, soft_wrap=True, color_system=None))
+    monkeypatch.setattr(common, "_load_config", lambda opts: h.config)
+    monkeypatch.setattr(common, "_validate_config", lambda config: [])
+    monkeypatch.setattr(common, "_setup_logging", lambda config, opts: None)
+    monkeypatch.setattr(common, "_wait_for_session", wait_session)
+    monkeypatch.setattr(cli_setup, "_workspace_kernels", lambda config: h.kernels)
+    monkeypatch.setattr(common, "_resolve_key", lambda provider: h.key_source)
+    monkeypatch.setattr(common, "_store_key", lambda provider, value: h.stored.append((provider.id, value)))
+    monkeypatch.setattr(common, "_delete_key", lambda provider: (h.deleted.append(provider.id) or True))
+    monkeypatch.setattr(common, "_load_context", load_context)
+    monkeypatch.setattr(common, "_render_prompt", lambda config, name, args: f"PROMPT[{name}]({args})")
+    monkeypatch.setattr(common, "_make_agent", lambda config, bundle, sandbox=None: (h.agent_sandboxes.append(sandbox) or h.agent))
+    monkeypatch.setattr(common, "_start_dependency_warmup", lambda: h.warmups.append("started"))
+    monkeypatch.setattr(common, "_open_browser", lambda url: h.opened.append(url))
 
     def start_kernel(console, runtime, port, *, verbose):
         """The chat's own kernel, started without a process (the nb fixture runs the real start)."""
@@ -322,7 +324,7 @@ def harness(tmp_path, monkeypatch):
         h.kernel_starts.append(running)
         return running
 
-    monkeypatch.setattr(cli, "_start_kernel", start_kernel)
+    monkeypatch.setattr(cli_chat, "_start_kernel", start_kernel)
     return h
 
 
@@ -370,8 +372,8 @@ def test_interactive_session_enters_composer_before_waiting_for_browser(harness,
         milestones.update(timings.milestones)
 
     monkeypatch.setattr(ui_console, "status", no_status)
-    monkeypatch.setattr(cli, "_use_composer", lambda opts: True)
-    monkeypatch.setattr(cli.ChatLoop, "run_interactive", run_interactive)
+    monkeypatch.setattr(cli_chat, "_use_composer", lambda opts: True)
+    monkeypatch.setattr(cli_chat.ChatLoop, "run_interactive", run_interactive)
     result = chat()
     assert result.exit_code == 0, result.output
     assert harness.opened == [harness.url]
@@ -387,8 +389,8 @@ def test_interactive_startup_failure_exits_one_without_reporting_twice(harness, 
         self.console.print("Could not prepare chat dependencies.")
         self.console.print("Bye.")
 
-    monkeypatch.setattr(cli, "_use_composer", lambda opts: True)
-    monkeypatch.setattr(cli.ChatLoop, "run_interactive", failed_startup)
+    monkeypatch.setattr(cli_chat, "_use_composer", lambda opts: True)
+    monkeypatch.setattr(cli_chat.ChatLoop, "run_interactive", failed_startup)
     result = chat()
     assert result.exit_code == 1, result.output
     assert result.output.count("Could not prepare chat dependencies.") == 1
@@ -409,7 +411,7 @@ def test_notebook_preparation_cancel_during_resolve_does_not_open_browser(harnes
     monkeypatch.setattr(harness.client, "resolve_session", resolve)
 
     async def scenario():
-        task = asyncio.create_task(cli._prepare_notebook(
+        task = asyncio.create_task(cli_chat._prepare_notebook(
             Console(file=output), harness.sandbox, "analysis.py", open_browser=True,
         ))
         try:
@@ -443,10 +445,10 @@ def test_notebook_preparation_cancel_stops_real_session_poll(harness, monkeypatc
         polling.set()
         return wait_for_session(client, notebook, timeout, interval=30, should_stop=should_stop)
 
-    monkeypatch.setattr(cli, "_wait_for_session", wait_session)
+    monkeypatch.setattr(common, "_wait_for_session", wait_session)
 
     async def scenario():
-        task = asyncio.create_task(cli._prepare_notebook(
+        task = asyncio.create_task(cli_chat._prepare_notebook(
             Console(file=output), harness.sandbox, "analysis.py", open_browser=True,
         ))
         async with asyncio.timeout(5):
@@ -605,7 +607,7 @@ def test_config_error_exits_1(harness, monkeypatch):
     def boom(opts):
         raise ConfigError("hailer.toml line 3: bad value", hint="Fix the value or delete the line.")
 
-    monkeypatch.setattr(cli, "_load_config", boom)
+    monkeypatch.setattr(common, "_load_config", boom)
     result = chat()
     assert result.exit_code == 1
     assert "line 3" in result.output and "Fix the value" in result.output
@@ -656,7 +658,7 @@ def test_every_chat_starts_its_own_kernel_opens_the_notebook_and_stops_the_kerne
 
 
 def test_invalid_config_problem_is_fatal(harness, monkeypatch):
-    monkeypatch.setattr(cli, "_validate_config", lambda config: ["[model_providers.internal].base_url is missing", "Warning: data directory not found"])
+    monkeypatch.setattr(common, "_validate_config", lambda config: ["[model_providers.internal].base_url is missing", "Warning: data directory not found"])
     result = chat()
     assert result.exit_code == 1
     assert "base_url is missing" in result.output
@@ -819,7 +821,7 @@ class NotebookHarness:
 
 @pytest.fixture
 def nb(harness, monkeypatch):
-    monkeypatch.setattr(cli, "_start_kernel", REAL_START_KERNEL)
+    monkeypatch.setattr(cli_chat, "_start_kernel", REAL_START_KERNEL)
     """Notebook-command collaborators on top of the chat harness: the real LocalRuntime with its
     process layer faked (nothing is spawned or killed). Marimo is not running by default."""
     from hailer.kernel import LocalProcesses, LocalRuntime
@@ -863,9 +865,9 @@ def nb(harness, monkeypatch):
             running = super().start(port, foreground=foreground)
             return with_folder_files(running, self.config.notebooks_root, lambda **kw: harness.bound_client(running))
 
-    monkeypatch.setattr(cli, "_runtime_for", lambda config: Runtime(config, procs=procs, token_factory=lambda: TOKEN))
-    monkeypatch.setattr(cli, "_find_free_port", lambda preferred: h.free_port if h.free_port is not None else preferred)
-    monkeypatch.setattr(cli, "_wait_for_session", wait_session)
+    monkeypatch.setattr(common, "_runtime_for", lambda config: Runtime(config, procs=procs, token_factory=lambda: TOKEN))
+    monkeypatch.setattr(common, "_find_free_port", lambda preferred: h.free_port if h.free_port is not None else preferred)
+    monkeypatch.setattr(common, "_wait_for_session", wait_session)
     return h
 
 
@@ -921,14 +923,14 @@ def test_notebook_no_browser_still_waits_and_continues_without_session(harness, 
 
 def test_dependency_warmup_starts_before_kernel_start(harness, nb, monkeypatch):
     order = []
-    start_kernel = cli._start_kernel
+    start_kernel = cli_chat._start_kernel
 
     def start(*args, **kwargs):
         order.append("kernel")
         return start_kernel(*args, **kwargs)
 
-    monkeypatch.setattr(cli, "_start_dependency_warmup", lambda: order.append("dependencies"))
-    monkeypatch.setattr(cli, "_start_kernel", start)
+    monkeypatch.setattr(common, "_start_dependency_warmup", lambda: order.append("dependencies"))
+    monkeypatch.setattr(cli_chat, "_start_kernel", start)
     result = notebook_cmd()
     assert result.exit_code == 0, result.output
     assert order == ["dependencies", "kernel"]
@@ -966,9 +968,9 @@ def test_startup_exit_settles_notebook_worker_before_stopping_owned_kernel(harne
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, 5)
 
-    monkeypatch.setattr(cli, "_use_composer", lambda opts: True)
-    monkeypatch.setattr(cli, "_wait_for_session", wait_session)
-    monkeypatch.setattr(cli.ChatLoop, "run_interactive", run_interactive)
+    monkeypatch.setattr(cli_chat, "_use_composer", lambda opts: True)
+    monkeypatch.setattr(common, "_wait_for_session", wait_session)
+    monkeypatch.setattr(cli_chat.ChatLoop, "run_interactive", run_interactive)
     result = notebook_cmd()
     assert result.exit_code == 0, result.output
     assert nb.proc.terminated
@@ -1002,7 +1004,7 @@ def test_notebook_reports_early_exit_with_log_tail(harness, nb, tmp_path):
 
 def test_ctrl_c_right_after_the_kernel_started_still_stops_it(harness, nb, monkeypatch):
     """Between the runtime returning the kernel and the chat's guarded block, Ctrl+C must not leak it."""
-    real_runtime_for = cli._runtime_for
+    real_runtime_for = common._runtime_for
     started: list = []
 
     class Interrupted:
@@ -1028,9 +1030,9 @@ def test_ctrl_c_right_after_the_kernel_started_still_stops_it(harness, nb, monke
         def start(self, port, **kw):
             return Interrupted(self.inner.start(port, **kw))
 
-    monkeypatch.setattr(cli, "_runtime_for", Runtime)
+    monkeypatch.setattr(common, "_runtime_for", Runtime)
     with pytest.raises(KeyboardInterrupt):
-        cli._start_kernel(Console(file=io.StringIO()), Runtime(harness.config), 2718, verbose=False)
+        cli_chat._start_kernel(Console(file=io.StringIO()), Runtime(harness.config), 2718, verbose=False)
     assert started == ["stopped"] and nb.proc.terminated
 
 
@@ -1113,7 +1115,7 @@ def init_cmd(ws: Path, *args: str):
 def test_init_writes_config_and_skeleton(harness, tmp_path, monkeypatch):
     ws = tmp_path / "fresh"
     ws.mkdir()
-    monkeypatch.setattr(cli, "_example_config_dir", lambda: None)
+    monkeypatch.setattr(cli_setup, "_example_config_dir", lambda: None)
     result = init_cmd(ws)
     assert result.exit_code == 0, result.output
     assert (ws / "hailer.toml").exists()
@@ -1131,7 +1133,7 @@ def test_init_creates_the_notebook_and_data_folder_so_notebook_can_start(harness
 
     ws = tmp_path / "fresh"
     ws.mkdir()
-    monkeypatch.setattr(cli, "_example_config_dir", lambda: None)
+    monkeypatch.setattr(cli_setup, "_example_config_dir", lambda: None)
     result = init_cmd(ws)
     assert result.exit_code == 0, result.output
     notebook = ws / "notebooks" / "analysis.py"
@@ -1147,7 +1149,7 @@ def test_init_creates_the_notebook_and_data_folder_so_notebook_can_start(harness
 def test_init_again_keeps_the_notebook_and_fills_in_what_is_missing(harness, tmp_path, monkeypatch):
     ws = tmp_path / "fresh"
     ws.mkdir()
-    monkeypatch.setattr(cli, "_example_config_dir", lambda: None)
+    monkeypatch.setattr(cli_setup, "_example_config_dir", lambda: None)
     init_cmd(ws)
     notebook = ws / "notebooks" / "analysis.py"
     notebook.write_text(NOTEBOOK_SOURCE, encoding="utf-8")
@@ -1168,7 +1170,7 @@ def test_init_uses_the_notebook_and_data_dir_from_an_existing_config(harness, tm
         '[model_providers.internal]\nbase_url = "https://llm.example.internal/v1"\nenv_key = "INTERNAL_MODEL_API_KEY"\n',
         encoding="utf-8",
     )
-    monkeypatch.setattr(cli, "_example_config_dir", lambda: None)
+    monkeypatch.setattr(cli_setup, "_example_config_dir", lambda: None)
     result = init_cmd(ws)
     assert result.exit_code == 0, result.output
     assert "already exists" in result.output, "the existing hailer.toml is kept"
@@ -1182,7 +1184,7 @@ def test_init_with_a_broken_config_skips_the_notebook(harness, tmp_path, monkeyp
     ws = tmp_path / "broken"
     ws.mkdir()
     (ws / "hailer.toml").write_text("[hailer\nnotebook = ", encoding="utf-8")
-    monkeypatch.setattr(cli, "_example_config_dir", lambda: None)
+    monkeypatch.setattr(cli_setup, "_example_config_dir", lambda: None)
     result = init_cmd(ws)
     assert result.exit_code == 0, result.output
     assert "Skipped the notebook and data folder" in result.output
@@ -1203,7 +1205,7 @@ def test_version_flag():
 
 def test_validation_message_with_brackets_is_printed_verbatim(harness, monkeypatch):
     monkeypatch.setattr(
-        cli,
+        common,
         "_validate_config",
         lambda config: ["[web].allowed_domains entry '*' is invalid", '[model_providers.internal].wire_api must be "responses"'],
     )
@@ -1226,7 +1228,7 @@ def test_reconfigure_streams_makes_cp1252_pipe_safe(monkeypatch):
     monkeypatch.setattr(sys, "stdout", pipe)
     monkeypatch.setattr(sys, "stderr", io.TextIOWrapper(io.BytesIO(), encoding="cp1252"))
     assert pipe.errors == "strict"
-    cli._reconfigure_streams()
+    common._reconfigure_streams()
     assert sys.stdout.errors == "replace" and sys.stderr.errors == "replace"
     console = Console(file=sys.stdout, force_terminal=False, width=80, highlight=False, color_system=None)
     console.print("┌─┐ → 🙂 shape: (6, 2)", markup=False)  # Polars frames and emoji must not crash
@@ -1264,7 +1266,7 @@ def test_unknown_prompt_reports_available(harness, monkeypatch):
     def render(config, name, args):
         raise HailerError(f"Unknown prompt {name!r}.", hint="Available prompts: monthly-pack")
 
-    monkeypatch.setattr(cli, "_render_prompt", render)
+    monkeypatch.setattr(common, "_render_prompt", render)
     result = chat(input_text="/prompt nope\n/exit\n")
     assert "Unknown prompt 'nope'" in result.output
     assert "Available prompts: monthly-pack" in result.output
@@ -1273,8 +1275,8 @@ def test_unknown_prompt_reports_available(harness, monkeypatch):
 
 def test_login_openai_then_status_reports_keyring(harness, monkeypatch):
     stored: dict[str, str] = {}
-    monkeypatch.setattr(cli, "_store_key", lambda provider, value: stored.__setitem__(provider.id, value))
-    monkeypatch.setattr(cli, "_resolve_key", lambda provider: ("v", "keyring") if provider.id in stored else (None, "missing"))
+    monkeypatch.setattr(common, "_store_key", lambda provider, value: stored.__setitem__(provider.id, value))
+    monkeypatch.setattr(common, "_resolve_key", lambda provider: ("v", "keyring") if provider.id in stored else (None, "missing"))
     result = runner.invoke(cli.app, ["status"], catch_exceptions=False)
     assert "Credentials: OPENAI_API_KEY missing (run: uvx hailer login openai)" in result.output
     result = runner.invoke(cli.app, ["login", "openai"], input="sk-test\n", catch_exceptions=False)
@@ -1357,10 +1359,10 @@ def test_commentary_deltas_are_not_printed_and_answer_appears_once(harness):
 
 def test_progress_line_shows_the_tool_in_use(harness):
     console = Console(force_terminal=False, width=100, highlight=False, color_system=None)
-    display = cli._TurnDisplay(console)
-    display(cli.AgentEvent("tool_call", "marimo_execute", {"arguments": "{'code': 'df.head()'}"}))
+    display = common._TurnDisplay(console)
+    display(common.AgentEvent("tool_call", "marimo_execute", {"arguments": "{'code': 'df.head()'}"}))
     assert display.last_activity == "marimo_execute"
-    display(cli.AgentEvent("tool_call", "notebook_open\nq2"))
+    display(common.AgentEvent("tool_call", "notebook_open\nq2"))
     assert display.last_activity == "notebook_open q2"  # one line, whatever the event carries
 
 
@@ -1369,20 +1371,14 @@ def test_progress_line_shows_the_tool_in_use(harness):
 # --------------------------------------------------------------------------- #
 
 
-def test_load_config_keeps_the_configured_notebook_and_hailer_notebook_is_saved_as_a_name(tmp_path, monkeypatch):
-    """config.notebook stays the configured notebook; the active one is a name in the state file.
-    An explicit HAILER_NOTEBOOK is written there, so the tools (which read only the file) and the
-    next session start on the same notebook."""
+def test_load_config_keeps_the_configured_notebook_and_the_active_one_in_the_state_file(tmp_path, monkeypatch):
+    """config.notebook stays the configured notebook; the active one is a name in the state file."""
     base = make_config(tmp_path)
     write_notebook(base, "other")
-    monkeypatch.delenv("HAILER_NOTEBOOK", raising=False)
     monkeypatch.setattr("hailer.config.load_config", lambda workspace=None, config_path=None: base)
     notebooks.save_active_notebook(base, "other.py")
-    assert cli._load_config(cli.CliOptions()) is base
+    assert common._load_config(common.CliOptions()) is base
     assert notebooks.load_active_notebook(base) == "other.py"
-    monkeypatch.setenv("HAILER_NOTEBOOK", "explicit")
-    assert cli._load_config(cli.CliOptions()).notebook == base.notebook
-    assert active_state(base) == "analysis.py" and notebooks.load_active_notebook(base) == "analysis.py"
 
 
 def test_a_session_converts_an_old_state_file_and_falls_back_from_a_deleted_notebook(harness):
@@ -1660,13 +1656,13 @@ def test_notebook_and_status_commands_read_fresh_state(harness, monkeypatch):
     """A switch written to the state file behind the CLI's back (a late tool call) is applied
     before /notebook and /status act, without opening a browser tab for it."""
     write_notebook(harness.config, "other")
-    load_context = cli._load_context
+    load_context = common._load_context
 
     def late_switch(config):  # once the chat has read the state: a late tool call switches
         notebooks.save_active_notebook(harness.config, "other.py")
         return load_context(config)
 
-    monkeypatch.setattr(cli, "_load_context", late_switch)
+    monkeypatch.setattr(common, "_load_context", late_switch)
     result = chat(input_text="/status\n/notebook\n/exit\n")
     assert result.exit_code == 0, result.output
     assert result.output.count("Active notebook is now other.py.") == 1
@@ -1725,7 +1721,7 @@ def docker(harness, monkeypatch, tmp_path):
     fake = FakeDocker()
     fake.notebooks = tmp_path / "kernel-notebooks"
     fake.notebooks.mkdir()
-    local_runtime_for = cli._runtime_for
+    local_runtime_for = common._runtime_for
     real_kernel = kernel_docker.DockerKernel
 
     def runtime_for(config):
@@ -1742,8 +1738,8 @@ def docker(harness, monkeypatch, tmp_path):
 
     monkeypatch.setattr(kernel_docker, "DockerKernel", folder_kernel)
     monkeypatch.setattr(notebook_sync, "SYNC_INTERVAL_SEC", 3600.0)  # copies come from turns and the stop only
-    monkeypatch.setattr(cli, "_runtime_for", runtime_for)
-    monkeypatch.setattr(cli, "_docker_runner", lambda: fake)
+    monkeypatch.setattr(common, "_runtime_for", runtime_for)
+    monkeypatch.setattr(common, "_docker_runner", lambda: fake)
     monkeypatch.setattr(kernel_docker, "_sleep", lambda seconds: None)  # network rm retries
     return fake
 
@@ -1764,12 +1760,12 @@ def test_kernel_line_of_the_unsafe_local_runtime_is_a_warning(harness):
     def panel(config):
         out = io.StringIO()
         console = Console(file=out, force_terminal=True, color_system="standard", no_color=False, width=200)
-        cli._startup_panel(console, config, "analysis.py")
+        common._startup_panel(console, config, "analysis.py")
         return next(line for line in out.getvalue().splitlines() if "Kernel:" in line)
 
-    assert cli._kernel_style(harness.config) == "yellow"
+    assert common._kernel_style(harness.config) == "yellow"
     assert "\x1b[33mKernel:     unsafe-local (runs as you; not isolated)" in panel(harness.config)
-    assert cli._kernel_style(docker_config(harness.config)) == ""
+    assert common._kernel_style(docker_config(harness.config)) == ""
     assert "\x1b[33m" not in panel(docker_config(harness.config))
 
 
@@ -1838,7 +1834,7 @@ def test_the_prompt_never_carries_the_servers_token(harness, nb, monkeypatch):
     from hailer.agent import system_prompt
 
     captured: list = []
-    monkeypatch.setattr(cli, "_make_agent", lambda config, bundle, sandbox=None: (captured.append((config, sandbox.server)) or harness.agent))
+    monkeypatch.setattr(common, "_make_agent", lambda config, bundle, sandbox=None: (captured.append((config, sandbox.server)) or harness.agent))
     result = notebook_cmd()
     assert result.exit_code == 0, result.output
     config, server = captured[0]
@@ -1865,7 +1861,7 @@ def test_cli_clients_carry_the_servers_token_and_the_kernels_notebooks_folder(tm
 def test_config_warnings_show_when_a_session_starts(harness, nb, monkeypatch):
     """A runtime line uncommented without its [kernel] line lands under [model]: say so, never silently local."""
     warning = "Warning: [model].runtime in hailer.toml is ignored: runtime belongs under [kernel]. Add a [kernel] line above it."
-    monkeypatch.setattr(cli, "_validate_config", lambda config: [warning])
+    monkeypatch.setattr(common, "_validate_config", lambda config: [warning])
     result = notebook_cmd()
     assert result.exit_code == 0, result.output
     assert f"warn  config: {warning}" in result.output
@@ -1873,7 +1869,7 @@ def test_config_warnings_show_when_a_session_starts(harness, nb, monkeypatch):
 
 def test_several_config_problems_are_listed_one_per_line(harness, monkeypatch):
     problems = ['Invalid [kernel].memory "4 GB"; write a size such as "4g"', "Invalid [kernel].cpus 0; use a number above 0"]
-    monkeypatch.setattr(cli, "_validate_config", lambda config: problems)
+    monkeypatch.setattr(common, "_validate_config", lambda config: problems)
     result = chat()
     assert result.exit_code == 1
     assert "FAIL  config: 2 problems in the configuration:" in result.output
@@ -1890,7 +1886,7 @@ def test_notebook_kernel_docker_runs_the_chat_against_a_container(harness, nb, d
 
     agent_configs: list = []
     labels: list = []
-    monkeypatch.setattr(cli, "_make_agent", lambda config, bundle, sandbox=None: (agent_configs.append((config, sandbox)) or harness.agent))
+    monkeypatch.setattr(common, "_make_agent", lambda config, bundle, sandbox=None: (agent_configs.append((config, sandbox)) or harness.agent))
     harness.agent.on_turn = lambda: labels.extend(owner_alive(harness.config.workspace, c.labels[LABEL_OWNER]) for c in docker.containers.values())
     harness.client = FakeClient(session=None)  # nobody has the tab open yet
     result = notebook_cmd(["--kernel", "docker", "--port", "2731"], input_text="hi\n/exit\n")
@@ -1924,8 +1920,8 @@ def test_notebook_downloads_a_missing_image_before_the_spinner_without_warning_f
             events.append("spinner")
             return super().status(*args, **kwargs)
 
-    monkeypatch.setattr(cli, "console_factory", lambda: RecordingConsole(force_terminal=False, width=120, highlight=False, soft_wrap=True, color_system=None))
-    monkeypatch.setattr(cli, "_chat_console", lambda opts: cli.console_factory())
+    monkeypatch.setattr(common, "console_factory", lambda: RecordingConsole(force_terminal=False, width=120, highlight=False, soft_wrap=True, color_system=None))
+    monkeypatch.setattr(cli_chat, "_chat_console", lambda opts: common.console_factory())
     docker.image_contract = None
     docker.stream_hook = lambda args: events.append(args[0])
     result = notebook_cmd(["--kernel", "docker"])
@@ -1951,14 +1947,14 @@ def test_a_retired_runtime_from_the_environment_is_one_config_row_with_an_enviro
 
     monkeypatch.setenv("HAILER_KERNEL", "local")
     harness.config = replace(harness.config, kernel=KernelConfig(runtime="local"))
-    monkeypatch.setattr(cli, "_validate_config", validate)
+    monkeypatch.setattr(common, "_validate_config", validate)
     result = runner.invoke(cli.app, ["doctor"], catch_exceptions=False, env={"COLUMNS": "250"})
     assert result.exit_code == 1
     assert " ".join(result.output.split()).count('now called "unsafe-local"') == 1, result.output
-    row = cli._config_check(validate(harness.config))
+    row = common._config_check(validate(harness.config))
     assert row.fatal and row.hint == "HAILER_KERNEL in the environment overrides [kernel] runtime in hailer.toml: change or unset it."
     monkeypatch.delenv("HAILER_KERNEL")
-    assert cli._config_check(validate(harness.config)).hint == cli.CONFIG_FIX_HINT, "from the file: fix the file"
+    assert common._config_check(validate(harness.config)).hint == common.CONFIG_FIX_HINT, "from the file: fix the file"
 
 
 @pytest.mark.parametrize("how", ["flag", "config"])
@@ -1969,7 +1965,7 @@ def test_the_retired_local_runtime_is_refused_with_the_way_to_opt_in(harness, nb
 
     if how == "config":
         harness.config = replace(harness.config, kernel=KernelConfig(runtime="local"))
-        monkeypatch.setattr(cli, "_validate_config", validate)
+        monkeypatch.setattr(common, "_validate_config", validate)
     result = notebook_cmd(["--kernel", "local"] if how == "flag" else [])
     assert result.exit_code == (2 if how == "flag" else 1), result.output
     output = " ".join(result.output.split())
@@ -2152,8 +2148,8 @@ def test_init_kernel_docker_switches_the_section_on(harness, tmp_path, monkeypat
     from hailer.config import load_config, validate
 
     monkeypatch.delenv("HAILER_KERNEL", raising=False)
-    monkeypatch.setattr(cli, "_example_config_dir", lambda: None)
-    monkeypatch.setattr(cli, "_docker_on_path", lambda: False)
+    monkeypatch.setattr(cli_setup, "_example_config_dir", lambda: None)
+    monkeypatch.setattr(cli_setup, "_docker_on_path", lambda: False)
     ws = tmp_path / "fresh"
     ws.mkdir()
     result = init_cmd(ws, "--kernel", "docker")
@@ -2173,11 +2169,11 @@ def test_init_writes_docker_and_says_how_to_get_docker_only_when_it_is_missing(h
     from hailer.config import load_config
 
     monkeypatch.delenv("HAILER_KERNEL", raising=False)
-    monkeypatch.setattr(cli, "_example_config_dir", lambda: None)
+    monkeypatch.setattr(cli_setup, "_example_config_dir", lambda: None)
     for found in (True, False):
         ws = tmp_path / f"found-{found}"
         ws.mkdir()
-        monkeypatch.setattr(cli, "_docker_on_path", lambda found=found: found)
+        monkeypatch.setattr(cli_setup, "_docker_on_path", lambda found=found: found)
         result = init_cmd(ws)
         assert result.exit_code == 0, result.output
         assert '[kernel]\nruntime = "docker"' in (ws / "hailer.toml").read_text(encoding="utf-8")
@@ -2193,8 +2189,8 @@ def test_init_kernel_unsafe_local_writes_it_and_says_it_is_not_isolated(harness,
     from hailer.config import load_config, validate
 
     monkeypatch.delenv("HAILER_KERNEL", raising=False)
-    monkeypatch.setattr(cli, "_example_config_dir", lambda: None)
-    monkeypatch.setattr(cli, "_docker_on_path", lambda: False)
+    monkeypatch.setattr(cli_setup, "_example_config_dir", lambda: None)
+    monkeypatch.setattr(cli_setup, "_docker_on_path", lambda: False)
     ws = tmp_path / "fresh"
     ws.mkdir()
     result = init_cmd(ws, "--kernel", "unsafe-local")
@@ -2209,8 +2205,8 @@ def test_init_kernel_flag_with_an_existing_config(harness, tmp_path, monkeypatch
     from hailer.config import load_config
 
     monkeypatch.delenv("HAILER_KERNEL", raising=False)
-    monkeypatch.setattr(cli, "_example_config_dir", lambda: None)
-    monkeypatch.setattr(cli, "_docker_on_path", lambda: True)
+    monkeypatch.setattr(cli_setup, "_example_config_dir", lambda: None)
+    monkeypatch.setattr(cli_setup, "_docker_on_path", lambda: True)
     ws = tmp_path / "fresh"
     ws.mkdir()
     init_cmd(ws)
@@ -2341,7 +2337,7 @@ def test_doctor_fails_a_unc_data_folder_with_the_start_wording(harness, docker, 
 
     monkeypatch.setattr(config_module, "_on_windows", lambda: True)
     monkeypatch.setattr(kernel_docker, "_on_windows", lambda: True)
-    monkeypatch.setattr(cli, "_validate_config", docker_mount_problems)  # validate()'s own checks would wait on the share
+    monkeypatch.setattr(common, "_validate_config", docker_mount_problems)  # validate()'s own checks would wait on the share
     share = Path(r"\\fileserver\team\sales")
     harness.config = replace(docker_config(harness.config), data_dir=share)
     result = runner.invoke(cli.app, ["doctor"], catch_exceptions=False, env={"COLUMNS": "400"})
@@ -2392,7 +2388,7 @@ def terminal():
         screen = io.StringIO()
         output = Vt100_Output(screen, lambda: Size(rows=24, columns=100), term="xterm-256color")
         console = Console(file=io.StringIO(), force_terminal=False, color_system=None)
-        yield cli._LineReader(console, interactive=True, pt_input=keys, pt_output=output), keys, screen
+        yield common._LineReader(console, interactive=True, pt_input=keys, pt_output=output), keys, screen
 
 
 def last_paste_mode(screen: io.StringIO) -> str | None:
@@ -2467,9 +2463,9 @@ def test_prompt_up_arrow_recalls_earlier_messages():
 
 
 def test_prompt_falls_back_to_plain_input_without_a_terminal(monkeypatch):
-    monkeypatch.setattr(cli, "_stdio_is_terminal", lambda: False)
+    monkeypatch.setattr(common, "_stdio_is_terminal", lambda: False)
     monkeypatch.setattr(Console, "input", lambda self, prompt="", **kw: "typed")
-    reader = cli._LineReader(Console(file=io.StringIO()))
+    reader = common._LineReader(Console(file=io.StringIO()))
     assert reader.interactive is False
     assert reader.read() == "typed"
     assert reader._session is None, "prompt_toolkit is never started on a pipe"
@@ -2477,7 +2473,7 @@ def test_prompt_falls_back_to_plain_input_without_a_terminal(monkeypatch):
 
 def test_chat_with_the_prompt_sends_a_pasted_block_as_one_turn(harness, monkeypatch):
     with terminal() as (reader, keys, screen):
-        monkeypatch.setattr(cli, "_make_line_reader", lambda console: reader)
+        monkeypatch.setattr(common, "_make_line_reader", lambda console: reader)
         modes_at_turn: list[str | None] = []
         harness.agent.on_turn = lambda: modes_at_turn.append(last_paste_mode(screen))
         keys.send_text("\x1b[200~sum revenue\nby region\x1b[201~\r/exit\r")
@@ -2490,7 +2486,7 @@ def test_chat_with_the_prompt_sends_a_pasted_block_as_one_turn(harness, monkeypa
 
 def test_chat_with_the_prompt_ctrl_c_in_a_turn_cancels_only_that_turn(harness, monkeypatch):
     with terminal() as (reader, keys, _screen):
-        monkeypatch.setattr(cli, "_make_line_reader", lambda console: reader)
+        monkeypatch.setattr(common, "_make_line_reader", lambda console: reader)
         harness.agent.fail_with = KeyboardInterrupt()  # the agent cancels the turn and re-raises
         keys.send_text("long question\r/exit\r")
         result = chat(input_text="")
@@ -2500,7 +2496,7 @@ def test_chat_with_the_prompt_ctrl_c_in_a_turn_cancels_only_that_turn(harness, m
 
 def test_chat_with_the_prompt_ctrl_c_at_the_prompt_exits(harness, monkeypatch):
     with terminal() as (reader, keys, _screen):
-        monkeypatch.setattr(cli, "_make_line_reader", lambda console: reader)
+        monkeypatch.setattr(common, "_make_line_reader", lambda console: reader)
         keys.send_text("\x03")
         result = chat(input_text="")
     assert result.exit_code == 0, result.output

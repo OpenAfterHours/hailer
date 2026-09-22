@@ -52,3 +52,20 @@ Other subcommands:
 
 Global options go before the subcommand: `--verbose`, `--config <path>`, `--workspace <path>`, `--new`,
 `--plain`, `--version` (for example `uvx hailer --workspace C:\projects\sales kernel stop`).
+
+## Environment variables {#environment-variables}
+
+Everything else comes from `hailer.toml`; a variable wins over the file, and a command-line option over both.
+
+| Variable | Overrides |
+|---|---|
+| `HAILER_CONFIG` | The config file (`--config`) |
+| `HAILER_WORKSPACE` | The workspace folder (`--workspace`) |
+| `HAILER_MODEL`, `HAILER_MODEL_PROVIDER` | `[model].name`, `[model].provider` |
+| `HAILER_KERNEL` | `[kernel].runtime` (`--kernel` wins over it) |
+| `HAILER_KERNEL_IMAGE` | `[kernel].image` |
+| `HAILER_LOG_LEVEL` | `[hailer].log_level` |
+| `HAILER_TRACING` | Nothing in the file: set it to let LangSmith tracing variables apply (see [Security](../security/data-handling.md#security)) |
+
+The notebook and the notebooks and data folders are set only in `hailer.toml` (`[hailer].notebook`,
+`notebooks_dir`, `data_dir`).

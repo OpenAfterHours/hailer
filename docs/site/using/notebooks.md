@@ -107,9 +107,7 @@ Where things live:
   `session.json`), so the next `uvx hailer` or `uvx hailer notebook` resumes where you left off; if that
   notebook is gone, the session starts on `[hailer].notebook`. A file written by an older Hailer (host
   paths) is converted on the first run; entries outside the notebooks folder are dropped. Delete the file
-  to go back to `[hailer].notebook`. `HAILER_NOTEBOOK=<path>` makes that notebook the active one for this and
-  later sessions: every Hailer command (`hailer`, `hailer notebook`, `status`, `doctor`)
-  writes it to the state file at startup, so the agent's tools see the same notebook.
+  to go back to `[hailer].notebook`.
 - `/notebook` also lists the notebooks you worked in recently (`Recent:`), most recent first.
 
 ```toml

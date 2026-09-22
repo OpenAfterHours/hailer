@@ -118,7 +118,7 @@ class MarimoSandbox:
     """A started kernel and its files.
 
     ``server`` has the URL and the token. ``notebooks_path`` is the kernel's path of the notebooks
-    folder (the local runtime: the host folder as :func:`~hailer.marimo_client.notebook_file_key`
+    folder (the unsafe-local runtime: the host folder as :func:`~hailer.marimo_client.notebook_file_key`
     writes it; docker: ``/work/notebooks``, the container's own) and ``native_paths`` says the
     kernel's paths are this machine's; ``data_path`` is the data folder as notebook code reaches it
     and ``data_dir`` the host folder behind it (a read-only mount in a container). ``log_hint``

@@ -267,7 +267,7 @@ def test_cpus_above_what_docker_has_are_lowered_with_a_note(tmp_path):
 )
 def test_start_refuses_mounts_that_expose_hailers_own_files(tmp_path, notebooks, data, fragment):
     """Checked on every start path, from the one rule set (config.docker_mount_problems): --foreground
-    never validates hailer.toml, and HAILER_DATA_DIR can move the folder."""
+    never validates hailer.toml."""
     config = make_config(
         tmp_path,
         notebooks_dir=tmp_path / notebooks if notebooks else tmp_path,

@@ -1,9 +1,33 @@
 # Proposal: a simpler sandbox architecture that can move to the cloud
 
-Status: **proposal, 2026-09-22.** Nothing here is built. It reviews `main` at v0.2.8 (4dc96df) against
-two goals: the agent's Python must run in a sandbox it cannot escape, and the project must stay small
-enough for one maintainer. It also prepares for the kernel running in GCP (or another cloud) with the
-same shape. Section 8 lists the decisions that are yours to make before any of it starts.
+Status: **phases 0–4 implemented on 2026-09-23** on branch `worktree-sandbox-simplification` (R1–R5 and
+R7; every recommendation in section 8 was accepted, R4 without waiting for R6); **R6 (GCP) is not started.**
+The current design is described in [PLAN.md](../PLAN.md); the text below is the proposal as written on
+2026-09-22, kept as the record of why. Where the build departs from it:
+
+- **tmpfs, not a volume**, for the docker kernel's `/work/notebooks` (§4.3): size-capped and owned by the
+  kernel user, nothing to clean up after a killed session.
+- **The image tag is derived from a content fingerprint**, not a hand-kept contract number (§4.5):
+  `marimo<version>-<sha256 prefix>` over the Dockerfile, the copied modules and the pinned package versions,
+  because a stored number could be left unbumped while a changed image reused a published tag.
+- **Owner lock files** (`.hailer/owner-<id>.lock`, held with an OS lock) decide which leftovers a start may
+  remove (§4.2), instead of host name and pid, which pid reuse and WSL/Windows pid namespaces make unreliable.
+- **`MarimoSandbox` is the contract** (§4.1): one concrete class that every runtime returns, no `Protocol`.
+  Its file methods are `list_notebooks`, `read_notebook`, `write_notebook`, `has_notebook`, `list_data` and
+  **`data_schema`** (the columns of a Parquet data file, for `list_periods`), plus `sync_soon`.
+- **Notebooks named like importable modules or tooling files are not synced** in either direction
+  (`json.py`, `conftest.py`, `test_*.py`, `setup.py`, ...), and the agent cannot create one in Docker.
+- **Files notebook code exports next to the notebooks in Docker vanish at stop**: only marimo notebooks come
+  back (an export belongs in a displayed result, or the unsafe-local runtime).
+- **`hailer exec` became the `/exec` slash command** in the chat's own kernel; there is no short-lived
+  sandbox variant.
+- R7 also removed `HAILER_NOTEBOOK`, `HAILER_NOTEBOOKS_DIR` and `HAILER_DATA_DIR` (§4.6), and moved
+  `CHAT_UI_PLAN.md` to `docs/history/` with the Docker plan and review.
+
+The original purpose: it reviews `main` at v0.2.8 (4dc96df) against two goals: the agent's Python must run
+in a sandbox it cannot escape, and the project must stay small enough for one maintainer. It also prepares
+for the kernel running in GCP (or another cloud) with the same shape. Section 8 lists the decisions that
+were the owner's to make before any of it started.
 
 ## 1. Summary
 

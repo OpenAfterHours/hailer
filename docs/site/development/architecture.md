@@ -30,8 +30,8 @@ The CLI runs the agent in its own process, with the model and provider taken fro
 has exactly the eleven tools above and nothing else: no shell, no file editing. The tools talk to the
 running marimo server over plain HTTP. Code from the agent runs in marimo's *scratchpad*, a temporary
 namespace that can read every notebook variable, and durable changes (new cells, edits, runs) go through
-marimo's code-mode API so they appear immediately in the browser. The notebook file on disk is written by
-marimo itself, never edited behind the kernel's back.
+marimo's code-mode API so they appear immediately in the browser. marimo writes the notebook file itself,
+never edited behind the kernel's back; with Docker that is the kernel's copy, which Hailer copies back.
 
 Where marimo and its kernel run is the *kernel runtime*, set by `[kernel] runtime`: `docker` (the default)
 starts it in a container (see [Isolated kernel (Docker)](../security/docker.md#isolated-kernel-docker)), and
@@ -44,4 +44,8 @@ after every turn, every 15 seconds and when it stops (`hailer.notebook_sync`).
 
 ## Design records
 
-The current module contracts are in [INTERFACES.md](https://github.com/OpenAfterHours/hailer/blob/main/docs/INTERFACES.md). Read [LEARNINGS.md](https://github.com/OpenAfterHours/hailer/blob/main/docs/LEARNINGS.md) before changing the agent, providers, tools or conversation lifecycle, and [PLAN.md](https://github.com/OpenAfterHours/hailer/blob/main/PLAN.md) for the architecture and implementation history.
+[PLAN.md](https://github.com/OpenAfterHours/hailer/blob/main/PLAN.md) describes the current architecture and
+the module contracts are in [INTERFACES.md](https://github.com/OpenAfterHours/hailer/blob/main/docs/INTERFACES.md).
+Read [LEARNINGS.md](https://github.com/OpenAfterHours/hailer/blob/main/docs/LEARNINGS.md) before changing the
+agent, providers, tools, kernel runtimes or conversation lifecycle. Earlier plans, reviews and dated findings
+are kept in [docs/history](https://github.com/OpenAfterHours/hailer/tree/main/docs/history).

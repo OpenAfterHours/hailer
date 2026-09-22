@@ -165,11 +165,6 @@ class Opener:
         return True
 
 
-@pytest.fixture(autouse=True)
-def _no_notebook_override(monkeypatch):
-    monkeypatch.delenv("HAILER_NOTEBOOK", raising=False)
-
-
 @pytest.fixture
 def ws(tmp_path):
     """A workspace with two notebooks; the configured one is analysis.py."""

@@ -1,7 +1,7 @@
 # Maintaining the docs
 
 The site uses [Zensical](https://zensical.org/) with the OpenAfterHours palette and typography shared by
-the RWA Calculator and Mooring sites. Zensical is pinned in the `docs` dependency group and `uv.lock`.
+the other OpenAfterHours sites. Zensical is pinned in the `docs` dependency group and `uv.lock`.
 It is not a runtime dependency of Hailer.
 
 ## Preview and validate
@@ -41,7 +41,8 @@ The signal animation stops after two cycles and is disabled for reduced motion.
 Public content is deliberately scoped to `docs/site/`. Engineering records such as
 [LEARNINGS.md](https://github.com/OpenAfterHours/hailer/blob/main/docs/LEARNINGS.md),
 [INTERFACES.md](https://github.com/OpenAfterHours/hailer/blob/main/docs/INTERFACES.md) and
-[PLAN.md](https://github.com/OpenAfterHours/hailer/blob/main/PLAN.md) retain their existing paths.
+[PLAN.md](https://github.com/OpenAfterHours/hailer/blob/main/PLAN.md) retain their existing paths; finished
+plans and reviews move to `docs/history/`.
 The developer guides link to those records; the build does not publish the rest of `docs/`.
 
 Edit the relevant guide when behaviour changes. Keep the README's concise quickstart aligned with the site's

@@ -199,7 +199,7 @@ that a recorded kernel was still the one it described, and never orphaning or de
 liveness probes, a start guard, settings-mismatch checks and id bookkeeping, and was the most intricate code
 in Hailer. Now each `uvx hailer` / `uvx hailer notebook` process starts its own kernel, keeps it in memory
 (the `Sandbox` its runtime's start returns, handed to the chat, the agent and the tools) and stops it in the `finally` of
-`cli._run_session` (`_start_kernel` runs inside the guarded block, so Ctrl+C right after the start cannot
+`hailer.cli.chat._run_session` (`_start_kernel` runs inside the guarded block, so Ctrl+C right after the start cannot
 leak the kernel); `/exec` replaced `hailer exec`. Do not add a way to find or attach to another process's
 kernel: a restart costs a few seconds, which is cheaper than the lifecycle bugs.
 
@@ -214,7 +214,7 @@ it (`msvcrt.locking` / `fcntl.flock`) and labels its containers and network with
 while its lock file exists and cannot be locked; the OS drops the lock however the process ends, so a reused
 pid (or a WSL/Windows pid namespace) can never make a dead owner look alive. A start removes only objects
 whose owner is not alive; `uvx hailer kernel stop` removes every labelled object and nothing in `.hailer`.
-An earlier design kept a per-session record for the local runtime and killed orphans by pid; it was dropped:
+An earlier design kept a per-session record for the local (now unsafe-local) runtime and killed orphans by pid; it was dropped:
 the `finally` stops the unsafe-local kernel on every normal exit, and a killed session's token-protected marimo is
 ended by the user (Task Manager or `kill`). Evidence: `test_owner_locks_say_whether_their_hailer_still_runs`,
 `test_a_start_never_removes_a_live_sessions_objects`, `test_start_removes_what_owners_that_are_gone_left_by_id`,

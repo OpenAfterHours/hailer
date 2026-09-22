@@ -13,6 +13,8 @@ import pytest
 from rich.console import Console
 
 import hailer.cli as cli
+from hailer.cli import chat as cli_chat
+from hailer.cli import common
 from hailer import notebooks
 from hailer.errors import HailerError
 from hailer.models import ContextBundle, SessionState, SkillInfo
@@ -127,7 +129,7 @@ def run_session(
     output = io.StringIO()
     console = Console(file=output, force_terminal=False, width=120, highlight=False)
     # The chat's own kernel: the sandbox given, else the harness's (what its fake start hands a chat).
-    controller = cli.ChatLoop(console, h.config, cli.CliOptions(new_thread=new_thread), sandbox=sandbox or h.sandbox)
+    controller = cli_chat.ChatLoop(console, h.config, common.CliOptions(new_thread=new_thread), sandbox=sandbox or h.sandbox)
     made: list[StubUI] = []
 
     def factory(console: Console, submit: Any, context: Any) -> StubUI:
@@ -277,7 +279,7 @@ def test_cancelled_notebook_session_wait_stops_worker_and_preserves_switch_notic
         stopped.set()
         return None
 
-    monkeypatch.setattr(cli, "_wait_for_session", wait_session)
+    monkeypatch.setattr(common, "_wait_for_session", wait_session)
 
     async def scenario(controller: Any, ui: StubUI) -> None:
         operation = asyncio.create_task(ui.submit("/notebook open other"))
@@ -349,7 +351,7 @@ def test_interactive_start_failure_or_cancellation_closes_agent_and_flushes(harn
     harness.agent = FailedAgent()
     output = io.StringIO()
     console = Console(file=output)
-    controller = cli.ChatLoop(console, harness.config, cli.CliOptions())
+    controller = cli_chat.ChatLoop(console, harness.config, common.CliOptions())
     ui = StubUI(console, controller.ahandle, controller.context_line, None)
     if isinstance(failure, asyncio.CancelledError):
         with pytest.raises(asyncio.CancelledError):
@@ -364,7 +366,7 @@ def test_failed_final_flush_still_restores_controller_console_and_closes_agent(h
     harness.agent = AsyncFakeAgent()
     original = Console(file=io.StringIO())
     replacement = Console(file=io.StringIO())
-    controller = cli.ChatLoop(original, harness.config, cli.CliOptions())
+    controller = cli_chat.ChatLoop(original, harness.config, common.CliOptions())
 
     async def scenario(_ui: StubUI) -> None:
         assert controller.console is replacement
@@ -399,7 +401,7 @@ def test_first_message_waits_for_both_startups_while_composer_accepts_paste_and_
             await release_notebook.wait()
 
         harness.agent = SlowAgent()
-        controller = cli.ChatLoop(Console(file=io.StringIO()), harness.config, cli.CliOptions())
+        controller = cli_chat.ChatLoop(Console(file=io.StringIO()), harness.config, common.CliOptions())
         timings = StartupTimings()
         with terminal(controller.ahandle, controller.context_line) as (ui, keys, screen, transcript, _size):
             running = asyncio.create_task(controller.run_interactive(
@@ -463,7 +465,7 @@ def test_startup_failure_retains_queued_message_and_new_draft_and_settles_siblin
                 await super().aclose()
 
         harness.agent = FailedAgent()
-        controller = cli.ChatLoop(Console(file=io.StringIO()), harness.config, cli.CliOptions())
+        controller = cli_chat.ChatLoop(Console(file=io.StringIO()), harness.config, common.CliOptions())
         with terminal(controller.ahandle, controller.context_line) as (ui, keys, _screen, transcript, _size):
             running = asyncio.create_task(controller.run_interactive(
                 ui_factory=lambda *_args: ui, prepare_notebook=lambda: preparation("notebook"),
@@ -520,7 +522,7 @@ def test_exit_during_startup_settles_preparation_before_closing_agent(harness, g
 
         harness.agent = SlowAgent()
         original = Console(file=io.StringIO())
-        controller = cli.ChatLoop(original, harness.config, cli.CliOptions())
+        controller = cli_chat.ChatLoop(original, harness.config, common.CliOptions())
         with terminal(controller.ahandle, controller.context_line) as (ui, keys, screen, transcript, _size):
             running = asyncio.create_task(controller.run_interactive(ui_factory=lambda *_args: ui))
             await asyncio.wait_for(entered.wait(), 5)
@@ -558,8 +560,8 @@ def test_exit_during_startup_settles_preparation_before_closing_agent(harness, g
 
 @pytest.mark.parametrize("args", [["--plain"], ["notebook", "--plain"], ["--plain", "notebook"]])
 def test_plain_option_reaches_default_and_notebook_sessions(harness, monkeypatch, args):
-    sessions: list[cli.CliOptions] = []
-    monkeypatch.setattr(cli, "_run_session", lambda _console, _config, opts, **_kwargs: sessions.append(opts))
+    sessions: list[common.CliOptions] = []
+    monkeypatch.setattr(cli_chat, "_run_session", lambda _console, _config, opts, **_kwargs: sessions.append(opts))
     result = runner.invoke(cli.app, args, catch_exceptions=False)
     assert result.exit_code == 0, result.output
     assert len(sessions) == 1 and sessions[0].plain
@@ -578,14 +580,14 @@ def test_plain_terminal_session_emits_no_cursor_controls(harness, monkeypatch, a
     output = TtyOutput()
     base_console = Console(file=output, force_terminal=True, color_system="standard", width=120)
     assert base_console.is_terminal
-    monkeypatch.setattr(cli, "console_factory", lambda: base_console)
-    monkeypatch.setattr(cli, "_stdio_is_terminal", lambda: True)
+    monkeypatch.setattr(common, "console_factory", lambda: base_console)
+    monkeypatch.setattr(common, "_stdio_is_terminal", lambda: True)
     monkeypatch.setenv("TERM", term)
 
     def interactive_input_must_not_start(_reader: Any) -> None:
         pytest.fail("plain terminal chat must use noninteractive input")
 
-    monkeypatch.setattr(cli._LineReader, "_prompt_session", interactive_input_must_not_start)
+    monkeypatch.setattr(common._LineReader, "_prompt_session", interactive_input_must_not_start)
     result = runner.invoke(cli.app, args, input="hello\n/exit\n", catch_exceptions=False)
     assert result.exit_code == 0, result.output
     assert harness.agent.turns == [("hello", None)]
@@ -601,6 +603,6 @@ def test_plain_terminal_session_emits_no_cursor_controls(harness, monkeypatch, a
      (True, "dumb", False, False), (True, "unknown", False, False), (True, "xterm", True, False)],
 )
 def test_terminal_selection_keeps_pipes_plain_and_honours_override(monkeypatch, tty, term, plain, expected):
-    monkeypatch.setattr(cli, "_stdio_is_terminal", lambda: tty)
+    monkeypatch.setattr(common, "_stdio_is_terminal", lambda: tty)
     monkeypatch.setenv("TERM", term)
-    assert cli._use_composer(cli.CliOptions(plain=plain)) is expected
+    assert cli_chat._use_composer(common.CliOptions(plain=plain)) is expected

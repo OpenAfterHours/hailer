@@ -22,7 +22,7 @@ class MarimoServer:
     nothing else finds or attaches to it."""
 
     url: str  # base URL without trailing slash, e.g. http://127.0.0.1:2718
-    pid: int | None = None  # local runtime: the marimo process
+    pid: int | None = None  # unsafe-local runtime: the marimo process
     #: The server's random auth token. Kept out of ``repr`` so it never lands in a log line or a
     #: test failure.
     token: str | None = field(default=None, repr=False)

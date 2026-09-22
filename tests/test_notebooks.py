@@ -7,7 +7,6 @@ the sandbox's (tests/test_sandbox.py).
 
 from __future__ import annotations
 
-import inspect
 import json
 import os
 from pathlib import Path
@@ -217,16 +216,6 @@ def test_an_old_active_entry_outside_the_folder_is_dropped(tmp_path):
     # a new-format file with a path in it is not a name either
     state.write_text(json.dumps({"version": 2, "active": "notebooks/analysis.py"}), encoding="utf-8")
     assert nbs.load_active_notebook(cfg) == "notebooks/analysis.py", "a valid name (a subfolder called notebooks)"
-
-
-def test_environment_never_bypasses_the_state_file(tmp_path, monkeypatch):
-    """HAILER_NOTEBOOK stays set for the whole session; if it won in the tools, tool calls would
-    ignore every switch. The CLI persists the override into the state file instead."""
-    cfg = make_config(tmp_path)
-    nbs.save_active_notebook(cfg, "other.py")
-    monkeypatch.setenv("HAILER_NOTEBOOK", "anything")
-    assert nbs.load_active_notebook(cfg) == "other.py"
-    assert "env" not in inspect.signature(nbs.load_active_notebook).parameters
 
 
 def test_save_active_notebook_tolerates_a_corrupt_state_file(tmp_path):
