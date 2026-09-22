@@ -7,7 +7,6 @@
 notebook = "notebooks/analysis.py"   # default notebook; the chat can create and open others
 # notebooks_dir = "notebooks"        # folder for notebooks created or opened from the chat (default: the notebook's folder)
 data_dir = "data"                    # the data files to analyse (CSV, Parquet, JSON, ...)
-# marimo_url = "http://127.0.0.1:2718"  # optional pin; when omitted Hailer reuses this workspace's marimo or starts one
 # context_dir = ".config/hailer/context"  # always-on context (*.md) sent with every session
 # skills_dir  = ".config/hailer/skills"   # on-demand skills (<name>/SKILL.md)
 # prompts_dir = ".config/hailer/prompts"  # reusable prompts (/prompt <name>)

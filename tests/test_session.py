@@ -38,6 +38,15 @@ def test_command_with_args():
     assert parse_command("/PROMPT monthly-pack 2025-03") == Command("prompt", "monthly-pack 2025-03")
 
 
+def test_a_pasted_exec_block_keeps_its_lines():
+    """The name ends at the first whitespace, a line break included: /exec code can be pasted."""
+    assert parse_command("/exec\nimport polars as pl\nprint(pl.__version__)") == Command(
+        "exec", "import polars as pl\nprint(pl.__version__)"
+    )
+    assert parse_command("/exec for x in range(2):\n    print(x)") == Command("exec", "for x in range(2):\n    print(x)")
+    assert parse_command("/exec\n    x = 1\n    print(x)\n") == Command("exec", "    x = 1\n    print(x)"), "indentation kept for dedent"
+
+
 def test_bare_slash_and_unknown():
     assert parse_command("/") == Command("", "")
     assert parse_command("/wat 1 2") == Command("wat", "1 2")

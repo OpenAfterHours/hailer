@@ -189,7 +189,7 @@ Investigated against the real installed APIs on Windows 11, Python 3.12/3.13. 20
    - `GET  {url}/health` (no auth) → `{"status": "healthy"}`
    - `GET  {url}/api/sessions` → `{ "<session_id>": {"filename": ..., "path": ...}, ... }`
    - `POST {url}/api/kernel/execute` with header `Marimo-Session-Id: <id>` and body `{"code": "..."}` → Server-Sent Events: `stdout` / `stderr` (`{"data": "..."}`) then `done` (`{"success": bool, "output": {"mimetype": ..., "data": ...}}`).
-   - Optional `Authorization: Bearer <token>` for tokened servers. Servers started with `--no-token` self-register at `%USERPROFILE%\.marimo\servers\<host>_<port>.json` (`server_id, pid, host, port, base_url, started_at, version`) which Hailer can read for auto-discovery.
+   - Optional `Authorization: Bearer <token>` for tokened servers. Servers started with `--no-token` self-register at `%USERPROFILE%\.marimo\servers\<host>_<port>.json` (`server_id, pid, host, port, base_url, started_at, version`). Hailer does not use them: each session talks only to the server it started.
 
 3. **Code executes in a scratchpad**, a temp namespace over the kernel globals. Reads see notebook variables; new top-level bindings are discarded. Durable notebook changes go through the private `marimo._code_mode` API inside the scratchpad:
    ```python
@@ -280,7 +280,7 @@ What is verified, and what is not:
    How it reaches the endpoint: `hailer.secrets.resolve_provider_key` reads the key inside the Hailer process and `build_model` hands it to `ChatOpenAI` as `api_key`. It is never written to a file, exported to the user's shell, passed on a command line or logged (redaction filter). Resolution order per provider: (a) the env var named in `env_key`, when set in the shell (for CI/automation), (b) `keyring` entry `service="hailer", username="<provider>:<env_key>"`, (c) neither → a `CredentialsError` suggesting `hailer login <provider>`. The built-in `openai` provider works the same way with `OPENAI_API_KEY` and has no other login. `hailer doctor` and `/status` report where the key came from (`keyring` or `env`), never the value.
 
    Same-user processes can read Credential Manager entries just as they can read env vars, so this is about not leaving the key in files and history, not about isolating it from the user's own account. `keyring` adds six small pure-Python packages; no bash, no native build.
-3. **Run `uv run hailer doctor`.** It reports: config valid, notebook found, where the active provider's key comes from, marimo running, notebook open in a browser (the checks normal startup runs too), then whether code mode answers in the kernel. It does not call the model endpoint. Failures print a fix, for example:
+3. **Run `uvx hailer doctor`.** It reports: config valid, notebook found, where the active provider's key comes from, and whether the kernel runtime can start here (Docker, the image, the folders): the checks normal startup runs too. It starts no kernel and does not call the model endpoint. Failures print a fix, for example:
    ```
    INTERNAL_MODEL_API_KEY is not set (required by provider 'internal')
    Store it once with:
@@ -357,7 +357,7 @@ Why Hailer's own tools instead of the upstream shell scripts:
 - No bash/curl/jq; works from `cmd.exe`/PowerShell.
 - Typed arguments: multi-line Python arrives intact (cmd.exe has no heredocs; shell quoting was the main Windows failure mode).
 - Hailer controls the result shape: truncation of large outputs with head/tail, session resolution by notebook path on every call, clear error strings the model can act on.
-- Same client is also exposed as `uv run hailer exec -c "..."` for humans and debugging.
+- Same client is also exposed as the `/exec <code>` slash command in the chat, for humans and debugging (it runs in the chat's own kernel).
 
 Not used: marimo's hidden `marimo edit --mcp code-mode` flag exposes `list_sessions` / `execute_code` over streamable HTTP at `/mcp/server` (needs `marimo[mcp]`). It is experimental, it requires the user to remember the flag, and the agent has no MCP client.
 
@@ -411,7 +411,6 @@ How each part is wired:
   [hailer]
   notebook    = "notebooks/analysis.py"
   data_dir    = "data"
-  marimo_url  = "http://127.0.0.1:2718"     # optional; auto-discovered from the registry when omitted
   context_dir = ".config/hailer/context"
   skills_dir  = ".config/hailer/skills"
 
@@ -445,17 +444,17 @@ hailer/
 ├── scripts/               make_sample_data.py ("25-01 pra101.parquet" ... for demos/tests), release.py,
 │                          build_kernel_image.py (docker buildx for CI and the release)
 ├── src/hailer/
-│   ├── cli.py             Typer app: chat REPL (default), `notebook`, `exec`, `status`, `doctor`, `login`, `logout`, `init`,
+│   ├── cli.py             Typer app: chat REPL (default), `notebook`, `status`, `doctor`, `login`, `logout`, `init`,
 │   │                      `kernel pull|build|stop`
-│   ├── kernel.py          kernel runtimes: PathMap, .hailer/kernel.json, the liveness check, LocalRuntime, runtime_for
-│   ├── kernel_docker.py   DockerRuntime (the docker CLI through an injectable runner), kernel stop
-│   ├── kernel_image.py    the kernel image: default name, build context, build, pull, version label
+│   ├── kernel.py          kernel runtimes: PathMap, the local kernel's environment, LocalRuntime, runtime_for
+│   ├── kernel_docker.py   DockerRuntime (the docker CLI through an injectable runner), owner locks, status, kernel stop
+│   ├── kernel_image.py    the kernel image: kernel contract tag, build context, build, pull, contract label
 │   ├── _forward.py        the asyncio TCP forwarder the docker kernel is reached through
 │   ├── docker/Dockerfile  the kernel image (package data)
 │   ├── agent.py           build_model (provider → ChatOpenAI), HailerAgent (threads, streamed turns, Ctrl+C),
 │   │                      system prompt, error mapping
 │   ├── tools.py           HailerTools (the 11 tools in §2) and hailer_tools(config) → LangChain tools
-│   ├── marimo_client.py   HTTP/SSE client, registry discovery, session resolution, launch commands
+│   ├── marimo_client.py   HTTP/SSE client, session resolution, the marimo launch command
 │   ├── notebooks.py       active-notebook state (.hailer/notebook.json), listing, creation from templates
 │   ├── browser.py         opens a URL in the user's browser (os.startfile first on Windows)
 │   ├── web.py             allow-list matching, fetch_page, HTML to text, truncation
@@ -490,7 +489,7 @@ Dependencies: `marimo` (pinned `==0.24.2`, `_code_mode` is private), `langchain>
 | Milestone | Deliverable | Proof |
 |---|---|---|
 | M0 Scaffold | `pyproject.toml`, `uv sync`, package skeleton, notebook, `.gitignore` | `uv run hailer --help` |
-| M1 Marimo path | `marimo_client.py` + `hailer exec` | With the notebook open in a browser: `uv run hailer exec -c "<cm snippet>"` adds a visible cell |
+| M1 Marimo path | `marimo_client.py` + `/exec` | With the notebook open in a browser: `/exec <cm snippet>` in the chat adds a visible cell |
 | M2 Agent path | `tools.py`, `agent.py` (chat model, tool loop, system prompt), hard-wired turn | `> create a simple dataframe and display it in Marimo` produces a notebook change |
 | M3 Conversation | REPL, `session.py`, streaming progress, Ctrl+C interrupt, EOF exit, thread resume | Three-turn definition-of-done sequence (dataframe → chart → summary) |
 | M4 Config & preflight | `config.py`, `hailer.toml`, env overrides, startup checks with actionable messages, `hailer notebook`, `--verbose` | Each error case in the spec prints a fix, no traceback |
@@ -502,7 +501,7 @@ Slash commands: `/help /status /new /exit /quit /model /notebook /clear /context
 
 ## 7. Risks and how the plan handles them
 
-- **Private `marimo._code_mode` API** → pin marimo; the `cm` patterns live in `prompts/system.md`, the `marimo_execute` description and `marimo_client.py`; `hailer doctor` probes code mode in the live kernel to detect drift.
+- **Private `marimo._code_mode` API** → pin marimo; the `cm` patterns live in `prompts/system.md`, the `marimo_execute` description and `marimo_client.py`; the kernel image's contract pins marimo, and the Docker integration test runs code mode in a real kernel.
 - **No browser session** → `marimo_status` detects it; the CLI, `notebook_create` and `notebook_open` open the URL (`hailer.browser`) and wait for the session.
 - **Session id churn on page refresh** → every call resolves the session by notebook path, never caches ids.
 - **LangChain's release pace** → `langchain` and `langchain-openai` are pinned `<2`, `langgraph-checkpoint-sqlite` `<4`; the `build_model` docstring records what to re-check before raising a bound, and the offline fake-gateway tests catch wire regressions on an upgrade.

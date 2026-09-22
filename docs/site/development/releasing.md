@@ -15,7 +15,8 @@ branch and tag atomically. The tag triggers `.github/workflows/release.yml`, whi
 1. runs every job in `test.yml` again (the four platforms and the Docker kernel job) and builds the sdist
    and wheel;
 2. makes sure the kernel image of this Hailer's kernel contract,
-   `ghcr.io/openafterhours/hailer-kernel:marimo<version>-<fingerprint>`, is in the registry: when the tag is
+   `ghcr.io/openafterhours/hailer-kernel:marimo<marimo version>-<first 12 hex of the contract fingerprint>`
+   (for example `marimo0.24.2-64a6b78f25cf`), is in the registry: when the tag is
    already published (the release changed nothing in the image) nothing is built; otherwise
    `scripts/build_kernel_image.py --push --if-missing` builds it for `linux/amd64` and `linux/arm64` and
    pushes it. That step is the one gate: a tag published without both platforms, only some tags published,

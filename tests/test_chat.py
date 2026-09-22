@@ -51,17 +51,16 @@ class AsyncFakeAgent(FakeAgent):
 def test_composer_keeps_docker_connection_across_switches(harness):
     from dataclasses import replace
     from test_cli import DOCKER_SERVER, TOKEN
-    from hailer.kernel import attach_runtime, docker_paths, kernel_state_path
+    from hailer.kernel import docker_paths
+    from hailer.models import KernelConfig
 
     server = replace(DOCKER_SERVER, paths=docker_paths(harness.config))
-    harness.config = attach_runtime(harness.config, server)
+    harness.config = replace(harness.config, kernel=KernelConfig(runtime="docker"))
     harness.agent = AsyncFakeAgent()
-    harness.server = None  # discovery cannot supply the connection after startup
     write_notebook(harness.config, "other")
 
     async def scenario(controller, ui):
         assert harness.agent_servers == [server]
-        kernel_state_path(harness.config.workspace).unlink(missing_ok=True)
         await ui.submit("/new")
         await ui.submit("/model changed-model")
         await ui.submit("/notebook open other")
@@ -127,7 +126,8 @@ def run_session(
 ) -> tuple[Any, StubUI, str]:
     output = io.StringIO()
     console = Console(file=output, force_terminal=False, width=120, highlight=False)
-    controller = cli.ChatLoop(console, h.config, cli.CliOptions(new_thread=new_thread), server=server)
+    # The chat's own kernel: the one given, else the harness's (what its fake start hands a chat).
+    controller = cli.ChatLoop(console, h.config, cli.CliOptions(new_thread=new_thread), server=server or h.server)
     made: list[StubUI] = []
 
     def factory(console: Console, submit: Any, context: Any) -> StubUI:

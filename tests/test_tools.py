@@ -112,9 +112,9 @@ class FakeClient:
         return "tok"
 
 
-def factory_for(client: FakeClient, url: str = "http://127.0.0.1:2718", version: str = "0.24.2"):
+def factory_for(client: FakeClient, url: str = "http://127.0.0.1:2718"):
     def factory():
-        return client, MarimoServer(url=url, server_id="127.0.0.1:2718", version=version, source="config")
+        return client, MarimoServer(url=url)
 
     return factory
 
@@ -230,7 +230,7 @@ def test_marimo_status_variants(tmp_path):
 
     tools = HailerTools(make_config(tmp_path), factory_for(FakeClient(has_session=True)))
     text = tools.marimo_status()
-    assert "running at http://127.0.0.1:2718 (version 0.24.2)" in text
+    assert "running at http://127.0.0.1:2718" in text
     assert "s1: notebooks/analysis.py (active notebook)" in text
     assert "active notebook: notebooks/analysis.py -> session s1 (ready)" in text
 
@@ -630,18 +630,28 @@ def test_default_client_uses_active_notebook_folder_and_workspace(ws, monkeypatc
         def __init__(self, base_url, token=None, **kw):
             captured.update(base_url=base_url, token=token, **kw)
 
-    monkeypatch.setattr(mc, "find_server", lambda config: MarimoServer(url="http://127.0.0.1:2718", source="config"))
     monkeypatch.setattr(mc, "MarimoClient", CapturingClient)
-    cfg = make_config(config.workspace, notebooks_dir=config.notebooks_root, marimo_token="tok")
-    client, server = HailerTools(cfg)._default_client()
-    assert isinstance(client, CapturingClient) and server.url == "http://127.0.0.1:2718"
+    cfg = make_config(config.workspace, notebooks_dir=config.notebooks_root)
+    server = MarimoServer(url="http://127.0.0.1:2718", token="tok")
+    client, got = HailerTools(cfg, server=server)._default_client()
+    assert isinstance(client, CapturingClient) and got is server
     assert captured["notebook"] == cfg.notebook and captured["workspace"] == cfg.workspace
     assert captured["token"] == "tok"
 
     notebooks.save_active_notebook(cfg, other)
-    HailerTools(cfg)._default_client()
+    HailerTools(cfg, server=server)._default_client()
     assert captured["notebook"] == other
     assert captured["paths"] is None
+
+
+def test_without_a_kernel_every_kernel_tool_says_so(ws):
+    """The tools never look for a server: without the chat's own kernel they report it."""
+    config, analysis, other = ws
+    tools = HailerTools(config)
+    with pytest.raises(MarimoUnavailableError) as exc:
+        tools._default_client()
+    assert "this session has no kernel" in str(exc.value) and "uvx hailer" in exc.value.hint
+    assert tools.marimo_execute("1").startswith("ERROR: marimo is not running: this session has no kernel")
 
 
 def test_default_client_uses_the_token_and_paths_of_the_server_hailer_started(ws, monkeypatch):
@@ -656,11 +666,10 @@ def test_default_client_uses_the_token_and_paths_of_the_server_hailer_started(ws
             captured.update(base_url=base_url, token=token, **kw)
 
     paths = docker_paths(config)
-    started = MarimoServer(url="http://127.0.0.1:2731", source="kernel", token="kernel-token", runtime="docker", paths=paths)
-    monkeypatch.setattr(mc, "find_server", lambda config: started)
+    started = MarimoServer(url="http://127.0.0.1:2731", token="kernel-token", runtime="docker", paths=paths)
     monkeypatch.setattr(mc, "MarimoClient", CapturingClient)
-    HailerTools(make_config(config.workspace, notebooks_dir=config.notebooks_root, marimo_token="user-token"))._default_client()
-    assert captured["token"] == "kernel-token", "the server's own token wins over HAILER_MARIMO_TOKEN"
+    HailerTools(make_config(config.workspace, notebooks_dir=config.notebooks_root), server=started)._default_client()
+    assert captured["token"] == "kernel-token"
     assert captured["paths"] is paths
     assert captured.get("token_in_links", False) is False, "hints from this client reach the model"
 
@@ -674,7 +683,7 @@ SECRET = "kernel-token-never-for-the-model"
 
 def signed_factory(client: FakeClient, **server_kw):
     def factory():
-        return client, MarimoServer(url="http://127.0.0.1:2718", source="kernel", token=SECRET, **server_kw)
+        return client, MarimoServer(url="http://127.0.0.1:2718", token=SECRET, **server_kw)
 
     return factory
 
@@ -714,13 +723,13 @@ def test_tools_send_kernel_paths_for_a_docker_kernel(ws):
 
 
 # --------------------------------------------------------------------------- #
-# marimo configured but down: the factory succeeds, the first request fails
+# The kernel went away: the factory succeeds, the first request fails
 # --------------------------------------------------------------------------- #
 
 
 class DownClient:
-    """What the real client looks like with ``marimo_url`` configured and nothing listening:
-    ``find_server`` returns the server unchecked, so every request raises."""
+    """What the real client looks like when the chat's kernel stopped (killed, or removed with
+    ``uvx hailer kernel stop``): the server is still held in memory, so every request raises."""
 
     def __init__(self):
         self.closed: list[str] = []
@@ -728,7 +737,7 @@ class DownClient:
     def _down(self):
         return MarimoUnavailableError(
             "Marimo is not running at http://127.0.0.1:2718 (connection refused).",
-            hint="Start everything in one go:\n\n    uvx hailer notebook",
+            hint="End the chat (/exit) and run uvx hailer again.",
         )
 
     def health(self):
@@ -747,7 +756,7 @@ class DownClient:
         self.closed.append(session_id)
 
 
-def test_notebook_create_with_marimo_configured_but_down(ws):
+def test_notebook_create_when_the_kernel_went_away(ws):
     config, analysis, other = ws
     opener = Opener()
     tools = HailerTools(config, factory_for(DownClient()), open_url=opener, session_wait_sec=0)
@@ -756,12 +765,12 @@ def test_notebook_create_with_marimo_configured_but_down(ws):
     assert created.is_file()
     assert notebooks.load_active_notebook(config) == created.resolve()
     assert text.startswith("Created notebooks/q2_churn.py from the starter template; it is now the active notebook.")
-    assert "marimo is not running" in text and "connection refused" in text and "uvx hailer notebook" in text
+    assert "marimo is not running" in text and "connection refused" in text and "uvx hailer again" in text
     assert not text.startswith("ERROR"), "a create that succeeded must not read as a failure"
     assert opener.urls == []
 
 
-def test_notebook_open_with_marimo_configured_but_down(ws):
+def test_notebook_open_when_the_kernel_went_away(ws):
     config, analysis, other = ws
     opener = Opener()
     tools = HailerTools(config, factory_for(DownClient()), open_url=opener, session_wait_sec=0)
@@ -772,16 +781,16 @@ def test_notebook_open_with_marimo_configured_but_down(ws):
     assert opener.urls == []
 
 
-def test_marimo_status_with_marimo_configured_but_down(ws):
+def test_marimo_status_when_the_kernel_went_away(ws):
     config, analysis, other = ws
     notebooks.save_active_notebook(config, other)
     text = HailerTools(config, factory_for(DownClient())).marimo_status()
     assert text.startswith("marimo: not running")
     assert "active notebook: notebooks/other.py" in text
-    assert "connection refused" in text and "uvx hailer notebook" in text
+    assert "connection refused" in text and "uvx hailer again" in text
 
 
-def test_notebook_close_and_list_with_marimo_configured_but_down(ws):
+def test_notebook_close_and_list_when_the_kernel_went_away(ws):
     config, analysis, other = ws
     client = DownClient()
     tools = HailerTools(config, factory_for(client))
@@ -793,7 +802,7 @@ def test_notebook_close_and_list_with_marimo_configured_but_down(ws):
     assert any("notebooks/analysis.py" in ln for ln in entries) and any("notebooks/other.py" in ln for ln in entries)
     assert "marimo is not reachable" in text and not any("[open]" in ln for ln in entries)
     # The list also carries the error and the launch hint, like the other tools when marimo is down.
-    assert "connection refused" in text and "uvx hailer notebook" in text
+    assert "connection refused" in text and "uvx hailer again" in text
 
 
 def test_session_wait_that_loses_marimo_is_reported_not_raised(ws):
@@ -820,13 +829,12 @@ def test_session_wait_that_loses_marimo_is_reported_not_raised(ws):
 
 
 # --------------------------------------------------------------------------- #
-# The server the chat is pinned to; the kernel the model works in
+# The chat's own server; the kernel the model works in
 # --------------------------------------------------------------------------- #
 
 
-def test_a_pinned_server_is_used_without_discovering_one(ws, monkeypatch):
-    """`hailer notebook` hands its chat the server it started: a kernel.json rewritten or removed
-    underneath (another terminal) cannot take its token and paths away."""
+def test_the_chats_server_is_used_from_memory(ws, monkeypatch):
+    """`hailer notebook` hands its chat the server it started: its token and paths come from memory."""
     from hailer import marimo_client as mc
     from hailer.kernel import docker_paths
 
@@ -837,11 +845,7 @@ def test_a_pinned_server_is_used_without_discovering_one(ws, monkeypatch):
         def __init__(self, base_url, token=None, **kw):
             captured.update(base_url=base_url, token=token, **kw)
 
-    def no_discovery(config):
-        raise AssertionError("a pinned chat never discovers a server")
-
-    pinned = MarimoServer(url="http://127.0.0.1:2731", source="kernel", token="pinned-token", runtime="docker", paths=docker_paths(config))
-    monkeypatch.setattr(mc, "find_server", no_discovery)
+    pinned = MarimoServer(url="http://127.0.0.1:2731", token="pinned-token", runtime="docker", paths=docker_paths(config))
     monkeypatch.setattr(mc, "MarimoClient", CapturingClient)
     _client, server = HailerTools(config, server=pinned)._default_client()
     assert server is pinned and captured["base_url"] == pinned.url and captured["token"] == "pinned-token"
@@ -850,7 +854,7 @@ def test_a_pinned_server_is_used_without_discovering_one(ws, monkeypatch):
 
 def test_hailer_tools_pins_every_tool_to_the_server(ws):
     config, analysis, other = ws
-    pinned = MarimoServer(url="http://127.0.0.1:2731", source="kernel", token="t")
+    pinned = MarimoServer(url="http://127.0.0.1:2731", token="t")
     tools = hailer_tools(config, server=pinned)
     status = next(t for t in tools if t.name == "marimo_status")
     assert status.func.__self__.server is pinned
@@ -863,7 +867,7 @@ def test_marimo_status_names_the_kernel_in_use_and_its_paths(ws):
 
     config, analysis, other = ws
     client = FakeClient(open_paths={analysis})
-    docker = MarimoServer(url="http://127.0.0.1:2731", source="kernel", token="t", runtime="docker", paths=docker_paths(config), network_access=True)
+    docker = MarimoServer(url="http://127.0.0.1:2731", token="t", runtime="docker", paths=docker_paths(config), network_access=True)
     text = HailerTools(config, lambda: (client, docker)).marimo_status()
     assert "kernel: docker (hailer-kernel " in text and "network on: the internet and this machine" in text
     assert "kernel paths: notebooks folder /work/notebooks (writable), data folder /work/data (read-only)" in text
@@ -878,7 +882,7 @@ def test_notebook_open_and_close_accept_the_kernels_paths(ws):
 
     config, analysis, other = ws
     client = FakeClient(open_paths={analysis, other})
-    docker = MarimoServer(url="http://127.0.0.1:2731", source="kernel", token="t", runtime="docker", paths=docker_paths(config))
+    docker = MarimoServer(url="http://127.0.0.1:2731", token="t", runtime="docker", paths=docker_paths(config))
     tools = HailerTools(config, lambda: (client, docker), open_url=Opener(client), session_wait_sec=0)
     text = tools.notebook_open("/work/notebooks/other.py")
     assert text.startswith("notebooks/other.py is now the active notebook."), text

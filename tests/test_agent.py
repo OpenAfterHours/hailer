@@ -8,7 +8,6 @@ import asyncio
 import signal
 import threading
 import time
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -275,18 +274,23 @@ def test_tracing_is_switched_off_unless_opted_in():
 
 
 def test_system_prompt_sections(tmp_path):
-    cfg = make_config(tmp_path, web=WebConfig(allowed_domains=("docs.pola.rs",)), marimo_url="http://127.0.0.1:2718")
+    from hailer.models import MarimoServer
+
+    cfg = make_config(tmp_path, web=WebConfig(allowed_domains=("docs.pola.rs",)))
+    server = MarimoServer(url="http://127.0.0.1:2718", token="kernel-token-123")
     bundle = ContextBundle(
         context_text="PRA101 is the counterparty credit risk return.",
         skills=[SkillInfo(name="pra101-recon", description="Reconcile PRA101 across months", path=tmp_path)],
     )
-    text = system_prompt(cfg, bundle)
+    text = system_prompt(cfg, bundle, server)
     assert "Hailer" in text
     assert "## Project context" in text and "PRA101 is the counterparty" in text
     assert "## Available skills" in text and "pra101-recon — Reconcile PRA101" in text and "load_skill" in text
     assert "## Web access" in text and "docs.pola.rs" in text and "fetch_page" in text
-    assert "## Workspace" in text and str(cfg.notebooks_root) in text and "http://127.0.0.1:2718" in text
-    assert text == system_prompt(cfg, bundle)  # deterministic
+    assert "## Workspace" in text and str(cfg.notebooks_root) in text and "- Marimo URL: http://127.0.0.1:2718\n" in text
+    assert "kernel-token-123" not in text
+    assert text == system_prompt(cfg, bundle, server)  # deterministic
+    assert "Marimo URL" not in system_prompt(cfg, bundle), "no kernel: no URL"
 
 
 def test_system_prompt_no_web(tmp_path):
@@ -314,11 +318,11 @@ def test_nothing_the_model_sees_carries_the_marimo_token(tmp_path):
 
     secret = "kernel-token-never-for-the-model-456"
     with serving(token=secret) as srv:
-        cfg = make_config(tmp_path, marimo_url=srv.url, marimo_token="user-marimo-token-123")
+        cfg = make_config(tmp_path)
         model = ScriptedModel(script=[call("marimo_status", {}), say("done")])
         agent = HailerAgent(
             cfg, ContextBundle(), model_factory=lambda provider, name, key: model, env=KEY_ENV,
-            server=MarimoServer(url=srv.url, source="kernel", token=secret),
+            server=MarimoServer(url=srv.url, token=secret),
         )  # fmt: skip
         try:
             agent.start()
@@ -328,8 +332,8 @@ def test_nothing_the_model_sees_carries_the_marimo_token(tmp_path):
     seen = "\n".join(str(getattr(message, "content", message)) for batch in model.seen for message in batch)
     assert f"marimo: running at {srv.url}" in seen, "the tool reached the pinned server (a missing token gets HTTP 401)"
     assert "- Marimo URL: " + srv.url in seen, "the system prompt names the server"
-    assert secret not in seen and "user-marimo-token-123" not in seen and "access_token" not in seen
-    leaky = system_prompt(replace(cfg, marimo_url=f"{srv.url}/?access_token={secret}"), ContextBundle())
+    assert secret not in seen and "access_token" not in seen
+    leaky = system_prompt(cfg, ContextBundle(), MarimoServer(url=f"{srv.url}/?access_token={secret}"))
     assert secret in leaky, "the check is sensitive: a signed-in URL in the prompt would carry the token"
 
 
@@ -350,13 +354,11 @@ def test_system_prompt_for_the_local_kernel_keeps_host_paths_and_the_package_rul
 
 def test_system_prompt_for_a_docker_kernel_gives_kernel_paths_and_its_limits(tmp_path):
     """The model copies paths into code; in a container only the mount points exist."""
-    from hailer.kernel import KernelState, write_kernel_state
+    from hailer.models import MarimoServer
 
-    cfg = make_config(
-        tmp_path, kernel=KernelConfig(runtime="docker"), marimo_url="http://127.0.0.1:2731", marimo_token="user-marimo-token-123"
-    )
-    write_kernel_state(cfg.workspace, KernelState(runtime="docker", url="http://127.0.0.1:2731", port=2731, token="kernel-token-456"))
-    text = system_prompt(cfg, ContextBundle())
+    cfg = make_config(tmp_path, kernel=KernelConfig(runtime="docker"))
+    server = MarimoServer(url="http://127.0.0.1:2731", token="kernel-token-456", runtime="docker")
+    text = system_prompt(cfg, ContextBundle(), server)
     workspace = text[text.index("## Workspace") :]
     assert workspace.startswith(
         "## Workspace\n\n"
@@ -369,7 +371,7 @@ def test_system_prompt_for_a_docker_kernel_gives_kernel_paths_and_its_limits(tmp
     assert "/tmp is scratch space in memory, shared by every notebook in the container and wiped when the kernel stops" in workspace
     assert str(cfg.workspace) not in text and str(cfg.data_dir) not in text, "no host paths"
     assert "ctx.packages.add()" not in text, "never told to install packages"
-    assert "user-marimo-token-123" not in text and "kernel-token-456" not in text and "access_token" not in text
+    assert "kernel-token-456" not in text and "access_token" not in text
 
 
 def test_system_prompt_for_a_docker_kernel_with_network(tmp_path):

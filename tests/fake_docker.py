@@ -119,9 +119,12 @@ class FakeDocker:
         self.containers[container.id] = container
         return container
 
-    def add_network(self, name: str, *, workspace: str | None = None) -> Network:
-        labels = {LABEL_WORKSPACE: workspace, LABEL_ROLE: "network"} if workspace is not None else {}
-        network = Network(self._new_id("network"), name, labels)
+    def add_network(self, name: str, *, workspace: str | None = None, **labels: str) -> Network:
+        all_labels = dict(labels)
+        if workspace is not None:
+            all_labels[LABEL_WORKSPACE] = workspace
+            all_labels[LABEL_ROLE] = "network"
+        network = Network(self._new_id("network"), name, all_labels)
         self.networks[network.id] = network
         return network
 
@@ -187,7 +190,12 @@ class FakeDocker:
         if args[:2] == ["network", "ls"]:
             rows = [n for n in self.networks.values() if self._matches(n.labels, n.name, args)]
             fmt = args[args.index("--format") + 1]
-            return self._done(args, 0, "".join(fmt.replace("{{.ID}}", n.id[:12]).replace("{{.Name}}", n.name) + "\n" for n in rows))
+
+            def network_row(n: Network) -> str:
+                text = fmt.replace("{{.ID}}", n.id[:12]).replace("{{.Name}}", n.name)
+                return re.sub(r'\{\{\.Label "([^"]+)"\}\}', lambda m: n.labels.get(m.group(1), ""), text)
+
+            return self._done(args, 0, "".join(network_row(n) + "\n" for n in rows))
         if args[:2] == ["network", "create"]:
             name = args[-1]
             if self.network(name) is not None:

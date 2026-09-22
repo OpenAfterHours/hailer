@@ -52,7 +52,7 @@ def start_marimo(config: HailerConfig, monkeypatch) -> Path:
 
     procs = Procs().local_processes()
     procs.spawn = spawn
-    running = kernel.LocalRuntime(config, procs=procs, probe=lambda *args: False).start(2718)
+    running = kernel.LocalRuntime(config, procs=procs).start(2718)
     return running.log_path
 
 

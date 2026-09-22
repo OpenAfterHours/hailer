@@ -4,21 +4,25 @@
 Everything here drives the ``docker`` CLI through a :class:`DockerRunner` (no Docker SDK), so the
 tests check argument lists against a scripted fake. It fails closed: every check raises a
 :class:`~hailer.errors.KernelRuntimeError` with a hint and nothing ever falls back to the local
-runtime. The shared pieces (``kernel.json``, :class:`~hailer.kernel.PathMap`, the start guard)
-live in :mod:`hailer.kernel`; ``runtime_for`` imports this module only when docker is asked for.
+runtime. The shared pieces (:class:`~hailer.kernel.PathMap`) live in :mod:`hailer.kernel`;
+``runtime_for`` imports this module only when docker is asked for.
 
-Containers and networks are removed by the ids Docker gave them when they were created (recorded
-in ``kernel.json``), never by name: an old handle (a chat started before a restart) then cannot
-remove a newer kernel that reuses the names. A start never removes a *running* kernel container
-it has no record of; ``uvx hailer kernel stop`` does, on request.
+Each Hailer process starts its own kernel: names are unique per start (the workspace id plus a
+random suffix) and every container and network carries labels for the workspace, its role, the
+kernel contract and its owner. The owner is an :class:`OwnerLock`: a ``.hailer/owner-<id>.lock``
+file the starting process holds an OS lock on for as long as it runs, so the OS itself says when
+the owner has gone (however it ended) and a reused pid can never make a dead owner look alive.
+The process removes what it started by the ids Docker gave it. A start also removes this
+workspace's objects whose owner is not alive; it never removes anything of a live owner.
+``uvx hailer kernel stop`` removes every labelled object of the workspace.
 """
 
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -30,7 +34,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
-from hailer import __version__, kernel_image
+from hailer import kernel_image
 from hailer.config import NOTEBOOK_CONTROL_FILES, is_unc_path, notebook_control_files
 from hailer.errors import HailerError, KernelRuntimeError
 from hailer.kernel import (
@@ -38,23 +42,12 @@ from hailer.kernel import (
     KERNEL_NOTEBOOKS_DIR,
     KERNEL_WORKDIR,
     START_TIMEOUT_SEC,
-    KernelState,
-    LocalProcesses,
-    LocalRuntime,
-    Probe,
     RunningKernel,
-    _host_parts,
-    _same_parts,
-    delete_kernel_state,
     describe_runtime,
     docker_paths,
-    live_kernel_state,
+    mask_token,
     new_token,
     note_kernel_start,
-    process_running,
-    read_kernel_state,
-    refuse_live_kernel,
-    write_kernel_state,
 )
 from hailer.marimo_client import wait_for_health
 from hailer.models import KERNEL_RUNTIME_DOCKER, Check, HailerConfig, KernelConfig, MarimoServer
@@ -71,11 +64,18 @@ KERNEL_HOME = "/home/analyst"
 KERNEL_TOKEN_FILE = PurePosixPath("/run/secrets/hailer-token")
 #: The folders under ``.hailer`` that hold a token file while a kernel starts.
 TOKEN_FOLDER_PREFIX = "kernel-token-"
+#: ``.hailer/owner-<id>.lock``: one per docker kernel start, locked by its Hailer process while it runs.
+OWNER_LOCK_PREFIX = "owner-"
+#: A lock file younger than this is never swept: its owner may not have locked it yet.
+OWNER_LOCK_GRACE_SEC = 10.0
+_OWNER_ID_RE = re.compile(r"[0-9a-f]{16}")
 #: Labels on every container and network Hailer creates, so it finds its own (and strays).
 LABEL_PREFIX = "org.openafterhours.hailer"
 LABEL_WORKSPACE = f"{LABEL_PREFIX}.workspace"
-LABEL_VERSION = f"{LABEL_PREFIX}.version"
 LABEL_ROLE = f"{LABEL_PREFIX}.role"
+LABEL_CONTRACT = f"{LABEL_PREFIX}.contract"
+#: The :class:`OwnerLock` id of the Hailer process that started the object.
+LABEL_OWNER = f"{LABEL_PREFIX}.owner"
 #: How long one docker command may take; ``docker version`` gets less (an engine that is still
 #: starting can hang instead of refusing).
 DOCKER_TIMEOUT_SEC = 60.0
@@ -264,15 +264,17 @@ def workspace_id(workspace: Path) -> str:
 
 @dataclass(frozen=True)
 class DockerNames:
-    """The names of one workspace's kernel container, forwarder container and internal network."""
+    """The names of one start's kernel container, forwarder container and internal network."""
 
     kernel: str
     forwarder: str
     network: str
 
 
-def docker_names(workspace: Path) -> DockerNames:
-    ident = workspace_id(workspace)
+def docker_names(workspace: Path, suffix: str | None = None) -> DockerNames:
+    """``hailer-kernel-<workspace id>-<suffix>`` and friends; ``suffix`` defaults to 6 random hex
+    characters, so every start (and every Hailer process in the workspace) gets names of its own."""
+    ident = f"{workspace_id(workspace)}-{suffix if suffix is not None else secrets.token_hex(3)}"
     return DockerNames(f"hailer-kernel-{ident}", f"hailer-fwd-{ident}", f"hailer-net-{ident}")
 
 
@@ -297,8 +299,8 @@ def write_token_file(workspace: Path, token: str) -> Path:
     ``0700``, so no other user of this machine reaches the file; on Windows the mode is ignored and
     the folder inherits the workspace's ACL. The file itself is ``0644``: the kernel's user in the
     container can be another uid (a root host, rootless Docker), and Docker mounts the file, not its
-    folder. :func:`remove_token_folder` deletes it once marimo has read it (at start); a folder left
-    by a Hailer that was killed while starting goes with :func:`sweep_token_folders`.
+    folder. The start deletes it (:func:`remove_token_folder`) once marimo has read it, in a
+    ``finally``, whatever ends the wait.
     """
     folder = Path(tempfile.mkdtemp(prefix=TOKEN_FOLDER_PREFIX, dir=ensure_state_dir(workspace)))
     path = folder / "token"
@@ -318,10 +320,132 @@ def remove_token_folder(folder: Path) -> str | None:
     return None
 
 
-def sweep_token_folders(workspace: Path) -> list[str]:
-    """Delete every token folder in ``.hailer`` (none should outlive a start); the warnings."""
-    folders = sorted(state_dir(workspace).glob(TOKEN_FOLDER_PREFIX + "*"))
-    return [warning for folder in folders if (warning := remove_token_folder(folder))]
+# --------------------------------------------------------------------------- #
+# Owners: a lock file each docker kernel's Hailer holds while it runs
+# --------------------------------------------------------------------------- #
+
+
+def _try_lock(fd: int) -> bool:
+    """An exclusive, non-blocking OS lock on ``fd`` (``msvcrt.locking`` / ``fcntl.flock``); False
+    when another open handle holds it (another process, or another handle in this one)."""
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined]
+    except OSError:
+        return False
+    return True
+
+
+def _unlock(fd: int) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_UN)  # type: ignore[attr-defined]
+    except OSError:
+        pass
+
+
+def _open_existing(path: Path) -> int | None:
+    try:
+        return os.open(path, os.O_RDWR | getattr(os, "O_BINARY", 0))
+    except OSError:
+        return None
+
+
+def _owner_lock_path(workspace: Path, owner_id: str) -> Path:
+    return state_dir(workspace) / f"{OWNER_LOCK_PREFIX}{owner_id}.lock"
+
+
+@dataclass
+class OwnerLock:
+    """The lock a Hailer process holds for the lifetime of a docker kernel it started. ``id`` is the
+    kernel's owner label. The OS drops the lock when the process ends, however it ends."""
+
+    id: str
+    path: Path
+    fd: int | None = field(default=None, repr=False)
+
+    def release(self) -> None:
+        """Unlock, close and delete the lock file. Idempotent, never raises."""
+        if self.fd is None:
+            return
+        fd, self.fd = self.fd, None
+        _unlock(fd)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            self.path.unlink()
+        except OSError:
+            pass
+
+
+def acquire_owner_lock(workspace: Path) -> OwnerLock:
+    """Create ``.hailer/owner-<random id>.lock`` and lock it; ``OSError`` when that fails."""
+    ident = secrets.token_hex(8)
+    path = ensure_state_dir(workspace) / f"{OWNER_LOCK_PREFIX}{ident}.lock"
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+    if not _try_lock(fd):
+        os.close(fd)
+        raise OSError(f"could not lock {path}")
+    return OwnerLock(ident, path, fd)
+
+
+def owner_alive(workspace: Path, owner_id: str) -> bool:
+    """True when ``owner_id``'s lock file exists and cannot be locked: the Hailer that started the
+    object still runs. False for a missing file, a lock anyone can take, or a label that is not an
+    owner id (an object without one)."""
+    if not _OWNER_ID_RE.fullmatch(owner_id or ""):
+        return False
+    fd = _open_existing(_owner_lock_path(workspace, owner_id))
+    if fd is None:
+        return False
+    try:
+        if _try_lock(fd):
+            _unlock(fd)
+            return False
+        return True
+    finally:
+        os.close(fd)
+
+
+def sweep_owner_locks(workspace: Path, *, grace: float = OWNER_LOCK_GRACE_SEC) -> None:
+    """Delete the ``.hailer/owner-*.lock`` files nobody holds (left by a Hailer that ended), except
+    ones younger than ``grace`` seconds (their owner may be about to lock them). Never raises."""
+    for path in state_dir(workspace).glob(f"{OWNER_LOCK_PREFIX}*.lock"):
+        try:
+            if time.time() - path.stat().st_mtime < grace:
+                continue
+        except OSError:
+            continue
+        fd = _open_existing(path)
+        if fd is None:
+            continue
+        try:
+            free = _try_lock(fd)
+            if free:
+                _unlock(fd)
+        finally:
+            os.close(fd)
+        if free:
+            try:
+                path.unlink()
+            except OSError:
+                pass
 
 
 def linux_host_user() -> tuple[int, int] | None:
@@ -457,70 +581,6 @@ def planted_warning(notebooks: Path, names: Sequence[str]) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# What a docker record says about the kernel
-# --------------------------------------------------------------------------- #
-
-
-def containers_gone(state: KernelState, runner: DockerRunner | None = None) -> bool:
-    """True when Docker says the kernel container ``state`` records is gone or stopped (a record
-    without container ids is not usable either). False whenever Docker cannot be asked."""
-    if not state.container_ids:
-        return True
-    try:
-        result = (runner or SubprocessDockerRunner()).run(
-            ["inspect", "--type", "container", "--format", "{{.State.Running}}", state.container_ids[0]],
-            timeout=DOCKER_PROBE_TIMEOUT_SEC,
-        )
-    except (HailerError, OSError, subprocess.TimeoutExpired):
-        return False
-    if result.returncode != 0:
-        return _missing(result)
-    return (result.stdout or "").strip() == "false"
-
-
-def _on_off(value: bool) -> str:
-    return "on" if value else "off"
-
-
-def settings_mismatch(state: KernelState, config: HailerConfig) -> list[str]:
-    """How the docker kernel ``state`` records was started differently from what ``config`` asks
-    for now, one phrase per setting (empty: it matches). The folders always count (the kernel
-    sees only what it mounted); image, network, memory and cpus only when ``config`` asks for docker."""
-    diffs: list[str] = []
-    recorded = {kernel: host for host, kernel in state.mounts}
-    for host, kernel_dir, what in (
-        (config.notebooks_root, KERNEL_NOTEBOOKS_DIR, "notebooks folder"),
-        (config.data_dir, KERNEL_DATA_DIR, "data folder"),
-    ):
-        started = recorded.get(str(kernel_dir))
-        if started is None:
-            continue
-        a, b = _host_parts(started), _host_parts(host)
-        if len(a) != len(b) or not _same_parts(a, b):
-            diffs.append(f"{what} {started}, hailer.toml: {host}")
-    kernel = config.kernel
-    if kernel.runtime != KERNEL_RUNTIME_DOCKER:
-        return diffs
-    if state.network_access != kernel.network:
-        diffs.append(f"network {_on_off(state.network_access)}, hailer.toml: {_on_off(kernel.network)}")
-    if state.image and state.image != kernel.effective_image:
-        diffs.append(f"image {state.image}, hailer.toml: {kernel.effective_image}")
-    if state.memory is not None and state.memory.strip().lower() != kernel.memory.strip().lower():
-        diffs.append(f"memory {state.memory}, hailer.toml: {kernel.memory}")
-    if state.cpus is not None and state.cpus != kernel.cpus:
-        diffs.append(f"cpus {state.cpus:g}, hailer.toml: {kernel.cpus:g}")
-    return diffs
-
-
-def mismatch_error(diffs: Sequence[str]) -> KernelRuntimeError:
-    """``KernelRuntimeError`` for reusing a kernel started with other settings (see :func:`settings_mismatch`)."""
-    return KernelRuntimeError(
-        f"The running kernel was started with other settings ({'; '.join(diffs)}).",
-        hint="Stop it with uvx hailer kernel stop, then run this command again to start one with the current settings.",
-    )
-
-
-# --------------------------------------------------------------------------- #
 # A running docker kernel
 # --------------------------------------------------------------------------- #
 
@@ -581,9 +641,8 @@ def _remove(runner: DockerRunner, kind: str, ident: str, shown: str) -> Removal:
 
 @dataclass
 class DockerKernel(RunningKernel):
-    """A docker kernel's containers and network: the ones this Hailer started, or found through
-    ``kernel.json``. ``containers`` are names (kernel first), ``container_ids`` the same containers'
-    ids; everything is removed and inspected by id."""
+    """The containers and network this Hailer started. ``containers`` are names (kernel first),
+    ``container_ids`` the same containers' ids; everything is removed and inspected by id."""
 
     runner: Any = None
     containers: tuple[str, ...] = ()
@@ -591,6 +650,7 @@ class DockerKernel(RunningKernel):
     network: str | None = None
     network_id: str | None = None
     stop_error: str = ""
+    owner: OwnerLock | None = None
 
     def _name(self, ident: str) -> str:
         for name, known in zip(self.containers, self.container_ids):
@@ -621,16 +681,19 @@ class DockerKernel(RunningKernel):
         return outcome
 
     def stop(self) -> None:
+        """Remove the containers and the network, then release the owner lock; ``stop_error`` says
+        what could not be removed (ownerless now, the next start or ``uvx hailer kernel stop``
+        removes it)."""
         self.stop_error = ""
         try:
             outcome = self.remove()
         except Exception as err:  # noqa: BLE001 - best effort on the way out
             self.stop_error = f"Could not stop the Docker kernel: {err}. Run uvx hailer kernel stop to retry."
-            return  # keep the record: kernel stop can retry when Docker is reachable
-        if outcome.failed:
-            self.stop_error = "Could not finish stopping the Docker kernel: " + "; ".join(outcome.failed) + ". Run uvx hailer kernel stop to retry."
-            return
-        super().stop()
+        else:
+            if outcome.failed:
+                self.stop_error = "Could not finish stopping the Docker kernel: " + "; ".join(outcome.failed) + ". Run uvx hailer kernel stop to retry."
+        if self.owner is not None:
+            self.owner.release()
 
     def log_tail(self, lines: int = 15, *, container: str | None = None) -> list[str]:
         """The last lines of ``docker logs`` for the kernel (or the container id ``container``), token masked."""
@@ -642,8 +705,7 @@ class DockerKernel(RunningKernel):
         except Exception:  # noqa: BLE001 - the log is a courtesy
             return []
         text = "\n".join(part for part in (result.stdout, result.stderr) if part)
-        token = self.server.token
-        return [line.replace(token, "<token>") if token else line for line in text.splitlines()][-lines:]
+        return mask_token(text.splitlines()[-lines:], self.server.token)
 
     def wait(self) -> int:
         """Follow the kernel's new log lines in this terminal (``--foreground``) until it stops or
@@ -698,12 +760,13 @@ class DockerKernel(RunningKernel):
 
 @dataclass(frozen=True)
 class Labelled:
-    """A container Docker lists with this workspace's label."""
+    """A container (or, with ``state`` empty, a network) Docker lists with this workspace's label."""
 
     id: str
     name: str
     state: str
     role: str
+    owner: str = ""  # the OwnerLock id of the Hailer that started it ("" without the label)
 
     @property
     def running(self) -> bool:
@@ -714,13 +777,14 @@ class DockerRuntime:
     """marimo in a Linux container that sees only the notebooks folder (read-write) and the data
     folder (read-only), without network access or any of the host's secrets.
 
-    One workspace gets (names from :func:`docker_names`, every one labelled with the workspace):
+    Each start gets (names from :func:`docker_names`, unique per runtime object; every one
+    labelled with the workspace, its role, the kernel contract and its :class:`OwnerLock` id):
 
-    - ``hailer-net-<id>``: an ``--internal`` network, with no route out.
-    - ``hailer-kernel-<id>``: ``marimo edit`` on that network only, hardened (read-only root,
-      no capabilities, pid, memory (no swap on top) and CPU limits), no port published (Docker
-      ignores ``-p`` on an internal network).
-    - ``hailer-fwd-<id>``: :mod:`hailer._forward` from the same image, published on
+    - ``hailer-net-<id>-<suffix>``: an ``--internal`` network, with no route out.
+    - ``hailer-kernel-<id>-<suffix>``: ``marimo edit`` on that network only, hardened (read-only
+      root, no capabilities, pid, memory (no swap on top) and CPU limits), no port published
+      (Docker ignores ``-p`` on an internal network).
+    - ``hailer-fwd-<id>-<suffix>``: :mod:`hailer._forward` from the same image, published on
       ``127.0.0.1:<port>`` and joined to both networks; it only ever connects to the kernel.
 
     ``[kernel] network = true`` runs the kernel on Docker's default network with its port
@@ -742,20 +806,21 @@ class DockerRuntime:
         start_timeout: float = START_TIMEOUT_SEC,
         health: Callable[..., bool] | None = None,
         user: Callable[[], tuple[int, int] | None] = linux_host_user,
-        probe: Probe | None = None,
+        suffix: str | None = None,
     ) -> None:
         self.config = config
         self.paths = docker_paths(config)
         self.runner: DockerRunner = runner if runner is not None else SubprocessDockerRunner()
-        self.names = docker_names(config.workspace)
+        self.names = docker_names(config.workspace, suffix)
         self._token_factory = token_factory
         self.start_timeout = start_timeout
         self._health = health
         self._user = user
-        self._probe = probe
         self._engine_version: str | None = None
         self._cpus = config.kernel.cpus
         self._prepared = False
+        #: The :class:`OwnerLock` id of the current start (its owner label); set by :meth:`start`.
+        self.owner_id = ""
 
     # -- what it is ---------------------------------------------------------- #
 
@@ -936,18 +1001,14 @@ class DockerRuntime:
         if problems:
             raise KernelRuntimeError(problems[0], hint="\n".join(problems[1:]))
 
-    def _gone(self, state: KernelState) -> bool:
-        return containers_gone(state, self.runner)
-
     def prepare(self, say: Callable[[str], None] | None = None) -> None:
-        """Docker runs a Linux engine, the folders are safe to mount, no kernel Hailer started for
-        this workspace is still running, and the image of this Hailer's kernel contract is here: downloaded now
-        (with docker's progress in this terminal) when it is missing. A ``[kernel].cpus`` above
+        """Docker runs a Linux engine, the folders are safe to mount, and the image of this Hailer's
+        kernel contract is here: downloaded now (with docker's progress in this terminal) when it is
+        missing. A ``[kernel].cpus`` above
         what Docker has is lowered, with a note. Raises ``KernelRuntimeError``."""
         out = say or _say
         self._check_mounts()
         self.engine_version()
-        refuse_live_kernel(Path(self.config.workspace), probe=self._probe, gone=self._gone)
         found = self._image_contract()
         if found is None:
             out(f"Downloading the kernel image {self.image} (first use; this can take a few minutes) ...")
@@ -985,8 +1046,9 @@ class DockerRuntime:
     def _labels(self, role: str) -> list[str]:
         return [
             "--label", f"{LABEL_WORKSPACE}={self.workspace_label}",
-            "--label", f"{LABEL_VERSION}={__version__}",
+            "--label", f"{LABEL_CONTRACT}={kernel_image.contract_tag()}",
             "--label", f"{LABEL_ROLE}={role}",
+            "--label", f"{LABEL_OWNER}={self.owner_id}",
         ]  # fmt: skip
 
     def network_command(self) -> list[str]:
@@ -1047,48 +1109,48 @@ class DockerRuntime:
             "python", "-m", "hailer._forward", self.names.kernel, str(KERNEL_PORT), str(KERNEL_PORT),
         ]  # fmt: skip
 
-    def _listed(self, args: Sequence[str], *, what: str) -> list[str]:
-        return [line.strip() for line in (self._docker(args, what=what).stdout or "").splitlines() if line.strip()]
+    def _listed(self, args: Sequence[str], *, what: str) -> list[list[str]]:
+        """The tab-separated rows a ``--format`` listing printed (every row padded to 5 fields)."""
+        lines = [line.strip() for line in (self._docker(args, what=what).stdout or "").splitlines() if line.strip()]
+        return [(line.split("\t") + [""] * 5)[:5] for line in lines]
 
     def labelled_containers(self) -> list[Labelled]:
         """Every container, running or not, labelled with this workspace."""
         label = f"label={LABEL_WORKSPACE}={self.workspace_label}"
-        rows = self._listed(
-            ["ps", "-a", "--filter", label, "--format", f'{{{{.ID}}}}\t{{{{.Names}}}}\t{{{{.State}}}}\t{{{{.Label "{LABEL_ROLE}"}}}}'],
-            what="list this workspace's containers",
-        )
-        found = []
-        for row in rows:
-            parts = (row.split("\t") + ["", "", ""])[:4]
-            found.append(Labelled(id=parts[0], name=parts[1], state=parts[2].lower(), role=parts[3]))
-        return found
+        fmt = "\t".join(["{{.ID}}", "{{.Names}}", "{{.State}}", *(f'{{{{.Label "{key}"}}}}' for key in _LISTED_LABELS)])
+        rows = self._listed(["ps", "-a", "--filter", label, "--format", fmt], what="list this workspace's containers")
+        return [Labelled(id=row[0], name=row[1], state=row[2].lower(), role=row[3], owner=row[4]) for row in rows]
 
-    def remove_leftovers(self, *, running: bool = False) -> Removal:
-        """Remove the containers and networks labelled with this workspace (left by a crash, a
-        ``kill``, a failed start or ``--keep-marimo``).
-
-        ``running=False`` (a start): a running kernel container is never removed (a liveness probe
-        that got it wrong must not destroy a kernel in use): ``KernelRuntimeError`` instead. A
-        running forwarder whose kernel is not running is removed. ``running=True`` (``kernel
-        stop``): everything goes.
-        """
-        containers = self.labelled_containers()
-        live = [c for c in containers if c.running and c.role != "forwarder"]
-        if live and not running:
-            raise KernelRuntimeError(
-                f"A kernel container for this workspace is still running, but Hailer cannot reach it: {', '.join(c.name for c in live)}.",
-                hint=(
-                    "Hailer never removes a running kernel on its own (it may still be in use). Stop it with "
-                    "uvx hailer kernel stop, then run this command again."
-                ),
-            )
-        outcome = Removal()
-        for container in containers:
-            outcome.add(_remove(self.runner, "container", container.id, container.name))
+    def labelled_networks(self) -> list[Labelled]:
+        """Every network labelled with this workspace (``state`` is empty)."""
         label = f"label={LABEL_WORKSPACE}={self.workspace_label}"
-        for row in self._listed(["network", "ls", "--filter", label, "--format", "{{.ID}}\t{{.Name}}"], what="list this workspace's networks"):
-            ident, _, name = row.partition("\t")
-            outcome.add(_remove(self.runner, "network", ident, name or ident))
+        fmt = "\t".join(["{{.ID}}", "{{.Name}}", "", *(f'{{{{.Label "{key}"}}}}' for key in _LISTED_LABELS)])
+        rows = self._listed(["network", "ls", "--filter", label, "--format", fmt], what="list this workspace's networks")
+        return [Labelled(id=row[0], name=row[1] or row[0], state="", role=row[3], owner=row[4]) for row in rows]
+
+    def remove_leftovers(self, *, every: bool = False) -> Removal:
+        """Remove containers and networks labelled with this workspace, containers first.
+
+        ``every=False`` (a start): only those whose owner is not alive (:func:`owner_alive`: its
+        Hailer ended, however, or the object has no owner label), running or not; anything of a
+        live owner stays. ``every=True`` (``uvx hailer kernel stop``): everything goes. Raises
+        only ``KernelRuntimeError`` when Docker cannot list them.
+        """
+        workspace = Path(self.config.workspace)
+        alive: dict[str, bool] = {}
+
+        def gone(item: Labelled) -> bool:
+            if item.owner not in alive:
+                alive[item.owner] = owner_alive(workspace, item.owner)
+            return every or not alive[item.owner]
+
+        outcome = Removal()
+        for container in self.labelled_containers():
+            if gone(container):
+                outcome.add(_remove(self.runner, "container", container.id, container.name))
+        for network in self.labelled_networks():
+            if gone(network):
+                outcome.add(_remove(self.runner, "network", network.id, network.name))
         return outcome
 
     def _stopped(self, containers: Sequence[str]) -> dict[str, str]:
@@ -1117,83 +1179,57 @@ class DockerRuntime:
                 stopped[ident] = "?"
         return stopped
 
-    def _labelled_ours(self, container: str) -> bool:
-        try:
-            result = self.runner.run(
-                ["inspect", "--type", "container", "--format", "{{json .Config.Labels}}", container], timeout=DOCKER_PROBE_TIMEOUT_SEC
-            )
-            labels = json.loads((result.stdout or "").strip() or "null") if result.returncode == 0 else None
-        except (HailerError, OSError, ValueError, subprocess.TimeoutExpired):
-            return False
-        return isinstance(labels, dict) and labels.get(LABEL_WORKSPACE) == self.workspace_label
-
     # -- lifecycle ------------------------------------------------------------ #
 
-    def _kernel(self, server: MarimoServer, state: KernelState | None = None) -> DockerKernel:
-        names = state.containers if state is not None else ()
-        return DockerKernel(
-            server=server,
-            log_hint=f"docker logs {names[0] if names else self.names.kernel}",
-            stop_hint="stop it with uvx hailer kernel stop",
-            workspace=Path(self.config.workspace),
-            runner=self.runner,
-            containers=names,
-            container_ids=state.container_ids if state is not None else (),
-            network=state.network if state is not None else None,
-            network_id=state.network_id if state is not None else None,
-        )
-
-    def find_running(self) -> RunningKernel | None:
-        """The docker kernel ``kernel.json`` records, when it answers with its token and its
-        container carries this workspace's label."""
-        state = live_kernel_state(Path(self.config.workspace), probe=self._probe, gone=self._gone)
-        if state is None or state.runtime != self.name or not state.container_ids:
-            return None
-        if not self._labelled_ours(state.container_ids[0]):
-            return None
-        return self._kernel(state.server(), state)
-
     def start(self, port: int, *, foreground: bool = False) -> RunningKernel:
-        """Create the network, the kernel and the forwarder, wait for ``/health`` through the
-        forwarder and write ``kernel.json`` (with the ids Docker gave them). The token reaches
-        marimo in a file (:func:`write_token_file`) that is deleted once the wait is over. ``foreground``
-        changes nothing here: the containers run detached either way, and
-        :meth:`DockerKernel.wait` follows the kernel's log."""
+        """Take an :class:`OwnerLock`, remove what owners that are gone left (:meth:`remove_leftovers`;
+        a failure there is a warning, since the new names never clash), then create the network, the
+        kernel and the forwarder and wait, through the forwarder, until marimo answers with this
+        start's token (the containers are checked first). The token reaches marimo in a file
+        (:func:`write_token_file`) that is deleted once the wait is over. ``foreground`` changes
+        nothing here: the containers run detached either way, and :meth:`DockerKernel.wait` follows
+        the kernel's log."""
         del foreground
         config = self.config
         workspace = Path(config.workspace)
         if not self._prepared:
             self.prepare()
         self._check_mounts()
-        refuse_live_kernel(workspace, probe=self._probe, gone=self._gone)  # drops a record that is provably gone
-        leftovers = self.remove_leftovers()  # refuses a running kernel it has no working record of
-        if leftovers.failed:
-            raise KernelRuntimeError("Docker could not remove what an earlier kernel left behind.", hint="\n".join(leftovers.failed))
-        delete_kernel_state(workspace)  # only now: whatever an old record named has been removed
-        for warning in sweep_token_folders(workspace):  # left by a Hailer killed while starting
-            _say(warning)
-        for folder in (config.notebooks_root, config.data_dir):
-            try:
-                folder.mkdir(parents=True, exist_ok=True)  # before Docker creates a missing one owned by root
-            except OSError as err:
-                raise KernelRuntimeError(f"Could not create {folder}: {err}", hint="Check the folder's permissions.") from err
+        try:
+            owner = acquire_owner_lock(workspace)
+        except OSError as err:
+            raise KernelRuntimeError(
+                f"Could not create the kernel's owner lock in {workspace / '.hailer'}: {err}",
+                hint="Check the permissions and free space in .hailer, then try again.",
+            ) from err
+        self.owner_id = owner.id
         names = self.names
         network_access = config.kernel.network
         token = self._token_factory()
         url = f"http://127.0.0.1:{port}"
-        server = MarimoServer(
-            url=url, server_id=f"127.0.0.1:{port}", source="kernel", token=token, runtime=self.name, paths=self.paths,
-            network_access=network_access,
-        )  # fmt: skip
-        kernel = self._kernel(server)
+        server = MarimoServer(url=url, token=token, runtime=self.name, paths=self.paths, network_access=network_access)
+        kernel = DockerKernel(server=server, log_hint=f"docker logs {names.kernel}", runner=self.runner, owner=owner)
         health = self._health if self._health is not None else wait_for_health
         try:
-            token_file = write_token_file(workspace, token)
-        except OSError as err:
-            raise KernelRuntimeError(
-                f"Could not write the kernel's token file in {workspace / '.hailer'}: {err}",
-                hint="Check the permissions and free space in .hailer, then try again.",
-            ) from err
+            sweep_owner_locks(workspace)
+            leftovers = self.remove_leftovers()
+            if leftovers.failed:
+                _say("Warning: Docker could not remove what an earlier kernel left behind: " + "; ".join(leftovers.failed))
+            for folder in (config.notebooks_root, config.data_dir):
+                try:
+                    folder.mkdir(parents=True, exist_ok=True)  # before Docker creates a missing one owned by root
+                except OSError as err:
+                    raise KernelRuntimeError(f"Could not create {folder}: {err}", hint="Check the folder's permissions.") from err
+            try:
+                token_file = write_token_file(workspace, token)
+            except OSError as err:
+                raise KernelRuntimeError(
+                    f"Could not write the kernel's token file in {workspace / '.hailer'}: {err}",
+                    hint="Check the permissions and free space in .hailer, then try again.",
+                ) from err
+        except BaseException:
+            owner.release()
+            raise
         try:
             if not network_access:
                 created = self._docker(self.network_command(), what="create the kernel's internal network")
@@ -1207,7 +1243,7 @@ class DockerRuntime:
                 self._docker(["network", "connect", kernel.network_id or names.network, forwarder], what="connect the forwarder to the kernel's network")
                 self._docker(["start", forwarder], what="start the forwarder container")
             ids = kernel.container_ids
-            healthy = health(url, self.start_timeout, should_stop=lambda: bool(self._stopped(ids)))
+            healthy = health(url, self.start_timeout, token=token, should_stop=lambda: bool(self._stopped(ids)))
         except BaseException:  # a docker error, or Ctrl+C while waiting: never leave containers behind
             kernel.stop()
             raise
@@ -1234,35 +1270,37 @@ class DockerRuntime:
             if tail:
                 hint += "\n" + "\n".join(f"    {line}" for line in tail)
             raise KernelRuntimeError(message, hint=hint)
-        try:
-            write_kernel_state(workspace, KernelState(
-                runtime=self.name,
-                url=url,
-                port=port,
-                token=token,
-                image=self.image,
-                containers=kernel.containers,
-                container_ids=kernel.container_ids,
-                network=kernel.network,
-                network_id=kernel.network_id,
-                network_access=network_access,
-                mounts=tuple((str(host), str(kernel_path)) for host, kernel_path in self.paths.mounts),
-                memory=config.kernel.memory,
-                cpus=config.kernel.cpus,
-            ))
-        except OSError as err:
-            kernel.stop()
-            raise KernelRuntimeError(
-                f"Could not record the Docker kernel: {err}",
-                hint="Check the permissions and free space in .hailer, then try again. uvx hailer kernel stop removes any leftovers.",
-            ) from err
         note_kernel_start(workspace, self.name, config.notebooks_root)
         return kernel
 
 
+#: The labels ``ps`` and ``network ls`` list after id, name and state.
+_LISTED_LABELS = (LABEL_ROLE, LABEL_OWNER)
+
+
 # --------------------------------------------------------------------------- #
-# uvx hailer kernel stop
+# uvx hailer status and uvx hailer kernel stop
 # --------------------------------------------------------------------------- #
+
+
+def workspace_kernels(config: HailerConfig, runner: DockerRunner | None = None) -> list[str]:
+    """``uvx hailer status``: this workspace's running docker kernels, one line each (empty: none),
+    whatever ``[kernel] runtime`` says, whenever the docker CLI is there. A Docker that cannot be
+    asked is one line saying so. Local kernels are not recorded anywhere. Never raises."""
+    if runner is None and shutil.which("docker") is None:
+        return []
+    docker = DockerRuntime(config, runner=runner)
+    try:
+        docker.engine_version()
+        containers = docker.labelled_containers()
+    except KernelRuntimeError as err:
+        return [] if str(err) == DOCKER_NOT_INSTALLED else [f"docker: not checked ({err})"]
+    workspace = Path(config.workspace)
+    return [
+        f"docker {c.name} (" + ("its Hailer session is running" if owner_alive(workspace, c.owner) else "its Hailer session has ended; the next start removes it") + ")"
+        for c in containers
+        if c.running and c.role == "kernel"
+    ]
 
 
 @dataclass
@@ -1275,86 +1313,34 @@ class StopReport:
     warnings: list[str] = field(default_factory=list)
 
 
-def _removed_line(outcome: Removal, url: str) -> str:
-    if outcome.failed:
-        detail = f" Removed {', '.join(outcome.removed)}." if outcome.removed else ""
-        return f"Could not finish stopping the docker kernel at {url}; its record was kept." + detail
-    if outcome.removed:
-        return f"Stopped the docker kernel at {url} (removed {', '.join(outcome.removed)})."
-    return f"Removed the record of a docker kernel whose containers were already gone ({url})."
-
-
-def stop_workspace_kernels(
-    config: HailerConfig,
-    runner: DockerRunner | None = None,
-    *,
-    procs: LocalProcesses | None = None,
-    probe: Probe | None = None,
-) -> StopReport:
-    """``uvx hailer kernel stop``: stop the server ``kernel.json`` records (either runtime) and
-    remove every container and network labelled with this workspace, running or not. It reports
-    what it actually removed; failures are reported, never raised, once anything was cleaned up.
-
-    A local server is stopped by its pid only when it answers with its token (so a stale record
-    never kills an unrelated process that reused the pid). Raises ``KernelRuntimeError`` when
-    a Docker record exists but Docker cannot be reached to remove its containers (``kernel.json``
-    is kept even when the server does not answer).
-    """
-    workspace = Path(config.workspace)
-    docker = DockerRuntime(config, runner=runner, probe=probe)
+def stop_workspace_kernels(config: HailerConfig, runner: DockerRunner | None = None) -> StopReport:
+    """``uvx hailer kernel stop``: remove every container and network labelled with this workspace,
+    running or not, whichever session started it. It reports what it actually removed; failures
+    are reported, never raised. Nothing in ``.hailer`` is touched (a session still starting keeps
+    its owner lock and token folder). A local kernel is recorded nowhere: the session that
+    started it stops it."""
+    report = StopReport()
+    docker = DockerRuntime(config, runner=runner)
+    docker_error: KernelRuntimeError | None = None
     try:
         docker.engine_version()
-        docker_error: KernelRuntimeError | None = None
+        leftovers = docker.remove_leftovers(every=True)
     except KernelRuntimeError as err:
         docker_error = err
-    report = StopReport()
-    state = read_kernel_state(workspace)
-    docker_notebooks: Path | None = None  # the notebooks folder a docker kernel had mounted, when one was stopped
-    if state is not None and state.runtime == KERNEL_RUNTIME_DOCKER:
-        stopped = docker._kernel(state.server(), state)
-        docker_notebooks = stopped.notebooks_folder or config.notebooks_root
-        if docker_error is None:
-            outcome = stopped.remove()
-            if not outcome.failed:
-                delete_kernel_state(workspace, token=state.token)
-            report.done.append(_removed_line(outcome, state.url))
-            report.failed += [f"Could not remove {failure}" for failure in outcome.failed]
-        else:
-            raise docker_error  # no engine: silence does not prove its containers are gone
-    elif state is not None:
-        running = LocalRuntime(config, procs=procs, probe=probe).find_running()
-        if running is not None:
-            running.stop()
-            process = f" (process {state.pid})" if state.pid is not None else ""
-            report.done.append(f"Stopped the local marimo server at {state.url}{process}.")
-        else:
-            delete_kernel_state(workspace)
-            line = f"Removed the record of a marimo server that no longer answers ({state.url})."
-            if state.pid is not None and process_running(state.pid):
-                line += (
-                    f" Process {state.pid} is still running: if it is that server (stuck or suspended), end it "
-                    "yourself (Task Manager, or kill); Hailer does not end a process it cannot identify."
-                )
-            report.done.append(line)
-    if docker_error is None:
-        try:
-            leftovers = docker.remove_leftovers(running=True)
-        except KernelRuntimeError as err:
-            report.failed.append(f"{err} {err.hint or ''}".strip())
-        else:
-            if leftovers.removed:
-                report.done.append("Removed " + ", ".join(leftovers.removed) + ".")
-                docker_notebooks = docker_notebooks or config.notebooks_root
-            report.failed += [f"Could not remove {failure}" for failure in leftovers.failed]
-    report.warnings += sweep_token_folders(workspace)
-    planted = planted_files(docker_notebooks)
-    if planted and docker_notebooks is not None:
-        report.warnings.append(planted_warning(docker_notebooks, planted))
-    if str(docker_error) == DOCKER_NOT_RUNNING:
+    else:
+        if leftovers.removed:
+            report.done.append("Removed " + ", ".join(leftovers.removed) + ".")
+            planted = planted_files(config.notebooks_root)
+            if planted:
+                report.warnings.append(planted_warning(config.notebooks_root, planted))
+        report.failed += [f"Could not remove {failure}" for failure in leftovers.failed]
+    if docker_error is not None and str(docker_error) == DOCKER_NOT_RUNNING:
         report.done.append(
-            "Docker is not running, so containers an earlier docker kernel may have left were not checked "
+            "Docker is not running, so containers a docker kernel may have left were not checked "
             "(start Docker Desktop and run uvx hailer kernel stop again to remove them)."
         )
+    elif docker_error is not None and str(docker_error) != DOCKER_NOT_INSTALLED:
+        report.failed.append(f"{docker_error} {docker_error.hint or ''}".strip())
     return report
 
 
@@ -1365,14 +1351,14 @@ __all__ = [
     "DockerRuntime",
     "Removal",
     "StopReport",
+    "OwnerLock",
     "SubprocessDockerRunner",
-    "containers_gone",
+    "acquire_owner_lock",
     "data_path_problems",
     "docker_names",
-    "mismatch_error",
+    "owner_alive",
     "remove_token_folder",
-    "settings_mismatch",
     "stop_workspace_kernels",
-    "sweep_token_folders",
+    "workspace_kernels",
     "write_token_file",
 ]

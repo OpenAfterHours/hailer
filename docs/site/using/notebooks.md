@@ -12,16 +12,20 @@ terminal. One server hosts every notebook in the folder, and marimo's own home p
 without `?file=`) lists them all. When you leave the chat (`/exit`, Ctrl+Z Enter, or Ctrl+C at the
 prompt) it stops the marimo server it started.
 
-- **The server needs a token.** Hailer gives every server it starts a random token and records it in
-  `.hailer/kernel.json`, so other programs on the machine cannot send code to the kernel. The link Hailer
-  opens or prints carries `access_token=...`, which signs the browser in. Links the agent quotes in the
-  chat leave the token out, because tool results go to the model endpoint; `/notebook` prints the signed-in
-  link.
-- **Reuse.** A server Hailer started for this workspace and left running (`--keep-marimo`, or `--foreground`
-  in another terminal) is reused and left running. So is a marimo server you started yourself with a
-  notebook from the folder open (local runtime only).
-- **Log.** marimo's output goes to `.hailer/marimo.log`, emptied at each start. Hailer masks the token in
-  the lines it prints from it. In docker mode the log is `docker logs hailer-kernel-<id>`.
+- **One server per session.** Every `uvx hailer` or `uvx hailer notebook` starts its own server and stops
+  it when the chat ends. Hailer never looks for, or attaches to, a server another session started, so
+  several sessions can run side by side in one workspace (each on its own port). Restarting the chat
+  re-runs the notebook in a fresh kernel.
+- **The server needs a token.** Hailer gives every server it starts a random token and keeps it in
+  memory, so other programs on the machine cannot send code to the kernel. The link Hailer opens or prints
+  carries `access_token=...`, which signs the browser in. Links the agent quotes in the chat leave the token
+  out, because tool results go to the model endpoint; `/notebook` prints the signed-in link.
+- **Log.** marimo's output goes to `.hailer/marimo-<pid>.log`, one per session, deleted when the kernel
+  stops. When a start fails, its last lines are in the error message; Hailer masks the token in them. In
+  docker mode the log is `docker logs hailer-kernel-<id>-<suffix>`.
+- **If Hailer is killed.** Nothing records a local kernel: its marimo keeps running (other programs still
+  need its token) until you end the `python -m marimo` process with Task Manager or `kill`. Docker kernels
+  left behind are removed by the next start or `uvx hailer kernel stop`.
 - **Where the code runs.** By default the kernel runs in Hailer's own Python, as you. To run it in an
   isolated container instead, add `--kernel docker` or see [Isolated kernel (Docker)](../security/docker.md#isolated-kernel-docker).
 
@@ -31,21 +35,20 @@ not the code behind them (the URL carries `view-as=present`). To see or edit the
 switches back. It is a normal edit session either way, so the agent works in it exactly the same.
 
 Flags: `--port N` (default 2718; a free port is chosen when it is busy), `--no-browser` (print the URL
-instead of opening it), `--keep-marimo` (leave the server running after the chat; `uvx hailer kernel stop`
-stops it later), `--foreground` (just run marimo attached to this terminal, no chat; it opens marimo's home
-page unless `--no-browser` is given), `--new` (start a fresh conversation), `--kernel local|docker` (where
+instead of opening it), `--foreground` (just run marimo attached to this terminal, no chat, until Ctrl+C; it
+opens marimo's home page unless `--no-browser` is given), `--new` (start a fresh conversation), `--kernel local|docker` (where
 notebook code runs for this run; the default comes from `[kernel] runtime`).
 
-Bare `uvx hailer` does the same as `uvx hailer notebook` with its defaults: it reuses this workspace's
-marimo server or starts one, opens the notebook, chats, and stops only a server it started. A kept server
-is found through `.hailer/kernel.json`:
+Bare `uvx hailer` does the same as `uvx hailer notebook` with its defaults: it starts its own marimo
+server, opens the notebook, chats, and stops the server when the chat ends:
 
 ```bash
 uvx hailer
 ```
 
-A pinned server (`[hailer].marimo_url` in `hailer.toml`, or `HAILER_MARIMO_URL`) is used as is, whichever
-folder it serves. If it does not answer, Hailer says so and exits; it never starts a server in its place.
+To run code in the kernel yourself, use `/exec <code>` in the chat: it runs in the active notebook's
+kernel session and prints the output, and nothing is sent to the model. The code may start on the line
+after `/exec`; an indented pasted block is dedented first.
 
 ## Working with several notebooks
 
@@ -63,14 +66,14 @@ You > which notebooks do we have?
 
 The agent lists the folder, creates `notebooks/q2_churn_review.py` (the name is slugified) or opens the
 existing file, and the browser tab appears by itself. Whatever it switches to becomes the **active
-notebook**: the one every later cell edit, `/status` line and `hailer exec` call refers to. The chat shows
+notebook**: the one every later cell edit, `/status` line and `/exec` call refers to. The chat shows
 `Active notebook is now notebooks/q2_churn_review.py.` when the agent switched.
 
 The same from the prompt, without a model round-trip:
 
 | Command | What it does |
 |---|---|
-| `/notebook` | Active notebook, folder, marimo state, the signed-in URL and the launch command. |
+| `/notebook` | Active notebook, folder, marimo state and the signed-in URL. |
 | `/notebook list` | Every notebook in the folder with `active` and `open` (has a kernel session) markers. |
 | `/notebook new <name> [--empty]` | Create `<slug>.py` from the starter template (or an empty marimo notebook with `--empty`), open it, make it active. |
 | `/notebook open <name>` | Switch to an existing notebook by name, filename or path; opens it in the browser when it has no session. |
@@ -92,7 +95,7 @@ Where things live:
 - The active notebook is remembered in `.hailer/notebook.json` (git-ignored, next to `session.json`), so
   the next `uvx hailer` or `uvx hailer notebook` resumes where you left off. Delete the file to go
   back to `[hailer].notebook`. `HAILER_NOTEBOOK=<path>` makes that notebook the active one for this and
-  later sessions: every Hailer command (`hailer`, `hailer notebook`, `hailer exec`, `status`, `doctor`)
+  later sessions: every Hailer command (`hailer`, `hailer notebook`, `status`, `doctor`)
   writes it to the state file at startup, so the agent's tools see the same notebook.
 - `/notebook` also lists the notebooks you worked in recently (`Recent:`), most recent first.
 

@@ -7,6 +7,7 @@ and credential operations. Only the synchronous facade drives an asyncio.Runner.
 from __future__ import annotations
 
 import asyncio
+import textwrap
 import threading
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
@@ -360,6 +361,8 @@ class ChatController:
             self._model(args)
         elif name == "notebook":
             self._notebook(args)
+        elif name == "exec":
+            self._exec(args)
         elif name == "clear":
             self.console.clear()
         elif name == "context":
@@ -475,6 +478,35 @@ class ChatController:
             self.state.provider = provider
         return f"Model set to {name}" + (f" ({provider})" if provider else "") + "; started a new thread."
 
+    # -- /exec ------------------------------------------------------------- #
+
+    def _exec(self, code: str) -> None:
+        """Run ``code`` in the scratchpad of the active notebook's kernel session (this chat's own
+        kernel) and print what it printed and returned. Nothing goes to the model."""
+        if not code.strip():
+            self.console.print("Usage: /exec <python code>  (runs in the active notebook's kernel; the model does not see it)", markup=False)
+            return
+        server, session, err = self._cli._marimo_state(self.config, self.server)
+        if server is None:
+            self.console.print("Marimo is not running.", markup=False)
+            return
+        if session is None:
+            self._cli._print_error(self.console, err or NoSessionError("The notebook is not open in a browser."), verbose=False)
+            return
+        self._check_stopped()
+        client = self._cli._make_client(server, self.config)
+        result = client.execute(textwrap.dedent(code), session_id=session.session_id)
+        if result.stdout.strip():
+            self.console.print(result.stdout.rstrip(), markup=False)
+        if result.output.strip() and result.output.strip() != result.stdout.strip():
+            self.console.print(result.output.rstrip(), markup=False)
+        if result.stderr.strip():
+            self.console.print(result.stderr.rstrip(), style="red", markup=False)
+        if not result.success:
+            self.console.print("(the code failed)", style="red", markup=False)
+        elif not (result.stdout.strip() or result.output.strip() or result.stderr.strip()):
+            self.console.print("(no output)", style="dim", markup=False)
+
     # -- /notebook --------------------------------------------------------- #
 
     def _notebook(self, args: str) -> None:
@@ -513,16 +545,11 @@ class ChatController:
             out.print(f"Marimo:    {server.url} ({state})", markup=False)
             out.print(f"URL:       {self._cli._notebook_link(out, server, cfg)}", markup=False)
             out.print("View:      app view (results only); Ctrl+. in the notebook toggles the code editor", markup=False)
-        out.print("Start everything in one go:  uvx hailer notebook", markup=False)
-        out.print(f"Launch:    {' '.join(self._cli._launch_command())}", markup=False)
         out.print(self._cli.NOTEBOOK_USAGE, markup=False)
 
     def _server_sessions(self) -> tuple[MarimoServer | None, Any, list[MarimoSession]]:
-        """(server, client, open sessions); server is None when marimo is not running."""
-        try:
-            server = self.server or self._cli._find_server(self.config)
-        except HailerError:
-            return None, None, []
+        """(server, client, open sessions) for this chat's kernel; server is None when it does not answer."""
+        server = self.server
         if server is None:
             return None, None, []
         client = self._cli._make_client(server, self.config)

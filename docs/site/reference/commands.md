@@ -7,6 +7,7 @@
 | `/new` | Start a new conversation thread (context files are re-read). |
 | `/model <name>` or `/model <provider>:<name>` | Switch model (and provider); starts a new thread. |
 | `/notebook`, `/notebook list`, `/notebook new <name> [--empty]`, `/notebook open <name>`, `/notebook close [name]` | Show or switch the active notebook (see *Working with several notebooks*). |
+| `/exec <code>` | Run Python in the active notebook's kernel and print its output, result and errors. Nothing is sent to the model. The notebook must be open in the browser; a pasted block keeps its lines and is dedented. |
 | `/context` | List loaded context files, skills, prompts and the web allowlist. |
 | `/skill <name> [message]` | Run a turn with a project skill attached. |
 | `/prompt <name> [args]` | Send a saved prompt from `.config/hailer/prompts`. |
@@ -39,15 +40,15 @@ Other subcommands:
 
 | Command | What it does |
 |---|---|
-| `hailer` | Start or reuse this workspace's notebook server, open the notebook and chat in the terminal. |
-| `hailer notebook [--port N] [--no-browser] [--keep-marimo] [--foreground] [--new] [--plain] [--kernel RUNTIME]` | The same session with extra startup options; marimo runs on the notebooks folder. `RUNTIME` is `local` or `docker`. |
-| `hailer exec -c "code"` (or `hailer exec script.py`, `hailer exec -` for stdin) | Run Python in the active notebook's kernel yourself. |
-| `hailer status`, `hailer doctor` | Configuration and state; the startup checks with fixes. |
+| `hailer` | Start this session's own notebook server, open the notebook and chat in the terminal; the server stops when the chat ends. |
+| `hailer notebook [--port N] [--no-browser] [--foreground] [--new] [--plain] [--kernel RUNTIME]` | The same session with extra startup options; marimo runs on the notebooks folder. `RUNTIME` is `local` or `docker`. |
+| `hailer status` | Configuration, credentials and this workspace's running Docker kernels (whenever Docker is installed). |
+| `hailer doctor` | The startup checks with fixes: configuration, credentials, Docker, the kernel image and folders. It starts no kernel. |
 | `hailer login <provider>`, `hailer logout <provider>` | Store or remove a provider's API key. |
 | `hailer init [--force] [--kernel RUNTIME]` | Set up a workspace (see Quick start); `--kernel` writes `[kernel] runtime`. |
 | `hailer kernel pull` | Download the kernel image for this Hailer (or `[kernel].image`). |
 | `hailer kernel build [--tag <name>]` | Build the kernel image, discovering host pip/uv mirror settings. `--pip-config FILE` overrides discovery; `--no-host-config` disables it. See [corporate mirrors](../security/docker.md#building-with-corporate-mirrors). |
-| `hailer kernel stop` | Stop this workspace's kernel (local or docker) and remove its containers and network. |
+| `hailer kernel stop` | Remove every Docker container and network of this workspace, whichever session started it, and say what was removed. |
 
 Global options go before the subcommand: `--verbose`, `--config <path>`, `--workspace <path>`, `--new`,
 `--plain`, `--version` (for example `uvx hailer --workspace C:\projects\sales kernel stop`).

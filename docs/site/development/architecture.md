@@ -36,7 +36,9 @@ marimo itself, never edited behind the kernel's back.
 Where marimo and its kernel run is the *kernel runtime*, set by `[kernel] runtime`: `local` (the default)
 starts marimo in Hailer's own Python, `docker` starts it in a container (see
 [Isolated kernel (Docker)](../security/docker.md#isolated-kernel-docker)). The agent, the conversation and the API key stay in
-the Hailer process either way.
+the Hailer process either way. Every session starts its own marimo server, keeps it (URL, token, path
+mapping) in memory for the agent's tools, and stops it when the chat ends; nothing attaches to a server
+another session started.
 
 ## Design records
 

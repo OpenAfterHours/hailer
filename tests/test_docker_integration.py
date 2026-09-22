@@ -20,7 +20,7 @@ One module-scoped kernel serves every test: :class:`~hailer.kernel.DockerRuntime
 temporary workspace holding sample sales data, headless Chrome stays connected to the notebook,
 and the tests talk to it through
 :class:`~hailer.marimo_client.MarimoClient` with host paths, as the agent's tools do. The last test
-stops it and checks that nothing is left behind (by the ids kernel.json records).
+stops it and checks that nothing is left behind (by the ids Docker gave it and the workspace label).
 """
 
 from __future__ import annotations
@@ -44,8 +44,7 @@ from fake_excel import write_workbook
 from hailer import kernel_image
 from hailer.config import load_config
 from hailer.errors import KernelRuntimeError
-from hailer.kernel import kernel_state_path
-from hailer.kernel_docker import LABEL_WORKSPACE, DockerKernel, DockerRuntime
+from hailer.kernel_docker import LABEL_CONTRACT, LABEL_OWNER, LABEL_WORKSPACE, DockerKernel, DockerRuntime, owner_alive
 from hailer.marimo_client import (
     MarimoClient,
     answers_with_token,
@@ -289,7 +288,7 @@ def docker_kernel(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Kernel]:
                 _end(chrome_proc)
             kernel.stop()
             try:
-                runtime.remove_leftovers(running=True)
+                runtime.remove_leftovers(every=True)
             except KernelRuntimeError:
                 pass
 
@@ -415,21 +414,22 @@ def test_the_token_is_not_in_docker_inspect_or_the_kernels_command_lines(docker_
     assert "marimo" in result.stdout and token not in result.stdout, "no process shows the token"
 
 
-def test_the_record_holds_the_ids_docker_gave_the_kernel(docker_kernel: Kernel):
-    """Stopping removes by id, so an old handle can never remove a newer kernel with the same names."""
-    from hailer.kernel import read_kernel_state
-
-    state = read_kernel_state(docker_kernel.config.workspace)
-    assert state is not None and len(state.container_ids) == 2 and state.network_id
+def test_the_containers_carry_this_process_as_their_owner(docker_kernel: Kernel):
+    """The labels a later start (or `uvx hailer kernel stop`) uses to tell a live session's kernel
+    from one a killed Hailer left behind; the kernel is removed by the ids Docker gave it."""
+    kernel = docker_kernel.kernel
+    assert len(kernel.container_ids) == 2 and kernel.network_id
     running = docker_kernel.docker("ps", "--no-trunc", "--format", "{{.ID}}")
-    assert all(ident in running for ident in state.container_ids), running
+    assert all(ident in running for ident in kernel.container_ids), running
+    labels = json.loads(docker_kernel.docker("inspect", "--format", "{{json .Config.Labels}}", kernel.container_ids[0])[0])
+    assert labels[LABEL_OWNER] == kernel.owner.id and owner_alive(docker_kernel.config.workspace, labels[LABEL_OWNER])
+    assert labels[LABEL_CONTRACT] == kernel_image.contract_tag()
 
 
-def test_stop_leaves_no_containers_network_or_record(docker_kernel: Kernel):
+def test_stop_leaves_no_containers_network_or_token(docker_kernel: Kernel):
     workspace = Path(docker_kernel.config.workspace)
     server = docker_kernel.kernel.server
     names = docker_kernel.runtime.names
-    assert kernel_state_path(workspace).is_file()
 
     docker_kernel.kernel.stop()
 
@@ -439,6 +439,6 @@ def test_stop_leaves_no_containers_network_or_record(docker_kernel: Kernel):
     everything = docker_kernel.docker("ps", "-a", "--format", "{{.Names}}")
     assert names.kernel not in everything and names.forwarder not in everything
     assert names.network not in docker_kernel.docker("network", "ls", "--format", "{{.Name}}")
-    assert not kernel_state_path(workspace).exists()
+    assert not list((workspace / ".hailer").glob("kernel-token-*")), "no token folder left"
     assert not answers_with_token(server.url, server.token)
     assert docker_kernel.notebook.is_file(), "the notebook stays on the host"

@@ -59,6 +59,7 @@ See [notebooks and sessions](notebooks.md) for switching, reopening and managing
 | See chat commands | `/help` |
 | See the active model and notebook | `/status` |
 | Show the notebook link | `/notebook` |
+| Run Python in the kernel yourself (not sent to the model) | `/exec <code>` |
 | Diagnose startup problems | `uvx hailer doctor` in your terminal |
 
 Cancelling a turn does not undo completed actions. Python already running in the notebook may continue;

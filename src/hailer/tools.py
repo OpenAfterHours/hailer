@@ -11,8 +11,8 @@ The *active notebook* (the one every kernel tool acts on) lives in
 ``<workspace>/.hailer/notebook.json`` and is re-read on every call: both the model
 (``notebook_create`` / ``notebook_open``) and the CLI (``/notebook`` commands) may switch it.
 
-The marimo server is the one the chat was pinned to (``hailer notebook`` hands over the server it
-started or reused, kept in memory), else it is discovered anew on every call.
+The marimo server is the one this Hailer process started, handed over by the chat and kept in
+memory; the tools never look for another.
 
 Tool results go to the model endpoint, so they never carry the marimo server's token: URLs in
 them are token-free (the user gets a signed-in link from ``/notebook`` in the chat), while the
@@ -219,7 +219,7 @@ class HailerTools:
         session_wait_sec: float = DEFAULT_SESSION_WAIT_SEC,
     ) -> None:
         self.config = config
-        #: The server this chat is pinned to (``hailer notebook``); ``None``: discover it per call.
+        #: The server this process started; ``None``: no kernel (every kernel tool says so).
         self.server = server
         self._client_factory = client_factory or self._default_client
         #: Opens a URL in the user's browser; injectable so tests never launch one.
@@ -237,12 +237,12 @@ class HailerTools:
         from . import marimo_client as mc  # lazy
 
         config = self._active_config()
-        server = self.server if self.server is not None else mc.find_server(config)
+        server = self.server
         if server is None:
-            raise MarimoUnavailableError("marimo is not running for this workspace (no server configured or found)", mc.launch_hint())
+            raise MarimoUnavailableError("marimo is not running: this session has no kernel", mc.launch_hint())
         client = mc.MarimoClient(
             server.url,
-            token=server.token or config.marimo_token,
+            token=server.token,
             notebook=config.notebook,
             workspace=config.workspace,
             paths=server.paths,
@@ -266,8 +266,6 @@ class HailerTools:
         try:
             from . import marimo_client as mc
 
-            if with_token and not server.token and self.config.marimo_token:
-                server = dataclasses.replace(server, token=self.config.marimo_token)
             return mc.open_notebook_url(server, notebook, with_token=with_token)
         except Exception:  # noqa: BLE001 - best effort
             return server.url
@@ -345,9 +343,9 @@ class HailerTools:
         outcome.client = client
         outcome.url = self._open_url(server, notebook)
         browser_url = self._open_url(server, notebook, with_token=True)
-        # With a configured marimo_url the server is not health-checked up front, so "marimo is
-        # down" first shows up here. The notebook was already created/switched by then; report it
-        # as a session outcome rather than letting the error replace the whole reply.
+        # A kernel that stopped (or went away) first shows up here. The notebook was already
+        # created/switched by then; report it as a session outcome rather than letting the error
+        # replace the whole reply.
         try:
             outcome.session = client.resolve_session(notebook)
             outcome.reused = True
@@ -432,10 +430,10 @@ class HailerTools:
                 except NoSessionError:
                     active_session = None
             except MarimoUnavailableError as err:
-                # A configured marimo_url is not health-checked up front, so a dead server can
-                # surface here as well as from the factory; the active notebook is named either way.
+                # A kernel that stopped surfaces here as well as from the factory; the active
+                # notebook is named either way.
                 return f"marimo: not running\nactive notebook: {active_name}\n{err}\n{err.hint}".rstrip()
-            lines = [f"marimo: running at {server.url}" + (f" (version {server.version})" if server.version else "")]
+            lines = [f"marimo: running at {server.url}"]
             lines += self._kernel_lines(server)
             if active_session is not None:
                 lines.append(f"active notebook: {active_name} -> session {active_session.session_id} (ready)")
@@ -713,8 +711,8 @@ def hailer_tools(
     open_url: UrlOpener | None = None,
     session_wait_sec: float = DEFAULT_SESSION_WAIT_SEC,
 ) -> list[Any]:
-    """Hailer's tools as LangChain tools (``TOOL_NAMES`` order), bound to ``config`` (and pinned to
-    ``server`` when given)."""
+    """Hailer's tools as LangChain tools (``TOOL_NAMES`` order), bound to ``config`` and to ``server``,
+    the kernel this process started."""
     from langchain_core.tools import StructuredTool  # lazy: keeps `hailer --help` and friends fast
 
     impl = HailerTools(config, client_factory, server=server, open_url=open_url, session_wait_sec=session_wait_sec)

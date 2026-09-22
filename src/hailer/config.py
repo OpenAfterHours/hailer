@@ -6,9 +6,8 @@ Sources, lowest to highest precedence:
 2. the project config file (``hailer.toml`` or ``.config/hailer/hailer.toml``)
 3. environment variables (``HAILER_*``)
 
-Secrets are never read from the file. ``HAILER_MARIMO_TOKEN`` is the only
-secret this module touches and it is kept in memory on the returned
-:class:`~hailer.models.HailerConfig` only.
+Secrets are never read from the file (API keys come from the environment or the OS credential
+store, see :mod:`hailer.secrets`).
 
 ``validate()`` returns human-readable problems. Strings that start with
 ``"Warning:"`` are non-fatal (the CLI shows them but continues); everything
@@ -55,7 +54,6 @@ _KNOWN_HAILER = {
     "notebook",
     "notebooks_dir",
     "data_dir",
-    "marimo_url",
     "context_dir",
     "skills_dir",
     "prompts_dir",
@@ -100,7 +98,6 @@ DEFAULT_CONFIG_TEMPLATE = """\
 notebook = "notebooks/analysis.py"   # default notebook; the chat can create and open others
 # notebooks_dir = "notebooks"        # folder for notebooks created or opened from the chat (default: the notebook's folder)
 data_dir = "data"                    # the data files to analyse (CSV, Parquet, JSON, ...)
-# marimo_url = "http://127.0.0.1:2718"  # optional pin; when omitted Hailer reuses this workspace's marimo or starts one
 # context_dir = ".config/hailer/context"  # always-on context (*.md) sent with every session
 # skills_dir  = ".config/hailer/skills"   # on-demand skills (<name>/SKILL.md)
 # prompts_dir = ".config/hailer/prompts"  # reusable prompts (/prompt <name>)
@@ -368,7 +365,6 @@ def load_config(
     context_dir = _str(hailer_tbl, "context_dir", "hailer", path, DEFAULT_CONTEXT_DIR)
     skills_dir = _str(hailer_tbl, "skills_dir", "hailer", path, DEFAULT_SKILLS_DIR)
     prompts_dir = _str(hailer_tbl, "prompts_dir", "hailer", path, DEFAULT_PROMPTS_DIR)
-    marimo_url = _clean_url(env.get("HAILER_MARIMO_URL") or _str(hailer_tbl, "marimo_url", "hailer", path))
     log_level = (env.get("HAILER_LOG_LEVEL") or _str(hailer_tbl, "log_level", "hailer", path, DEFAULT_LOG_LEVEL) or DEFAULT_LOG_LEVEL).upper()
     max_tool_output_chars = _int(hailer_tbl, "max_tool_output_chars", "hailer", path, 12_000)
     max_context_bytes = _int(hailer_tbl, "max_context_bytes", "hailer", path, 24_000)
@@ -436,8 +432,6 @@ def load_config(
         providers=providers,
         web=web,
         kernel=kernel,
-        marimo_url=marimo_url,
-        marimo_token=(env.get("HAILER_MARIMO_TOKEN") or None),
         log_level=log_level,
         config_path=path,
         max_tool_output_chars=max_tool_output_chars,
@@ -489,13 +483,7 @@ def _unknown_key_warnings(path: Path) -> list[str]:
             warnings.append(f"Warning: unknown section [{key}] in {path} is ignored.")
     hailer_tbl = data.get("hailer") or {}
     if isinstance(hailer_tbl, dict):
-        if "marimo_token" in hailer_tbl:
-            warnings.append(
-                f"Warning: [hailer].marimo_token in {path} is ignored; secrets do not belong in the file. "
-                "Set the HAILER_MARIMO_TOKEN environment variable instead."
-            )
-        rest = misplaced_kernel_keys(hailer_tbl, "hailer")
-        check({k: v for k, v in rest.items() if k != "marimo_token"}, _KNOWN_HAILER, "hailer")
+        check(misplaced_kernel_keys(hailer_tbl, "hailer"), _KNOWN_HAILER, "hailer")
     model_tbl = data.get("model") or {}
     if isinstance(model_tbl, dict):
         check(misplaced_kernel_keys(model_tbl, "model"), _KNOWN_MODEL, "model")
@@ -754,20 +742,14 @@ def _kernel_problems(config: HailerConfig) -> list[str]:
             "Warning: [kernel].pass_env applies to the local runtime only; a docker kernel gets none of your "
             "environment variables."
         )
-    if config.marimo_url:
-        problems.append(
-            '[hailer].marimo_url (or HAILER_MARIMO_URL) cannot be used with [kernel] runtime = "docker": '
-            "Hailer starts and finds its own container. Remove marimo_url, or set runtime = \"local\" to use "
-            "that server."
-        )
     problems.extend(docker_mount_problems(config))
     return problems
 
 
 def _pass_env_warnings(config: HailerConfig) -> list[str]:
     """``[kernel].pass_env`` names that hand notebook code Hailer's own secrets: a provider's API key
-    or header variable, or ``HAILER_MARIMO_TOKEN``."""
-    own: dict[str, str] = {"OPENAI_API_KEY": "the API key of the openai provider", "HAILER_MARIMO_TOKEN": "the marimo server token"}
+    or header variable."""
+    own: dict[str, str] = {"OPENAI_API_KEY": "the API key of the openai provider"}
     for provider in config.providers.values():
         if provider.env_key:
             own[provider.env_key] = f'the API key of provider "{provider.id}"'

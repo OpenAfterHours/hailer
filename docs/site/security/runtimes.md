@@ -46,13 +46,14 @@ and notebook code written in Docker later has your account's access if you run i
 ## Check the runtime in use
 
 `/status` inside a conversation, or `uvx hailer status` in a terminal, shows the runtime.
-`uvx hailer doctor` checks the configuration and kernel without calling the model endpoint.
+`uvx hailer doctor` checks the configuration, Docker, the kernel image and the folders without starting a
+kernel or calling the model endpoint.
 
-To apply changed Docker settings, stop a kept kernel before starting again:
+Each session starts its own kernel, so changed Docker settings apply from the next `uvx hailer`. To remove
+Docker kernels left behind by a Hailer that was killed (the next start also removes them):
 
 ```bash
 uvx hailer kernel stop
-uvx hailer
 ```
 
-See [notebooks and sessions](../using/notebooks.md) for when Hailer reuses a server and when it stops one.
+See [notebooks and sessions](../using/notebooks.md) for when Hailer starts and stops a server.

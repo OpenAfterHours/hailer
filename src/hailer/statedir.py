@@ -1,7 +1,8 @@
 """The workspace's ``.hailer`` folder: Hailer's own state, never user content.
 
-It holds ``session.json``, ``notebook.json``, ``threads.sqlite`` and ``marimo.log``, and changes on
-every turn. Everything that writes there creates the folder through :func:`ensure_state_dir`, which
+It holds ``session.json``, ``notebook.json`` and ``threads.sqlite``, and, while a kernel runs, the
+running session's kernel files (a local kernel's record and log, a docker kernel's token folder
+while it starts). It changes on every turn. Everything that writes there creates the folder through :func:`ensure_state_dir`, which
 also puts a ``.gitignore`` containing ``*`` inside it: git then ignores the folder in any repository,
 without an entry in the user's own ``.gitignore`` (which Hailer never touches). Standard library only.
 """

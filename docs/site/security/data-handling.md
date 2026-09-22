@@ -20,15 +20,15 @@ makes the analysis possible. What the code can reach depends on the kernel runti
 - **`local` (the default): not sandboxed.** The kernel runs in Hailer's own Python, as you, with your file
   and network access. Hailer closes two gaps around it:
   - *Other programs.* The marimo server Hailer starts requires a random token, handed to marimo on stdin
-    (never on a command line) and kept in `.hailer/kernel.json`, so another program on the machine cannot
-    send code to the kernel. A marimo server you start yourself with `--no-token` has no such protection.
+    (never on a command line) and kept in memory by the session that started it, so another program on the
+    machine cannot send code to the kernel. Hailer never uses a marimo server it did not start.
   - *Secrets in the environment.* The server's environment leaves out every provider's `env_key` and
-    `OPENAI_API_KEY`, the variables named in `env_http_headers`, `HAILER_MARIMO_TOKEN`, the names
+    `OPENAI_API_KEY`, the variables named in `env_http_headers`, the names
     `PASSWORD`, `SECRET`, `TOKEN`, `PGPASSWORD` and `MYSQL_PWD`, and every name ending in `_KEY`, `_TOKEN`,
     `_SECRET`, `_PASSWORD`, `_PASSWD`, `_PWD`, `_CREDENTIALS`, `_CONNECTION_STRING` or `APIKEY` (any case).
     `uvx hailer doctor` shows how many were withheld. A notebook that needs one of them (a database
     password, say) gets it through `[kernel] pass_env = ["DB_PASSWORD"]`; naming a provider's key or
-    header variable, or `HAILER_MARIMO_TOKEN`, there is a `config` warning.
+    header variable there is a `config` warning.
 
   Notebook code can still read the OS credential store and every file you can, which is why the `Kernel:`
   line says `not isolated`.
@@ -84,8 +84,9 @@ third party. Set `HAILER_TRACING=1` if you do want the tracing variables in your
 
 **On disk:** the conversation (your messages, the agent's replies, tool calls and their truncated results)
 is stored unencrypted in `.hailer/threads.sqlite` inside the workspace until `/new` or `hailer --new`
-replaces it. `.hailer/kernel.json` records the marimo server Hailer started (runtime, URL, token and, for
-docker, the container and network ids and the settings it was started with) and is deleted after successful cleanup; failed Docker cleanup keeps the record for retry; `.hailer/last-kernel.json` notes which runtime last used the notebooks folder. `.hailer/marimo.log`
-holds the local server's output, including its signed-in URL, and is emptied at each start. On macOS and
-Linux these three files are readable by you only. `.hailer/` is never mounted into a docker kernel and is
+replaces it. While a local kernel runs, `.hailer/marimo-<pid>.log` holds its output, including its
+signed-in URL; it is deleted when the kernel stops, also after a failed start. The kernel's token is kept
+in memory only. A docker kernel's token file exists only while the kernel starts, and
+`.hailer/owner-<id>.lock` marks a running docker session (it holds no secret). `.hailer/last-kernel.json` notes which runtime last used the
+notebooks folder. On macOS and Linux these files are readable by you only. `.hailer/` is never mounted into a docker kernel and is
 kept out of git by its own `.gitignore` containing `*`; Hailer never edits your repository's `.gitignore`.

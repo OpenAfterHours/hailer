@@ -22,16 +22,13 @@ if TYPE_CHECKING:  # pragma: no cover - annotations only; hailer.kernel imports 
 
 @dataclass(frozen=True)
 class MarimoServer:
-    """A running marimo server: one Hailer started (``.hailer/kernel.json``), the configured URL,
-    or one found in marimo's registry."""
+    """The marimo server this Hailer process started, held in memory for as long as it runs:
+    nothing else finds or attaches to it."""
 
     url: str  # base URL without trailing slash, e.g. http://127.0.0.1:2718
-    server_id: str = ""
-    pid: int | None = None
-    version: str = ""
-    source: Literal["config", "registry", "env", "kernel"] = "config"
-    #: The auth token of a server Hailer started; ``None`` for servers started with ``--no-token``.
-    #: Kept out of ``repr`` so it never lands in a log line or a test failure.
+    pid: int | None = None  # local runtime: the marimo process
+    #: The server's random auth token. Kept out of ``repr`` so it never lands in a log line or a
+    #: test failure.
     token: str | None = field(default=None, repr=False)
     #: Where the kernel runs: "local" (Hailer's own Python) or "docker".
     runtime: str = "local"
@@ -174,8 +171,6 @@ class HailerConfig:
     providers: dict[str, ProviderConfig] = field(default_factory=dict)
     web: WebConfig = field(default_factory=WebConfig)
     kernel: KernelConfig = field(default_factory=KernelConfig)
-    marimo_url: str | None = None
-    marimo_token: str | None = None  # value is read from env only, never from file
     log_level: str = "WARNING"
     config_path: Path | None = None
     max_tool_output_chars: int = 12_000

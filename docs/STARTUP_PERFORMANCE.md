@@ -7,7 +7,7 @@ serial gate before chat appeared. Configuration and context loading took about 4
 
 ## Implemented behavior
 
-- Start dependency-only imports on a daemon worker before kernel discovery/start.
+- Start dependency-only imports on a daemon worker before the kernel start.
 - After server health, render the composer before agent setup and notebook waiting; those two
   preparations run concurrently. Kernel startup and its validation still precede the composer.
 - Accept typing and paste immediately. Keep one submitted first message until preparation finishes,

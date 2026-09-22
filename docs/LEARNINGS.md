@@ -102,8 +102,11 @@ the marimo token: the local kernel reads it from stdin, the Docker kernel from a
 mount (`--token-password-file`), because `docker inspect` shows a container's arguments and environment.
 The file is deleted once marimo answers (it reads it as its CLI starts). On Docker Desktop for Windows
 (29.4.3, 2026-09-22) the file then also disappears inside the container; on Linux the mount keeps the
-deleted inode readable there, which gives notebook code nothing it lacks. Evidence:
-`test_the_token_reaches_marimo_in_a_file_that_is_gone_once_it_started` and the Docker integration test
+deleted inode readable there, which gives notebook code nothing it lacks. The start deletes the
+`.hailer/kernel-token-<random>` folder in a `finally`; nothing sweeps token folders, because several sessions
+start in one workspace and a sweep could delete another session's token before its marimo read it. Evidence:
+`test_the_token_reaches_marimo_in_a_file_that_is_gone_once_it_started`,
+`test_the_token_file_is_removed_when_a_start_fails` and the Docker integration test
 `test_the_token_is_not_in_docker_inspect_or_the_kernels_command_lines`.
 
 The kernel image is versioned by its kernel contract (`hailer.kernel_image`), not by Hailer's version, so
@@ -169,7 +172,7 @@ the agent's original event loop. A cancelled wait must neither cancel shared imp
 shutdown wait for them; failed imports must produce an actionable error without re-importing them
 on the UI thread.
 
-Start warmup before kernel discovery/start. Once the server is healthy, render the interactive
+Start warmup before the kernel start. Once the server is healthy, render the interactive
 composer before preparing the agent and waiting for the notebook in parallel. A user can type and
 paste while either is pending; one first submission may wait for preparation and must run at most
 once. Preserve both that message and any next draft on failure. Ordinary busy-turn submissions
@@ -187,3 +190,34 @@ session milestones. Keep event-controlled startup tests in `test_chat.py`, `test
 `test_cli.py` and `test_agent_warmup.py` alongside the agent lifecycle checks; do not turn a passing
 recorded-terminal test into a claim about physical Windows Ctrl+C. The measurements, live-check
 scope and reproduction commands are in [STARTUP_PERFORMANCE.md](STARTUP_PERFORMANCE.md).
+
+## 11. One session, one kernel: own it, never find one
+
+Until 2026-09-22 a session could reuse a kernel another terminal had started (`.hailer/kernel.json`,
+marimo's registry of `--no-token` servers, `[hailer].marimo_url`, `--keep-marimo`, `hailer exec`). Proving
+that a recorded kernel was still the one it described, and never orphaning or destroying a busy one, took
+liveness probes, a start guard, settings-mismatch checks and id bookkeeping, and was the most intricate code
+in Hailer. Now each `uvx hailer` / `uvx hailer notebook` process starts its own kernel, keeps it in memory
+(`MarimoServer`, handed to the chat, the agent and the tools) and stops it in the `finally` of
+`cli._run_session` (`_start_kernel` runs inside the guarded block, so Ctrl+C right after the start cannot
+leak the kernel); `/exec` replaced `hailer exec`. Do not add a way to find or attach to another process's
+kernel: a restart costs a few seconds, which is cheaper than the lifecycle bugs.
+
+Two sessions can pick the same free port. The start's wait therefore checks its own process (local) or
+containers (docker) first and then requires `answers_with_token(url, its own token)`: a bare `/health`
+check once let a second session adopt the first one's server, and every call then got 401. Evidence:
+`test_a_start_never_takes_another_sessions_server_on_the_same_port_for_its_own` and
+`test_wait_for_health_with_a_token_accepts_only_the_server_that_holds_it`.
+
+Docker ownership is a lock, not a pid: each start creates `.hailer/owner-<random>.lock`, holds an OS lock on
+it (`msvcrt.locking` / `fcntl.flock`) and labels its containers and network with that id. An owner is alive
+while its lock file exists and cannot be locked; the OS drops the lock however the process ends, so a reused
+pid (or a WSL/Windows pid namespace) can never make a dead owner look alive. A start removes only objects
+whose owner is not alive; `uvx hailer kernel stop` removes every labelled object and nothing in `.hailer`.
+An earlier design kept a per-session record for the local runtime and killed orphans by pid; it was dropped:
+the `finally` stops the local kernel on every normal exit, and a killed session's token-protected marimo is
+ended by the user (Task Manager or `kill`). Evidence: `test_owner_locks_say_whether_their_hailer_still_runs`,
+`test_a_start_never_removes_a_live_sessions_objects`, `test_start_removes_what_owners_that_are_gone_left_by_id`,
+`test_two_sessions_run_side_by_side_and_each_removes_only_its_own`,
+`test_ctrl_c_right_after_the_kernel_started_still_stops_it` and the owner-label check in
+`tests/test_docker_integration.py`.

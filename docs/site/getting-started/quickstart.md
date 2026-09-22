@@ -77,8 +77,8 @@ in `my-analysis` and run `uvx hailer` again; it resumes your conversation and ac
 Use `/new` for a fresh conversation, or `/help` to see the chat commands.
 
 If startup fails, run `uvx hailer doctor` for checks and suggested fixes, or see
-[Troubleshooting](../reference/troubleshooting.md#troubleshooting). A missing marimo server before your first session is expected:
-`uvx hailer` starts it for you.
+[Troubleshooting](../reference/troubleshooting.md#troubleshooting). `doctor` starts no
+kernel: every `uvx hailer` session starts its own and stops it when the chat ends.
 
 **Data and code:** files are read locally, but your messages, code and notebook tool outputs (which can
 include data samples) go to the configured model endpoint. By default, notebook code runs with your

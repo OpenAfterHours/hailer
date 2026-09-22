@@ -44,7 +44,8 @@ runtime  = "docker"   # "local" (default) or "docker"
   Kernel:     docker (hailer-kernel marimo0.24.2-64a6b78f25cf; network on: the internet and this machine; data read-only)
   ```
 
-  A docker kernel Hailer started for this workspace is the one in use whatever the file says: `uvx hailer` attaches to it when its mounted folders match and the line says `docker`.
+  Each session starts its own kernel with the settings in effect when it starts, so the line always
+  describes the kernel this chat uses.
 - **Docker mode fails closed.** Docker missing or not running, Docker Desktop set to Windows containers,
   an image of another kernel contract, or a folder layout it refuses (below): Hailer stops and says how to
   fix it (see [Troubleshooting](../reference/troubleshooting.md#troubleshooting)). It never runs notebook code on this machine instead.
@@ -221,45 +222,43 @@ row, and every start stops on it, `--foreground` included (the same rules, in on
   gets a warning (`doctor` rows `data` and `notebooks`): Docker Desktop usually cannot see it. Symlinks and
   junctions inside the data folder that point outside it do not resolve in the container; `doctor` lists
   them. Copy such data to a folder on a local disk.
-- `[hailer].marimo_url` (or `HAILER_MARIMO_URL`) cannot be combined with docker: Hailer starts and finds its
-  own containers.
 
-## Starting, reusing and stopping
+## Starting and stopping
 
-- **What runs.** `uvx hailer notebook` creates three things, each labelled with the workspace:
-  `hailer-net-<id>`, an internal network with no route out; `hailer-kernel-<id>`, the kernel, on that
-  network only; and `hailer-fwd-<id>`, a small forwarder from the same image, published on
-  `127.0.0.1:<port>` only, which carries the browser's and Hailer's requests to the kernel (Docker
-  publishes no port for a container on an internal network). `<id>` comes from the workspace path, so two
-  workspaces can run side by side. With `network = true` there is only the kernel, published directly.
-  When the chat ends, Hailer removes the kernel it started. Reused kernels are left running.
-- **Reuse.** `--keep-marimo` leaves the kernel running. Both `uvx hailer` and `uvx hailer notebook`
-  reuse it only when its mounted folders match. When Docker is configured, image, network, memory and
-  CPU settings must also match; otherwise the command asks you to run `uvx hailer kernel stop` first.
-  `--kernel local` can attach to a running Docker kernel with matching folders. The chat keeps that
-  server's token and path mapping in memory, including across notebook and model switches.
-- **`--foreground`** starts the kernel and follows its log in this terminal. Ctrl+C stops and removes it;
-  when it ends for another reason, Hailer says why (out of memory, removed from outside, exited).
-- **`uvx hailer kernel stop`** stops this workspace's kernel, docker or local, and removes every container
-  and network labelled with the workspace, running or not. It prints what it removed, says when Docker is
-  not running (so leftovers could not be checked), and exits 1 when a recorded Docker kernel cannot be stopped or a removal failed (a container another
-  terminal is removing at the same moment counts as removed, and a network whose containers are still
-  detaching is retried for a few seconds). If Docker is unreachable, the recorded Docker kernel is kept
-  for retry. An unanswered health check alone never proves those containers are gone.
+- **What runs.** Every `uvx hailer` or `uvx hailer notebook` session creates three things of its own:
+  `hailer-net-<id>-<suffix>`, an internal network with no route out; `hailer-kernel-<id>-<suffix>`, the
+  kernel, on that network only; and `hailer-fwd-<id>-<suffix>`, a small forwarder from the same image,
+  published on `127.0.0.1:<port>` only, which carries the browser's and Hailer's requests to the kernel
+  (Docker publishes no port for a container on an internal network). `<id>` comes from the workspace path
+  and `<suffix>` is random, so several sessions and several workspaces run side by side. With
+  `network = true` there is only the kernel, published directly. When the chat ends, Hailer removes what
+  it started, by the ids Docker gave it.
+- **Labels and owners.** Every container and network carries labels for the workspace, its role, the
+  kernel contract and its owner. The owner is a lock file, `.hailer/owner-<id>.lock`, that the Hailer
+  session creates and holds an operating-system lock on for as long as it runs; the operating system drops
+  the lock when the process ends, however it ends. A start waits only for the server that answers with its
+  own token, so two sessions that pick the same port never take each other's server. Nothing attaches to a
+  kernel another session started; the chat keeps its own server's token and path mapping in memory,
+  including across notebook and model switches.
+- **`--foreground`** starts the kernel and follows its log in this terminal, without a chat. Ctrl+C stops
+  and removes it; when it ends for another reason, Hailer says why (out of memory, removed from outside,
+  exited).
+- **Leftovers.** If Hailer itself is killed, its containers keep running. The next start in the workspace
+  removes every labelled object whose owner is not alive (its lock file is gone or nobody holds it, or it
+  has no owner label), running or not, and deletes lock files nobody holds. It never removes anything of a
+  session that is still running.
+- **`uvx hailer kernel stop`** removes every container and network labelled with the workspace, running
+  or not, whichever session started it. It prints what it removed, says
+  when Docker is not running (so leftovers could not be checked), and exits 1 when a removal failed (a
+  container another terminal is removing at the same moment counts as removed, and a network whose
+  containers are still detaching is retried for a few seconds).
 - **Files the kernel may have planted.** When a docker kernel stops (the chat ends, `--foreground` ends,
   `uvx hailer kernel stop`), Hailer scans the notebooks folder and its subfolders for `.git`, `.vscode`,
   `.idea`, `.devcontainer` and `hailer.toml` and prints a loud `WARNING` naming them: notebook code can
   write there, and git or an editor would run commands from them. Delete them (unless you put them there
   yourself) before you run git in that folder or open it in an editor. `uvx hailer doctor` shows the
   same as a `notebooks` warning. Nothing is removed for you.
-- **Leftovers.** If Hailer itself is killed, the containers keep running and `.hailer/kernel.json` still
-  records them, so the next `uvx hailer notebook` or `uvx hailer` attaches to them and
-  `uvx hailer kernel stop` removes them. A start never removes a running kernel container that Hailer has
-  no working record of, because it may still be in use: it stops and points at `uvx hailer kernel stop`.
-  A start also refuses while the recorded kernel (docker or local) does not answer but is not provably
-  gone (its containers or its process still exist: busy, stuck or suspended), and keeps its record so
-  `uvx hailer kernel stop` can still find it. Stopped leftovers are cleaned up by the next start.
-- **Logs.** `docker logs hailer-kernel-<id>`. A failed start prints its last lines.
+- **Logs.** `docker logs hailer-kernel-<id>-<suffix>`. A failed start prints its last lines.
 
 ## Platforms
 

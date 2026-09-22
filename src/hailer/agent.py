@@ -256,8 +256,9 @@ def _base_prompt_text() -> str:
     return _FALLBACK_SYSTEM_PROMPT
 
 
-def system_prompt(config: HailerConfig, bundle: ContextBundle) -> str:
-    """The agent's instructions: persona + project context + skills + web + workspace."""
+def system_prompt(config: HailerConfig, bundle: ContextBundle, server: MarimoServer | None = None) -> str:
+    """The agent's instructions: persona + project context + skills + web + workspace (with the
+    URL of ``server``, the kernel this process started, when there is one)."""
     parts: list[str] = [_base_prompt_text()]
 
     if bundle.context_text.strip():
@@ -286,14 +287,14 @@ def system_prompt(config: HailerConfig, bundle: ContextBundle) -> str:
             "project context only."
         )
 
-    parts.append(_workspace_section(config))
+    parts.append(_workspace_section(config, server))
     return "\n\n".join(p.rstrip() for p in parts) + "\n"
 
 
-def _workspace_section(config: HailerConfig) -> str:
+def _workspace_section(config: HailerConfig, server: MarimoServer | None = None) -> str:
     """Where things are, as the kernel sees them, plus the runtime's notes.
 
-    ``config.kernel`` is the runtime in effect (the CLI applies ``attach_runtime`` first). A docker
+    ``config.kernel`` is the runtime the chat's kernel was started with. A docker
     kernel knows the folders by their mount points, so the model gets those, never host paths it
     would copy into code that cannot reach them. The active notebook is deliberately absent: it
     changes with /notebook and the notebook tools during a conversation; the model learns it from
@@ -313,8 +314,8 @@ def _workspace_section(config: HailerConfig) -> str:
             f"- Notebooks folder: {config.notebooks_root}",
             f"- Data directory: {config.data_dir}",
         ]
-    if config.marimo_url:
-        lines.append(f"- Marimo URL: {config.marimo_url}")
+    if server is not None:
+        lines.append(f"- Marimo URL: {server.url}")
     return "## Workspace\n\n" + "\n".join(lines) + "\n" + runtime_prompt_notes(config.kernel)
 
 
@@ -505,7 +506,7 @@ class HailerAgent:
     ) -> None:
         self.config = config
         self._bundle = bundle
-        #: The marimo server the tools are pinned to (``hailer notebook``); ``None``: discovered per call.
+        #: The marimo server this process started; the tools use it (``None``: no kernel).
         self._server = server
         self._environ: Mapping[str, str] = env if env is not None else os.environ
         self._model_factory = model_factory
@@ -643,7 +644,7 @@ class HailerAgent:
         self._graph = create_agent(
             model,
             self._tools,
-            system_prompt=system_prompt(self.config, self._bundle),
+            system_prompt=system_prompt(self.config, self._bundle, self._server),
             middleware=middleware,
             checkpointer=self._saver,
         )

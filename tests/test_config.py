@@ -70,8 +70,6 @@ def test_defaults_without_config_file(tmp_path: Path) -> None:
     assert cfg.model.summarize_after_tokens == 100_000
     assert cfg.providers == {}
     assert cfg.web.allowed_domains == ()
-    assert cfg.marimo_url is None
-    assert cfg.marimo_token is None
     assert cfg.log_level == "WARNING"
     assert cfg.max_tool_output_chars == 12_000
     assert cfg.max_context_bytes == 24_000
@@ -147,7 +145,6 @@ FULL_CONFIG = """
 notebook = "nb/main.py"
 notebooks_dir = "nb"
 data_dir = "parquet"
-marimo_url = "http://127.0.0.1:2718/"
 context_dir = "ctx"
 skills_dir = "sk"
 prompts_dir = "pr"
@@ -187,7 +184,6 @@ def test_full_file_is_mapped(tmp_path: Path) -> None:
     assert cfg.notebook == (ws / "nb" / "main.py").resolve()
     assert cfg.notebooks_dir == (ws / "nb").resolve()
     assert cfg.data_dir == (ws / "parquet").resolve()
-    assert cfg.marimo_url == "http://127.0.0.1:2718"  # trailing slash stripped
     assert cfg.context_dir == (ws / "ctx").resolve()
     assert cfg.skills_dir == (ws / "sk").resolve()
     assert cfg.prompts_dir == (ws / "pr").resolve()
@@ -272,8 +268,6 @@ def test_every_env_override(tmp_path: Path) -> None:
         "HAILER_NOTEBOOK": str(other_nb),
         "HAILER_NOTEBOOKS_DIR": "envnbs",
         "HAILER_DATA_DIR": "envdata",
-        "HAILER_MARIMO_URL": "http://localhost:9999/",
-        "HAILER_MARIMO_TOKEN": "supersecrettoken",
         "HAILER_MODEL": "gpt-5.5",
         "HAILER_MODEL_PROVIDER": "openai",
         "HAILER_LOG_LEVEL": "debug",
@@ -282,8 +276,6 @@ def test_every_env_override(tmp_path: Path) -> None:
     assert cfg.notebook == other_nb.resolve()
     assert cfg.notebooks_dir == (ws / "envnbs").resolve()
     assert cfg.data_dir == (ws / "envdata").resolve()
-    assert cfg.marimo_url == "http://localhost:9999"
-    assert cfg.marimo_token == "supersecrettoken"
     assert cfg.model.name == "gpt-5.5"
     assert cfg.model.provider == "openai"
     assert cfg.model.reasoning_effort == "high"  # not overridden by env
@@ -297,17 +289,6 @@ def test_env_config_and_workspace_override(tmp_path: Path) -> None:
     assert cfg.workspace == ws.resolve()
     assert cfg.config_path == custom.resolve()
     assert cfg.model.name == "from-env-file"
-
-
-def test_token_never_read_from_file_and_never_in_validate_output(tmp_path: Path) -> None:
-    ws = _make_workspace(tmp_path, '[hailer]\nmarimo_token = "filesecret123"\n')
-    cfg = load_config(workspace=ws, env={"HAILER_MARIMO_TOKEN": "envsecret456"})
-    assert cfg.marimo_token == "envsecret456"
-    problems = validate(cfg)
-    joined = "\n".join(problems)
-    assert "filesecret123" not in joined
-    assert "envsecret456" not in joined
-    assert any("marimo_token" in p and p.startswith("Warning:") for p in problems)
 
 
 # --------------------------------------------------------------------------- #
@@ -572,17 +553,6 @@ def test_kernel_wrong_types_raise_config_error(tmp_path: Path, text: str, fragme
 def test_kernel_bad_values_are_fatal(tmp_path: Path, text: str, env: dict, fragment: str) -> None:
     errors = _errors(validate(load_config(workspace=_make_workspace(tmp_path, text), env=env)))
     assert len(errors) == 1 and fragment in errors[0], errors
-
-
-def test_docker_refuses_marimo_url(tmp_path: Path) -> None:
-    ws = _make_workspace(tmp_path, '[hailer]\nmarimo_url = "http://127.0.0.1:2718"\n[kernel]\nruntime = "docker"\n')
-    errors = _errors(validate(load_config(workspace=ws, env={})))
-    assert len(errors) == 1 and "marimo_url" in errors[0] and "its own container" in errors[0]
-    assert _errors(validate(load_config(workspace=ws, env={"HAILER_KERNEL": "local"}))) == [], "fine for local"
-    (tmp_path / "env").mkdir()
-    plain = _make_workspace(tmp_path / "env", '[kernel]\nruntime = "docker"\n')
-    errors = _errors(validate(load_config(workspace=plain, env={"HAILER_MARIMO_URL": "http://127.0.0.1:2718"})))
-    assert len(errors) == 1 and "HAILER_MARIMO_URL" in errors[0]
 
 
 @pytest.mark.parametrize("data_dir", ["notebooks", "notebooks/data", "NOTEBOOKS/Data"])
@@ -854,13 +824,13 @@ def test_pass_env_naming_hailers_own_secrets_is_a_warning(tmp_path: Path) -> Non
     text = (
         '[model]\nprovider = "corp"\n[model_providers.corp]\nbase_url = "https://llm.example.internal/v1"\n'
         'env_key = "CORP_API_KEY"\nenv_http_headers = { "X-Client-Id" = "CORP_CLIENT_ID" }\n'
-        '[kernel]\npass_env = ["CORP_API_KEY", "CORP_CLIENT_ID", "HAILER_MARIMO_TOKEN", "DB_PASSWORD"]\n'
+        '[kernel]\npass_env = ["CORP_API_KEY", "CORP_CLIENT_ID", "OPENAI_API_KEY", "DB_PASSWORD"]\n'
     )
     warnings = [p for p in validate(load_config(workspace=_make_workspace(tmp_path, text), env={})) if "pass_env" in p]
     assert len(warnings) == 3 and all(w.startswith("Warning: [kernel].pass_env lets notebook code read ") for w in warnings)
     assert 'CORP_API_KEY (the API key of provider "corp")' in warnings[0]
     assert 'CORP_CLIENT_ID (the X-Client-Id header of provider "corp")' in warnings[1]
-    assert "HAILER_MARIMO_TOKEN (the marimo server token)" in warnings[2]
+    assert "OPENAI_API_KEY (the API key of the openai provider)" in warnings[2]
 
 
 def test_kernel_runtime_errors_quote_like_the_rest(tmp_path: Path) -> None:

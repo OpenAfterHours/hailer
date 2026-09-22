@@ -1,23 +1,19 @@
-"""Tests for hailer.kernel: the path map, .hailer/kernel.json and the one liveness check every
-caller shares, the kernel's environment and prompt notes, and the local runtime (its process
-layer faked: nothing is spawned or killed). The docker runtime has tests/test_kernel_docker.py.
-No Docker needed; liveness probes are stubs (no connects to closed ports)."""
+"""Tests for hailer.kernel: the path map, the kernel's environment and prompt notes, and the local
+runtime (its process layer faked: nothing is spawned or killed). The docker runtime has
+tests/test_kernel_docker.py. No Docker needed."""
 
 from __future__ import annotations
 
-import json
 import os
 import stat
 import subprocess
 import sys
-from dataclasses import replace
 from pathlib import Path, PurePosixPath
 
 import pytest
 
 from fake_docker import FakeDocker
-from fake_kernel import LIVE, TOKEN, FakeProc, Procs, answers, make_config
-from hailer import __version__
+from fake_kernel import TOKEN, FakeProc, Procs, make_config
 from hailer import kernel as k
 from hailer.errors import ConfigError, KernelRuntimeError
 from hailer.kernel_image import contract_tag
@@ -110,170 +106,7 @@ def test_path_map_does_not_resolve_symlinks(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# .hailer/kernel.json
-# --------------------------------------------------------------------------- #
-
-
-def test_local_state_round_trips_without_docker_fields(tmp_path):
-    state = k.KernelState(runtime="local", url="http://127.0.0.1:2718", port=2718, token=TOKEN, pid=4242)
-    path = k.write_kernel_state(tmp_path, state)
-    assert path == tmp_path / ".hailer" / "kernel.json"
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    assert set(raw) == {"runtime", "url", "port", "token", "hailer_version", "started", "pid"}
-    assert raw["hailer_version"] == __version__ and raw["started"]
-    assert k.read_kernel_state(tmp_path) == state
-    assert TOKEN not in repr(state), "the token stays out of reprs"
-    server = state.server()
-    assert server == MarimoServer(
-        url="http://127.0.0.1:2718", server_id="127.0.0.1:2718", pid=4242, source="kernel", token=TOKEN, runtime="local"
-    )
-
-
-def test_docker_state_round_trips_with_ids_mounts_and_settings(tmp_path):
-    mounts = ((str(tmp_path / "notebooks"), "/work/notebooks"), (str(tmp_path / "data"), "/work/data"))
-    state = k.KernelState(
-        runtime="docker",
-        url="http://127.0.0.1:2731",
-        port=2731,
-        token=TOKEN,
-        image="ghcr.io/openafterhours/hailer-kernel:0.2.5",
-        containers=("hailer-kernel-abc", "hailer-fwd-abc"),
-        container_ids=("a" * 64, "b" * 64),
-        network="hailer-net-abc",
-        network_id="c" * 64,
-        network_access=True,
-        mounts=mounts,
-        memory="4G",
-        cpus=1.5,
-    )
-    k.write_kernel_state(tmp_path, state)
-    raw = json.loads(k.kernel_state_path(tmp_path).read_text(encoding="utf-8"))
-    assert "pid" not in raw and raw["containers"] == ["hailer-kernel-abc", "hailer-fwd-abc"]
-    assert raw["container_ids"] == ["a" * 64, "b" * 64] and raw["network_id"] == "c" * 64
-    assert raw["mounts"] == [list(pair) for pair in mounts] and raw["network_access"] is True
-    assert (raw["memory"], raw["cpus"]) == ("4G", 1.5), "the settings it was started with"
-    loaded = k.read_kernel_state(tmp_path)
-    assert loaded == state
-    server = loaded.server()
-    assert server.runtime == "docker" and server.paths is not None and server.network_access is True
-    assert server.paths.to_kernel(tmp_path / "data" / "a.csv") == "/work/data/a.csv"
-
-
-@pytest.mark.parametrize(
-    "content",
-    [
-        "{not json",
-        "[]",
-        '{"runtime": "local", "url": "http://127.0.0.1:2718", "port": 2718}',  # no token
-        '{"runtime": "local", "url": "http://127.0.0.1:2718", "port": "2718", "token": "t"}',
-        '{"runtime": "local", "url": "ftp://x", "port": 1, "token": "t"}',
-        '{"runtime": "docker", "url": "http://127.0.0.1:1", "port": 1, "token": "t", "mounts": [["only one"]]}',
-    ],
-)
-def test_malformed_state_is_ignored(tmp_path, content):
-    path = k.kernel_state_path(tmp_path)
-    path.parent.mkdir(parents=True)
-    path.write_text(content, encoding="utf-8")
-    assert k.read_kernel_state(tmp_path) is None
-    assert k.delete_kernel_state(tmp_path, token="whatever"), "a malformed file belongs to nobody"
-
-
-def test_delete_state_only_removes_the_server_it_names(tmp_path):
-    assert not k.delete_kernel_state(tmp_path), "nothing to delete"
-    k.write_kernel_state(tmp_path, k.KernelState(runtime="local", url="http://127.0.0.1:2718", port=2718, token="newer"))
-    assert not k.delete_kernel_state(tmp_path, token="older"), "a newer start replaced it"
-    assert k.read_kernel_state(tmp_path) is not None
-    assert k.delete_kernel_state(tmp_path, token="newer")
-    assert k.read_kernel_state(tmp_path) is None
-
-
-@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
-def test_state_file_is_private(tmp_path):
-    path = k.write_kernel_state(tmp_path, k.KernelState(runtime="local", url="http://127.0.0.1:2718", port=2718, token=TOKEN))
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
-
-
-# --------------------------------------------------------------------------- #
-# Is the recorded server up? (one answer for every caller)
-# --------------------------------------------------------------------------- #
-
-
-def test_live_state_needs_a_server_that_answers_with_its_token(tmp_path):
-    assert k.live_kernel_state(tmp_path, probe=answers()) is None, "no record"
-    state = k.KernelState(runtime="local", url=LIVE, port=2718, token=TOKEN, pid=77)
-    k.write_kernel_state(tmp_path, state)
-    assert k.live_kernel_state(tmp_path, probe=answers((LIVE, TOKEN))) == state
-    assert k.live_kernel_state(tmp_path, probe=answers((LIVE, "another-token")), gone=lambda s: False) is None
-    assert k.read_kernel_state(tmp_path) == state, "not provably gone: kept (a slow server is never taken for dead)"
-
-
-def test_a_record_whose_server_is_provably_gone_is_deleted(tmp_path):
-    """So the next tool call does not pay for another health check (about a second on Windows)."""
-    k.write_kernel_state(tmp_path, k.KernelState(runtime="local", url=LIVE, port=2718, token=TOKEN, pid=77))
-    assert k.live_kernel_state(tmp_path, probe=answers(), gone=lambda s: s.pid == 77) is None
-    assert k.read_kernel_state(tmp_path) is None
-
-
-def test_record_is_gone_only_when_the_os_or_docker_says_so(tmp_path, monkeypatch):
-    local = k.KernelState(runtime="local", url=LIVE, port=2718, token=TOKEN, pid=77)
-    for running, gone in ((False, True), (True, False), (None, False)):
-        monkeypatch.setattr(k, "process_running", lambda pid, running=running: running)
-        assert k.record_is_gone(local) is gone
-    assert not k.record_is_gone(replace(local, pid=None)), "no pid: cannot tell"
-    docker = k.KernelState(runtime="docker", url=LIVE, port=2718, token=TOKEN, container_ids=("f" * 64,))
-    fake = FakeDocker()
-    assert k.record_is_gone(docker, docker_runner=fake), "no such container"
-    kernel = fake.add_container("hailer-kernel-x")
-    assert not k.record_is_gone(replace(docker, container_ids=(kernel.id,)), docker_runner=fake), "running"
-    kernel.state = "exited"
-    assert k.record_is_gone(replace(docker, container_ids=(kernel.id,)), docker_runner=fake), "stopped"
-    assert not k.record_is_gone(docker, docker_runner=FakeDocker(engine=None)), "Docker cannot be asked"
-    assert k.record_is_gone(replace(docker, container_ids=())), "a docker record without ids is not usable"
-
-
-def test_process_running():
-    assert k.process_running(os.getpid()) is True
-    done = subprocess.run([sys.executable, "-c", "import os; print(os.getpid())"], capture_output=True, text=True, check=True)
-    assert k.process_running(int(done.stdout)) is False, "an ended process"
-    assert k.process_running(0) is False
-
-
-def test_the_start_guard_names_the_live_server(tmp_path):
-    k.refuse_live_kernel(tmp_path, probe=answers())  # nothing recorded: fine
-    k.write_kernel_state(tmp_path, k.KernelState(runtime="docker", url=LIVE, port=2718, token=TOKEN))
-    with pytest.raises(KernelRuntimeError) as exc:
-        k.refuse_live_kernel(tmp_path, probe=answers((LIVE, TOKEN)))
-    assert str(exc.value) == f"A docker kernel Hailer started for this workspace is already running at {LIVE}."
-    assert "uvx hailer kernel stop" in exc.value.hint
-    k.write_kernel_state(tmp_path, k.KernelState(runtime="local", url=LIVE, port=2718, token=TOKEN))
-    with pytest.raises(KernelRuntimeError) as exc:
-        k.refuse_live_kernel(tmp_path, probe=answers((LIVE, TOKEN)))
-    assert "local marimo server" in str(exc.value) and "uvx hailer kernel stop" in exc.value.hint
-    k.refuse_live_kernel(tmp_path, probe=answers(), gone=lambda s: True)  # provably gone: fine, and dropped
-    assert k.read_kernel_state(tmp_path) is None
-
-
-@pytest.mark.parametrize("foreground", [False, True])
-def test_a_server_that_does_not_answer_but_is_not_gone_is_never_orphaned(tmp_path, monkeypatch, foreground):
-    """A busy or suspended server: its process still exists, so a new start must not replace its record."""
-    monkeypatch.setattr(k, "process_running", lambda pid: True)
-    state = k.KernelState(runtime="local", url=LIVE, port=2718, token="theirs", pid=4321)
-    k.write_kernel_state(tmp_path, state)
-    procs = Procs()
-    with pytest.raises(KernelRuntimeError) as exc:
-        runtime(tmp_path, procs).start(2720, foreground=foreground)
-    assert str(exc.value) == (
-        f"A local marimo server Hailer started for this workspace (process 4321) may still be running, but it does not answer at {LIVE}."
-    )
-    assert "busy, stuck or suspended" in exc.value.hint and "uvx hailer kernel stop" in exc.value.hint
-    assert procs.calls == [] and k.read_kernel_state(tmp_path) == state
-    monkeypatch.setattr(k, "process_running", lambda pid: None)  # the OS cannot say: still refused
-    with pytest.raises(KernelRuntimeError):
-        runtime(tmp_path, procs).prepare(say=pytest.fail)
-
-
-# --------------------------------------------------------------------------- #
-# The kernel's environment, descriptions, attaching
+# The kernel's environment and descriptions
 # --------------------------------------------------------------------------- #
 
 
@@ -363,22 +196,6 @@ def test_prompt_notes_per_runtime():
     assert "No internet" not in online
 
 
-def test_attach_runtime_follows_the_kernel_in_use(tmp_path):
-    config = make_config(tmp_path)
-    local = MarimoServer(url="http://127.0.0.1:2718", runtime="local")
-    docker = MarimoServer(url="http://127.0.0.1:2731", runtime="docker", source="kernel")
-    assert k.attach_runtime(config, None) is config
-    assert k.attach_runtime(config, local) is config
-    attached = k.attach_runtime(config, docker)
-    assert attached.kernel.runtime == "docker" and attached.kernel.network is False
-    online = replace(docker, network_access=True)
-    assert k.attach_runtime(config, online).kernel.network is True, "the network setting it was started with"
-    docker_config = replace(config, kernel=KernelConfig(runtime="docker"))
-    assert k.attach_runtime(docker_config, docker) is docker_config
-    assert k.attach_runtime(docker_config, online).kernel.network is True, "the kernel's, not hailer.toml's"
-    assert k.attach_runtime(docker_config, local) is docker_config, "never downgraded to local"
-
-
 def test_runtime_for_never_falls_back_to_local(tmp_path):
     from hailer.kernel_docker import DockerRuntime
 
@@ -405,12 +222,12 @@ def test_the_public_api_is_small():
 
 
 def runtime(tmp_path, procs: Procs, **kw) -> k.LocalRuntime:
+    """The local runtime with its process layer faked."""
     return k.LocalRuntime(
         kw.pop("config", None) or make_config(tmp_path),
         procs=procs.local_processes(),
         environ=kw.pop("environ", {"PATH": "p", "OPENAI_API_KEY": "sk-secret"}),
         token_factory=lambda: TOKEN,
-        probe=kw.pop("probe", answers()),
         **kw,
     )
 
@@ -431,25 +248,24 @@ def test_local_runtime_describes_itself(tmp_path):
     assert not hasattr(rt, "prompt_notes"), "one prompt path: runtime_prompt_notes"
 
 
-def test_start_passes_the_token_on_stdin_scrubs_the_environment_and_records_the_server(tmp_path):
+def test_start_passes_the_token_on_stdin_and_scrubs_the_environment(tmp_path):
     procs = Procs()
     running = runtime(tmp_path, procs).start(2718)
     kind, cmd, cwd, log_path, env, stdin_text = procs.calls[0]
-    assert kind == "spawn" and cwd == tmp_path and log_path == tmp_path / ".hailer" / "marimo.log"
+    assert kind == "spawn" and cwd == tmp_path and log_path == k.local_log_path(tmp_path)
+    assert log_path.name == f"marimo-{os.getpid()}.log", "one log per Hailer process"
     assert cmd == [sys.executable, "-m", "marimo", "edit", "notebooks", "--token-password-file", "-", "--headless", "--port", "2718", "--skip-update-check"]
     assert stdin_text == TOKEN and TOKEN not in " ".join(cmd)
     assert env == {"PATH": "p"}, "no API key in the kernel's environment"
-    assert procs.calls[1] == ("health", "http://127.0.0.1:2718", k.START_TIMEOUT_SEC)
-    assert running.server == MarimoServer(
-        url="http://127.0.0.1:2718", server_id="127.0.0.1:2718", pid=4242, source="kernel", token=TOKEN, runtime="local"
-    )
-    assert running.log_hint == str(tmp_path / ".hailer" / "marimo.log") and "4242" in running.stop_hint
-    state = k.read_kernel_state(tmp_path)
-    assert (state.runtime, state.url, state.port, state.token, state.pid) == ("local", "http://127.0.0.1:2718", 2718, TOKEN, 4242)
+    assert procs.calls[1] == ("health", "http://127.0.0.1:2718", k.START_TIMEOUT_SEC, TOKEN), "waits for its own token"
+    assert running.server == MarimoServer(url="http://127.0.0.1:2718", pid=4242, token=TOKEN, runtime="local")
+    assert running.log_hint == str(log_path)
+    assert [p.name for p in (tmp_path / ".hailer").glob("*.json")] == ["last-kernel.json"], "no kernel record"
 
+    log_path.write_text(f"URL: http://localhost:2718?access_token={TOKEN}\n", encoding="utf-8")
     running.stop()
-    assert procs.proc.terminated and procs.removed == ["http://127.0.0.1:2718"]
-    assert k.read_kernel_state(tmp_path) is None
+    assert procs.proc.terminated
+    assert not log_path.exists(), "the log (it holds the signed-in URL) goes with the server"
     running.stop()  # idempotent
 
 
@@ -459,43 +275,25 @@ def test_foreground_start_attaches_to_this_terminal(tmp_path):
     kind, cmd, _cwd, _log, env, stdin_text = procs.calls[0]
     assert kind == "attach" and "--headless" in cmd and stdin_text == TOKEN and "OPENAI_API_KEY" not in env
     assert running.log_hint == "this terminal" and running.log_tail() == []
-    assert k.read_kernel_state(tmp_path).url == "http://127.0.0.1:2720"
     procs.proc.returncode = 0  # marimo exits by itself (the shutdown button)
     assert running.wait() == 0 and running.ended == "marimo shut itself down."
     procs.proc.returncode = 1  # ended from outside: kernel stop in another terminal, Task Manager
     assert running.wait() == 1
     assert running.ended.startswith("marimo stopped (exit code 1): it was ended from outside this terminal (uvx hailer kernel stop")
     running.stop()
-    assert k.read_kernel_state(tmp_path) is None
-
-
-@pytest.mark.parametrize("recorded", ["local", "docker"])
-@pytest.mark.parametrize("foreground", [False, True])
-def test_start_refuses_to_orphan_a_live_server(tmp_path, recorded, foreground):
-    """`hailer notebook --foreground` skips the reuse step, so the guard itself must refuse."""
-    k.write_kernel_state(tmp_path, k.KernelState(runtime=recorded, url=LIVE, port=2718, token="theirs", pid=77))
-    procs = Procs()
-    rt = runtime(tmp_path, procs, probe=answers((LIVE, "theirs")))
-    with pytest.raises(KernelRuntimeError):
-        rt.prepare(say=pytest.fail)  # before any "Starting marimo" line
-    with pytest.raises(KernelRuntimeError) as exc:
-        rt.start(2720, foreground=foreground)
-    assert LIVE in str(exc.value) and "uvx hailer kernel stop" in exc.value.hint
-    assert procs.calls == [], "nothing started"
-    assert k.read_kernel_state(tmp_path).token == "theirs", "the record of the live server is kept"
 
 
 def test_start_reports_an_early_exit_with_the_log_tail_and_cleans_up(tmp_path):
     procs = Procs(healthy=False, proc=FakeProc(exit_code=3))
-    log = tmp_path / ".hailer" / "marimo.log"
+    log = k.local_log_path(tmp_path)
     log.parent.mkdir(parents=True)
     log.write_text("\n".join([*(f"line {i}" for i in range(19)), f"URL: http://localhost:2718?access_token={TOKEN}"]), encoding="utf-8")
     with pytest.raises(KernelRuntimeError) as exc:
         runtime(tmp_path, procs).start(2718)
     assert str(exc.value) == "Marimo exited early (code 3)."
-    assert exc.value.hint.startswith(f"Log: {log}") and "    line 18" in exc.value.hint and "line 3\n" not in exc.value.hint
+    assert exc.value.hint.startswith("Last lines of its log:") and "    line 18" in exc.value.hint and "line 3\n" not in exc.value.hint
     assert TOKEN not in exc.value.hint and "access_token=<token>" in exc.value.hint, "the token is masked in the tail"
-    assert k.read_kernel_state(tmp_path) is None, "nothing recorded for a server that never came up"
+    assert not log.exists(), "the tail is in the hint; the log never outlives the start"
 
 
 def test_start_that_times_out_stops_the_server(tmp_path):
@@ -528,28 +326,24 @@ def test_start_that_cannot_spawn_is_a_runtime_error(tmp_path):
     assert str(exc.value).startswith("Could not start marimo:") and exc.value.hint
 
 
-def test_start_replaces_a_record_whose_server_is_gone(tmp_path, monkeypatch):
-    monkeypatch.setattr(k, "process_running", lambda pid: False)
-    k.write_kernel_state(tmp_path, k.KernelState(runtime="local", url="http://127.0.0.1:9", port=9, token="old", pid=77))
-    running = runtime(tmp_path, Procs()).start(2718)
-    assert k.read_kernel_state(tmp_path).token == TOKEN
-    running.stop()
+@pytest.mark.parametrize("bound", [False, True], ids=["exited", "still-starting"])
+def test_a_start_never_takes_another_sessions_server_on_the_same_port_for_its_own(tmp_path, bound):
+    """Two sessions picked the same free port: the other session's server answers /health there,
+    but only a server that holds this start's token counts. Otherwise every call would get 401."""
+    from fake_marimo import serving
+    from hailer.marimo_client import wait_for_health
 
-
-def test_find_running_needs_a_server_that_answers_with_its_token(tmp_path):
-    procs = Procs()
-    rt = runtime(tmp_path, procs, probe=answers((LIVE, TOKEN)))
-    assert rt.find_running() is None, "no record"
-    k.write_kernel_state(tmp_path, k.KernelState(runtime="local", url=LIVE, port=2718, token="not-its-token", pid=77))
-    assert rt.find_running() is None
-    k.write_kernel_state(tmp_path, k.KernelState(runtime="docker", url=LIVE, port=2718, token=TOKEN))
-    assert rt.find_running() is None, "a docker kernel is not the local runtime's"
-    k.write_kernel_state(tmp_path, k.KernelState(runtime="local", url=LIVE, port=2718, token=TOKEN, pid=77))
-    running = rt.find_running()
-    assert running is not None and running.server.token == TOKEN and running.server.pid == 77
-    running.stop()
-    assert procs.killed == [77] and procs.removed == [LIVE], "an earlier run's server is stopped by pid"
-    assert k.read_kernel_state(tmp_path) is None
+    with serving(token="the-other-sessions-token") as other:
+        port = other.server_address[1]
+        procs = Procs(proc=FakeProc(exit_code=None if bound else 1))  # 1: this marimo could not bind the port
+        layer = procs.local_processes()
+        layer.wait_for_health = wait_for_health  # the real wait, against the real (other) server
+        rt = k.LocalRuntime(make_config(tmp_path), procs=layer, environ={}, token_factory=lambda: TOKEN, start_timeout=0.3)
+        with pytest.raises(KernelRuntimeError) as exc:
+            rt.start(port)
+    expected = f"Marimo did not answer on http://127.0.0.1:{port} within 0 s." if bound else "Marimo exited early (code 1)."
+    assert str(exc.value) == expected
+    assert procs.proc.terminated or not bound
 
 
 # --------------------------------------------------------------------------- #

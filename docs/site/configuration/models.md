@@ -49,7 +49,7 @@ Then:
 
 ```bash
 uvx hailer login internal     # stores the key in the OS credential store (hidden prompt)
-uvx hailer doctor             # config / notebook / credentials / marimo / session, with fixes
+uvx hailer doctor             # config / notebook / credentials / kernel runtime, with fixes
 uvx hailer
 ```
 

@@ -10,8 +10,9 @@
   may still finish and switch the active notebook a moment later. Hailer re-reads the state after every
   turn and before `/notebook` and `/status`, so the next command shows the right notebook; a `/notebook
   new` typed in that instant can still be overtaken by the late switch.
-- Both `uvx hailer` and `uvx hailer notebook` start or reuse this workspace's marimo server and stop only
-  a server they started. An explicitly pinned server must already be running.
+- Every `uvx hailer` and `uvx hailer notebook` session starts its own marimo server and stops it when the
+  chat ends, so restarting the chat re-runs the notebook in a fresh kernel. A server you start yourself
+  (for example with `marimo edit --no-token`) cannot be used, and two sessions never share a kernel.
 - Every request carries about 10 KB of instructions and 5 KB of tool definitions (measured with an empty
   project context) plus the conversation; an endpoint with a strict request-size limit needs room for that.
 - The endpoint must support function calling in the standard OpenAI shape. An endpoint that streams tool
@@ -28,5 +29,4 @@
   integration test only covers amd64. Podman is not supported.
 - The docker kernel has only the packages in the image (marimo, Polars, fastexcel, DuckDB, altair, plotly); anything
   else needs an image of your own, built `FROM` Hailer's (so it keeps the kernel contract label) and named in
-  `[kernel].image`. There is one kernel per workspace, and
-  changing `[kernel]` settings while one is kept running needs `uvx hailer kernel stop` first.
+  `[kernel].image`. Changed `[kernel]` settings apply from the next session.
