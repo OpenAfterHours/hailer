@@ -117,7 +117,7 @@ def folder_sandbox(config: Any, server: MarimoServer | None = None, *, docker: b
     ``docker``, as a container sees them (``/work/notebooks``, ``/work/data``)."""
     from hailer.marimo_client import notebook_file_key
 
-    server = server or MarimoServer(url="http://127.0.0.1:2718", runtime="docker" if docker else "local")
+    server = server or MarimoServer(url="http://127.0.0.1:2718", runtime="docker" if docker else "unsafe-local")
     return FolderSandbox(
         server=server,
         notebooks_path="/work/notebooks" if docker else notebook_file_key(config.notebooks_root),

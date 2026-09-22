@@ -72,6 +72,7 @@ def make_config(tmp_path: Path, **overrides: Any) -> HailerConfig:
         prompts_dir=ws / ".config" / "hailer" / "prompts",
         model=ModelConfig(name="internal-analyst", provider="internal", reasoning_effort="medium", summarize_after_tokens=0),
         providers={"internal": CHAT_PROVIDER},
+        kernel=KernelConfig(runtime="unsafe-local"),  # explicit: host paths in the prompt, no Docker
         config_path=ws / "hailer.toml",
     )
     base.update(overrides)

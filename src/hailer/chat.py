@@ -428,7 +428,8 @@ class ChatController:
             ("Web access", self._cli._web_line(self.config)),
         ]
         for label, value in rows:
-            table.add_row(Text(label), Text(value))
+            style = self._cli._kernel_style(self.config) if label == "Kernel" else ""  # unsafe-local: a warning
+            table.add_row(Text(label), Text(value, style=style))
         self.console.print(table)
 
     def _active_provider(self) -> ProviderConfig | None:

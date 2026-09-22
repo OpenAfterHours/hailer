@@ -19,10 +19,11 @@
   calls in a non-standard way may lose their arguments; `stream = false` on the provider avoids that.
 - After Ctrl+C during a long `marimo_execute`, the turn ends at once but the code keeps running in the
   kernel until it finishes, or until you interrupt or restart the kernel from the notebook.
-- The docker kernel needs Docker, which is not always an option: Docker Desktop is free for personal use
-  and small businesses, but larger organisations need a paid subscription (check Docker's current terms),
-  and managed machines often block Docker Desktop, WSL2 or Hyper-V. That is why `local` stays the default
-  and fully supported.
+- The default docker kernel needs Docker, which is not always an option: Docker Desktop is free for
+  personal use and small businesses, but larger organisations need a paid subscription (check Docker's
+  current terms), and managed machines often block Docker Desktop, WSL2 or Hyper-V. Where it is not,
+  `runtime = "unsafe-local"` runs notebook code on the machine as you, without isolation, for those who
+  accept that (see [Kernel runtimes](../security/runtimes.md#kernel-runtimes)).
 - Reading large data files through a Windows bind mount is slower than reading them from a local folder;
   how much slower for large Parquet files has not been measured yet.
 - A docker kernel works on copies of the notebooks (see [Notebook copies](../security/docker.md#notebook-copies)):

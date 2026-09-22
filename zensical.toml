@@ -34,7 +34,7 @@ nav = [
   ] },
   { "Security and runtimes" = [
     { "Data handling and security" = "security/data-handling.md" },
-    { "Local and Docker runtimes" = "security/runtimes.md" },
+    { "Kernel runtimes" = "security/runtimes.md" },
     { "Docker setup and operations" = "security/docker.md" },
   ] },
   { "Reference and development" = [

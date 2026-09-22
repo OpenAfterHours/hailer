@@ -44,16 +44,15 @@ provider = "openai"                  # "openai" = api.openai.com with OPENAI_API
 # allowed_domains = ["docs.pola.rs", "duckdb.org", "**.marimo.io"]
 # max_page_bytes = 200000
 
-# Where notebook code runs. "local" (the default): marimo runs in Hailer's own Python, as you,
-# with your files and network (not isolated). "docker": marimo runs in a container that sees only
-# the notebooks folder and, read-only, the data folder, with no network; it needs Docker Desktop
-# or Docker Engine. HAILER_KERNEL overrides runtime for one run. To switch it on, uncomment both
-# the section line, [kernel], and the settings under it.
-#
-# [kernel]
-# runtime = "local"                  # "local" or "docker"
-# image   = ""                       # docker: default ghcr.io/openafterhours/hailer-kernel:<hailer version>
+# Where notebook code runs. "docker" (the default): marimo runs in a Linux container with a
+# notebooks folder of its own (your notebooks are copied in and back) that sees only the data
+# folder, read-only, with no network; it needs Docker Desktop or Docker Engine, running.
+# "unsafe-local": marimo runs in Hailer's own Python, as you, with your files and network (not
+# isolated); write it only if you accept that. HAILER_KERNEL overrides runtime for one run.
+
+[kernel]
+runtime = "docker"                   # "docker" or "unsafe-local"
+# image   = ""                       # docker: default ghcr.io/openafterhours/hailer-kernel:<kernel contract>
 # memory  = "4g"                     # docker: container memory limit (no swap on top)
 # cpus    = 2                        # docker: container CPU limit
 # network = false                    # docker: true lets notebook code reach the internet and this machine
-# pass_env = []                      # local: variables with secret-looking names notebook code may read

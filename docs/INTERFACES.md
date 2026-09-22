@@ -23,12 +23,15 @@ without agreement (report a needed change instead).
   `http.server` for the marimo protocol (`tests/fake_marimo.py`), a scripted chat model and the loopback
   `tests/fake_gateway.py` for the agent, the stateful scripted `docker` CLI in `tests/fake_docker.py`,
   `tmp_path` for files, an in-memory keyring backend (`keyring.backends.fail` / a tiny custom backend) for
-  secrets. The local runtime's process layer is faked (`tests/fake_kernel.py`): no test connects to a closed port. The one
-  exception is `tests/test_docker_integration.py`, skipped unless `HAILER_DOCKER_TESTS` is set.
+  secrets. The unsafe-local runtime's process layer is faked (`tests/fake_kernel.py`): no test connects to a closed port.
+  Docker is the default runtime, so a test that builds a config names its runtime (`KernelConfig(runtime=...)`)
+  whenever it starts or describes a kernel. The one exception is `tests/test_docker_integration.py`, skipped
+  unless `HAILER_DOCKER_TESTS` is set.
 - **Secrets never appear** in logs, prompts, tool results, exception messages, or config files. The provider key
   is resolved in-process (`secrets.resolve_provider_key`) and handed to the HTTP client; Hailer never writes it
-  to a file or puts it into an environment, and the local marimo server's environment leaves out the key's
-  variable and every other name `kernel.withheld_variables` recognises. The logging redaction filter masks
+  to a file or puts it into an environment. A docker kernel gets none of the host's variables, and the
+  unsafe-local marimo server's environment leaves out the key's variable and every other name
+  `kernel.withheld_variables` recognises (no setting lets one through). The logging redaction filter masks
   `Authorization` headers, bearer tokens, bare `sk-...` keys and any value whose env var name ends in `_KEY`,
   `_TOKEN`, `_SECRET`, `_PASSWORD`. The marimo server's token (`MarimoServer.token`, kept out of `repr`) lives
   in the memory of the session that started the kernel (and, while it runs, in that session's owner-only
@@ -154,14 +157,15 @@ For marimo verification, see PLAN.md §1. For LangChain lessons and maintained r
 
 ```python
 CONFIG_FILENAMES = ("hailer.toml", ".config/hailer/hailer.toml")
-DEFAULT_CONFIG_TEMPLATE: str            # commented hailer.toml written by `hailer init`
+DEFAULT_CONFIG_TEMPLATE: str            # commented hailer.toml written by `hailer init`, with [kernel] runtime = "docker"
 def find_workspace(start: Path | None = None) -> Path      # cwd or first parent containing a config file / pyproject.toml; else cwd
 def find_config_path(workspace: Path, explicit: Path | None = None, env: Mapping[str, str] = os.environ) -> Path | None
 def load_config(workspace: Path | None = None, config_path: Path | None = None, env: Mapping[str, str] = os.environ) -> HailerConfig
 def validate(config: HailerConfig) -> list[str]            # human-readable problems, empty if fine
 def docker_mount_problems(config: HailerConfig, *, windows: bool | None = None) -> list[str]   # every docker-mode data-folder rule (below)
 def is_unc_path(path) -> bool                              # \\server\share\... or \\?\UNC\...
-def config_template(kernel: str | None = None) -> str      # DEFAULT_CONFIG_TEMPLATE; kernel="local"|"docker" switches its [kernel] section on with that runtime
+def config_template(kernel: str | None = None) -> str      # DEFAULT_CONFIG_TEMPLATE; kernel="docker"|"unsafe-local" names that runtime in its [kernel] section
+def runtime_problem(runtime: str, where: str = "[kernel].runtime") -> str   # why a value is not a runtime; the retired "local" has its own message
 def write_default_config(path: Path, *, overwrite: bool = False, kernel: str | None = None) -> None
 ```
 Rules: missing file → defaults (not an error); unparsable → `ConfigError` naming the file and line; unknown
@@ -186,20 +190,24 @@ active provider declared (or `openai`), custom provider has `base_url` and `env_
 table without `base_url` is the built-in endpoint and needs neither), `wire_api in ("responses", "chat")`,
 domains are well-formed.
 
-`[kernel]` maps to `KernelConfig` (models.py): `runtime` (`"local"` default | `"docker"`; `HAILER_KERNEL`
-overrides it, then `--kernel` in the CLI; stored lower-cased), `image` (`HAILER_KERNEL_IMAGE` overrides; `""`
-= the default, `KernelConfig.effective_image` = `kernel_image.default_image()`,
+`[kernel]` maps to `KernelConfig` (models.py): `runtime` (`"docker"` default | `"unsafe-local"`;
+`HAILER_KERNEL` overrides it, then `--kernel` in the CLI; stored lower-cased), `image` (`HAILER_KERNEL_IMAGE`
+overrides; `""` = the default, `KernelConfig.effective_image` = `kernel_image.default_image()`,
 `ghcr.io/openafterhours/hailer-kernel:marimo<marimo version>-<fingerprint>`),
-`memory` (`"4g"`, docker `--memory` format, kept as written), `cpus` (number, `2`), `network` (`false`),
-`pass_env` (list of names, local runtime only). A wrong type is a `ConfigError` that quotes the value as
-written (`must be a number, not "2" (str)`). `validate` adds: `runtime` known, `memory` matches
-`<number>[b|k|m|g]` above 0, `cpus > 0`, `pass_env` entries are names; and with `runtime = "docker"`:
-`pass_env` set → warning (docker gets no host variables), plus every
-`docker_mount_problems` entry (fatal); with `runtime = "local"`: a `pass_env` name that is a provider's
-`env_key` or `env_http_headers` variable or `OPENAI_API_KEY` → warning. "The notebooks folder is the
-workspace itself" is a warning in either runtime (no mount rule applies to the notebooks folder).
-Kernel runtime values are quoted with double quotes (`Unknown kernel runtime "podman".`, `--kernel must be
-"local" or "docker", not "podman".`). A key from `_KNOWN_KERNEL` found
+`memory` (`"4g"`, docker `--memory` format, kept as written), `cpus` (number, `2`), `network` (`false`).
+The removed `pass_env` is an unknown key (its value is never quoted). A wrong type is a `ConfigError` that
+quotes the value as written (`must be a number, not "2" (str)`). `validate` adds: `runtime` is one of
+`VALID_KERNEL_RUNTIMES` (fatal, `runtime_problem`), `memory` matches `<number>[b|k|m|g]` above 0,
+`cpus > 0`; and with `runtime = "docker"` every `docker_mount_problems` entry (fatal). "The notebooks folder
+is the workspace itself" is a warning in either runtime (no mount rule applies to the notebooks folder).
+`runtime = "local"` (the name before 2026-09-22) is fatal with its own
+message, the same for `HAILER_KERNEL`, `--kernel` (exit 2) and `runtime_for`: `Invalid [kernel].runtime
+"local" (or HAILER_KERNEL): the runtime that runs notebook code on this machine is now called
+"unsafe-local", because notebook code then runs as you, with your files and network. Write "unsafe-local"
+only if you accept that; otherwise use "docker", the isolated default.` (`Use "unsafe-local"` for
+`--kernel`). Other values: `Invalid
+[kernel].runtime "podman" (or HAILER_KERNEL); use "docker" (...) or "unsafe-local" (...).` (`Invalid
+--kernel "podman"; ...` for the flag). A key from `_KNOWN_KERNEL` found
 under `[hailer]` or `[model]` (an uncommented `runtime` whose `[kernel]` line is still commented out) is a
 warning naming the fix, not "unknown key". The CLI's `config` row turns warnings into a warning row, so
 they show at session start too.
@@ -220,7 +228,7 @@ Errors added for the notebook feature (`errors.py`): `NotebookExistsError` (crea
 `NotebookPathError` (a reference outside the notebooks folder, a name `notebooks.check_notebook_name` refuses,
 or a notebook that is not UTF-8 text). For the kernel runtimes: `KernelRuntimeError` (a
 runtime cannot start or reach marimo: the process exited, Docker is missing or down, an image problem). Types added to `models.py`: `KernelConfig` (above),
-`KERNEL_RUNTIME_LOCAL` / `KERNEL_RUNTIME_DOCKER` / `VALID_KERNEL_RUNTIMES`, `KERNEL_IMAGE_REPOSITORY`, the
+`KERNEL_RUNTIME_DOCKER` / `KERNEL_RUNTIME_UNSAFE_LOCAL` / `VALID_KERNEL_RUNTIMES`, `KERNEL_IMAGE_REPOSITORY`, the
 `MarimoServer` fields listed under `marimo_client.py`, and `HailerConfig.kernel`.
 
 ## `log.py`  (owner: wave 1 / A)
@@ -318,7 +326,7 @@ answer on that port and to start a new session.
 
 A Hailer process only ever talks to the server it started itself; the CLI keeps its sandbox in memory and
 hands it to the chat, the agent and its tools; nothing is looked up. `MarimoServer` (models.py) carries
-`url`, `pid` (local), `token` (`repr=False`), `runtime` (`"local"`/`"docker"`) and `network_access`.
+`url`, `pid` (unsafe-local), `token` (`repr=False`), `runtime` (`"docker"` default /`"unsafe-local"`) and `network_access`.
 `MarimoSession` carries `session_id`, `filename`, `path` (as marimo reports them) and `name` (the notebook's
 name in the notebooks folder, or `None`).
 
@@ -433,25 +441,27 @@ or attaches to a kernel another process started.
 
 ```python
 LAST_KERNEL_FILENAME = "last-kernel.json"
-LOCAL_LOG_PREFIX = "marimo-"              # .hailer/marimo-<pid>.log: the local runtime's log, one per process, deleted on stop
+LOCAL_LOG_PREFIX = "marimo-"              # .hailer/marimo-<pid>.log: the unsafe-local runtime's log, one per process, deleted on stop
 START_TIMEOUT_SEC = 60.0                  # the start's wait, counted after any image pull
 KERNEL_WORKDIR, KERNEL_NOTEBOOKS_DIR, KERNEL_DATA_DIR   # PurePosixPath: /work, /work/notebooks (docker: the kernel's own tmpfs), /work/data (read-only mount)
 KERNEL_SECRET_SUFFIXES   # SECRET_ENV_SUFFIXES (_KEY _TOKEN _SECRET _PASSWORD) + _PASSWD _PWD _CREDENTIALS _CONNECTION_STRING APIKEY
 KERNEL_SECRET_NAMES = ("PGPASSWORD", "MYSQL_PWD", "PASSWORD", "SECRET", "TOKEN")
 LOCAL_PROMPT_NOTES; DOCKER_PROMPT_NOTES; DOCKER_NETWORK_PROMPT_NOTES   # what the model is told about the kernel
+UNSAFE_LOCAL_HINT                         # the unsafe-local doctor row's hint: how to isolate notebook code
 
 def new_token() -> str                                     # secrets.token_urlsafe(32)
 def local_log_path(workspace, pid=None) -> Path            # .hailer/marimo-<pid>.log (this process by default)
 def note_kernel_start(workspace, runtime, notebooks_root) -> None       # .hailer/last-kernel.json; never raises
 def docker_wrote_notebooks(workspace, notebooks_root) -> bool            # the last server on this folder was a docker kernel
 def withheld_variables(config: HailerConfig, environ: Mapping[str, str]) -> list[str]
-    # sorted names the local server does not get: every provider env_key and OPENAI_API_KEY, every env_http_headers
-    # variable, KERNEL_SECRET_NAMES, and names ending in KERNEL_SECRET_SUFFIXES (any case);
-    # never a name in config.kernel.pass_env. Exact names compare case-insensitively on Windows
+    # sorted names the unsafe-local server does not get: every provider env_key and OPENAI_API_KEY, every
+    # env_http_headers variable, KERNEL_SECRET_NAMES, and names ending in KERNEL_SECRET_SUFFIXES (any case);
+    # no setting lets one through. Exact names compare case-insensitively on Windows
 def kernel_environment(config, environ) -> dict[str, str]                # environ minus withheld_variables
 def describe_runtime(kernel: KernelConfig) -> str   # <contract> is kernel_image.contract_tag()
-    # "local (runs as you; not isolated)" | "docker (hailer-kernel <contract>; no network; data read-only)" |
-    # "docker (hailer-kernel <contract>; network on: the internet and this machine; data read-only)"
+    # "docker (hailer-kernel <contract>; no network; data read-only)" |
+    # "docker (hailer-kernel <contract>; network on: the internet and this machine; data read-only)" |
+    # "unsafe-local (runs as you; not isolated)" | '<value> (not a kernel runtime: use "docker" or "unsafe-local")'
 def runtime_prompt_notes(kernel: KernelConfig) -> str                     # LOCAL_ / DOCKER_ / DOCKER_NETWORK_PROMPT_NOTES; never touches Docker
 def spawn_marimo(cmd, cwd, log_path, *, env=None, stdin_text=None) -> Popen   # background; fresh owner-only log (O_TRUNC); token written to stdin, then closed; own process group on Windows
 def attach_marimo(cmd, cwd, *, env=None, stdin_text=None) -> Popen            # --foreground: output in this terminal
@@ -467,21 +477,23 @@ def log_tail(path, lines=15, *, token=None) -> list[str]                  # the 
     # this terminal (uvx hailer kernel stop, Task Manager or kill), or it failed; its own output is above."
 
 class KernelRuntime(Protocol):
-    name: str                              # "local" | "docker"
+    name: str                              # "docker" | "unsafe-local"
     def check(self) -> list[Check]         # rows for doctor and hailer notebook
     def prepare(self, say: Callable[[str], None] | None = None) -> None   # slow steps and warnings before any spinner (docker: pull a missing image); start() runs it when not done
     def start(self, port: int, *, foreground: bool = False) -> MarimoSandbox   # starts a new server on 127.0.0.1:port and waits until it answers with this start's token (its own process/containers checked first); KernelRuntimeError (log tail in the hint) and nothing left running on failure
     def describe(self) -> str                                             # the text after "Kernel:"
-class LocalRuntime:                        # LocalRuntime(config, *, procs=None, environ=None, token_factory=new_token, start_timeout=60.0)
-    # check: one non-fatal "kernel" row: describe() + how many variables are withheld + pass_env
-    # prepare: warns when docker_wrote_notebooks ("Warning: the notebooks in <folder> were last
-    #   run by the isolated docker kernel; in local mode their code runs on this machine as you. ...")
+class LocalRuntime:                        # runtime = "unsafe-local"; LocalRuntime(config, *, procs=None, environ=None, token_factory=new_token, start_timeout=60.0)
+    # (the class keeps its name: it is the runtime on this machine; "unsafe-" is the setting's warning)
+    # check: one warning "kernel" row (ok=False, fatal=False): describe() + how many variables are withheld,
+    #   hint UNSAFE_LOCAL_HINT. kernel_checks(starting=True) drops it: the startup panel shows the line instead
+    # prepare: warns when docker_wrote_notebooks ("Warning: the notebooks in <folder> were last run by the
+    #   isolated docker kernel; with the unsafe-local kernel their code runs on this machine as you. ...")
     # start: marimo_server_command + kernel_environment + the token on stdin; log .hailer/marimo-<pid>.log (None in
     #   foreground); wait_for_health(token=its token, should_stop=its process ended); note_kernel_start on success; "Marimo
     #   exited early (code N)." / "Marimo did not answer on <url> within 60 s." with "Last lines of its log:" and the masked
     #   tail otherwise (the log is deleted). No state file: a Hailer that is killed leaves its token-protected marimo
     #   running, to be ended with Task Manager or kill
-def runtime_for(config: HailerConfig, runner=None) -> KernelRuntime   # LocalRuntime | kernel_docker.DockerRuntime; ConfigError for an unknown runtime; never falls back
+def runtime_for(config: HailerConfig, runner=None) -> KernelRuntime   # kernel_docker.DockerRuntime | LocalRuntime; ConfigError (config.runtime_problem) for "local" or an unknown runtime; never falls back
 ```
 
 ## `kernel_docker.py`  (owner: docker kernel, 2026-09-19)
@@ -501,8 +513,13 @@ class DockerRunner(Protocol):              # args never include "docker"; both r
     def run(self, args, *, timeout=None, check=False) -> CompletedProcess[str]     # captured text; check: non-zero exit → KernelRuntimeError quoting docker
     def stream(self, args, *, keep_errors=False) -> CompletedProcess[str]          # output in this terminal (pull, build, logs -f); keep_errors keeps docker's last 20 error lines in .stderr
 class SubprocessDockerRunner:              # the docker CLI on PATH (shutil.which), stdin empty, UTF-8
-def docker_not_installed() -> KernelRuntimeError
-def docker_not_running(detail="") -> KernelRuntimeError   # hint names DOCKER_CONTEXT / `docker context use default` when docker said "context"
+DOCKER_INSTALL_ADVICE                      # where to get Docker Desktop / Docker Engine (docs.docker.com links); also init's next steps
+UNSAFE_LOCAL_OPTION                        # the last hint line of every "no usable Docker" error: runtime = "unsafe-local" in
+                                           # hailer.toml (or HAILER_KERNEL), "only if you accept that notebook code then runs as you, ..."
+def without_unsafe_local_option(hint) -> str   # hint minus that line: `hailer kernel pull|build|stop` manage Docker itself
+def docker_not_installed() -> KernelRuntimeError          # hint: DOCKER_INSTALL_ADVICE, then UNSAFE_LOCAL_OPTION
+def docker_not_running(detail="") -> KernelRuntimeError   # hint names DOCKER_CONTEXT / `docker context use default` when docker said "context"; ends with UNSAFE_LOCAL_OPTION
+# engine_version() on Windows containers: "Docker runs windows containers; ..." with the switch advice and UNSAFE_LOCAL_OPTION
 def docker_said(result) -> str             # "docker said: <last 3 lines>" or ""
 def workspace_id(workspace) -> str         # 10 hex chars of sha256(normcase(resolved path))
 def docker_names(workspace, suffix=None) -> DockerNames # hailer-kernel-<id>-<suffix>, hailer-fwd-..., hailer-net-...; suffix: 6 random hex chars (unique per start)
@@ -860,10 +877,10 @@ async def await_dependency_warmup() -> None  # await from this loop; cancellatio
 def disable_tracing_unless_opted_in(environ: Any = None) -> bool   # sets LANGSMITH_TRACING, LANGSMITH_TRACING_V2, LANGCHAIN_TRACING and LANGCHAIN_TRACING_V2 to "false" (in os.environ by default) unless HAILER_TRACING is 1/true/yes/on; True when tracing was left alone. Run when the agent creates its event loop, so a variable left over from another project cannot send prompts and tool results to LangSmith
 def system_prompt(config: HailerConfig, bundle: ContextBundle, server: MarimoServer | None = None) -> str  # prompts/system.md (importlib.resources; a built-in fallback persona when missing or empty) + project context + skills index + web allowlist statement + workspace section. Invariant: the text does NOT depend on config.notebook, which changes mid-conversation (the model learns it from marimo_status() and CLI notices). Sent with every model call, never stored in the conversation
     # Workspace section (_workspace_section), for config.kernel (the runtime the session's kernel was started with):
-    # local: workspace, "Notebooks folder: <notebooks_root>", data dir as host paths; docker: "/work (in the kernel; only the two
+    # unsafe-local: workspace, "Notebooks folder: <notebooks_root>", data dir as host paths; docker: "/work (in the kernel; only the two
     # folders below are yours)", "/work/notebooks (writable; only marimo notebooks are copied back to the user)", "/work/data (read-only)", never a
     # host path the code could not reach. Then "- Marimo URL: <server.url>" (never the token; left out without a server) and kernel.runtime_prompt_notes(config.kernel): the
-    # package-install rule lives in the local (and docker network=true) notes, not in system.md
+    # package-install rule lives in the unsafe-local (and docker network=true) notes, not in system.md
 def map_exception(exc: BaseException, config: HailerConfig, *, model: str | None = None, provider: str | None = None) -> Exception
 class HailerAgent:
     def __init__(self, config: HailerConfig, bundle: ContextBundle, *, model_factory: ModelFactory | None = None, tools: list[Any] | None = None, env: Mapping[str, str] | None = None, threads_path: Path | None = None, sandbox: MarimoSandbox | None = None) -> None
@@ -966,7 +983,8 @@ load config, run local and kernel checks, begin dependency-only warmup, then pre
 session's own kernel through the chosen runtime (`_start_kernel`; nothing is looked for or reused).
 Interactive mode shows the startup panel and editable composer before agent preparation and
 browser-session waiting run concurrently. Plain/piped mode retains the notebook wait before its prompt.
-`--kernel local|docker` overrides the runtime for `notebook`. The kernel is stopped in the `finally` of
+`--kernel docker|unsafe-local` overrides the runtime for `notebook` (`_kernel_choice`: any other value, `local`
+included, prints `config.runtime_problem` and exits 2). The kernel is stopped in the `finally` of
 `_run_session` (and `_run_foreground`) whatever ends the chat: `_start_kernel` is called inside that guarded
 block, and it stops a kernel the runtime returned if Ctrl+C arrives before it hands it over. A docker kernel's
 `stop` makes the last notebook copy back before its containers go, so every way out (`/exit`, EOF, Ctrl+C, an
@@ -993,7 +1011,10 @@ Other commands: `status` shows the configuration, credentials, context and a `Ke
 (`kernel_docker.workspace_kernels`, via `_workspace_kernels`: running Docker kernels; "none running for this
 workspace (each uvx hailer session starts its own)"); `doctor` is a table of `local_checks` + `kernel_checks` (config, notebook,
 credentials, the runtime: Docker, the image, the folders) and never starts, probes or calls a kernel or the
-model endpoint; `init [--force] [--kernel local|docker]` creates the workspace; `login` and `logout` manage
+model endpoint (an unsafe-local runtime is a WARN `kernel` row with `UNSAFE_LOCAL_HINT`; exit 0); `init [--force]
+[--kernel docker|unsafe-local]` creates the workspace (`hailer.toml` always names a runtime, `docker` without the flag;
+`_kernel_next_steps` adds, without `docker` on PATH, `DOCKER_INSTALL_ADVICE` and the unsafe-local opt-in, and for
+unsafe-local that it is not isolated); `login` and `logout` manage
 provider credentials; `kernel pull`, `kernel build [--tag]` and `kernel stop` manage the image and every kernel
 of the workspace. Global options include `--verbose/-v`, `--config`, `--workspace`, `--new`, `--plain` and
 `--version`. Human-facing links include the token; tool-result links omit it. The doctor's `notebook` row is
@@ -1005,7 +1026,8 @@ Agent start (`ChatLoop.start`):
 `start(forget_thread_id=<that thread>)` so the stored conversation is deleted; a different id coming back from
 a resume means the thread was gone, the CLI says so and resets the counters. Credentials: a `"missing"` key is
 a fatal preflight failure for every provider, the built-in `openai` included; `status` and `/status` show
-`<env_key> from env|keyring` or `<env_key> missing (run: uvx hailer login <id>)`; both also show the `Kernel:` line. Interactive chat is selected when stdin/stdout are terminals, unless `--plain` is set or
+`<env_key> from env|keyring` or `<env_key> missing (run: uvx hailer login <id>)`; both also show the `Kernel:` line,
+in yellow (`cli._kernel_style`) for unsafe-local, as the startup panel and `--foreground` do. Interactive chat is selected when stdin/stdout are terminals, unless `--plain` is set or
 `TERM` is `dumb`/`unknown`. `--plain` is a global option and also an option on `notebook`.
 
 `chat.py:ChatController` holds shared session, slash-command and notebook operations; `cli.ChatLoop`
@@ -1120,7 +1142,7 @@ package-install rule) are appended by `agent.system_prompt`. Loaded with
 - `test_session.py`, `test_cli.py` (Typer `CliRunner`; slash commands; preflight messages with fakes; a
   `FakeAgent` with the `HailerAgent` surface the CLI uses): E
 - Kernel runtimes (docker kernel, 2026-09-19), none of which start anything: `test_kernel.py` (the withheld
-  variables and `pass_env`, the local sandbox's folders and URLs, prompt notes, `LocalRuntime` with
+  variables, with no way through, the unsafe-local sandbox's folders and URLs, prompt notes, `LocalRuntime` with
   `LocalProcesses` faked, and a start that never adopts another server on its port), `test_kernel_docker.py`
   (`DockerRuntime` argument lists and labels, fail-closed checks, owner locks and leftovers, sessions side
   by side, `workspace_kernels`, `stop_workspace_kernels`, folder checks, the subprocess runner) against `fake_docker.py` (`FakeDocker`: a stateful scripted docker CLI with ids, unique names,

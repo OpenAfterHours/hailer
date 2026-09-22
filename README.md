@@ -13,12 +13,14 @@ You'll need:
 
 - [uv](https://docs.astral.sh/uv/getting-started/installation/), which provides the `uvx` command.
   Install it, then reopen your terminal.
+- **Docker**, installed and running: [Docker Desktop](https://docs.docker.com/desktop/) on Windows or
+  macOS, [Docker Engine](https://docs.docker.com/engine/install/) on Linux. Your notebook code runs in a
+  Docker container that sees only your data folder, read-only, with no network.
 - An [OpenAI API key](https://platform.openai.com/api-keys) for the default setup.
 - A web browser.
 
 These steps work in PowerShell on Windows and in a terminal on macOS or Linux. `uvx` downloads Hailer,
-its dependencies and a suitable Python version when needed. You do not need to clone this repository
-or install Docker.
+its dependencies and a suitable Python version when needed. You do not need to clone this repository.
 
 ### 1. Create a workspace and sign in
 
@@ -33,7 +35,8 @@ uvx hailer login openai
 
 `init` creates your settings (`hailer.toml`), a starter notebook and a `data/` folder. At the login prompt,
 paste your API key; input is hidden and the key is saved in your operating system's credential store.
-The starter settings use OpenAI with `gpt-5.5`.
+The starter settings use OpenAI with `gpt-5.5` and the Docker kernel (`[kernel] runtime = "docker"`).
+If Docker is not on your machine, `init` says so and how to get it.
 
 For a company or another model endpoint, follow [custom endpoint setup](https://openafterhours.github.io/hailer/configuration/models/#a-custom-or-internal-endpoint)
 after `init`, using that provider's login command, then continue below.
@@ -61,8 +64,9 @@ From the same terminal, run:
 uvx hailer
 ```
 
-Hailer opens the notebook in your browser and starts the chat in your terminal. **Keep the notebook tab
-open while you work**; it provides the live session that runs the analysis.
+The first start downloads Hailer's kernel image, which takes a minute or two. Then Hailer opens the notebook
+in your browser and starts the chat in your terminal. **Keep the notebook tab open while you work**; it
+provides the live session that runs the analysis.
 
 Ask a question in the terminal, for example:
 
@@ -81,19 +85,22 @@ in `my-analysis` and run `uvx hailer` again; it resumes your conversation and ac
 Use `/new` for a fresh conversation, or `/help` to see the chat commands.
 
 If startup fails, run `uvx hailer doctor` for checks and suggested fixes, or see
-[Troubleshooting](https://openafterhours.github.io/hailer/reference/troubleshooting/#troubleshooting). `doctor` starts no
-kernel: every `uvx hailer` session starts its own and stops it when the chat ends.
+[Troubleshooting](https://openafterhours.github.io/hailer/reference/troubleshooting/#troubleshooting). `Docker is not installed.`
+or `Docker is not running.` means exactly that: install or start Docker and run `uvx hailer` again. `doctor`
+starts no kernel: every `uvx hailer` session starts its own and stops it when the chat ends.
 
 **Data and code:** files are read locally, but your messages, code and notebook tool outputs (which can
-include data samples) go to the configured model endpoint. By default, notebook code runs with your
-account's file and network access. See [Security](https://openafterhours.github.io/hailer/security/data-handling/#security) and the optional
-[Docker runtime](https://openafterhours.github.io/hailer/security/docker/#isolated-kernel-docker) for details.
+include data samples) go to the configured model endpoint. Notebook code runs in the Docker container,
+which sees your data folder read-only and has no network. Where Docker is not an option,
+`runtime = "unsafe-local"` runs it on your machine as you, with your files and network, if you accept that.
+See [Security](https://openafterhours.github.io/hailer/security/data-handling/#security) and
+[kernel runtimes](https://openafterhours.github.io/hailer/security/runtimes/#kernel-runtimes) for details.
 
 ## Documentation
 
 - **Using Hailer:** [everyday workflow](https://openafterhours.github.io/hailer/using/workflow/), [notebooks and sessions](https://openafterhours.github.io/hailer/using/notebooks/), [data and Excel](https://openafterhours.github.io/hailer/using/data/).
 - **Configuration:** [models and endpoints](https://openafterhours.github.io/hailer/configuration/models/), [context, skills and prompts](https://openafterhours.github.io/hailer/configuration/context/).
-- **Security:** [data handling](https://openafterhours.github.io/hailer/security/data-handling/), [local and Docker runtimes](https://openafterhours.github.io/hailer/security/runtimes/).
+- **Security:** [data handling](https://openafterhours.github.io/hailer/security/data-handling/), [kernel runtimes](https://openafterhours.github.io/hailer/security/runtimes/).
 - **Help:** [installation and upgrades](https://openafterhours.github.io/hailer/getting-started/installation/), [troubleshooting](https://openafterhours.github.io/hailer/reference/troubleshooting/), [known limitations](https://openafterhours.github.io/hailer/reference/limitations/).
 
 ## Development

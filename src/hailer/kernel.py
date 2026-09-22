@@ -5,17 +5,19 @@ Every ``uvx hailer`` (and ``uvx hailer notebook``) process starts its own marimo
 the chat runs, and stops it on exit. Nothing ever finds or attaches to a server another process
 started.
 
-- :class:`LocalRuntime` (here) runs marimo in Hailer's own Python, as the user (the default).
-  The server gets a random token and an environment without the secrets Hailer can recognise.
-- :class:`~hailer.kernel_docker.DockerRuntime` runs it in a Linux container with a notebooks
-  folder of its own (the workspace's notebooks are copied in and back) that sees only the data
-  folder, read-only, with no network. It fails closed: it never falls back to the local runtime.
+- :class:`~hailer.kernel_docker.DockerRuntime` (the default) runs it in a Linux container with a
+  notebooks folder of its own (the workspace's notebooks are copied in and back) that sees only
+  the data folder, read-only, with no network. It fails closed: it never falls back to the
+  unsafe-local runtime.
+- :class:`LocalRuntime` (here; ``runtime = "unsafe-local"``) runs marimo in Hailer's own Python,
+  as the user, with their files and network. The server gets a random token and an environment
+  without the secrets Hailer can recognise; nothing else is isolated.
 
 Pieces every runtime shares:
 
 - :class:`~hailer.sandbox.MarimoSandbox`: the started kernel and its files; each runtime's kernel
   subclasses it and fills in where the kernel sees the notebooks and data folders.
-- :func:`kernel_environment`: the environment a local marimo server gets.
+- :func:`kernel_environment`: the environment an unsafe-local marimo server gets.
 - :func:`runtime_prompt_notes`: what the model is told about the kernel it works in.
 
 Import order: this module imports :mod:`hailer.marimo_client` and :mod:`hailer.sandbox`.
@@ -39,7 +41,7 @@ from hailer.log import SECRET_ENV_SUFFIXES
 from hailer.marimo_client import marimo_server_command, notebook_file_key, wait_for_health
 from hailer.models import (
     KERNEL_RUNTIME_DOCKER,
-    KERNEL_RUNTIME_LOCAL,
+    KERNEL_RUNTIME_UNSAFE_LOCAL,
     Check,
     HailerConfig,
     KernelConfig,
@@ -50,7 +52,7 @@ from hailer.statedir import ensure_state_dir, state_dir
 
 #: Which runtime last started a server on which notebooks folder (``.hailer/last-kernel.json``).
 LAST_KERNEL_FILENAME = "last-kernel.json"
-#: ``.hailer/marimo-<pid>.log``: the local runtime's log, one per Hailer process, deleted on stop.
+#: ``.hailer/marimo-<pid>.log``: the unsafe-local runtime's log, one per Hailer process, deleted on stop.
 LOCAL_LOG_PREFIX = "marimo-"
 #: How long a start waits for ``/health`` (counted after any image pull in docker mode).
 START_TIMEOUT_SEC = 60.0
@@ -64,16 +66,22 @@ KERNEL_WORKDIR = PurePosixPath("/work")
 KERNEL_NOTEBOOKS_DIR = PurePosixPath("/work/notebooks")
 KERNEL_DATA_DIR = PurePosixPath("/work/data")
 
-#: Names that mark an environment variable as a secret the local kernel does not get: the log
+#: Names that mark an environment variable as a secret the unsafe-local kernel does not get: the log
 #: redaction suffixes plus these (any case), and the exact names below.
 KERNEL_SECRET_SUFFIXES: tuple[str, ...] = (
     *SECRET_ENV_SUFFIXES, "_PASSWD", "_PWD", "_CREDENTIALS", "_CONNECTION_STRING", "APIKEY",
 )  # fmt: skip
 KERNEL_SECRET_NAMES: tuple[str, ...] = ("PGPASSWORD", "MYSQL_PWD", "PASSWORD", "SECRET", "TOKEN")
 
-#: The package-install rule for a kernel that can reach the internet (the local runtime).
+#: How to leave the unsafe-local runtime (its ``doctor`` row's hint).
+UNSAFE_LOCAL_HINT = (
+    "Notebook code runs as you, with your files and network. To isolate it, install and start Docker, then set "
+    '[kernel] runtime = "docker" in hailer.toml (the default; unset HAILER_KERNEL if it says unsafe-local).'
+)
+#: The unsafe-local runtime, which can reach the internet and the user's files.
 LOCAL_PROMPT_NOTES = (
-    "- The kernel runs on the user's machine as the user (not isolated).\n"
+    "- The kernel runs on the user's machine as the user, with their files and network (the unsafe-local "
+    "runtime: not isolated). Read and write only what the task needs.\n"
     "- Do not install packages unless the task truly needs it; if so use `ctx.packages.add()` and say so."
 )
 #: The docker runtime, as the model needs to know it (the Workspace block gives the two folders).
@@ -135,7 +143,7 @@ def _now() -> str:
 
 
 def local_log_path(workspace: Path, pid: int | None = None) -> Path:
-    """``<workspace>/.hailer/marimo-<pid>.log``: this process's local marimo log."""
+    """``<workspace>/.hailer/marimo-<pid>.log``: this process's unsafe-local marimo log."""
     return state_dir(workspace) / f"{LOCAL_LOG_PREFIX}{os.getpid() if pid is None else pid}.log"
 
 
@@ -160,7 +168,7 @@ def _unlink(path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Which runtime last used the notebooks folder (a docker kernel's notebooks, later run locally)
+# Which runtime last used the notebooks folder (a docker kernel's notebooks, later run unsafe-local)
 # --------------------------------------------------------------------------- #
 
 
@@ -196,13 +204,12 @@ def docker_wrote_notebooks(workspace: Path, notebooks_root: Path) -> bool:
 
 
 def withheld_variables(config: HailerConfig, environ: Mapping[str, str]) -> list[str]:
-    """The names in ``environ`` a local marimo server does not get, sorted.
+    """The names in ``environ`` an unsafe-local marimo server does not get, sorted.
 
     Withheld: every declared provider's ``env_key`` and ``OPENAI_API_KEY``, every variable named in
     a provider's ``env_http_headers``, the names in :data:`KERNEL_SECRET_NAMES`, and every name ending in one of :data:`KERNEL_SECRET_SUFFIXES`
     (``_KEY``, ``_TOKEN``, ``_SECRET``, ``_PASSWORD``, ``_PASSWD``, ``_PWD``, ``_CREDENTIALS``,
-    ``_CONNECTION_STRING``, ``APIKEY``; any case). ``[kernel].pass_env`` names are never withheld.
-    Exact names compare case-insensitively on Windows, like the environment itself.
+    ``_CONNECTION_STRING``, ``APIKEY``; any case), with no way to let one through. Exact names compare case-insensitively on Windows, like the environment itself.
     """
 
     def fold(name: str) -> str:
@@ -214,32 +221,27 @@ def withheld_variables(config: HailerConfig, environ: Mapping[str, str]) -> list
             named.add(provider.env_key)
         named.update(provider.env_http_headers.values())
     dropped = {fold(name) for name in named}
-    passed = {fold(name) for name in config.kernel.pass_env}
-    return sorted(
-        name
-        for name in environ
-        if fold(name) not in passed and (fold(name) in dropped or name.upper().endswith(KERNEL_SECRET_SUFFIXES))
-    )
+    return sorted(name for name in environ if fold(name) in dropped or name.upper().endswith(KERNEL_SECRET_SUFFIXES))
 
 
 def kernel_environment(config: HailerConfig, environ: Mapping[str, str]) -> dict[str, str]:
     """``environ`` without the secrets :func:`withheld_variables` names, for a marimo server Hailer
     starts on this machine. Notebook code can still read the OS credential store and files, which
-    is why the local runtime is "not isolated"."""
+    is why the unsafe-local runtime is "not isolated"."""
     withheld = set(withheld_variables(config, environ))
     return {name: value for name, value in environ.items() if name not in withheld}
 
 
 def describe_runtime(kernel: KernelConfig) -> str:
     """The text after ``Kernel:`` in the startup panel, ``hailer status`` and ``/status``."""
-    if kernel.runtime == KERNEL_RUNTIME_LOCAL:
-        return "local (runs as you; not isolated)"
+    if kernel.runtime == KERNEL_RUNTIME_UNSAFE_LOCAL:
+        return "unsafe-local (runs as you; not isolated)"
     if kernel.runtime == KERNEL_RUNTIME_DOCKER:
         from hailer.kernel_image import contract_tag  # lazy: only the docker runtime needs it
 
         network = "network on: the internet and this machine" if kernel.network else "no network"
         return f"docker (hailer-kernel {contract_tag()}; {network}; data read-only)"
-    return f"{kernel.runtime} (unknown runtime)"
+    return f'{kernel.runtime} (not a kernel runtime: use "docker" or "unsafe-local")'
 
 
 def runtime_prompt_notes(kernel: KernelConfig) -> str:
@@ -255,7 +257,7 @@ def runtime_prompt_notes(kernel: KernelConfig) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Processes (the local runtime)
+# Processes (the unsafe-local runtime)
 # --------------------------------------------------------------------------- #
 
 
@@ -439,7 +441,7 @@ class LocalKernel(MarimoSandbox):
 class KernelRuntime(Protocol):
     """Starts and describes the marimo server of one Hailer process."""
 
-    name: str  # "local" | "docker"
+    name: str  # "docker" | "unsafe-local"
 
     def check(self) -> list[Check]:
         """Rows for ``hailer doctor`` and ``hailer notebook``: can this runtime run a kernel here?"""
@@ -468,11 +470,13 @@ class KernelRuntime(Protocol):
 
 
 class LocalRuntime:
-    """marimo in Hailer's own Python, as the user: not isolated, but the server Hailer starts has
-    a random token (passed on stdin, never on the command line) and an environment without the
-    secrets :func:`withheld_variables` recognises."""
+    """``runtime = "unsafe-local"``: marimo in Hailer's own Python, as the user, with their files and
+    network. Not isolated: the server Hailer starts only has a random token (passed on stdin, never
+    on the command line) and an environment without the secrets :func:`withheld_variables`
+    recognises. The class keeps its name (it is the runtime on this machine); the ``unsafe-``
+    prefix belongs to the setting a user writes."""
 
-    name = KERNEL_RUNTIME_LOCAL
+    name = KERNEL_RUNTIME_UNSAFE_LOCAL
 
     def __init__(
         self,
@@ -499,16 +503,12 @@ class LocalRuntime:
         return self._environ if self._environ is not None else os.environ
 
     def check(self) -> list[Check]:
+        """One warning row: notebook code runs as the user, with their files and network."""
         summary = self.describe()
         withheld = withheld_variables(self.config, self.environ)
         if withheld:
             summary += f"; {len(withheld)} secret-looking environment variable(s) withheld from notebook code"
-        passed = self.config.kernel.pass_env
-        if passed:
-            summary += f"; passed through by [kernel].pass_env: {', '.join(passed)}"
-        elif withheld:
-            summary += " ([kernel].pass_env lets named ones through)"
-        return [Check("kernel", True, summary, fatal=False)]
+        return [Check("kernel", False, summary, hint=UNSAFE_LOCAL_HINT, fatal=False)]
 
     def prepare(self, say: Callable[[str], None] | None = None) -> None:
         """Nothing to download: marimo runs in Hailer's own Python. Warns when a docker kernel was
@@ -517,12 +517,12 @@ class LocalRuntime:
             out = say or _print
             out(
                 f"Warning: the notebooks in {self.config.notebooks_root} were last run by the isolated docker kernel; "
-                "in local mode their code runs on this machine as you. Open only notebooks you trust."
+                "with the unsafe-local kernel their code runs on this machine as you. Open only notebooks you trust."
             )
             out('    To keep them isolated: uvx hailer notebook --kernel docker (or [kernel] runtime = "docker").')
 
     def describe(self) -> str:
-        return describe_runtime(KernelConfig(runtime=KERNEL_RUNTIME_LOCAL))
+        return describe_runtime(KernelConfig(runtime=KERNEL_RUNTIME_UNSAFE_LOCAL))
 
     def start(self, port: int, *, foreground: bool = False) -> MarimoSandbox:
         """Start marimo and wait until it answers with this start's token. A Hailer that is killed
@@ -583,20 +583,19 @@ def _print(text: str) -> None:
 
 
 def runtime_for(config: HailerConfig, runner: Any = None) -> KernelRuntime:
-    """The runtime ``config.kernel.runtime`` asks for; ``ConfigError`` for an unknown one. Nothing
-    is checked yet (``check``, ``prepare`` and ``start`` do that), and docker never falls back to
-    local."""
+    """The runtime ``config.kernel.runtime`` asks for; ``ConfigError`` for an unknown one (the
+    retired ``local`` included). Nothing is checked yet (``check``, ``prepare`` and ``start`` do
+    that), and docker never falls back to unsafe-local."""
     runtime = config.kernel.runtime
-    if runtime == KERNEL_RUNTIME_LOCAL:
+    if runtime == KERNEL_RUNTIME_UNSAFE_LOCAL:
         return LocalRuntime(config)
     if runtime == KERNEL_RUNTIME_DOCKER:
         from hailer.kernel_docker import DockerRuntime  # lazy: most runs never touch Docker
 
         return DockerRuntime(config, runner=runner)
-    raise ConfigError(
-        f'Unknown kernel runtime "{runtime}".',
-        hint='Set [kernel] runtime to "local" or "docker" in hailer.toml (or HAILER_KERNEL).',
-    )
+    from hailer.config import runtime_problem  # lazy: hailer.config is only needed for this message
+
+    raise ConfigError(runtime_problem(runtime))
 
 
 __all__ = [

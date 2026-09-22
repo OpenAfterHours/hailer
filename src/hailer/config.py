@@ -74,7 +74,7 @@ _KNOWN_PROVIDER = {
     "query_params",
 }
 _KNOWN_WEB = {"allowed_domains", "max_page_bytes"}
-_KNOWN_KERNEL = {"runtime", "image", "memory", "cpus", "network", "pass_env"}
+_KNOWN_KERNEL = {"runtime", "image", "memory", "cpus", "network"}
 
 # docker --memory: a number with an optional b/k/m/g unit ("4g", "512m", "1.5g").
 _MEMORY_RE = re.compile(r"^(\d+(?:\.\d+)?)[bkmg]?$", re.IGNORECASE)
@@ -135,19 +135,18 @@ provider = "openai"                  # "openai" = api.openai.com with OPENAI_API
 # allowed_domains = ["docs.pola.rs", "duckdb.org", "**.marimo.io"]
 # max_page_bytes = 200000
 
-# Where notebook code runs. "local" (the default): marimo runs in Hailer's own Python, as you,
-# with your files and network (not isolated). "docker": marimo runs in a container that sees only
-# the notebooks folder and, read-only, the data folder, with no network; it needs Docker Desktop
-# or Docker Engine. HAILER_KERNEL overrides runtime for one run. To switch it on, uncomment both
-# the section line, [kernel], and the settings under it.
-#
-# [kernel]
-# runtime = "local"                  # "local" or "docker"
-# image   = ""                       # docker: default ghcr.io/openafterhours/hailer-kernel:<hailer version>
+# Where notebook code runs. "docker" (the default): marimo runs in a Linux container with a
+# notebooks folder of its own (your notebooks are copied in and back) that sees only the data
+# folder, read-only, with no network; it needs Docker Desktop or Docker Engine, running.
+# "unsafe-local": marimo runs in Hailer's own Python, as you, with your files and network (not
+# isolated); write it only if you accept that. HAILER_KERNEL overrides runtime for one run.
+
+[kernel]
+runtime = "docker"                   # "docker" or "unsafe-local"
+# image   = ""                       # docker: default ghcr.io/openafterhours/hailer-kernel:<kernel contract>
 # memory  = "4g"                     # docker: container memory limit (no swap on top)
 # cpus    = 2                        # docker: container CPU limit
 # network = false                    # docker: true lets notebook code reach the internet and this machine
-# pass_env = []                      # local: variables with secret-looking names notebook code may read
 """
 
 
@@ -411,7 +410,6 @@ def load_config(
         memory=(_str(kernel_tbl, "memory", "kernel", path, kernel_defaults.memory) or "").strip(),  # as written: messages quote it
         cpus=_number(kernel_tbl, "cpus", "kernel", path, kernel_defaults.cpus),
         network=_bool(kernel_tbl, "network", "kernel", path, kernel_defaults.network),
-        pass_env=tuple(name.strip() for name in _str_list(kernel_tbl, "pass_env", "kernel", path, '["DB_PASSWORD"]')),
     )
 
     resolved_notebook = _resolve(ws, notebook or DEFAULT_NOTEBOOK)
@@ -467,14 +465,14 @@ def _unknown_key_warnings(path: Path) -> list[str]:
                 warnings.append(f"Warning: unknown key [{section}].{key} in {path} is ignored.")
 
     def misplaced_kernel_keys(table: Mapping[str, Any], section: str) -> dict[str, Any]:
-        """Warn about [kernel] settings that landed in ``section`` (an uncommented ``runtime`` line
-        whose ``[kernel]`` line is still commented out); the rest of ``table``."""
+        """Warn about [kernel] settings that landed in ``section`` (a ``runtime`` line without a
+        ``[kernel]`` line above it); the rest of ``table``."""
         for key in table:
             if key in _KNOWN_KERNEL and key not in _KNOWN_HAILER and key not in _KNOWN_MODEL:
                 warnings.append(
-                    f"Warning: [{section}].{key} in {path} is ignored: {key} belongs under [kernel]. Uncomment the "
-                    "[kernel] line above it too, or add one (uvx hailer notebook --kernel docker tries the docker "
-                    "kernel once without editing the file)."
+                    f"Warning: [{section}].{key} in {path} is ignored: {key} belongs under [kernel]. Add a "
+                    "[kernel] line above it (uvx hailer notebook --kernel <runtime> picks a runtime for one run "
+                    "without editing the file)."
                 )
         return {k: v for k, v in table.items() if not (k in _KNOWN_KERNEL and k not in _KNOWN_HAILER and k not in _KNOWN_MODEL)}
 
@@ -640,14 +638,28 @@ def docker_mount_problems(config: HailerConfig, *, windows: bool | None = None) 
     return []
 
 
+def runtime_problem(runtime: str, where: str = "[kernel].runtime") -> str:
+    """Why ``runtime``, read from ``where``, is not a kernel runtime. The retired ``local`` gets its
+    own message: the unisolated runtime is only ever chosen by writing ``unsafe-local``."""
+    value = f'{where} "{runtime}"' + (" (or HAILER_KERNEL)" if where == "[kernel].runtime" else "")
+    if runtime == "local":  # the runtime's name before 2026-09-22: refused, never mapped
+        verb = "Use" if where.startswith("--") else "Write"
+        return (
+            f"Invalid {value}: the runtime that runs notebook code on this machine is now called "
+            f'"unsafe-local", because notebook code then runs as you, with your files and network. {verb} '
+            '"unsafe-local" only if you accept that; otherwise use "docker", the isolated default.'
+        )
+    return (
+        f'Invalid {value}; use "docker" (notebook code runs in an isolated container, the default) '
+        'or "unsafe-local" (it runs as you, with your files and network: not isolated).'
+    )
+
+
 def _kernel_problems(config: HailerConfig) -> list[str]:
     kernel = config.kernel
     problems: list[str] = []
     if kernel.runtime not in VALID_KERNEL_RUNTIMES:
-        problems.append(
-            f'Invalid [kernel].runtime "{kernel.runtime}" (or HAILER_KERNEL); use "local" (notebook code runs '
-            'in Hailer\'s own Python, as you) or "docker" (it runs in an isolated container).'
-        )
+        problems.append(runtime_problem(kernel.runtime))
     memory = _MEMORY_RE.match(kernel.memory)
     if memory is None or float(memory.group(1)) <= 0:
         problems.append(
@@ -656,41 +668,9 @@ def _kernel_problems(config: HailerConfig) -> list[str]:
         )
     if not kernel.cpus > 0:
         problems.append(f"Invalid [kernel].cpus {kernel.cpus:g}; use a number above 0, e.g. cpus = 2.")
-    for name in kernel.pass_env:
-        if not name or "=" in name:
-            problems.append(f'Invalid [kernel].pass_env entry "{name}"; list environment variable names, e.g. pass_env = ["DB_PASSWORD"].')
-    if kernel.runtime != KERNEL_RUNTIME_DOCKER:
-        problems.extend(_pass_env_warnings(config))
-        return problems
-    if kernel.pass_env:
-        problems.append(
-            "Warning: [kernel].pass_env applies to the local runtime only; a docker kernel gets none of your "
-            "environment variables."
-        )
-    problems.extend(docker_mount_problems(config))
+    if kernel.runtime == KERNEL_RUNTIME_DOCKER:
+        problems.extend(docker_mount_problems(config))
     return problems
-
-
-def _pass_env_warnings(config: HailerConfig) -> list[str]:
-    """``[kernel].pass_env`` names that hand notebook code Hailer's own secrets: a provider's API key
-    or header variable."""
-    own: dict[str, str] = {"OPENAI_API_KEY": "the API key of the openai provider"}
-    for provider in config.providers.values():
-        if provider.env_key:
-            own[provider.env_key] = f'the API key of provider "{provider.id}"'
-        for header, variable in provider.env_http_headers.items():
-            own[variable] = f'the {header} header of provider "{provider.id}"'
-
-    def fold(name: str) -> str:
-        return name.upper() if os.name == "nt" else name
-
-    folded = {fold(name): what for name, what in own.items()}
-    return [
-        f'Warning: [kernel].pass_env lets notebook code read {name} ({folded[fold(name)]}); code the model writes could '
-        "then use or leak it. Remove it from pass_env unless notebooks truly need it."
-        for name in config.kernel.pass_env
-        if fold(name) in folded
-    ]
 
 
 def validate(config: HailerConfig) -> list[str]:
@@ -806,17 +786,17 @@ def validate(config: HailerConfig) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 
-_KERNEL_SECTION_OFF = '# [kernel]\n# runtime = "local"'
+_KERNEL_RUNTIME_LINE = f'[kernel]\nruntime = "{KERNEL_RUNTIME_DOCKER}"'
 
 
 def config_template(kernel: str | None = None) -> str:
-    """:data:`DEFAULT_CONFIG_TEMPLATE`; with ``kernel`` ("local" or "docker") its ``[kernel]`` section
-    is switched on with that runtime (the other keys stay commented out)."""
+    """:data:`DEFAULT_CONFIG_TEMPLATE` (``runtime = "docker"``); with ``kernel`` ("docker" or
+    "unsafe-local") its ``[kernel]`` section names that runtime instead."""
     if kernel is None:
         return DEFAULT_CONFIG_TEMPLATE
     if kernel not in VALID_KERNEL_RUNTIMES:
-        raise ConfigError(f'Unknown kernel runtime "{kernel}".', hint='Use "local" or "docker".')
-    return DEFAULT_CONFIG_TEMPLATE.replace(_KERNEL_SECTION_OFF, f'[kernel]\nruntime = "{kernel}"', 1)
+        raise ConfigError(runtime_problem(kernel, "kernel runtime"))
+    return DEFAULT_CONFIG_TEMPLATE.replace(_KERNEL_RUNTIME_LINE, f'[kernel]\nruntime = "{kernel}"', 1)
 
 
 def write_default_config(path: Path, *, overwrite: bool = False, kernel: str | None = None) -> None:

@@ -72,22 +72,17 @@ def test_kernel_environment_drops_every_secret(tmp_path):
     assert len(k.withheld_variables(config, environ)) == len(environ) - len(env)
 
 
-def test_pass_env_lets_named_variables_through(tmp_path):
-    config = make_config(tmp_path, kernel=KernelConfig(pass_env=("DB_PASSWORD", "OPENAI_API_KEY")))
-    env = k.kernel_environment(config, {"DB_PASSWORD": "p", "OPENAI_API_KEY": "sk", "GITHUB_TOKEN": "g", "PATH": "x"})
-    assert env == {"DB_PASSWORD": "p", "OPENAI_API_KEY": "sk", "PATH": "x"}, "unchanged, even a provider key the user names"
-
-
 @pytest.mark.skipif(os.name != "nt", reason="environment names are case-insensitive on Windows only")
 def test_kernel_environment_names_ignore_case_on_windows(tmp_path):
     internal = ProviderConfig(id="internal", base_url="https://x/v1", env_key="Corp_Llm_Credential")
-    config = make_config(tmp_path, providers={"internal": internal}, kernel=KernelConfig(pass_env=("db_password",)))
-    assert k.kernel_environment(config, {"CORP_LLM_CREDENTIAL": "c", "Path": "p", "DB_PASSWORD": "d"}) == {"Path": "p", "DB_PASSWORD": "d"}
+    config = make_config(tmp_path, providers={"internal": internal}, kernel=KernelConfig(runtime="unsafe-local"))
+    assert k.kernel_environment(config, {"CORP_LLM_CREDENTIAL": "c", "Path": "p", "db_password": "d"}) == {"Path": "p"}
 
 
 def test_describe_runtime():
-    assert k.describe_runtime(KernelConfig()) == "local (runs as you; not isolated)"
-    assert k.describe_runtime(KernelConfig(runtime="docker")) == f"docker (hailer-kernel {contract_tag()}; no network; data read-only)"
+    assert k.describe_runtime(KernelConfig(runtime="unsafe-local")) == "unsafe-local (runs as you; not isolated)"
+    assert k.describe_runtime(KernelConfig()) == f"docker (hailer-kernel {contract_tag()}; no network; data read-only)", "the default"
+    assert k.describe_runtime(KernelConfig(runtime="local")) == 'local (not a kernel runtime: use "docker" or "unsafe-local")'
     assert k.describe_runtime(KernelConfig(runtime="docker", network=True)) == (
         f"docker (hailer-kernel {contract_tag()}; network on: the internet and this machine; data read-only)"
     )
@@ -99,8 +94,10 @@ def test_effective_image():
 
 
 def test_prompt_notes_per_runtime():
-    assert k.runtime_prompt_notes(KernelConfig()) == k.LOCAL_PROMPT_NOTES
-    offline = k.runtime_prompt_notes(KernelConfig(runtime="docker"))
+    assert k.runtime_prompt_notes(KernelConfig(runtime="unsafe-local")) == k.LOCAL_PROMPT_NOTES
+    assert "not isolated" in k.LOCAL_PROMPT_NOTES and "with their files and network" in k.LOCAL_PROMPT_NOTES
+    offline = k.runtime_prompt_notes(KernelConfig())
+    assert offline == k.runtime_prompt_notes(KernelConfig(runtime="docker")), "docker is the default"
     assert "No internet access" in offline and "ctx.packages.add is unavailable" in offline
     assert "/tmp is scratch space in memory, shared by every notebook in the container and wiped when the kernel stops" in offline
     assert "ctx.packages.add()" not in offline, "never told to install packages"
@@ -112,13 +109,14 @@ def test_prompt_notes_per_runtime():
 def test_runtime_for_never_falls_back_to_local(tmp_path):
     from hailer.kernel_docker import DockerRuntime
 
-    assert isinstance(k.runtime_for(make_config(tmp_path)), k.LocalRuntime)
+    assert isinstance(k.runtime_for(make_config(tmp_path, kernel=KernelConfig(runtime="unsafe-local"))), k.LocalRuntime)
     fake = FakeDocker(installed=False)
-    docker = k.runtime_for(make_config(tmp_path, kernel=KernelConfig(runtime="docker")), runner=fake)
-    assert isinstance(docker, DockerRuntime) and docker.runner is fake
+    docker = k.runtime_for(make_config(tmp_path), runner=fake)
+    assert isinstance(docker, DockerRuntime) and docker.runner is fake, "docker is the default"
     with pytest.raises(KernelRuntimeError) as exc:
         docker.start(2731)
-    assert str(exc.value) == "Docker is not installed." and 'runtime = "local"' in exc.value.hint
+    assert str(exc.value) == "Docker is not installed." and 'runtime = "unsafe-local"' in exc.value.hint
+    assert not fake.commands("run"), "fails closed"
     with pytest.raises(ConfigError):
         k.runtime_for(make_config(tmp_path, kernel=KernelConfig(runtime="podman")))
 
@@ -135,9 +133,9 @@ def test_the_public_api_is_small():
 
 
 def runtime(tmp_path, procs: Procs, **kw) -> k.LocalRuntime:
-    """The local runtime with its process layer faked."""
+    """The unsafe-local runtime with its process layer faked."""
     return k.LocalRuntime(
-        kw.pop("config", None) or make_config(tmp_path),
+        kw.pop("config", None) or make_config(tmp_path, kernel=KernelConfig(runtime="unsafe-local")),
         procs=procs.local_processes(),
         environ=kw.pop("environ", {"PATH": "p", "OPENAI_API_KEY": "sk-secret"}),
         token_factory=lambda: TOKEN,
@@ -147,16 +145,12 @@ def runtime(tmp_path, procs: Procs, **kw) -> k.LocalRuntime:
 
 def test_local_runtime_describes_itself(tmp_path):
     rt = runtime(tmp_path, Procs())
-    assert rt.name == "local"
-    assert rt.describe() == "local (runs as you; not isolated)"
+    assert rt.name == "unsafe-local"
+    assert rt.describe() == "unsafe-local (runs as you; not isolated)"
     [row] = rt.check()
-    assert row.ok and not row.fatal
-    assert row.summary == (
-        "local (runs as you; not isolated); 1 secret-looking environment variable(s) withheld from notebook code "
-        "([kernel].pass_env lets named ones through)"
-    )
-    passing = runtime(tmp_path, Procs(), config=make_config(tmp_path, kernel=KernelConfig(pass_env=("DB_PASSWORD",))))
-    assert passing.check()[0].summary.endswith("; passed through by [kernel].pass_env: DB_PASSWORD")
+    assert not row.ok and not row.fatal, "a warning: notebook code is not isolated"
+    assert row.summary == "unsafe-local (runs as you; not isolated); 1 secret-looking environment variable(s) withheld from notebook code"
+    assert 'runtime = "docker"' in row.hint and "with your files and network" in row.hint
     rt.prepare(say=pytest.fail)  # nothing to download, nothing to warn about
     assert not hasattr(rt, "prompt_notes"), "one prompt path: runtime_prompt_notes"
 
@@ -171,7 +165,7 @@ def test_start_passes_the_token_on_stdin_and_scrubs_the_environment(tmp_path):
     assert stdin_text == TOKEN and TOKEN not in " ".join(cmd)
     assert env == {"PATH": "p"}, "no API key in the kernel's environment"
     assert procs.calls[1] == ("health", "http://127.0.0.1:2718", k.START_TIMEOUT_SEC, TOKEN), "waits for its own token"
-    assert running.server == MarimoServer(url="http://127.0.0.1:2718", pid=4242, token=TOKEN, runtime="local")
+    assert running.server == MarimoServer(url="http://127.0.0.1:2718", pid=4242, token=TOKEN, runtime="unsafe-local")
     assert running.log_hint == str(log_path)
     assert [p.name for p in (tmp_path / ".hailer").glob("*.json")] == ["last-kernel.json"], "no kernel record"
     # the sandbox: the kernel knows the host's own folders
@@ -179,7 +173,7 @@ def test_start_passes_the_token_on_stdin_and_scrubs_the_environment(tmp_path):
 
     assert running.native_paths and running.notebooks_path == notebook_file_key(tmp_path / "notebooks")
     assert running.data_path == str(tmp_path / "data") and running.data_dir == tmp_path / "data"
-    assert running.describe() == "local (runs as you; not isolated)"
+    assert running.describe() == "unsafe-local (runs as you; not isolated)"
     assert running.notebook_url("q3/r.py") == f"http://127.0.0.1:2718/?file={notebook_file_key(tmp_path / 'notebooks')}/q3/r.py&view-as=present"
     assert running.home_url(with_token=True) == f"http://127.0.0.1:2718/?access_token={TOKEN}" and TOKEN not in repr(running)
 

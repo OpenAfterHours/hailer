@@ -159,7 +159,7 @@ def test_check_rows_when_docker_is_ready(tmp_path):
 @pytest.mark.parametrize(
     ("fake", "message", "hint"),
     [
-        (FakeDocker(installed=False), "Docker is not installed.", 'runtime = "local"'),
+        (FakeDocker(installed=False), "Docker is not installed.", "https://docs.docker.com/desktop/"),
         (FakeDocker(engine=None), "Docker is not running.", "Start Docker Desktop"),
         (FakeDocker(engine="29.4.3 windows"), "Docker runs windows containers; Hailer's kernel image needs Linux containers.", "Switch to Linux containers"),
     ],
@@ -169,6 +169,10 @@ def test_docker_that_cannot_run_the_kernel_fails_closed(tmp_path, fake, message,
     rows = rt.check()
     docker = next(r for r in rows if r.name == "docker")
     assert not docker.ok and docker.fatal and docker.summary == message and hint in docker.hint
+    assert docker.hint.endswith(
+        'Or, only if you accept that notebook code then runs as you, with your files and network (not isolated): '
+        'set [kernel] runtime = "unsafe-local" in hailer.toml (or HAILER_KERNEL=unsafe-local).'
+    ), "both ways on, the opt-in last"
     assert "image" not in [r.name for r in rows]
     with pytest.raises(KernelRuntimeError) as exc:
         rt.start(2731)

@@ -17,8 +17,16 @@ tools from other software on your machine. Nothing asks for approval before a to
 matters is `marimo_execute`: it runs the Python the model writes in the notebook kernel. That is what
 makes the analysis possible. What the code can reach depends on the kernel runtime:
 
-- **`local` (the default): not sandboxed.** The kernel runs in Hailer's own Python, as you, with your file
-  and network access. Hailer closes two gaps around it:
+- **`docker` (the default): isolated.** The kernel runs in a container with its own copy of your notebooks
+  and the data folder (read-only), with no network, none of your environment variables, as a non-root user
+  with resource limits (see [Isolated kernel (Docker)](docker.md#isolated-kernel-docker)). It cannot write to
+  your machine: Hailer copies notebooks back, and only marimo notebooks with plain names (see
+  [Notebook copies](docker.md#notebook-copies)). Hailer refuses to mount a data folder that would expose its
+  own files or your credentials (`~/.ssh`, `~/.aws`, `%APPDATA%`, ...), on every start path (see
+  [Which data folder can be mounted](docker.md#which-data-folder-can-be-mounted)). Without a usable Docker a
+  start stops; it never falls back to running notebook code on your machine.
+- **`unsafe-local` (only if you write it): not sandboxed.** The kernel runs in Hailer's own Python, as you,
+  with your file and network access. Hailer closes two gaps around it:
   - *Other programs.* The marimo server Hailer starts requires a random token, handed to marimo on stdin
     (never on a command line) and kept in memory by the session that started it, so another program on the
     machine cannot send code to the kernel. Hailer never uses a marimo server it did not start.
@@ -26,19 +34,10 @@ makes the analysis possible. What the code can reach depends on the kernel runti
     `OPENAI_API_KEY`, the variables named in `env_http_headers`, the names
     `PASSWORD`, `SECRET`, `TOKEN`, `PGPASSWORD` and `MYSQL_PWD`, and every name ending in `_KEY`, `_TOKEN`,
     `_SECRET`, `_PASSWORD`, `_PASSWD`, `_PWD`, `_CREDENTIALS`, `_CONNECTION_STRING` or `APIKEY` (any case).
-    `uvx hailer doctor` shows how many were withheld. A notebook that needs one of them (a database
-    password, say) gets it through `[kernel] pass_env = ["DB_PASSWORD"]`; naming a provider's key or
-    header variable there is a `config` warning.
+    `uvx hailer doctor` shows how many were withheld. No setting lets one through.
 
   Notebook code can still read the OS credential store and every file you can, which is why the `Kernel:`
-  line says `not isolated`.
-- **`docker`: isolated.** The kernel runs in a container with its own copy of your notebooks and the data
-  folder (read-only), with no network, none of your environment variables, as a non-root user with
-  resource limits (see [Isolated kernel (Docker)](docker.md#isolated-kernel-docker)). It cannot write to your
-  machine: Hailer copies notebooks back, and only marimo notebooks with plain names (see
-  [Notebook copies](docker.md#notebook-copies)). Hailer refuses to mount a data folder that would expose its
-  own files or your credentials (`~/.ssh`, `~/.aws`, `%APPDATA%`, ...), on every start path (see
-  [Which data folder can be mounted](docker.md#which-data-folder-can-be-mounted)).
+  line says `not isolated`, in a warning colour.
 
 The instructions forbid destructive file operations and sending data anywhere, but instructions are not an
 enforcement boundary: use an endpoint and model you trust, keep the data folder to data the agent may read,
@@ -49,9 +48,9 @@ and press Ctrl+C if a turn goes somewhere you did not intend.
 - *Output goes to the model.* Anything notebook code prints or returns is a tool result and is sent to the
   model endpoint, in either runtime.
 - *Notebooks are code.* A notebook the container wrote is copied back to your notebooks folder, and it
-  runs on your machine, as you, if it is later opened with the local runtime (or with marimo directly, or
-  imported by a script: marimo runs a notebook's setup cell on import). Hailer warns on the first local
-  start after a docker kernel used the notebooks folder. Keep the notebooks folder inside your project's git
+  runs on your machine, as you, if it is later opened with the unsafe-local runtime (or with marimo directly,
+  or imported by a script: marimo runs a notebook's setup cell on import). Hailer warns on the first
+  unsafe-local start after a docker kernel used the notebooks folder. Keep the notebooks folder inside your project's git
   repository, so every change is a diff you can review. Only notebooks come back: git and editor settings,
   test-runner hooks (`conftest.py`, `test_*.py`), Python start-up hooks and other files notebook code writes
   stay in the container (see [Notebook copies](docker.md#notebook-copies)). A notebook named like a module
@@ -64,8 +63,8 @@ and press Ctrl+C if a turn goes somewhere you did not intend.
 - *The image is trusted by name.* Hailer checks its tag and kernel contract label, not a signature, and runs
   whatever `[kernel].image` names. The image pins marimo, Polars, fastexcel, DuckDB, altair, plotly and its base
   image, but not their dependencies.
-- *It is a choice, not a policy.* Anyone can switch back to `local`. An organisation that must enforce
-  isolation should run Hailer itself in a managed virtual machine or dev container.
+- *It is a default, not a policy.* Anyone can write `runtime = "unsafe-local"`. An organisation that must
+  enforce isolation should run Hailer itself in a managed virtual machine or dev container.
 
 **Links and tokens:** the notebook link Hailer opens in your browser, and every link the CLI prints
 (`/notebook`, `hailer status`, `doctor`), carries `access_token=<token>`, which signs the browser in. It
@@ -80,7 +79,7 @@ third party. Set `HAILER_TRACING=1` if you do want the tracing variables in your
 
 **On disk:** the conversation (your messages, the agent's replies, tool calls and their truncated results)
 is stored unencrypted in `.hailer/threads.sqlite` inside the workspace until `/new` or `hailer --new`
-replaces it. While a local kernel runs, `.hailer/marimo-<pid>.log` holds its output, including its
+replaces it. While an unsafe-local kernel runs, `.hailer/marimo-<pid>.log` holds its output, including its
 signed-in URL; it is deleted when the kernel stops, also after a failed start. The kernel's token is kept
 in memory only. A docker kernel's token file exists only while the kernel starts, and
 `.hailer/owner-<id>.lock` marks a running docker session (it holds no secret). `.hailer/last-kernel.json` notes which runtime last used the

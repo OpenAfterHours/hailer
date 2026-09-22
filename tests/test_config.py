@@ -494,9 +494,9 @@ def test_validate_unknown_keys_are_warnings(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_kernel_defaults_to_local(tmp_path: Path) -> None:
+def test_kernel_defaults_to_docker(tmp_path: Path) -> None:
     cfg = load_config(workspace=_make_workspace(tmp_path), env={})
-    assert cfg.kernel == KernelConfig(runtime="local", image=None, memory="4g", cpus=2.0, network=False)
+    assert cfg.kernel == KernelConfig(runtime="docker", image=None, memory="4g", cpus=2.0, network=False)
 
 
 def test_kernel_section_is_parsed(tmp_path: Path) -> None:
@@ -514,8 +514,8 @@ def test_kernel_section_is_parsed(tmp_path: Path) -> None:
 
 def test_kernel_env_overrides_the_file(tmp_path: Path) -> None:
     ws = _make_workspace(tmp_path, '[kernel]\nruntime = "docker"\nimage = "from-file"\n')
-    cfg = load_config(workspace=ws, env={"HAILER_KERNEL": "local", "HAILER_KERNEL_IMAGE": "from-env"})
-    assert (cfg.kernel.runtime, cfg.kernel.image) == ("local", "from-env")
+    cfg = load_config(workspace=ws, env={"HAILER_KERNEL": "Unsafe-Local", "HAILER_KERNEL_IMAGE": "from-env"})
+    assert (cfg.kernel.runtime, cfg.kernel.image) == ("unsafe-local", "from-env")
     assert load_config(workspace=ws, env={}).kernel.runtime == "docker"
 
 
@@ -543,7 +543,6 @@ def test_kernel_wrong_types_raise_config_error(tmp_path: Path, text: str, fragme
         ("", {"HAILER_KERNEL": "vm"}, '[kernel].runtime "vm"'),
         ('[kernel]\nmemory = "lots"\n', {}, '[kernel].memory "lots"'),
         ('[kernel]\nmemory = "4 GB"\n', {}, '[kernel].memory "4 GB"'),  # quoted as written, not lower-cased
-        ('[kernel]\npass_env = [""]\n', {}, "[kernel].pass_env"),
         ('[kernel]\nmemory = "4tb"\n', {}, "[kernel].memory"),
         ('[kernel]\nmemory = "0g"\n', {}, "[kernel].memory"),
         ("[kernel]\ncpus = 0\n", {}, "[kernel].cpus"),
@@ -553,6 +552,23 @@ def test_kernel_wrong_types_raise_config_error(tmp_path: Path, text: str, fragme
 def test_kernel_bad_values_are_fatal(tmp_path: Path, text: str, env: dict, fragment: str) -> None:
     errors = _errors(validate(load_config(workspace=_make_workspace(tmp_path, text), env=env)))
     assert len(errors) == 1 and fragment in errors[0], errors
+
+
+@pytest.mark.parametrize(("text", "env"), [('[kernel]\nruntime = "local"\n', {}), ("", {"HAILER_KERNEL": "LOCAL"})])
+def test_the_retired_local_runtime_is_fatal_and_says_how_to_opt_in(tmp_path: Path, text: str, env: dict) -> None:
+    """Nobody keeps the unisolated kernel without writing "unsafe-local" and reading what it means."""
+    config = load_config(workspace=_make_workspace(tmp_path, text), env=env)
+    errors = _errors(validate(config))
+    assert errors == [
+        'Invalid [kernel].runtime "local" (or HAILER_KERNEL): the runtime that runs notebook code on this machine is '
+        'now called "unsafe-local", because notebook code then runs as you, with your files and network. Write '
+        '"unsafe-local" only if you accept that; otherwise use "docker", the isolated default.'
+    ]
+    from hailer.kernel import runtime_for
+
+    with pytest.raises(ConfigError) as excinfo:
+        runtime_for(config)
+    assert str(excinfo.value) == errors[0], "never a runtime, not even the local one"
 
 
 @pytest.mark.parametrize(
@@ -588,25 +604,25 @@ def test_docker_allows_notebooks_inside_the_data_folder(tmp_path: Path) -> None:
 
 
 def test_kernel_unknown_keys_are_warnings(tmp_path: Path) -> None:
-    ws = _make_workspace(tmp_path, '[kernel]\nruntime = "local"\nmounts = ["x"]\n')
+    ws = _make_workspace(tmp_path, '[kernel]\nruntime = "unsafe-local"\nmounts = ["x"]\n')
     problems = validate(load_config(workspace=ws, env={}))
     assert _errors(problems) == []
     assert any(p.startswith("Warning:") and "[kernel].mounts" in p for p in problems)
     assert not any("unknown section [kernel]" in p for p in problems)
 
 
-def test_template_documents_the_kernel_section_commented_out() -> None:
-    assert "# [kernel]\n# runtime = \"local\"" in DEFAULT_CONFIG_TEMPLATE
-    assert "HAILER_KERNEL" in DEFAULT_CONFIG_TEMPLATE
-    for key in ("image", "memory", "cpus", "network"):
-        assert f"\n# {key} " in DEFAULT_CONFIG_TEMPLATE
-    uncommented = DEFAULT_CONFIG_TEMPLATE.replace("# [kernel]", "[kernel]").replace('# runtime = "local"', 'runtime = "docker"')
+def test_template_writes_the_docker_runtime_and_documents_the_rest() -> None:
     import tomllib
 
-    assert tomllib.loads(uncommented)["kernel"] == {"runtime": "docker"}, "`init --kernel docker` can switch it on in place"
+    assert '\n[kernel]\nruntime = "docker"' in DEFAULT_CONFIG_TEMPLATE
+    assert tomllib.loads(DEFAULT_CONFIG_TEMPLATE)["kernel"] == {"runtime": "docker"}
+    assert "HAILER_KERNEL" in DEFAULT_CONFIG_TEMPLATE and '"unsafe-local"' in DEFAULT_CONFIG_TEMPLATE
+    for key in ("image", "memory", "cpus", "network"):
+        assert f"\n# {key} " in DEFAULT_CONFIG_TEMPLATE
+    assert "pass_env" not in DEFAULT_CONFIG_TEMPLATE
 
 
-@pytest.mark.parametrize("runtime", ["docker", "local"])
+@pytest.mark.parametrize("runtime", ["docker", "unsafe-local"])
 def test_write_default_config_can_switch_the_kernel_section_on(tmp_path: Path, runtime: str) -> None:
     ws = _make_workspace(tmp_path)
     write_default_config(ws / "hailer.toml", kernel=runtime)
@@ -684,7 +700,7 @@ def test_validate_provider_key_typo_is_an_unknown_key_warning(tmp_path: Path) ->
 
 
 # --------------------------------------------------------------------------- #
-# [kernel]: mounts that would expose Hailer's own files, pass_env, misplaced keys, wording
+# [kernel]: mounts that would expose Hailer's own files, removed and misplaced keys, wording
 # --------------------------------------------------------------------------- #
 
 
@@ -699,15 +715,15 @@ def test_validate_provider_key_typo_is_an_unknown_key_warning(tmp_path: Path) ->
 )
 def test_docker_refuses_mounts_that_expose_hailers_own_files(tmp_path: Path, text: str, fragment: str) -> None:
     """Notebook code would read hailer.toml, .hailer/ (the conversations) or the context through the
-    read-only data mount. Fatal in docker mode only: the local runtime mounts nothing."""
+    read-only data mount. Fatal in docker mode only: the unsafe-local runtime mounts nothing."""
     ws = _make_workspace(tmp_path, text + '[kernel]\nruntime = "docker"\n')
     for name in ("analysis.py", ".config/hailer/context/a.py", ".hailer/nb/a.py"):
         _write(ws / name, "import marimo\n")
     errors = _errors(validate(load_config(workspace=ws, env={})))
     expected = fragment.format(ws=ws.resolve(), sep=os.sep)
     assert any(expected in e for e in errors), errors
-    local = _errors(validate(load_config(workspace=ws, env={"HAILER_KERNEL": "local"})))
-    assert not any("With [kernel] runtime" in e for e in local), "the local runtime mounts nothing"
+    local = _errors(validate(load_config(workspace=ws, env={"HAILER_KERNEL": "unsafe-local"})))
+    assert not any("With [kernel] runtime" in e for e in local), "the unsafe-local runtime mounts nothing"
 
 
 def test_docker_refuses_a_data_folder_moved_by_the_environment(tmp_path: Path) -> None:
@@ -731,30 +747,28 @@ def test_the_default_layout_is_fine_for_docker(tmp_path: Path) -> None:
     assert docker_mount_problems(config) == [] and _errors(validate(config)) == []
 
 
-def test_pass_env_is_a_list_of_names_for_the_local_runtime(tmp_path: Path) -> None:
-    ws = _make_workspace(tmp_path, '[kernel]\npass_env = ["DB_PASSWORD", " AWS_SECRET_ACCESS_KEY "]\n')
+def test_pass_env_is_gone_and_reported_as_an_unknown_key_without_its_value(tmp_path: Path) -> None:
+    """[kernel].pass_env let secret-looking variables through to the local kernel; it was removed.
+    An old file gets the plain unknown-key warning, which never prints what the setting named."""
+    ws = _make_workspace(tmp_path, '[kernel]\nruntime = "unsafe-local"\npass_env = ["CORP_DB_PASSWORD"]\n')
     config = load_config(workspace=ws, env={})
-    assert config.kernel.pass_env == ("DB_PASSWORD", "AWS_SECRET_ACCESS_KEY")
-    assert not any("pass_env" in p for p in validate(config))
-    (tmp_path / "docker").mkdir()
-    docker = _make_workspace(tmp_path / "docker", '[kernel]\nruntime = "docker"\npass_env = ["DB_PASSWORD"]\n')
-    problems = validate(load_config(workspace=docker, env={}))
-    assert any(p.startswith("Warning: [kernel].pass_env applies to the local runtime only") for p in problems)
-    (tmp_path / "bad").mkdir()
-    with pytest.raises(ConfigError) as excinfo:
-        load_config(workspace=_make_workspace(tmp_path / "bad", '[kernel]\npass_env = "DB_PASSWORD"\n'), env={})
-    assert 'must be a list of strings, not "DB_PASSWORD"' in str(excinfo.value) and 'pass_env = ["DB_PASSWORD"]' in excinfo.value.hint
+    problems = validate(config)
+    assert _errors(problems) == []
+    [warning] = [p for p in problems if "pass_env" in p]
+    assert warning.startswith("Warning: unknown key [kernel].pass_env in ") and warning.endswith("hailer.toml is ignored.")
+    assert not any("CORP_DB_PASSWORD" in p for p in problems)
+    assert not hasattr(config.kernel, "pass_env")
 
 
 @pytest.mark.parametrize("section", ["model", "hailer"])
 def test_a_kernel_setting_in_another_table_is_named(tmp_path: Path, section: str) -> None:
-    """Uncommenting only the runtime line of the template lands it under [model]: silently local."""
-    text = '[hailer]\nruntime = "docker"\n' if section == "hailer" else '[model]\nname = "gpt-5.5"\nruntime = "docker"\n'
+    """A runtime line under another table is ignored (the kernel stays docker) and named."""
+    text = '[hailer]\nruntime = "unsafe-local"\n' if section == "hailer" else '[model]\nname = "gpt-5.5"\nruntime = "unsafe-local"\n'
     ws = _make_workspace(tmp_path, text)
     config = load_config(workspace=ws, env={})
-    assert config.kernel.runtime == "local"
+    assert config.kernel.runtime == "docker"
     warnings = [p for p in validate(config) if p.startswith("Warning:")]
-    assert any(f"[{section}].runtime" in w and "belongs under [kernel]" in w and "Uncomment the [kernel] line" in w for w in warnings), warnings
+    assert any(f"[{section}].runtime" in w and "belongs under [kernel]" in w and "Add a [kernel] line above it" in w for w in warnings), warnings
     assert not any(f"unknown key [{section}].runtime" in w for w in warnings), "one warning, the specific one"
 
 
@@ -815,26 +829,13 @@ def test_docker_refuses_unc_folders_as_errors(tmp_path: Path) -> None:
 def test_a_notebooks_folder_that_is_the_workspace_is_one_warning_in_either_runtime(tmp_path: Path) -> None:
     ws = _make_workspace(tmp_path, '[hailer]\nnotebooks_dir = "."\nnotebook = "analysis.py"\n[kernel]\nruntime = "docker"\n')
     _write(ws / "analysis.py", "import marimo\n")
-    for env in ({}, {"HAILER_KERNEL": "local"}):
+    for env in ({}, {"HAILER_KERNEL": "unsafe-local"}):
         problems = validate(load_config(workspace=ws, env=env))
         assert sum("is the workspace" in p for p in problems) == 1, problems
         assert any(p.startswith("Warning: the notebooks folder is the workspace itself") for p in problems)
 
 
-def test_pass_env_naming_hailers_own_secrets_is_a_warning(tmp_path: Path) -> None:
-    text = (
-        '[model]\nprovider = "corp"\n[model_providers.corp]\nbase_url = "https://llm.example.internal/v1"\n'
-        'env_key = "CORP_API_KEY"\nenv_http_headers = { "X-Client-Id" = "CORP_CLIENT_ID" }\n'
-        '[kernel]\npass_env = ["CORP_API_KEY", "CORP_CLIENT_ID", "OPENAI_API_KEY", "DB_PASSWORD"]\n'
-    )
-    warnings = [p for p in validate(load_config(workspace=_make_workspace(tmp_path, text), env={})) if "pass_env" in p]
-    assert len(warnings) == 3 and all(w.startswith("Warning: [kernel].pass_env lets notebook code read ") for w in warnings)
-    assert 'CORP_API_KEY (the API key of provider "corp")' in warnings[0]
-    assert 'CORP_CLIENT_ID (the X-Client-Id header of provider "corp")' in warnings[1]
-    assert "OPENAI_API_KEY (the API key of the openai provider)" in warnings[2]
-
-
 def test_kernel_runtime_errors_quote_like_the_rest(tmp_path: Path) -> None:
     with pytest.raises(ConfigError) as excinfo:
         config_template("podman")
-    assert str(excinfo.value) == 'Unknown kernel runtime "podman".'
+    assert str(excinfo.value).startswith('Invalid kernel runtime "podman"; use "docker"')

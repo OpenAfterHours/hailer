@@ -141,7 +141,7 @@ class DownClient:
 def sandbox(config: HailerConfig, client=None, *, docker: bool = False, token: str | None = None, network: bool = False):
     """The chat's sandbox on ``config``'s folders; its clients are ``client`` (default: a DownClient)."""
     client = client if client is not None else DownClient()
-    server = MarimoServer(url="http://127.0.0.1:2718", token=token, runtime="docker" if docker else "local", network_access=network)
+    server = MarimoServer(url="http://127.0.0.1:2718", token=token, runtime="docker" if docker else "unsafe-local", network_access=network)
     return folder_sandbox(config, server, docker=docker, client_factory=lambda **kw: client)
 
 
@@ -753,7 +753,7 @@ def test_marimo_status_names_the_kernel_in_use_and_its_paths(ws):
     assert "kernel: docker (hailer-kernel " in text and "network on: the internet and this machine" in text
     assert "kernel paths: notebooks folder /work/notebooks, data folder /work/data; use these in code" in text
     local = HailerTools(ws, sandbox(ws, client)).marimo_status()
-    assert "kernel: local (runs as you; not isolated)" in local
+    assert "kernel: unsafe-local (runs as you; not isolated)" in local
     assert f"data folder {ws.data_dir}" in local and ws.notebooks_root.as_posix() in local
 
 

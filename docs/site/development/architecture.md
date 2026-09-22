@@ -21,9 +21,9 @@ Terminal ─────► │  conversation   │   (create_agent + ChatOpenAI
                 │ Marimo runtime  │   scratchpad over the kernel globals +
                 │ Polars · DuckDB │   marimo._code_mode for durable cells
                 │ Python          │
-                └────────┬────────┘   local (default): Hailer's own Python, as you
-                         │            docker: a Linux container with copies of the
-                    Browser UI        notebooks and, read-only, the data folder
+                └────────┬────────┘   docker (default): a Linux container with copies of
+                         │            the notebooks and, read-only, the data folder
+                    Browser UI        unsafe-local: Hailer's own Python, as you
 ```
 
 The CLI runs the agent in its own process, with the model and provider taken from `hailer.toml`. The agent
@@ -33,9 +33,9 @@ namespace that can read every notebook variable, and durable changes (new cells,
 marimo's code-mode API so they appear immediately in the browser. The notebook file on disk is written by
 marimo itself, never edited behind the kernel's back.
 
-Where marimo and its kernel run is the *kernel runtime*, set by `[kernel] runtime`: `local` (the default)
-starts marimo in Hailer's own Python, `docker` starts it in a container (see
-[Isolated kernel (Docker)](../security/docker.md#isolated-kernel-docker)). The agent, the conversation and the API key stay in
+Where marimo and its kernel run is the *kernel runtime*, set by `[kernel] runtime`: `docker` (the default)
+starts it in a container (see [Isolated kernel (Docker)](../security/docker.md#isolated-kernel-docker)), and
+`unsafe-local` starts marimo in Hailer's own Python, as the user. The agent, the conversation and the API key stay in
 the Hailer process either way. Every session starts its own marimo server, keeps it in memory for the
 agent's tools as a *sandbox* (its URL and token, and its files), and stops it when the chat ends; nothing attaches to a server
 another session started. A docker kernel keeps its notebooks in a folder of its own: the session copies

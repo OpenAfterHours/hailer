@@ -98,7 +98,7 @@ translated faithfully. Evidence: `tests/test_kernel_packages.py`, `tests/test_ke
 
 Keep credentials out of prompts, logs and errors. Use Hailer's credential resolution and redaction
 helpers; do not move keys into subprocess arguments or new plaintext config files. The same holds for
-the marimo token: the local kernel reads it from stdin, the Docker kernel from a read-only single-file
+the marimo token: the unsafe-local kernel reads it from stdin, the Docker kernel from a read-only single-file
 mount (`--token-password-file`), because `docker inspect` shows a container's arguments and environment.
 The file is deleted once marimo answers (it reads it as its CLI starts). On Docker Desktop for Windows
 (29.4.3, 2026-09-22) the file then also disappears inside the container; on Linux the mount keeps the
@@ -215,7 +215,7 @@ while its lock file exists and cannot be locked; the OS drops the lock however t
 pid (or a WSL/Windows pid namespace) can never make a dead owner look alive. A start removes only objects
 whose owner is not alive; `uvx hailer kernel stop` removes every labelled object and nothing in `.hailer`.
 An earlier design kept a per-session record for the local runtime and killed orphans by pid; it was dropped:
-the `finally` stops the local kernel on every normal exit, and a killed session's token-protected marimo is
+the `finally` stops the unsafe-local kernel on every normal exit, and a killed session's token-protected marimo is
 ended by the user (Task Manager or `kill`). Evidence: `test_owner_locks_say_whether_their_hailer_still_runs`,
 `test_a_start_never_removes_a_live_sessions_objects`, `test_start_removes_what_owners_that_are_gone_left_by_id`,
 `test_two_sessions_run_side_by_side_and_each_removes_only_its_own`,
@@ -308,8 +308,42 @@ Keep these properties; each has a test in `tests/test_notebook_sync.py` unless n
 Linux UID mapping (`--user <uid>:<gid>`) stays: nothing is written through a mount any more, but the kernel
 still reads the data folder as the user, and files only the owner may read (`0600` exports) would otherwise be
 unreadable. The notebooks-folder mount rules and the planted-file scan are gone; the data-folder rules
-(`config.docker_mount_problems`) remain. The unsafe local runtime keeps the simple "last run by the isolated
+(`config.docker_mount_problems`) remain. The unsafe-local runtime keeps the simple "last run by the isolated
 docker kernel" warning (`kernel.docker_wrote_notebooks`): a notebook is code wherever it came from. Evidence at
 the Docker level: `test_the_notebooks_folder_is_the_containers_own_and_only_notebooks_come_back` and
 `test_stop_copies_the_last_edit_back_and_leaves_no_containers_network_or_token` in
 `tests/test_docker_integration.py` (Windows 11, Docker Desktop 29.4.3, 2026-09-22, `HAILER_DOCKER_TESTS=strict`).
+
+## 14. Isolation is the default; running unisolated is a decision the user writes down
+
+Until 2026-09-22 the kernel ran in Hailer's own Python, as the user, unless `[kernel] runtime = "docker"`
+was set, and `[kernel].pass_env` could hand secret-looking variables to notebook code. Code the model writes
+therefore had the user's files and network by default. Now `docker` is the default (`KernelConfig`,
+`MarimoServer`, the `init` template, a file without `[kernel]`), and the unisolated runtime is called
+`unsafe-local`. Keep these properties:
+
+- **The old name is refused, not mapped.** `runtime = "local"`, `HAILER_KERNEL=local` and `--kernel local`
+  are a fatal config problem (`config.runtime_problem`; `--kernel` exits 2; `runtime_for` raises the same
+  text) telling the user to write `unsafe-local` only if they accept that notebook code runs as them, with
+  their files and network. Silently mapping `local` would keep people unisolated without a decision, and
+  silently mapping it to docker would break their start without saying why. Evidence:
+  `test_the_retired_local_runtime_is_fatal_and_says_how_to_opt_in` (test_config) and
+  `test_the_retired_local_runtime_is_refused_with_the_way_to_opt_in` (test_cli).
+- **No fallback, two ways on.** Without a usable Docker (no CLI, engine down, Windows containers) a start
+  fails closed; every such hint ends with `kernel_docker.UNSAFE_LOCAL_OPTION` after the install/start advice
+  (`test_docker_that_cannot_run_the_kernel_fails_closed`), except in `uvx hailer kernel ...`, which manages
+  Docker itself (`test_kernel_pull`). A bad runtime is one `config` row, and its fix names `HAILER_KERNEL`
+  when that set it (`test_a_retired_runtime_from_the_environment_is_one_config_row_with_an_environment_fix`). `init` still writes `docker` on a machine without
+  Docker and says how to install it or opt in
+  (`test_init_writes_docker_and_says_how_to_get_docker_only_when_it_is_missing`).
+- **Visible every time.** The `Kernel:` line is `unsafe-local (runs as you; not isolated)` in yellow in the
+  startup panel, `status`, `/status` and `--foreground`, and a WARN row in `doctor`; a start drops that row
+  so the panel says it once (`test_kernel_line_of_the_unsafe_local_runtime_is_a_warning`,
+  `test_doctor_has_a_kernel_row`).
+- **No pass-through.** `[kernel].pass_env` is gone; an old file gets the ordinary unknown-key warning, which
+  never quotes the value (`test_pass_env_is_gone_and_reported_as_an_unknown_key_without_its_value`). The
+  secret-looking names stay withheld from an unsafe-local kernel.
+- **The offline suite never needs Docker.** Because the default now reaches Docker, test configs that start
+  or describe a kernel name their runtime (`KernelConfig(runtime="unsafe-local")` in the CLI and agent
+  fixtures, `runtime="docker"` against `fake_docker.py`); only `tests/test_docker_integration.py` uses a real
+  engine.

@@ -18,6 +18,6 @@ max_page_bytes = 200000
 
 Text fetched from an allowed site becomes a tool result and is sent to the model endpoint like any other
 result. `/context`, `/status` and the startup panel show the active allowlist. The allowlist governs the
-agent's own web tool, not what notebook code can do: with the default local kernel, code the agent runs
-in the notebook is ordinary Python on your machine with your network access; with the docker kernel it
-has no network at all unless `[kernel] network = true` (see [Security](../security/data-handling.md#security)).
+agent's own web tool, not what notebook code can do: with the default docker kernel, code the agent runs
+in the notebook has no network at all unless `[kernel] network = true`; with `unsafe-local` it is ordinary
+Python on your machine with your network access (see [Security](../security/data-handling.md#security)).

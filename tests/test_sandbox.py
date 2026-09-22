@@ -62,7 +62,7 @@ def local_box(fake, tmp_path) -> sb.MarimoSandbox:
     )  # fmt: skip
 
 
-@pytest.fixture(params=["docker", "local"])
+@pytest.fixture(params=["docker", "unsafe-local"])
 def box(request, fake, tmp_path):
     return docker_box(fake, tmp_path) if request.param == "docker" else local_box(fake, tmp_path)
 

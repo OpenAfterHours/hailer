@@ -1,58 +1,61 @@
 # Docker setup and operations {#isolated-kernel-docker}
 
-By default the notebook kernel runs in Hailer's own Python, as you: the code the agent writes can read and
-change every file your account can, and reach the network (see [Security](data-handling.md#security)). If Docker is
-installed, you can run the kernel in a container instead. The agent, the conversation and the API key
-stay on your machine; only marimo and the notebook code move into the container.
+By default the notebook kernel runs in a Docker container: the code the agent writes sees its own copy of
+your notebooks and, read-only, the data folder, with no network. The agent, the conversation and the API
+key stay on your machine; only marimo and the notebook code run in the container. The alternative,
+`unsafe-local`, runs the kernel in Hailer's own Python, as you: the code can then read and change every file
+your account can, and reach the network (see [Kernel runtimes](runtimes.md#kernel-runtimes)).
 
-| | `local` (the default) | `docker` |
+| | `docker` (the default) | `unsafe-local` (opt-in) |
 |---|---|---|
-| Where marimo and notebook code run | Hailer's own Python, as you | A Linux container, as a non-root user |
-| Files notebook code can read | Everything your account can | Its own copy of your notebooks and the data folder, nothing else |
-| Files it can change | Everything your account can | Its copy of the notebooks only; data is read-only, and only marimo notebooks are [copied back](#notebook-copies) |
-| Network | Yours | None, unless `network = true` |
-| Your environment variables | All except secret-looking names (see [Security](data-handling.md#security)) | None |
-| Needs | Nothing | Docker Desktop (Windows, macOS) or Docker Engine (Linux), and the kernel image |
+| Where marimo and notebook code run | A Linux container, as a non-root user | Hailer's own Python, as you |
+| Files notebook code can read | Its own copy of your notebooks and the data folder, nothing else | Everything your account can |
+| Files it can change | Its copy of the notebooks only; data is read-only, and only marimo notebooks are [copied back](#notebook-copies) | Everything your account can |
+| Network | None, unless `network = true` | Yours |
+| Your environment variables | None | All except secret-looking names (see [Security](data-handling.md#security)) |
+| Needs | [Docker Desktop](https://docs.docker.com/desktop/) (Windows, macOS) or [Docker Engine](https://docs.docker.com/engine/install/) (Linux), running, and the kernel image | Nothing |
 
 ## Choosing the runtime
 
 ```toml
 [kernel]
-runtime  = "docker"   # "local" (default) or "docker"
-# image   = ""        # docker: default ghcr.io/openafterhours/hailer-kernel:marimo<version>-<fingerprint>
-# memory  = "4g"      # docker: memory limit, no swap on top
-# cpus    = 2         # docker: CPU limit (lowered to what Docker has, with a note)
-# network = false     # docker: true lets notebook code reach the internet, this machine and other containers
-# pass_env = []       # local: secret-looking variables notebook code may still read (see Security)
+runtime = "docker"                   # "docker" (the default) or "unsafe-local"
+# image   = ""                       # docker: default ghcr.io/openafterhours/hailer-kernel:<kernel contract>
+# memory  = "4g"                     # docker: memory limit, no swap on top
+# cpus    = 2                        # docker: CPU limit (lowered to what Docker has, with a note)
+# network = false                    # docker: true lets notebook code reach the internet, this machine and other containers
 ```
 
-- **At setup:** `uvx hailer init --kernel docker` writes a `hailer.toml` with this section switched on.
-  Plain `uvx hailer init` writes it commented out, and when Docker is found on the machine its next steps
-  say how to switch it on. `init` never rewrites an existing `hailer.toml` without `--force`, and says so
-  when `--kernel` could not be applied.
-- **In an existing file:** uncomment the `[kernel]` line as well as `runtime`. A `runtime` line that ends up
-  under `[model]` or `[hailer]` is ignored with a warning that says so.
-- **For one run:** `uvx hailer notebook --kernel docker` (or `--kernel local`), or `HAILER_KERNEL=docker` in
+- **At setup:** `uvx hailer init` writes this section with `runtime = "docker"`, whether or not Docker is on
+  the machine; without Docker its next steps say where to get it, or how to opt into `unsafe-local`.
+  `uvx hailer init --kernel unsafe-local` writes that runtime instead. `init` never rewrites an existing
+  `hailer.toml` without `--force`, and says so when `--kernel` could not be applied.
+- **In an existing file:** a `hailer.toml` without a `[kernel]` section uses Docker. A `runtime` line that
+  ends up under `[model]` or `[hailer]` is ignored with a warning that says so. `runtime = "local"`, the old
+  name of the unsafe runtime, is an error that says to write `"unsafe-local"` only if you accept what it means.
+- **For one run:** `uvx hailer notebook --kernel docker` (or `--kernel unsafe-local`), or `HAILER_KERNEL` in
   the environment. The flag wins over the variable, the variable over the file. `HAILER_KERNEL_IMAGE`
   overrides `image`.
 - **Which one is in use** shows in the startup panel, `uvx hailer status`, `/status` and `uvx hailer doctor`
-  (`marimo0.24.2-64a6b78f25cf` is the kernel contract, below):
+  (`marimo0.24.2-64a6b78f25cf` is the kernel contract, below; the `unsafe-local` line is in a warning colour):
 
   ```text
-  Kernel:     local (runs as you; not isolated)
   Kernel:     docker (hailer-kernel marimo0.24.2-64a6b78f25cf; no network; data read-only)
   Kernel:     docker (hailer-kernel marimo0.24.2-64a6b78f25cf; network on: the internet and this machine; data read-only)
+  Kernel:     unsafe-local (runs as you; not isolated)
   ```
 
   Each session starts its own kernel with the settings in effect when it starts, so the line always
   describes the kernel this chat uses.
 - **Docker mode fails closed.** Docker missing or not running, Docker Desktop set to Windows containers,
   an image of another kernel contract, or a data folder it refuses (below): Hailer stops and says how to
-  fix it (see [Troubleshooting](../reference/troubleshooting.md#troubleshooting)). It never runs notebook code on this machine instead.
+  fix it (see [Troubleshooting](../reference/troubleshooting.md#troubleshooting)). It never runs notebook
+  code on this machine instead; when Docker itself is the problem, the message names the other way on,
+  `runtime = "unsafe-local"`, for those who accept that notebook code then runs as them.
 
 ## First run: the kernel image
 
-The first `uvx hailer notebook` in docker mode downloads
+The first `uvx hailer` (or `uvx hailer notebook`) downloads
 `ghcr.io/openafterhours/hailer-kernel:marimo<version>-<fingerprint>` (for example `marimo0.24.2-64a6b78f25cf`; about
 200 MB to download, 900 MB on disk), with docker's progress in the terminal. After that a start takes a few seconds (4.3 s measured on Windows 11 with Docker
 Desktop). `uvx hailer kernel pull` downloads it ahead of time.
@@ -239,7 +242,7 @@ container.
 So notebook code cannot plant git hooks or settings, editor or dev-container settings, a `hailer.toml`,
 test-runner hooks or Python modules in your notebooks folder: those stay in the container and are gone when
 it stops. A notebook itself is still code: open one the kernel wrote only in a runtime you trust with it
-(the docker kernel, or `local` if you read it first). A copy back is written atomically (a temporary file
+(the docker kernel, or `unsafe-local` if you read it first). A copy back is written atomically (a temporary file
 replaced into place) inside the notebooks folder only, never through a symlink or junction; a failed copy is
 a warning, and the file on your machine stays as it was.
 

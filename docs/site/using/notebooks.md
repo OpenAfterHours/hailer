@@ -20,14 +20,15 @@ prompt) it stops the marimo server it started.
   memory, so other programs on the machine cannot send code to the kernel. The link Hailer opens or prints
   carries `access_token=...`, which signs the browser in. Links the agent quotes in the chat leave the token
   out, because tool results go to the model endpoint; `/notebook` prints the signed-in link.
-- **Log.** marimo's output goes to `.hailer/marimo-<pid>.log`, one per session, deleted when the kernel
-  stops. When a start fails, its last lines are in the error message; Hailer masks the token in them. In
-  docker mode the log is `docker logs hailer-kernel-<id>-<suffix>`.
-- **If Hailer is killed.** Nothing records a local kernel: its marimo keeps running (other programs still
-  need its token) until you end the `python -m marimo` process with Task Manager or `kill`. Docker kernels
-  left behind are removed by the next start or `uvx hailer kernel stop`.
-- **Where the code runs.** By default the kernel runs in Hailer's own Python, as you. To run it in an
-  isolated container instead, add `--kernel docker` or see [Isolated kernel (Docker)](../security/docker.md#isolated-kernel-docker).
+- **Log.** The kernel's log is `docker logs hailer-kernel-<id>-<suffix>`. When a start fails, its last
+  lines are in the error message; Hailer masks the token in them. With `unsafe-local`, marimo's output goes
+  to `.hailer/marimo-<pid>.log`, one per session, deleted when the kernel stops.
+- **If Hailer is killed.** Docker kernels left behind are removed by the next start or
+  `uvx hailer kernel stop`. Nothing records an unsafe-local kernel: its marimo keeps running (other programs
+  still need its token) until you end the `python -m marimo` process with Task Manager or `kill`.
+- **Where the code runs.** By default the kernel runs in an isolated Docker container (see
+  [Isolated kernel (Docker)](../security/docker.md#isolated-kernel-docker)). `unsafe-local` runs it in
+  Hailer's own Python, as you (see [Kernel runtimes](../security/runtimes.md#kernel-runtimes)).
 - **Docker works on copies.** A docker kernel has a notebooks folder of its own. Hailer copies your
   notebooks into it when it starts and copies the ones that changed back after every turn, every 15
   seconds and when the session ends; only marimo notebooks with plain names travel, never other files
@@ -43,8 +44,8 @@ switches back. It is a normal edit session either way, so the agent works in it 
 
 Flags: `--port N` (default 2718; a free port is chosen when it is busy), `--no-browser` (print the URL
 instead of opening it), `--foreground` (just run marimo attached to this terminal, no chat, until Ctrl+C; it
-opens marimo's home page unless `--no-browser` is given), `--new` (start a fresh conversation), `--kernel local|docker` (where
-notebook code runs for this run; the default comes from `[kernel] runtime`).
+opens marimo's home page unless `--no-browser` is given), `--new` (start a fresh conversation), `--kernel docker|unsafe-local`
+(where notebook code runs for this run; the default comes from `[kernel] runtime`, which defaults to `docker`).
 
 Bare `uvx hailer` does the same as `uvx hailer notebook` with its defaults: it starts its own marimo
 server, opens the notebook, chats, and stops the server when the chat ends:

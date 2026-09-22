@@ -43,7 +43,7 @@ from hailer.session import save_session, session_path
 runner = CliRunner()
 # The real kernel start, captured before the harness replaces it.
 REAL_START_KERNEL = cli._start_kernel
-SERVER = MarimoServer(url="http://127.0.0.1:2718")  # the kernel the harness's fake start hands the chat
+SERVER = MarimoServer(url="http://127.0.0.1:2718", runtime="unsafe-local")  # the kernel the harness's fake start hands the chat
 TOKEN = "test-token-0123456789"  # what the nb fixture's runtime hands the servers it starts
 
 
@@ -199,7 +199,8 @@ class FakeClient:
 
 
 def make_config(
-    ws: Path, *, notebook_exists=True, provider="openai", providers=None, web=None, notebooks_dir="notebooks"
+    ws: Path, *, notebook_exists=True, provider="openai", providers=None, web=None, notebooks_dir="notebooks",
+    kernel: KernelConfig = KernelConfig(runtime="unsafe-local"),  # explicit: the suite never needs Docker
 ) -> HailerConfig:
     nb = ws / notebooks_dir / "analysis.py"
     if notebook_exists:
@@ -220,6 +221,7 @@ def make_config(
         model=ModelConfig(name="gpt-5.5", provider=provider),
         providers=providers or {},
         web=web or WebConfig(),
+        kernel=kernel,
         config_path=ws / "hailer.toml",
     )
 
@@ -710,7 +712,7 @@ def test_exec_slash_command_talks_to_the_real_server_with_its_token(harness, mon
 
     with serving(token=TOKEN) as srv:
         srv.sessions = {"s1": {"filename": "notebooks/analysis.py", "path": str(harness.config.notebook)}}
-        harness.server, harness.real_clients = MarimoServer(url=srv.url, token=TOKEN), True
+        harness.server, harness.real_clients = MarimoServer(url=srv.url, token=TOKEN, runtime="unsafe-local"), True
         result = chat(input_text="/exec print('x')\n/exit\n")
     assert result.exit_code == 0, result.output
     assert "hello world" in result.output and "42" in result.output
@@ -888,7 +890,7 @@ def test_notebook_starts_marimo_runs_chat_and_stops_it(harness, nb, monkeypatch)
     # the notebook already had a session, so no browser and no wait
     assert harness.opened == [] and nb.session_waits == []
     assert "Notebook is open (session s1)" in result.output
-    assert "Kernel:     local (runs as you; not isolated)" in result.output
+    assert "Kernel:     unsafe-local (runs as you; not isolated)" in result.output
     assert harness.agent.started == [None], "the chat ran in the same terminal"
     assert nb.proc.terminated
     assert "Stopped marimo." in result.output
@@ -1066,7 +1068,7 @@ def test_notebook_foreground_runs_marimo_attached_without_chat(harness, nb, monk
     assert nb.spawned == [] and harness.agent.started == []
     # Hailer opens marimo's home page signed in
     assert harness.opened == [f"http://127.0.0.1:2718/?access_token={TOKEN}"]
-    assert "Kernel:     local (runs as you; not isolated)" in result.output
+    assert "Kernel:     unsafe-local (runs as you; not isolated)" in result.output
     assert "Marimo is running at http://127.0.0.1:2718. Ctrl+C stops it." in result.output
 
 
@@ -1700,7 +1702,7 @@ def test_session_matching_is_by_path_not_filename(harness):
 # Kernel runtimes: the Kernel line, doctor, docker fails closed, attaching, tokens
 # --------------------------------------------------------------------------- #
 
-LOCAL_LINE = "local (runs as you; not isolated)"
+LOCAL_LINE = "unsafe-local (runs as you; not isolated)"
 DOCKER_SERVER = MarimoServer(url="http://127.0.0.1:2731", token=TOKEN, runtime="docker")
 CONTRACT = kernel_image.contract_tag()
 IMAGE = f"ghcr.io/openafterhours/hailer-kernel:{CONTRACT}"
@@ -1755,10 +1757,34 @@ def test_kernel_line_in_the_startup_panel_status_and_slash_status(harness):
     assert f"Kernel:     {LOCAL_LINE}" in result.output
 
 
+def test_kernel_line_of_the_unsafe_local_runtime_is_a_warning(harness):
+    """The startup panel (so also hailer status) and /status show an unsafe-local kernel in a
+    warning style; a docker kernel's line is plain."""
+
+    def panel(config):
+        out = io.StringIO()
+        console = Console(file=out, force_terminal=True, color_system="standard", no_color=False, width=200)
+        cli._startup_panel(console, config, "analysis.py")
+        return next(line for line in out.getvalue().splitlines() if "Kernel:" in line)
+
+    assert cli._kernel_style(harness.config) == "yellow"
+    assert "\x1b[33mKernel:     unsafe-local (runs as you; not isolated)" in panel(harness.config)
+    assert cli._kernel_style(docker_config(harness.config)) == ""
+    assert "\x1b[33m" not in panel(docker_config(harness.config))
+
+
 def test_doctor_has_a_kernel_row(harness):
-    result = runner.invoke(cli.app, ["doctor"], catch_exceptions=False)
+    """unsafe-local is a warning row (not a failure) that says how to isolate notebook code."""
+    result = runner.invoke(cli.app, ["doctor"], catch_exceptions=False, env={"COLUMNS": "250"})
     assert result.exit_code == 0, result.output
-    assert any("kernel" in line and "OK" in line and "local (runs as you" in line for line in result.output.splitlines())
+    assert any("kernel" in line and "WARN" in line and LOCAL_LINE in line for line in result.output.splitlines())
+    assert 'runtime = "docker"' in result.output
+
+
+def test_a_start_leaves_the_unsafe_local_warning_to_the_startup_panel(harness):
+    result = chat(input_text="/exit\n")
+    assert result.exit_code == 0, result.output
+    assert "warn  kernel" not in result.output and f"Kernel:     {LOCAL_LINE}" in result.output
 
 
 def test_doctor_reports_a_runtime_it_cannot_use(harness, docker):
@@ -1767,7 +1793,7 @@ def test_doctor_reports_a_runtime_it_cannot_use(harness, docker):
     result = runner.invoke(cli.app, ["doctor"], catch_exceptions=False)
     assert result.exit_code == 1
     assert any("docker" in line and "FAIL" in line and "Docker is not installed." in line for line in result.output.splitlines())
-    assert 'runtime = "local"' in result.output
+    assert "https://docs.docker.com/desktop/" in result.output and 'runtime = "unsafe-local"' in result.output
 
 
 @pytest.mark.parametrize("args", [["notebook", "--help"], ["kernel", "--help"], ["kernel", "build", "--help"], ["init", "--help"]])
@@ -1838,7 +1864,7 @@ def test_cli_clients_carry_the_servers_token_and_the_kernels_notebooks_folder(tm
 
 def test_config_warnings_show_when_a_session_starts(harness, nb, monkeypatch):
     """A runtime line uncommented without its [kernel] line lands under [model]: say so, never silently local."""
-    warning = "Warning: [model].runtime in hailer.toml is ignored: runtime belongs under [kernel]. Uncomment the [kernel] line above it too."
+    warning = "Warning: [model].runtime in hailer.toml is ignored: runtime belongs under [kernel]. Add a [kernel] line above it."
     monkeypatch.setattr(cli, "_validate_config", lambda config: [warning])
     result = notebook_cmd()
     assert result.exit_code == 0, result.output
@@ -1912,11 +1938,45 @@ def test_notebook_downloads_a_missing_image_before_the_spinner_without_warning_f
 
 def test_notebook_kernel_flag_beats_the_file_and_rejects_other_values(harness, nb, docker):
     harness.config = docker_config(harness.config)
-    result = notebook_cmd(["--kernel", "LOCAL"])
+    result = notebook_cmd(["--kernel", "UNSAFE-LOCAL"])
     assert result.exit_code == 0, result.output
-    assert len(nb.spawned) == 1 and not docker.commands("run"), "--kernel local ran a local server"
+    assert len(nb.spawned) == 1 and not docker.commands("run"), "--kernel unsafe-local ran a local server"
     result = notebook_cmd(["--kernel", "podman"])
-    assert result.exit_code == 2 and '--kernel must be "local" or "docker"' in result.output
+    assert result.exit_code == 2 and 'use "docker"' in result.output and '"unsafe-local"' in result.output
+
+
+def test_a_retired_runtime_from_the_environment_is_one_config_row_with_an_environment_fix(harness, monkeypatch):
+    """HAILER_KERNEL=local: said once (the config row; the kernel rows stay out) and the fix names the variable."""
+    from hailer.config import validate
+
+    monkeypatch.setenv("HAILER_KERNEL", "local")
+    harness.config = replace(harness.config, kernel=KernelConfig(runtime="local"))
+    monkeypatch.setattr(cli, "_validate_config", validate)
+    result = runner.invoke(cli.app, ["doctor"], catch_exceptions=False, env={"COLUMNS": "250"})
+    assert result.exit_code == 1
+    assert " ".join(result.output.split()).count('now called "unsafe-local"') == 1, result.output
+    row = cli._config_check(validate(harness.config))
+    assert row.fatal and row.hint == "HAILER_KERNEL in the environment overrides [kernel] runtime in hailer.toml: change or unset it."
+    monkeypatch.delenv("HAILER_KERNEL")
+    assert cli._config_check(validate(harness.config)).hint == cli.CONFIG_FIX_HINT, "from the file: fix the file"
+
+
+@pytest.mark.parametrize("how", ["flag", "config"])
+def test_the_retired_local_runtime_is_refused_with_the_way_to_opt_in(harness, nb, docker, how, monkeypatch):
+    """"local" is no longer a runtime: --kernel and the configuration (hailer.toml or HAILER_KERNEL,
+    see test_config) refuse it, nothing starts, and the message says what "unsafe-local" means."""
+    from hailer.config import validate
+
+    if how == "config":
+        harness.config = replace(harness.config, kernel=KernelConfig(runtime="local"))
+        monkeypatch.setattr(cli, "_validate_config", validate)
+    result = notebook_cmd(["--kernel", "local"] if how == "flag" else [])
+    assert result.exit_code == (2 if how == "flag" else 1), result.output
+    output = " ".join(result.output.split())
+    verb = "Use" if how == "flag" else "Write"
+    assert 'now called "unsafe-local"' in output and f'{verb} "unsafe-local" only if you accept that' in output
+    assert "runs as you, with your files and network" in output
+    assert not nb.spawned and not docker.commands("run"), "nothing started"
 
 
 def test_notebook_foreground_in_docker_mode_follows_the_log_and_removes_the_containers(harness, nb, docker):
@@ -1970,6 +2030,9 @@ def test_kernel_pull(harness, docker):
     docker.installed = False
     result = runner.invoke(cli.app, ["kernel", "pull"], catch_exceptions=False)
     assert result.exit_code == 1 and "Docker is not installed." in result.output
+    assert "https://docs.docker.com/desktop/" in result.output and "unsafe-local" not in result.output, (
+        "another runtime is no answer to a command that manages Docker"
+    )
 
 
 def test_kernel_pull_of_an_image_that_is_not_published(harness, docker):
@@ -2104,7 +2167,11 @@ def test_init_kernel_docker_switches_the_section_on(harness, tmp_path, monkeypat
     assert "uv run" not in result.output
 
 
-def test_init_mentions_the_docker_kernel_only_when_docker_is_installed(harness, tmp_path, monkeypatch):
+def test_init_writes_docker_and_says_how_to_get_docker_only_when_it_is_missing(harness, tmp_path, monkeypatch):
+    """Without the flag init writes runtime = "docker" whether or not Docker is installed; without
+    Docker its next steps give both ways on: install Docker, or opt into unsafe-local."""
+    from hailer.config import load_config
+
     monkeypatch.delenv("HAILER_KERNEL", raising=False)
     monkeypatch.setattr(cli, "_example_config_dir", lambda: None)
     for found in (True, False):
@@ -2113,10 +2180,29 @@ def test_init_mentions_the_docker_kernel_only_when_docker_is_installed(harness, 
         monkeypatch.setattr(cli, "_docker_on_path", lambda found=found: found)
         result = init_cmd(ws)
         assert result.exit_code == 0, result.output
-        assert "# [kernel]" in (ws / "hailer.toml").read_text(encoding="utf-8"), "commented out without the flag"
-        hint = 'uncomment the [kernel] and runtime lines in hailer.toml and set runtime = "docker"'
-        assert (hint in result.output) is found, "both lines: uncommenting only runtime would land under [model]"
-        assert ("uvx hailer notebook --kernel docker" in result.output) is found
+        assert '[kernel]\nruntime = "docker"' in (ws / "hailer.toml").read_text(encoding="utf-8")
+        assert load_config(workspace=ws, env={}).kernel.runtime == "docker"
+        assert f'Wrote {ws / "hailer.toml"} ([kernel] runtime = "docker")' in result.output
+        output = " ".join(result.output.split())
+        assert ("Docker was not found on this machine" in output) is not found
+        assert ("https://docs.docker.com/desktop/" in output) is not found
+        assert ('set runtime = "unsafe-local" under [kernel]' in output) is not found
+
+
+def test_init_kernel_unsafe_local_writes_it_and_says_it_is_not_isolated(harness, tmp_path, monkeypatch):
+    from hailer.config import load_config, validate
+
+    monkeypatch.delenv("HAILER_KERNEL", raising=False)
+    monkeypatch.setattr(cli, "_example_config_dir", lambda: None)
+    monkeypatch.setattr(cli, "_docker_on_path", lambda: False)
+    ws = tmp_path / "fresh"
+    ws.mkdir()
+    result = init_cmd(ws, "--kernel", "unsafe-local")
+    assert result.exit_code == 0, result.output
+    config = load_config(workspace=ws, env={})
+    assert config.kernel.runtime == "unsafe-local" and validate(config) == []
+    output = " ".join(result.output.split())
+    assert "runs on this machine as you, with your files and network (unsafe-local: not isolated)" in output
 
 
 def test_init_kernel_flag_with_an_existing_config(harness, tmp_path, monkeypatch):
@@ -2130,9 +2216,12 @@ def test_init_kernel_flag_with_an_existing_config(harness, tmp_path, monkeypatch
     init_cmd(ws)
     result = init_cmd(ws, "--kernel", "docker")
     assert "already exists" in result.output
-    assert 'hailer.toml was kept, so [kernel] runtime is still "local". To change it, set runtime = "docker" under [kernel]' in result.output
+    assert "hailer.toml already exists" not in init_cmd(ws, "--kernel", "unsafe-local", "--force").output
+    result = init_cmd(ws, "--kernel", "docker")
+    assert "already exists" in result.output
+    assert 'hailer.toml was kept, so [kernel] runtime is still "unsafe-local". To change it, set runtime = "docker" under [kernel]' in result.output
     assert "uvx hailer init --kernel docker --force" in result.output
-    assert "Optional: to isolate notebook code" not in result.output, "the kept advice is not repeated"
+    assert "not isolated" not in result.output.split("hailer.toml was kept")[1], "the kept advice is not repeated"
     result = init_cmd(ws, "--kernel", "docker", "--force")
     assert result.exit_code == 0 and load_config(workspace=ws, env={}).kernel.runtime == "docker"
     result = init_cmd(tmp_path / "other", "--kernel", "vm")
@@ -2241,7 +2330,7 @@ def test_a_local_foreground_server_ended_from_outside_says_so(harness, nb):
 
 def test_kernel_flag_values_are_quoted_like_other_messages(harness, nb):
     result = notebook_cmd(["--kernel", "podman"])
-    assert result.exit_code == 2 and '--kernel must be "local" or "docker", not "podman".' in result.output
+    assert result.exit_code == 2 and 'Invalid --kernel "podman"; use "docker"' in result.output
 
 
 def test_doctor_fails_a_unc_data_folder_with_the_start_wording(harness, docker, monkeypatch):

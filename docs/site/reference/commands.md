@@ -41,11 +41,11 @@ Other subcommands:
 | Command | What it does |
 |---|---|
 | `hailer` | Start this session's own notebook server, open the notebook and chat in the terminal; the server stops when the chat ends. |
-| `hailer notebook [--port N] [--no-browser] [--foreground] [--new] [--plain] [--kernel RUNTIME]` | The same session with extra startup options; marimo runs on the notebooks folder. `RUNTIME` is `local` or `docker`. |
+| `hailer notebook [--port N] [--no-browser] [--foreground] [--new] [--plain] [--kernel RUNTIME]` | The same session with extra startup options; marimo runs on the notebooks folder. `RUNTIME` is `docker` or `unsafe-local` (notebook code runs as you). |
 | `hailer status` | Configuration, credentials and this workspace's running Docker kernels (whenever Docker is installed). |
 | `hailer doctor` | The startup checks with fixes: configuration, credentials, Docker, the kernel image and folders. It starts no kernel. |
 | `hailer login <provider>`, `hailer logout <provider>` | Store or remove a provider's API key. |
-| `hailer init [--force] [--kernel RUNTIME]` | Set up a workspace (see Quick start); `--kernel` writes `[kernel] runtime`. |
+| `hailer init [--force] [--kernel RUNTIME]` | Set up a workspace (see Quick start). `hailer.toml` gets `[kernel] runtime = "docker"`, or the `--kernel` runtime. |
 | `hailer kernel pull` | Download the kernel image for this Hailer (or `[kernel].image`). |
 | `hailer kernel build [--tag <name>]` | Build the kernel image, discovering host pip/uv mirror settings. `--pip-config FILE` overrides discovery; `--no-host-config` disables it. See [corporate mirrors](../security/docker.md#building-with-corporate-mirrors). |
 | `hailer kernel stop` | Remove every Docker container and network of this workspace, whichever session started it, and say what was removed. |

@@ -3,8 +3,8 @@ memory) and the data folder (read-only), with no network and none of the host's 
 
 Everything here drives the ``docker`` CLI through a :class:`DockerRunner` (no Docker SDK), so the
 tests check argument lists against a scripted fake. It fails closed: every check raises a
-:class:`~hailer.errors.KernelRuntimeError` with a hint and nothing ever falls back to the local
-runtime. The sandbox a start returns (:class:`DockerKernel`) is a
+:class:`~hailer.errors.KernelRuntimeError` with a hint and nothing ever falls back to the
+unsafe-local runtime. The sandbox a start returns (:class:`DockerKernel`) is a
 :class:`~hailer.sandbox.MarimoSandbox` whose kernel knows the folders as ``/work/notebooks`` and
 ``/work/data``; ``runtime_for`` imports this module only when docker is asked for. Nothing in the
 container can write to this machine: the workspace's notebooks are copied in when the kernel starts
@@ -132,13 +132,28 @@ class DockerRunner(Protocol):
         ...
 
 
+#: Where to get Docker (the hints below and ``uvx hailer init``).
+DOCKER_INSTALL_ADVICE = (
+    "Install Docker Desktop (Windows, macOS: https://docs.docker.com/desktop/) or Docker Engine "
+    "(Linux: https://docs.docker.com/engine/install/)"
+)
+#: The other way to run: the second option of every "no usable Docker" error.
+UNSAFE_LOCAL_OPTION = (
+    'Or, only if you accept that notebook code then runs as you, with your files and network (not isolated): '
+    'set [kernel] runtime = "unsafe-local" in hailer.toml (or HAILER_KERNEL=unsafe-local).'
+)
+
+
+def without_unsafe_local_option(hint: str) -> str:
+    """``hint`` without :data:`UNSAFE_LOCAL_OPTION`: for ``uvx hailer kernel ...``, which manage Docker
+    itself, where another runtime is no answer."""
+    return hint.replace(f"\n{UNSAFE_LOCAL_OPTION}", "")
+
+
 def docker_not_installed() -> KernelRuntimeError:
     return KernelRuntimeError(
         DOCKER_NOT_INSTALLED,
-        hint=(
-            "Install Docker Desktop (Windows, macOS) or Docker Engine (Linux), then run the command again. "
-            'Or set [kernel] runtime = "local" in hailer.toml to run notebook code on this machine without isolation.'
-        ),
+        hint=f"Hailer runs notebook code in a Docker container. {DOCKER_INSTALL_ADVICE}, start it, and run the command again.\n{UNSAFE_LOCAL_OPTION}",
     )
 
 
@@ -151,6 +166,7 @@ def docker_not_running(detail: str = "") -> KernelRuntimeError:
         )
     if detail:
         hint += f"\n{detail}"
+    hint += f"\n{UNSAFE_LOCAL_OPTION}"
     return KernelRuntimeError(DOCKER_NOT_RUNNING, hint=hint)
 
 
@@ -785,7 +801,7 @@ class DockerRuntime:
     internet, services on this machine (``host.docker.internal``) and other containers.
 
     Every check fails closed with a :class:`KernelRuntimeError`; nothing here ever falls back to
-    the local runtime. All docker calls go through ``runner`` (:class:`DockerRunner`).
+    the unsafe-local runtime. All docker calls go through ``runner`` (:class:`DockerRunner`).
     """
 
     name = KERNEL_RUNTIME_DOCKER
@@ -895,7 +911,7 @@ class DockerRuntime:
                 f"Docker runs {engine_os or 'non-Linux'} containers; Hailer's kernel image needs Linux containers.",
                 hint=(
                     "Switch Docker Desktop to Linux containers (its tray icon menu: Switch to Linux containers), "
-                    'or set [kernel] runtime = "local" in hailer.toml.'
+                    f"and run the command again.\n{UNSAFE_LOCAL_OPTION}"
                 ),
             )
         self._engine_version = version
@@ -1321,7 +1337,7 @@ def stop_workspace_kernels(config: HailerConfig, runner: DockerRunner | None = N
     """``uvx hailer kernel stop``: remove every container and network labelled with this workspace,
     running or not, whichever session started it. It reports what it actually removed; failures
     are reported, never raised. Nothing in ``.hailer`` is touched (a session still starting keeps
-    its owner lock and token folder). A local kernel is recorded nowhere: the session that
+    its owner lock and token folder). An unsafe-local kernel is recorded nowhere: the session that
     started it stops it."""
     report = StopReport()
     docker = DockerRuntime(config, runner=runner)
@@ -1341,7 +1357,7 @@ def stop_workspace_kernels(config: HailerConfig, runner: DockerRunner | None = N
             "(start Docker Desktop and run uvx hailer kernel stop again to remove them)."
         )
     elif docker_error is not None and str(docker_error) != DOCKER_NOT_INSTALLED:
-        report.failed.append(f"{docker_error} {docker_error.hint or ''}".strip())
+        report.failed.append(f"{docker_error} {without_unsafe_local_option(docker_error.hint or '')}".strip())
     return report
 
 

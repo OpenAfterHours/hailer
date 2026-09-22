@@ -26,8 +26,8 @@ class MarimoServer:
     #: The server's random auth token. Kept out of ``repr`` so it never lands in a log line or a
     #: test failure.
     token: str | None = field(default=None, repr=False)
-    #: Where the kernel runs: "local" (Hailer's own Python) or "docker".
-    runtime: str = "local"
+    #: Where the kernel runs: "docker" or "unsafe-local" (Hailer's own Python, as the user).
+    runtime: str = "docker"
     #: Docker only: whether the kernel was started with ``[kernel] network = true``.
     network_access: bool = False
 
@@ -125,27 +125,26 @@ class WebConfig:
     max_page_bytes: int = 200_000
 
 
-#: Where the notebook kernel runs: in Hailer's own Python, as the user (the default), or in a
-#: Docker container with its own notebooks folder (copied to and from the workspace's) that sees
-#: only the data folder, read-only.
-KERNEL_RUNTIME_LOCAL = "local"
+#: Where the notebook kernel runs: in a Docker container with its own notebooks folder (copied to
+#: and from the workspace's) that sees only the data folder, read-only (the default), or in
+#: Hailer's own Python, as the user, with their files and network ("unsafe-local": not isolated,
+#: and named so that choosing it is a decision).
 KERNEL_RUNTIME_DOCKER = "docker"
-VALID_KERNEL_RUNTIMES = (KERNEL_RUNTIME_LOCAL, KERNEL_RUNTIME_DOCKER)
+KERNEL_RUNTIME_UNSAFE_LOCAL = "unsafe-local"
+VALID_KERNEL_RUNTIMES = (KERNEL_RUNTIME_DOCKER, KERNEL_RUNTIME_UNSAFE_LOCAL)
 #: The published kernel image; the tag is the kernel contract (see ``hailer.kernel_image``).
 KERNEL_IMAGE_REPOSITORY = "ghcr.io/openafterhours/hailer-kernel"
 
 
 @dataclass(frozen=True)
 class KernelConfig:
-    """The ``[kernel]`` table: where notebook code runs. Only ``runtime`` matters for ``local``."""
+    """The ``[kernel]`` table: where notebook code runs. Only ``runtime`` matters for ``unsafe-local``."""
 
-    runtime: str = KERNEL_RUNTIME_LOCAL  # one of VALID_KERNEL_RUNTIMES (validate() reports others)
+    runtime: str = KERNEL_RUNTIME_DOCKER  # one of VALID_KERNEL_RUNTIMES (validate() reports others)
     image: str | None = None  # None: the published image for this Hailer's kernel contract
     memory: str = "4g"  # docker --memory format: <number>[b|k|m|g], as written (any case)
     cpus: float = 2.0
     network: bool = False  # docker only: True puts the kernel on the default bridge network
-    #: Local only: environment variables the kernel gets even though their names look secret.
-    pass_env: tuple[str, ...] = ()
 
     @property
     def effective_image(self) -> str:

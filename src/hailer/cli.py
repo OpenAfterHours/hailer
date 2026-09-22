@@ -38,6 +38,7 @@ from hailer.chat import ChatController
 from hailer.errors import ConfigError, CredentialsError, HailerError, NoSessionError
 from hailer.models import (
     KERNEL_RUNTIME_DOCKER,
+    KERNEL_RUNTIME_UNSAFE_LOCAL,
     VALID_KERNEL_RUNTIMES,
     WIRE_API_CHAT,
     AgentEvent,
@@ -186,6 +187,12 @@ def _kernel_line(config: HailerConfig) -> str:
     from hailer.kernel import describe_runtime
 
     return describe_runtime(config.kernel)
+
+
+def _kernel_style(config: HailerConfig) -> str:
+    """A warning style (yellow) for the ``Kernel:`` line of the unsafe-local runtime, whose notebook
+    code is not isolated (the startup panel, ``hailer status``, ``/status``, ``--foreground``)."""
+    return "yellow" if config.kernel.runtime == KERNEL_RUNTIME_UNSAFE_LOCAL else ""
 
 
 def _list_cells_code() -> str:
@@ -343,19 +350,20 @@ def _plural(count: int, noun: str) -> str:
 
 
 def _startup_panel(console: Console, config: HailerConfig, notebook: str | None = None) -> None:
-    """The panel with the settings; ``notebook``: the active notebook (default: the state file's)."""
-    body = "\n".join(
+    """The panel with the settings; ``notebook``: the active notebook (default: the state file's).
+    An unsafe-local ``Kernel:`` line is shown in a warning style (:func:`_kernel_style`)."""
+    body = Text("\n").join(
         [
-            f"Model:      {config.model.name}",
-            f"Provider:   {_provider_line(config)}",
-            f"Notebook:   {notebook or notebooks.load_active_notebook(config)}",
-            f"Notebooks:  {_relative(config.notebooks_root, config.workspace)}",
-            f"Workspace:  {config.workspace}",
-            f"Kernel:     {_kernel_line(config)}",
-            f"Web access: {_web_line(config)}",
+            Text(f"Model:      {config.model.name}"),
+            Text(f"Provider:   {_provider_line(config)}"),
+            Text(f"Notebook:   {notebook or notebooks.load_active_notebook(config)}"),
+            Text(f"Notebooks:  {_relative(config.notebooks_root, config.workspace)}"),
+            Text(f"Workspace:  {config.workspace}"),
+            Text(f"Kernel:     {_kernel_line(config)}", style=_kernel_style(config)),
+            Text(f"Web access: {_web_line(config)}"),
         ]
     )
-    console.print(Panel(Text(body), title="Hailer", expand=False))
+    console.print(Panel(body, title="Hailer", expand=False))
     console.print("Type /help for commands.\n", markup=False)
 
 
@@ -385,17 +393,28 @@ def kernel_checks(config: HailerConfig, *, starting: bool = False) -> list[Check
     """The kernel runtime's rows (``hailer doctor``, ``hailer notebook``): Docker, the image and the
     folders for the docker runtime; no kernel is started or probed. A runtime that cannot be
     used is one failed ``kernel`` row. ``starting``: a start follows, which downloads a missing
-    image itself, so that warning is left out."""
+    image itself and shows the ``Kernel:`` line (unsafe-local: in a warning style), so those two
+    warnings are left out. A runtime that is not one has no rows: the ``config`` row reports it."""
+    if config.kernel.runtime not in VALID_KERNEL_RUNTIMES:
+        return []
     try:
         checks = list(_runtime_for(config).check())
     except HailerError as err:
         return [Check("kernel", False, str(err), hint=err.hint)]
     if starting:
-        checks = [c for c in checks if not (c.name == "image" and not c.ok and not c.fatal)]
+        checks = [c for c in checks if not (c.name in ("image", "kernel") and not c.ok and not c.fatal)]
     return checks
 
 
 CONFIG_FIX_HINT = "Fix hailer.toml (uvx hailer init writes a starter file and creates a missing notebook)."
+
+
+def _config_fix_hint(fatal: list[str]) -> str:
+    """How to fix the fatal ``config`` problems: in hailer.toml, or in ``HAILER_KERNEL`` when that
+    variable set the runtime a problem names."""
+    if os.environ.get("HAILER_KERNEL") and any(p.startswith("Invalid [kernel].runtime") for p in fatal):
+        return "HAILER_KERNEL in the environment overrides [kernel] runtime in hailer.toml: change or unset it."
+    return CONFIG_FIX_HINT
 
 
 def _config_check(problems: list[str]) -> Check:
@@ -406,7 +425,7 @@ def _config_check(problems: list[str]) -> Check:
     if fatal:
         summary = fatal[0] if len(fatal) == 1 else f"{len(fatal)} problems in the configuration:"
         listed = [] if len(fatal) == 1 else [f"- {p}" for p in fatal]
-        return Check("config", False, summary, hint="\n".join([*listed, *warnings, CONFIG_FIX_HINT]), fatal=True)
+        return Check("config", False, summary, hint="\n".join([*listed, *warnings, _config_fix_hint(fatal)]), fatal=True)
     if not warnings:
         return Check("config", True, "ok", fatal=False)
     if len(warnings) == 1:
@@ -729,12 +748,15 @@ APP_VIEW_HINT = (
 
 
 def _kernel_choice(console: Console, value: str | None) -> str | None:
-    """A ``--kernel`` value ("local" or "docker"); exit 2 for anything else."""
+    """A ``--kernel`` value ("docker" or "unsafe-local"); exit 2 for anything else (the retired
+    "local" with its own message)."""
     if value is None:
         return None
     choice = value.strip().lower()
     if choice not in VALID_KERNEL_RUNTIMES:
-        console.print(f'--kernel must be "local" or "docker", not "{value}".', style="red", markup=False)
+        from hailer.config import runtime_problem
+
+        console.print(runtime_problem(choice, "--kernel"), style="red", markup=False)
         raise typer.Exit(code=2)
     return choice
 
@@ -797,7 +819,7 @@ def _run_foreground(console: Console, config: HailerConfig, runtime: Any, port: 
         except HailerError as err:
             _print_error(console, err, verbose=verbose)
             return 1
-        console.print(f"Kernel:     {runtime.describe()}", markup=False)
+        console.print(f"Kernel:     {runtime.describe()}", style=_kernel_style(config), markup=False)
         console.print(f"Marimo is running at {running.server.url}. Ctrl+C stops it.", markup=False)
         home = running.home_url(with_token=True)
         if open_browser:
@@ -952,7 +974,7 @@ def notebook(
     kernel: str | None = typer.Option(
         None,
         "--kernel",
-        help='Where notebook code runs for this run: "local" (as you) or "docker" (an isolated container). Default: \\[kernel] runtime.',
+        help='Where notebook code runs for this run: "docker" (an isolated container) or "unsafe-local" (as you, with your files and network). Default: \\[kernel] runtime.',
         show_default=False,
     ),
     plain: bool = typer.Option(False, "--plain", help="Use line-oriented chat without the persistent composer."),
@@ -1062,6 +1084,14 @@ kernel_app = typer.Typer(
 app.add_typer(kernel_app, name="kernel")
 
 
+def _for_kernel_command(err: HailerError) -> HailerError:
+    """``err`` without the unsafe-local opt-in: ``hailer kernel ...`` manages Docker itself."""
+    from hailer.kernel_docker import without_unsafe_local_option
+
+    err.hint = without_unsafe_local_option(err.hint)
+    return err
+
+
 def _docker_runtime(config: HailerConfig) -> Any:
     from hailer.kernel_docker import DockerRuntime
 
@@ -1078,7 +1108,7 @@ def kernel_pull(ctx: typer.Context) -> None:
     try:
         contract = runtime.pull(say=lambda text: console.print(text, markup=False))
     except HailerError as err:
-        _print_error(console, err, verbose=opts.verbose)
+        _print_error(console, _for_kernel_command(err), verbose=opts.verbose)
         raise typer.Exit(code=1)
     console.print(f"{runtime.image} is ready (kernel contract {contract}).", markup=False)
 
@@ -1141,7 +1171,7 @@ def kernel_build(
                 ),
             )
     except HailerError as err:
-        _print_error(console, err, verbose=opts.verbose)
+        _print_error(console, _for_kernel_command(err), verbose=opts.verbose)
         raise typer.Exit(code=1)
     console.print(f"Built {image}.", markup=False)
     if image != config.kernel.effective_image:
@@ -1150,7 +1180,7 @@ def kernel_build(
 
 @kernel_app.command("stop")
 def kernel_stop(ctx: typer.Context) -> None:
-    """Stop every kernel of this workspace (local or docker, whichever session started it) and remove its Docker containers and networks."""
+    """Stop every Docker kernel of this workspace, whichever session started it, and remove its containers and networks."""
     from hailer.kernel_docker import stop_workspace_kernels
 
     opts = _opts(ctx)
@@ -1281,7 +1311,7 @@ def init(
     kernel: str | None = typer.Option(
         None,
         "--kernel",
-        help='Write \\[kernel] runtime = "local" or "docker" into hailer.toml (docker: notebook code runs in an isolated container).',
+        help='Write \\[kernel] runtime = "docker" (the default: an isolated container) or "unsafe-local" (notebook code runs as you) into hailer.toml.',
         show_default=False,
     ),
 ) -> None:
@@ -1302,7 +1332,7 @@ def init(
         from hailer.config import write_default_config
 
         write_default_config(config_path, overwrite=force, kernel=choice)
-        console.print(f"Wrote {config_path}" + (f' ([kernel] runtime = "{choice}")' if choice else ""), markup=False)
+        console.print(f'Wrote {config_path} ([kernel] runtime = "{choice or KERNEL_RUNTIME_DOCKER}")', markup=False)
 
     target = workspace / ".config" / "hailer"
     example = _example_config_dir()
@@ -1332,12 +1362,12 @@ def init(
         console.print(f"{target} already set up.", markup=False)
 
     config = _init_notebook_and_data(console, workspace, config_path, verbose=opts.verbose)
-    runtime = config.kernel.runtime if config is not None else (choice or "local")
+    runtime = config.kernel.runtime if config is not None else (choice or KERNEL_RUNTIME_DOCKER)
     kept = choice is not None and config is not None and runtime != choice
     if kept:
         console.print(
             f'hailer.toml was kept, so [kernel] runtime is still "{runtime}". To change it, set '
-            f'runtime = "{choice}" under [kernel] in hailer.toml (uncomment the [kernel] line too), or run '
+            f'runtime = "{choice}" under [kernel] in hailer.toml (add a [kernel] line if there is none), or run '
             f"uvx hailer init --kernel {choice} --force to rewrite the file.",
             markup=False,
         )
@@ -1357,25 +1387,34 @@ def init(
 
 
 def _kernel_next_steps(runtime: str, *, kept: bool = False) -> list[str]:
-    """What ``init`` adds to the next steps about where notebook code runs (nothing more after the
-    "hailer.toml was kept" advice, which already says how to switch)."""
-    docker_found = _docker_on_path()
+    """What ``init`` adds to the next steps about where notebook code runs: for docker, how to get
+    Docker when it is not on this machine (or opt into unsafe-local); for unsafe-local, that it is
+    not isolated (nothing more after the "hailer.toml was kept" advice, which says how to switch)."""
+    from hailer.config import runtime_problem
+    from hailer.kernel_docker import DOCKER_INSTALL_ADVICE
+
+    if runtime not in VALID_KERNEL_RUNTIMES:  # a kept hailer.toml, e.g. the retired "local"
+        return ["\n" + runtime_problem(runtime)]
     if runtime == KERNEL_RUNTIME_DOCKER:
         lines = [
             "\nNotebook code runs in a Docker container (no network; the data folder is read-only).",
             "The first uvx hailer notebook downloads the kernel image (uvx hailer kernel pull does it now); where "
             "it cannot be downloaded, uvx hailer kernel build builds it on this machine.",
         ]
-        if not docker_found:
-            lines.append("Docker was not found on this machine: install Docker Desktop (or Docker Engine) first.")
+        if not _docker_on_path():
+            lines += [
+                f"Docker was not found on this machine. {DOCKER_INSTALL_ADVICE}, start it, then run uvx hailer doctor.",
+                "Or, only if you accept that notebook code then runs as you, with your files and network (not "
+                'isolated): set runtime = "unsafe-local" under [kernel] in hailer.toml '
+                "(or run uvx hailer init --kernel unsafe-local --force).",
+            ]
         return lines
-    if docker_found and not kept:
-        return [
-            "\nOptional: to isolate notebook code in a container (Docker was found on this machine), uncomment the "
-            '[kernel] and runtime lines in hailer.toml and set runtime = "docker", or try it once with '
-            "uvx hailer notebook --kernel docker."
-        ]
-    return []
+    if kept:
+        return []
+    return [
+        "\nNotebook code runs on this machine as you, with your files and network (unsafe-local: not isolated). "
+        'To isolate it, install and start Docker, then set runtime = "docker" under [kernel] in hailer.toml.'
+    ]
 
 
 def main() -> None:
