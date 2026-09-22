@@ -37,7 +37,7 @@ def save_session(config: HailerConfig, monkeypatch) -> Path:
 
 
 def save_active_notebook(config: HailerConfig, monkeypatch) -> Path:
-    notebooks.save_active_notebook(config, config.notebook)
+    notebooks.save_active_notebook(config, "analysis.py")
     return notebooks.state_path(config.workspace)
 
 

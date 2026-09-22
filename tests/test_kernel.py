@@ -1,4 +1,4 @@
-"""Tests for hailer.kernel: the path map, the kernel's environment and prompt notes, and the local
+"""Tests for hailer.kernel: the kernel's environment and prompt notes, and the local
 runtime (its process layer faked: nothing is spawned or killed). The docker runtime has
 tests/test_kernel_docker.py. No Docker needed."""
 
@@ -8,7 +8,6 @@ import os
 import stat
 import subprocess
 import sys
-from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -18,92 +17,6 @@ from hailer import kernel as k
 from hailer.errors import ConfigError, KernelRuntimeError
 from hailer.kernel_image import contract_tag
 from hailer.models import KernelConfig, MarimoServer, ModelConfig, ProviderConfig
-
-# --------------------------------------------------------------------------- #
-# PathMap
-# --------------------------------------------------------------------------- #
-
-
-def docker_map(tmp_path: Path) -> k.PathMap:
-    return k.docker_paths(make_config(tmp_path))
-
-
-def test_identity_map_uses_the_notebook_file_key(tmp_path):
-    from hailer.marimo_client import notebook_file_key
-
-    identity = k.PathMap()
-    nb = tmp_path / "notebooks" / ".." / "notebooks" / "a b.py"
-    assert identity.identity
-    assert identity.to_kernel(nb) == notebook_file_key(nb)
-    assert identity.to_host("anything/at all.py") == "anything/at all.py"
-
-
-def test_docker_map_translates_both_ways_including_subfolders(tmp_path):
-    paths = docker_map(tmp_path)
-    assert not paths.identity
-    assert paths.to_kernel(tmp_path / "notebooks" / "analysis.py") == "/work/notebooks/analysis.py"
-    assert paths.to_kernel(tmp_path / "notebooks" / "team" / "q2 churn.py") == "/work/notebooks/team/q2 churn.py"
-    assert paths.to_kernel(tmp_path / "notebooks") == "/work/notebooks"
-    assert paths.to_kernel(tmp_path / "data" / "25-01 sales.parquet") == "/work/data/25-01 sales.parquet"
-    assert paths.to_kernel(tmp_path / "notebooks" / "sub" / ".." / "x.py") == "/work/notebooks/x.py", "normalised like the file key"
-    assert Path(paths.to_host("/work/notebooks/team/q2 churn.py")) == tmp_path / "notebooks" / "team" / "q2 churn.py"
-    assert Path(paths.to_host("/work/data/25-01 sales.parquet")) == tmp_path / "data" / "25-01 sales.parquet"
-    assert Path(paths.to_host("/work/notebooks")) == tmp_path / "notebooks"
-
-
-def test_paths_outside_every_mount(tmp_path):
-    paths = docker_map(tmp_path)
-    with pytest.raises(ValueError):
-        paths.to_kernel(tmp_path / "elsewhere" / "x.py")
-    with pytest.raises(ValueError):
-        paths.to_kernel(tmp_path / "notebooks-old" / "x.py"), "a sibling with the same prefix is not inside"
-    with pytest.raises(ValueError):
-        paths.to_kernel(tmp_path)
-    assert paths.to_host("/tmp/scratch.py") is None
-    assert paths.to_host("/work/hailer.toml") is None
-    assert paths.to_host("/work/notebooksX/a.py") is None
-    assert paths.to_host("/work/notebooks/../../etc/passwd") is None, "normalised before matching"
-    assert paths.to_host("notebooks/analysis.py") is None, "relative kernel paths have no host path"
-    assert paths.to_host("") is None
-
-
-def test_longest_mount_wins(tmp_path):
-    paths = k.PathMap(
-        (
-            (tmp_path / "work", PurePosixPath("/work/notebooks")),
-            (tmp_path / "work" / "data", PurePosixPath("/work/data")),
-        )
-    )
-    assert paths.to_kernel(tmp_path / "work" / "data" / "a.csv") == "/work/data/a.csv"
-    assert paths.to_kernel(tmp_path / "work" / "nb.py") == "/work/notebooks/nb.py"
-    assert Path(paths.to_host("/work/data/a.csv")) == tmp_path / "work" / "data" / "a.csv"
-
-
-@pytest.mark.skipif(os.name != "nt", reason="Windows paths compare case-insensitively")
-def test_windows_host_paths_ignore_case_and_separators(tmp_path):
-    paths = docker_map(tmp_path)
-    shouted = str(tmp_path / "NOTEBOOKS" / "Team" / "Report.py").upper().replace("REPORT.PY", "Report.py")
-    assert paths.to_kernel(shouted) == "/work/notebooks/TEAM/Report.py", "the case below the mount is kept"
-    assert paths.to_kernel(str(tmp_path / "notebooks" / "a.py").replace("\\", "/")) == "/work/notebooks/a.py"
-    mixed = k.PathMap(((Path(str(tmp_path).upper()) / "Notebooks", PurePosixPath("/work/notebooks")),))
-    assert mixed.to_kernel(tmp_path / "notebooks" / "a.py") == "/work/notebooks/a.py"
-
-
-@pytest.mark.skipif(os.name == "nt", reason="POSIX paths are case-sensitive")
-def test_posix_host_paths_are_case_sensitive(tmp_path):
-    paths = docker_map(tmp_path)
-    with pytest.raises(ValueError):
-        paths.to_kernel(tmp_path / "NOTEBOOKS" / "a.py")
-    assert paths.to_kernel(tmp_path / "notebooks" / "a.py") == "/work/notebooks/a.py"
-
-
-def test_path_map_does_not_resolve_symlinks(tmp_path, monkeypatch):
-    """Like marimo's file keys: a notebooks folder reached through a junction keeps its own path."""
-    monkeypatch.setattr(Path, "resolve", lambda self, strict=False: Path(str(self).replace("linked", "real")))
-    paths = k.PathMap(((tmp_path / "linked", PurePosixPath("/work/notebooks")),))
-    assert paths.to_kernel(tmp_path / "linked" / "a.py") == "/work/notebooks/a.py"
-    assert "linked" in paths.to_host("/work/notebooks/a.py")
-
 
 # --------------------------------------------------------------------------- #
 # The kernel's environment and descriptions
@@ -234,7 +147,7 @@ def runtime(tmp_path, procs: Procs, **kw) -> k.LocalRuntime:
 
 def test_local_runtime_describes_itself(tmp_path):
     rt = runtime(tmp_path, Procs())
-    assert rt.name == "local" and rt.paths.identity
+    assert rt.name == "local"
     assert rt.describe() == "local (runs as you; not isolated)"
     [row] = rt.check()
     assert row.ok and not row.fatal
@@ -261,6 +174,14 @@ def test_start_passes_the_token_on_stdin_and_scrubs_the_environment(tmp_path):
     assert running.server == MarimoServer(url="http://127.0.0.1:2718", pid=4242, token=TOKEN, runtime="local")
     assert running.log_hint == str(log_path)
     assert [p.name for p in (tmp_path / ".hailer").glob("*.json")] == ["last-kernel.json"], "no kernel record"
+    # the sandbox: the kernel knows the host's own folders
+    from hailer.marimo_client import notebook_file_key
+
+    assert running.native_paths and running.notebooks_path == notebook_file_key(tmp_path / "notebooks")
+    assert running.data_path == str(tmp_path / "data") and running.data_dir == tmp_path / "data"
+    assert running.describe() == "local (runs as you; not isolated)"
+    assert running.notebook_url("q3/r.py") == f"http://127.0.0.1:2718/?file={notebook_file_key(tmp_path / 'notebooks')}/q3/r.py&view-as=present"
+    assert running.home_url(with_token=True) == f"http://127.0.0.1:2718/?access_token={TOKEN}" and TOKEN not in repr(running)
 
     log_path.write_text(f"URL: http://localhost:2718?access_token={TOKEN}\n", encoding="utf-8")
     running.stop()

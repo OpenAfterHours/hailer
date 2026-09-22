@@ -198,7 +198,7 @@ marimo's registry of `--no-token` servers, `[hailer].marimo_url`, `--keep-marimo
 that a recorded kernel was still the one it described, and never orphaning or destroying a busy one, took
 liveness probes, a start guard, settings-mismatch checks and id bookkeeping, and was the most intricate code
 in Hailer. Now each `uvx hailer` / `uvx hailer notebook` process starts its own kernel, keeps it in memory
-(`MarimoServer`, handed to the chat, the agent and the tools) and stops it in the `finally` of
+(the `Sandbox` its runtime's start returns, handed to the chat, the agent and the tools) and stops it in the `finally` of
 `cli._run_session` (`_start_kernel` runs inside the guarded block, so Ctrl+C right after the start cannot
 leak the kernel); `/exec` replaced `hailer exec`. Do not add a way to find or attach to another process's
 kernel: a restart costs a few seconds, which is cheaper than the lifecycle bugs.
@@ -221,3 +221,36 @@ ended by the user (Task Manager or `kill`). Evidence: `test_owner_locks_say_whet
 `test_two_sessions_run_side_by_side_and_each_removes_only_its_own`,
 `test_ctrl_c_right_after_the_kernel_started_still_stops_it` and the owner-label check in
 `tests/test_docker_integration.py`.
+
+## 12. Files belong to the sandbox: names above the runtime, paths only inside it
+
+Until 2026-09-22 the tools listed, created and resolved notebooks by walking the host's notebooks folder,
+read the data folder for `list_periods`, stored host paths in `.hailer/notebook.json`, and translated host
+paths to container paths (and back) through a `PathMap` that every layer carried. That only worked because the
+docker kernel's notebooks folder was a bind mount of the host's; it could not hold for notebooks that live in a
+container's own filesystem or in a cloud kernel. Now the started kernel is a `hailer.sandbox.Sandbox`: notebooks
+are names relative to its notebooks folder (`"q3/review.py"`), notebook files go through marimo's own file API
+(`/api/files/list_files`, `/file_details`, `/create`, `/update`, `/delete`; marimo 0.24.2, bearer token plus the
+`Marimo-Server-Token` header, no browser session needed), and data files are names from `list_data()`. The only
+place a name becomes a path is the runtime layer (`MarimoClient.file_key` / `name_of`, from the sandbox's
+`notebooks_path`), for `?file=` keys and session matching.
+
+Keep it that way: `hailer.tools` must not name the notebooks or data folders or call a file-system API
+(`test_the_tools_never_touch_the_notebooks_or_data_folders` checks the source). Every name is checked by
+`notebooks.check_notebook_name` before a request (no `..`, drive, leading `/`, dot- or dunder-folder, `:`
+stream, trailing dot/space or Windows device name): `test_names_are_checked_before_any_request`. marimo's
+`create` never overwrites; it writes `<stem>_1.py` instead, so a create that loses a race deletes that copy and
+reports the existing file (`test_a_file_that_appears_during_a_create_is_never_overwritten`).
+
+marimo's file endpoints confine nothing and follow links: a live probe against marimo 0.24.2 wrote
+`jn/escape.py` through a junction to outside the notebooks folder, and `Q3/Review.py` replaced `q3/review.py`
+on Windows and came back with the variant's spelling. So Hailer checks every path before sending it: a local
+kernel's names are compared with links resolved (a link out of the folder is outside; reads, writes and
+listings stop there), a Windows kernel's names ignore case and keep the listing's spelling, and
+`fake_marimo.py` records every path it was asked about instead of confining them
+(`test_a_link_out_of_the_notebooks_folder_is_never_followed`, `test_a_case_variant_is_the_same_notebook_on_windows`,
+`test_hailer_never_sends_a_path_outside_the_notebooks_folder`). marimo's `update` writes `\r\n` on Windows
+while `create` stores the bytes as given: compare contents with `sandbox.notebook_digest`. `notebook.json`
+without a `version` is the old host-path format: entries inside the notebooks folder are converted, everything
+else is dropped (`test_an_old_state_file_is_converted_to_names`). Workspace setup (`uvx hailer init`, the
+doctor's notebook row) may stay host-side.

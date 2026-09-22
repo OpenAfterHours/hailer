@@ -19,7 +19,7 @@ Run it with ``HAILER_DOCKER_TESTS=1 uv run pytest tests/test_docker_integration.
 One module-scoped kernel serves every test: :class:`~hailer.kernel.DockerRuntime` starts it for a
 temporary workspace holding sample sales data, headless Chrome stays connected to the notebook,
 and the tests talk to it through
-:class:`~hailer.marimo_client.MarimoClient` with host paths, as the agent's tools do. The last test
+the sandbox's :class:`~hailer.marimo_client.MarimoClient` by notebook name, as the agent's tools do. The last test
 stops it and checks that nothing is left behind (by the ids Docker gave it and the workspace label).
 """
 
@@ -50,11 +50,10 @@ from hailer.marimo_client import (
     answers_with_token,
     build_create_cell_code,
     find_free_port,
-    open_notebook_url,
     wait_for_session,
 )
 from hailer.models import ExecResult, HailerConfig
-from hailer.notebooks import ensure_notebook
+from hailer.notebooks import default_notebook, ensure_notebook
 
 MODE = os.environ.get("HAILER_DOCKER_TESTS", "").strip().lower()
 STRICT = MODE == "strict"
@@ -209,10 +208,11 @@ class Kernel:
 
     @property
     def notebook(self) -> Path:
+        """The notebook's file on the host (the notebooks folder is a bind mount)."""
         return self.config.notebook
 
     def run(self, code: str) -> ExecResult:
-        return self.client.execute(code, notebook=self.notebook, timeout=EXEC_TIMEOUT_SEC)
+        return self.client.execute(code, notebook=default_notebook(self.config), timeout=EXEC_TIMEOUT_SEC)
 
     def docker(self, *args: str) -> list[str]:
         result = self.runtime.runner.run(list(args), check=True, timeout=60)
@@ -269,12 +269,10 @@ def docker_kernel(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Kernel]:
         assert isinstance(kernel, DockerKernel)
         chrome_proc: subprocess.Popen | None = None
         try:
-            server = kernel.server
-            client = MarimoClient(
-                server.url, server.token, paths=server.paths, notebook=config.notebook, workspace=workspace, timeout=30
-            )
-            chrome_proc = open_in_browser(chrome, open_notebook_url(server, config.notebook, with_token=True), scratch)
-            if wait_for_session(client, config.notebook, timeout=SESSION_TIMEOUT_SEC) is None:
+            name = default_notebook(config)
+            client = kernel.client(notebook=name, timeout=30)
+            chrome_proc = open_in_browser(chrome, kernel.notebook_url(name, with_token=True), scratch)
+            if wait_for_session(client, name, timeout=SESSION_TIMEOUT_SEC) is None:
                 tail = "\n".join(kernel.log_tail(30))
                 pytest.fail(f"no marimo session for {config.notebook.name} within {SESSION_TIMEOUT_SEC:.0f} s\n{tail}")
             yield Kernel(
@@ -424,6 +422,25 @@ def test_the_containers_carry_this_process_as_their_owner(docker_kernel: Kernel)
     labels = json.loads(docker_kernel.docker("inspect", "--format", "{{json .Config.Labels}}", kernel.container_ids[0])[0])
     assert labels[LABEL_OWNER] == kernel.owner.id and owner_alive(docker_kernel.config.workspace, labels[LABEL_OWNER])
     assert labels[LABEL_CONTRACT] == kernel_image.contract_tag()
+
+
+def test_notebook_files_go_through_marimos_file_api_in_the_container(docker_kernel: Kernel):
+    """The sandbox contract against the real marimo in the container: notebooks listed, created,
+    read and replaced by names relative to /work/notebooks, through marimo's file endpoints."""
+    from hailer.errors import NotebookExistsError
+    from hailer.notebooks import render_template
+
+    kernel = docker_kernel.kernel
+    assert default_notebook(docker_kernel.config) in [f.name for f in kernel.list_notebooks()]
+    source = render_template("empty", title="File API")
+    assert kernel.write_notebook("api/check.py", source, replace=False).name == "api/check.py"
+    assert (docker_kernel.config.notebooks_root / "api" / "check.py").read_bytes() == source.encode("utf-8")
+    assert kernel.read_notebook("api/check.py") == source
+    with pytest.raises(NotebookExistsError):
+        kernel.write_notebook("api/check.py", source, replace=False)
+    kernel.write_notebook("api/check.py", source + "# again\n")
+    assert kernel.read_notebook("api/check.py").endswith("# again\n")
+    assert "api/check.py" in [f.name for f in kernel.list_notebooks()]
 
 
 def test_stop_leaves_no_containers_network_or_token(docker_kernel: Kernel):

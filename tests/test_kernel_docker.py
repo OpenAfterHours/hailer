@@ -119,7 +119,7 @@ def test_linux_host_user(monkeypatch):
 def test_docker_runtime_describes_itself(tmp_path):
     rt = kd.DockerRuntime(make_config(tmp_path), runner=FakeDocker())  # built for `kernel stop` from a local config
     assert rt.name == "docker" and rt.describe() == f"docker (hailer-kernel {CONTRACT}; no network; data read-only)"
-    assert rt.paths.to_kernel(tmp_path / "data" / "a.csv") == "/work/data/a.csv"
+    assert not hasattr(rt, "paths"), "names in the notebooks folder replaced the host <-> kernel path map"
     assert not hasattr(rt, "prompt_notes"), "one prompt path: runtime_prompt_notes"
 
 
@@ -426,9 +426,13 @@ def test_start_runs_the_hardened_kernel_offline_behind_a_forwarder(tmp_path):
     assert (tmp_path / "data").is_dir() and (tmp_path / "notebooks").is_dir(), "created before Docker could create them"
 
     assert isinstance(running, kd.DockerKernel)
-    assert running.server == MarimoServer(
-        url="http://127.0.0.1:2731", token=TOKEN, runtime="docker", paths=k.docker_paths(make_config(tmp_path)),
-    )  # fmt: skip
+    assert running.server == MarimoServer(url="http://127.0.0.1:2731", token=TOKEN, runtime="docker")
+    # the sandbox: the kernel knows the folders by their mount points; data is listed on the host
+    assert running.notebooks_path == "/work/notebooks" and running.data_path == "/work/data" and not running.native_paths
+    assert running.data_dir == tmp_path / "data" and running.notebooks_folder == tmp_path / "notebooks"
+    assert running.notebook_url("q3/r.py") == "http://127.0.0.1:2731/?file=/work/notebooks/q3/r.py&view-as=present"
+    assert running.describe() == f"docker (hailer-kernel {CONTRACT}; no network; data read-only)"
+    assert running.sync_out() == [], "a no-op while the notebooks folder is a bind mount"
     assert running.log_hint == f"docker logs {names.kernel}"
     assert running.containers == (names.kernel, names.forwarder) and running.container_ids == (kernel_c.id, forwarder_c.id)
     assert running.network == names.network and running.network_id == network.id

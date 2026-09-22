@@ -7,12 +7,15 @@ tools. A method's docstring is the description the model sees.
 Every tool returns plain text. Hailer errors become ``ERROR: <message>\\n<hint>``
 text so the model can act on them; nothing is raised into the agent loop.
 
-The *active notebook* (the one every kernel tool acts on) lives in
+The kernel is the :class:`~hailer.sandbox.MarimoSandbox` this Hailer process started, handed over by
+the chat and kept in memory; the tools never look for another. Everything they know about files
+comes from it: notebooks are names relative to its notebooks folder (``"sales.py"``,
+``"q3/review.py"``) and data files are names in its data folder. The tools never read or write
+either folder themselves.
+
+The *active notebook* (the one every kernel tool acts on) is a name in
 ``<workspace>/.hailer/notebook.json`` and is re-read on every call: both the model
 (``notebook_create`` / ``notebook_open``) and the CLI (``/notebook`` commands) may switch it.
-
-The marimo server is the one this Hailer process started, handed over by the chat and kept in
-memory; the tools never look for another.
 
 Tool results go to the model endpoint, so they never carry the marimo server's token: URLs in
 them are token-free (the user gets a signed-in link from ``/notebook`` in the chat), while the
@@ -26,16 +29,18 @@ import dataclasses
 import datetime as _dt
 import inspect
 import logging
-import os
 import threading
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import notebooks
 from .errors import HailerError, MarimoUnavailableError, NoSessionError
-from .models import KERNEL_RUNTIME_DOCKER, ExecResult, HailerConfig, MarimoServer, MarimoSession
+from .models import ExecResult, HailerConfig, MarimoSession
 from .web import truncate_text
+
+if TYPE_CHECKING:  # pragma: no cover - annotations only; the sandbox module imports marimo_client
+    from .sandbox import MarimoSandbox
 
 log = logging.getLogger("hailer.tools")
 
@@ -70,7 +75,6 @@ for _c in _ctx.cells:
     print(f"{_c.id}\\t{_c.name}\\t{_c.status}\\terrors={len(_c.errors)}\\t{_first[:100]}")
 '''.strip()
 
-ClientFactory = Callable[[], tuple[Any, MarimoServer]]
 UrlOpener = Callable[[str], bool]
 
 # Mimetypes whose rendered value is useful to a language model as-is.
@@ -128,52 +132,9 @@ def _default_open_url(url: str) -> bool:
     return open_url(url)
 
 
-def _same_file(a: Path | None, b: Path | None) -> bool:
-    if a is None or b is None:
-        return False
-    try:
-        return os.path.normcase(str(Path(a).resolve())) == os.path.normcase(str(Path(b).resolve()))
-    except OSError:
-        return False
-
-
-def _absolute(config: HailerConfig, value: str | Path) -> Path:
-    """A session/notebook path as an absolute path (relative values are taken from the workspace)."""
-    path = Path(value)
-    if not path.is_absolute():
-        path = Path(config.workspace) / path
-    try:
-        return path.resolve()
-    except OSError:
-        return path
-
-
-def _in_folder(config: HailerConfig, path: Path) -> bool:
-    try:
-        Path(path).resolve().relative_to(Path(config.notebooks_root).resolve())
-    except (ValueError, OSError):
-        return False
-    return True
-
-
-def _session_label(config: HailerConfig, session: MarimoSession) -> str:
-    """The session's notebook as shown to the model: workspace-relative when absolute, else as given."""
-    raw = session.path or session.filename
-    if not raw:
-        return "(unsaved notebook)"
-    if Path(raw).is_absolute():
-        return notebooks.notebook_display_name(config, Path(raw))
-    return raw
-
-
-def _kernel_data_dir(config: HailerConfig) -> str:
-    """The data folder as notebook code reaches it: its mount point in a docker kernel (the host path
-    does not exist there), the host path otherwise. ``list_periods`` runs on the host either way."""
-    if config.kernel.runtime == KERNEL_RUNTIME_DOCKER:
-        from .kernel import KERNEL_DATA_DIR  # lazy: keeps import-time coupling low
-
-        return str(KERNEL_DATA_DIR)
-    return str(config.data_dir)
+def _session_label(session: MarimoSession) -> str:
+    """The session's notebook as shown to the model: its name, else the path marimo reported."""
+    return session.name or session.path or session.filename or "(unsaved notebook)"
 
 
 def _fmt_size(size: int) -> str:
@@ -212,16 +173,15 @@ class HailerTools:
     def __init__(
         self,
         config: HailerConfig,
-        client_factory: ClientFactory | None = None,
+        sandbox: MarimoSandbox | None = None,
         *,
-        server: MarimoServer | None = None,
         open_url: UrlOpener | None = None,
         session_wait_sec: float = DEFAULT_SESSION_WAIT_SEC,
     ) -> None:
         self.config = config
-        #: The server this process started; ``None``: no kernel (every kernel tool says so).
-        self.server = server
-        self._client_factory = client_factory or self._default_client
+        #: The sandbox this process started (:class:`~hailer.sandbox.MarimoSandbox`); ``None``: no kernel
+        #: (every kernel tool says so).
+        self.sandbox = sandbox
         #: Opens a URL in the user's browser; injectable so tests never launch one.
         self.open_url: UrlOpener = open_url or _default_open_url
         #: How long to wait for a kernel session after opening the browser.
@@ -229,25 +189,20 @@ class HailerTools:
 
     # -- plumbing ----------------------------------------------------------- #
 
-    def _active_config(self) -> HailerConfig:
-        """The configuration with ``notebook`` set to the active notebook (re-read every call)."""
-        return dataclasses.replace(self.config, notebook=notebooks.load_active_notebook(self.config))
+    def _active(self) -> str:
+        """The active notebook's name (re-read from the state file every call)."""
+        return notebooks.load_active_notebook(self.config)
 
-    def _default_client(self) -> tuple[Any, MarimoServer]:
-        from . import marimo_client as mc  # lazy
+    def _kernel(self) -> Any:
+        """The sandbox, or ``MarimoUnavailableError`` when this session has none."""
+        if self.sandbox is None:
+            from .marimo_client import launch_hint  # lazy
 
-        config = self._active_config()
-        server = self.server
-        if server is None:
-            raise MarimoUnavailableError("marimo is not running: this session has no kernel", mc.launch_hint())
-        client = mc.MarimoClient(
-            server.url,
-            token=server.token,
-            notebook=config.notebook,
-            workspace=config.workspace,
-            paths=server.paths,
-        )
-        return client, server
+            raise MarimoUnavailableError("marimo is not running: this session has no kernel", launch_hint())
+        return self.sandbox
+
+    def _client(self, notebook: str | None = None) -> Any:
+        return self._kernel().client(notebook=notebook)
 
     def _truncate(self, text: str) -> str:
         return truncate_text(text, self.config.max_tool_output_chars)
@@ -261,88 +216,51 @@ class HailerTools:
             log.exception("tool failed")
             return self._truncate(f"ERROR: unexpected {type(exc).__name__}: {exc}")
 
-    def _open_url(self, server: MarimoServer, notebook: Path, *, with_token: bool = False) -> str:
+    def _url(self, notebook: str, *, with_token: bool = False) -> str:
         """The notebook's URL: token-free for the model (the default), signed in for the browser."""
+        sandbox = self._kernel()
         try:
-            from . import marimo_client as mc
-
-            return mc.open_notebook_url(server, notebook, with_token=with_token)
+            return sandbox.notebook_url(notebook, with_token=with_token)
         except Exception:  # noqa: BLE001 - best effort
-            return server.url
+            return sandbox.server.url
 
-    def _host_notebook(self, config: HailerConfig, ref: str) -> str:
-        """``ref`` as the host knows it: the model sees the kernel's paths (``/work/notebooks/...``
-        in a container) and may pass one back; anything else is returned unchanged."""
-        text = (ref or "").strip().strip("\"'").strip()
-        if not text.startswith("/"):
-            return ref
-        try:
-            _client, server = self._client_factory()
-            paths = server.paths
-        except HailerError:
-            paths = None
-        if paths is None and config.kernel.runtime == KERNEL_RUNTIME_DOCKER:
-            from .kernel import docker_paths  # lazy: keeps import-time coupling low
+    def _resolve(self, ref: str) -> str:
+        """``ref`` as the name of an existing notebook: the model may pass a name, a file name or the
+        kernel's path (``/work/notebooks/...`` in a container)."""
+        sandbox = self._kernel()
+        names = [info.name for info in sandbox.list_notebooks()]
+        return notebooks.resolve_notebook(ref, names, folders=notebooks.reference_folders(self.config, sandbox.notebooks_path))
 
-            paths = docker_paths(config)
-        if paths is None or paths.identity:
-            return ref
-        host = paths.to_host(text)
-        return host if host is not None else ref
-
-    def _kernel_lines(self, server: MarimoServer) -> list[str]:
-        """Where notebook code runs and where it finds the folders, from the server in use (a chat
-        whose kernel changed underneath still gets the truth)."""
-        from .kernel import KERNEL_DATA_DIR, KERNEL_NOTEBOOKS_DIR, describe_runtime  # lazy
-
-        config = self.config
-        if server.runtime == KERNEL_RUNTIME_DOCKER:
-            kernel = dataclasses.replace(config.kernel, runtime=KERNEL_RUNTIME_DOCKER, network=server.network_access)
-            return [
-                f"kernel: {describe_runtime(kernel)}",
-                f"kernel paths: notebooks folder {KERNEL_NOTEBOOKS_DIR} (writable), data folder {KERNEL_DATA_DIR} "
-                "(read-only); use these in code",
-            ]
-        kernel = dataclasses.replace(config.kernel, runtime="local")
+    def _kernel_lines(self) -> list[str]:
+        """Where notebook code runs and where it finds the folders, from the sandbox in use."""
+        sandbox = self._kernel()
         return [
-            f"kernel: {describe_runtime(kernel)}",
-            f"kernel paths: notebooks folder {config.notebooks_root}, data folder {config.data_dir}",
+            f"kernel: {sandbox.describe()}",
+            f"kernel paths: notebooks folder {sandbox.notebooks_path}, data folder {sandbox.data_path}; use these in code",
         ]
 
-    def _display(self, config: HailerConfig, path: Path) -> str:
-        return notebooks.notebook_display_name(config, path)
-
-    def _open_paths(self) -> set[str] | None:
-        """Normalised paths of the notebooks that have a session; ``None`` when marimo is unreachable."""
-        return self._open_paths_or_error()[0]
-
-    def _open_paths_or_error(self) -> tuple[set[str] | None, HailerError | None]:
-        """Like ``_open_paths`` but also returns the error that made marimo unreachable."""
+    def _open_names_or_error(self) -> tuple[set[str] | None, HailerError | None]:
+        """The names of the notebooks that have a session (``None`` when marimo is unreachable)
+        and the error that made it unreachable."""
         try:
-            client, _ = self._client_factory()
-            sessions = client.sessions()
+            sessions = self._client().sessions()
         except HailerError as err:
             return None, err
-        out: set[str] = set()
-        for session in sessions:
-            raw = session.path or session.filename
-            if raw:
-                out.add(os.path.normcase(str(_absolute(self.config, raw))))
-        return out, None
+        return {s.name for s in sessions if s.name}, None
 
-    def _bring_up(self, notebook: Path) -> _SessionOutcome:
+    def _bring_up(self, notebook: str) -> _SessionOutcome:
         """Make sure ``notebook`` has a kernel session: reuse one, else open the browser and wait."""
         from . import marimo_client as mc  # lazy
 
         outcome = _SessionOutcome()
         try:
-            client, server = self._client_factory()
+            client = self._client(notebook)
         except HailerError as err:
             outcome.marimo_error = err
             return outcome
         outcome.client = client
-        outcome.url = self._open_url(server, notebook)
-        browser_url = self._open_url(server, notebook, with_token=True)
+        outcome.url = self._url(notebook)
+        browser_url = self._url(notebook, with_token=True)
         # A kernel that stopped (or went away) first shows up here. The notebook was already
         # created/switched by then; report it as a session outcome rather than letting the error
         # replace the whole reply.
@@ -404,9 +322,8 @@ class HailerTools:
         """
 
         def go() -> str:
-            config = self._active_config()
-            client, _ = self._client_factory()
-            result = client.execute(code, notebook=config.notebook)
+            active = self._active()
+            result = self._client(active).execute(code, notebook=active)
             text = _result_text(result)
             return text if result.success else f"Execution failed.\n{text}"
 
@@ -419,43 +336,41 @@ class HailerTools:
         the reply contains the URL the user must open."""
 
         def go() -> str:
-            config = self._active_config()
-            active_name = self._display(config, config.notebook)
+            active = self._active()
             active_session: MarimoSession | None
             try:
-                client, server = self._client_factory()
+                sandbox = self._kernel()
+                client = self._client(active)
                 sessions = client.sessions()
                 try:
-                    active_session = client.resolve_session(config.notebook)
+                    active_session = client.resolve_session(active)
                 except NoSessionError:
                     active_session = None
             except MarimoUnavailableError as err:
-                # A kernel that stopped surfaces here as well as from the factory; the active
+                # A kernel that stopped surfaces here as well as without a sandbox; the active
                 # notebook is named either way.
-                return f"marimo: not running\nactive notebook: {active_name}\n{err}\n{err.hint}".rstrip()
-            lines = [f"marimo: running at {server.url}"]
-            lines += self._kernel_lines(server)
+                return f"marimo: not running\nactive notebook: {active}\n{err}\n{err.hint}".rstrip()
+            lines = [f"marimo: running at {sandbox.server.url}"]
+            lines += self._kernel_lines()
             if active_session is not None:
-                lines.append(f"active notebook: {active_name} -> session {active_session.session_id} (ready)")
+                lines.append(f"active notebook: {active} -> session {active_session.session_id} (ready)")
             else:
                 lines.append(
-                    f"active notebook: {active_name} has NO session. "
-                    f"Ask the user to open {self._open_url(server, config.notebook)} in a browser. {NOTEBOOK_LINK_TIP}"
+                    f"active notebook: {active} has NO session. "
+                    f"Ask the user to open {self._url(active)} in a browser. {NOTEBOOK_LINK_TIP}"
                 )
             if sessions:
                 lines.append("sessions:")
                 for s in sessions:
-                    label = _session_label(config, s)
-                    raw = s.path or s.filename
                     if active_session is not None and s.session_id == active_session.session_id:
                         marker = "(active notebook)"
-                    elif raw and _in_folder(config, _absolute(config, raw)):
+                    elif s.name:
                         marker = "(another notebook in the notebooks folder; notebook_open switches to it)"
-                    elif raw:
+                    elif s.path or s.filename:
                         marker = "(outside the notebooks folder)"
                     else:
                         marker = "(unsaved)"
-                    lines.append(f"  - {s.session_id}: {label} {marker}")
+                    lines.append(f"  - {s.session_id}: {_session_label(s)} {marker}")
             else:
                 lines.append("sessions: none (no notebook is open in a browser)")
             return "\n".join(lines)
@@ -468,9 +383,8 @@ class HailerTools:
         that owns a variable and to avoid creating duplicate cells."""
 
         def go() -> str:
-            config = self._active_config()
-            client, _ = self._client_factory()
-            result = client.execute(_list_cells_code(), notebook=config.notebook)
+            active = self._active()
+            result = self._client(active).execute(_list_cells_code(), notebook=active)
             text = _result_text(result)
             if not result.success:
                 return f"Could not list cells.\n{text}"
@@ -490,24 +404,25 @@ class HailerTools:
         creating a notebook (to avoid duplicates) and when the user refers to an existing one."""
 
         def go() -> str:
-            config = self._active_config()
-            folder = self._display(config, config.notebooks_root)
-            infos = notebooks.list_notebooks(config)
+            active = self._active()
+            sandbox = self._kernel()
+            folder = sandbox.notebooks_path
+            infos = sandbox.list_notebooks()
             if not infos:
                 return f"No notebooks in {folder} yet. Create one with notebook_create(name)."
-            open_paths, marimo_error = self._open_paths_or_error()
+            open_names, marimo_error = self._open_names_or_error()
             lines = [f"Notebooks in {folder} ([active] = the one tools act on, [open] = has a kernel session):"]
             for info in infos:
                 markers: list[str] = []
-                if _same_file(info.path, config.notebook):
+                if notebooks.same_name(info.name, active):
                     markers.append("[active]")
-                if open_paths is not None and os.path.normcase(str(_absolute(config, info.path))) in open_paths:
+                if open_names is not None and info.name in open_names:
                     markers.append("[open]")
-                line = f"  - {self._display(config, info.path)}  modified {_fmt_when(info.modified)}  {_fmt_size(info.size)}"
+                line = f"  - {info.name}  modified {_fmt_when(info.modified)}  {_fmt_size(info.size)}"
                 if markers:
                     line += "  " + " ".join(markers)
                 lines.append(line)
-            if open_paths is None:
+            if open_names is None:
                 lines.append("(marimo is not reachable, so which notebooks are open is unknown.)")
                 if marimo_error is not None:
                     lines.append(str(marimo_error))
@@ -527,12 +442,11 @@ class HailerTools:
             kind = (template or "starter").strip().lower()
             if kind not in notebooks.TEMPLATE_KINDS:
                 return f"ERROR: unknown template {template!r}.\nUse 'starter' (imports, data helpers, welcome cell) or 'empty'."
-            config = self._active_config()
-            path = notebooks.create_notebook(config, name, kind=kind)  # type: ignore[arg-type]
-            notebooks.save_active_notebook(config, path)
-            display = self._display(config, path)
-            lines = [f"Created {display} from the {kind} template; it is now the active notebook."]
-            lines.extend(self._session_lines(self._bring_up(path)))
+            filename, source = notebooks.new_notebook(name, kind=kind)  # type: ignore[arg-type]
+            created = self._kernel().write_notebook(filename, source, replace=False).name
+            notebooks.save_active_notebook(self.config, created)
+            lines = [f"Created {created} from the {kind} template; it is now the active notebook."]
+            lines.extend(self._session_lines(self._bring_up(created)))
             if kind == "starter":
                 lines.append(
                     "The starter template already defines mo, pl, duckdb, Path, WORKSPACE, DATA_DIR, data_files, "
@@ -553,15 +467,13 @@ class HailerTools:
         session yet. Returns its cells so you can continue where the notebook left off."""
 
         def go() -> str:
-            config = self._active_config()
-            path = notebooks.resolve_notebook(config, self._host_notebook(config, notebook))
-            notebooks.save_active_notebook(config, path)
-            display = self._display(config, path)
-            outcome = self._bring_up(path)
-            lines = [f"{display} is now the active notebook."]
+            name = self._resolve(notebook)
+            notebooks.save_active_notebook(self.config, name)
+            outcome = self._bring_up(name)
+            lines = [f"{name} is now the active notebook."]
             lines.extend(self._session_lines(outcome))
             if outcome.session is not None and outcome.client is not None:
-                result = outcome.client.execute(_list_cells_code(), notebook=path)
+                result = outcome.client.execute(_list_cells_code(), notebook=name)
                 text = _result_text(result)
                 if result.success:
                     lines.append("Cells (id, name, status, errors, first line):")
@@ -578,28 +490,27 @@ class HailerTools:
         until it is reopened with notebook_open."""
 
         def go() -> str:
-            config = self._active_config()
-            ref = self._host_notebook(config, notebook) if (notebook or "").strip() else ""
-            path = notebooks.resolve_notebook(config, ref) if ref else config.notebook
-            display = self._display(config, path)
+            active = self._active()
             try:
-                client, _ = self._client_factory()
-                session = client.resolve_session(path)
+                name = self._resolve(notebook) if (notebook or "").strip() else active
+                client = self._client(name)
+                session = client.resolve_session(name)
             except NoSessionError:
-                return f"{display} is not open (no kernel session), so there is nothing to close."
+                return f"{name} is not open (no kernel session), so there is nothing to close."
             except MarimoUnavailableError as err:
-                return f"marimo is not running, so {display} has no kernel session to close.\n{err}\n{err.hint}".rstrip()
+                shown = (notebook or "").strip() or active
+                return f"marimo is not running, so {shown} has no kernel session to close.\n{err}\n{err.hint}".rstrip()
             client.shutdown_session(session.session_id)
             lines = [
-                f"Closed the kernel session ({session.session_id}) of {display}; its memory is freed and its browser tab is disconnected."
+                f"Closed the kernel session ({session.session_id}) of {name}; its memory is freed and its browser tab is disconnected."
             ]
-            if _same_file(path, config.notebook):
+            if notebooks.same_name(name, active):
                 lines.append(
                     "It stays the active notebook, but nothing can run in it until it is opened again "
                     "(notebook_open reopens it, or notebook_open another notebook to switch)."
                 )
             else:
-                lines.append(f"The active notebook is still {self._display(config, config.notebook)}.")
+                lines.append(f"The active notebook is still {active}.")
             return "\n".join(lines)
 
         return self._run(go)
@@ -615,21 +526,25 @@ class HailerTools:
         def go() -> str:
             from . import periods  # lazy
 
-            data_dir = self.config.data_dir
-            shown = _kernel_data_dir(self.config)
-            if not data_dir.is_dir():
-                return f"Data directory does not exist: {shown}"
-            files = periods.scan_period_files(data_dir, name.strip() or None)
-            if files:
-                text = periods.describe_periods(files)
+            sandbox = self._kernel()
+            shown = sandbox.data_path
+            files = sandbox.list_data()
+            wanted = name.strip().lower() or None
+            found = []
+            for info in files:
+                pf = periods.parse_period_file(Path(info.name)) if info.name.lower().endswith(".parquet") else None
+                if pf is not None and (wanted is None or pf.stem == wanted):
+                    found.append(pf)
+            if found:
+                text = periods.describe_periods(found, schema=lambda pf: sandbox.data_schema(pf.path.name))
             else:
                 text = (
                     f"No period files found in {shown}"
                     + (f" for '{name.strip()}'" if name.strip() else "")
                     + ". Monthly files are named like '25-01 sales.parquet' (YY-MM then the dataset name)."
                 )
-            listed = {pf.path.name for pf in files}
-            others = [p.name for p in periods.list_data_files(data_dir) if p.name not in listed]
+            listed = {pf.path.name for pf in found}
+            others = [f.name for f in files if f.name.lower().endswith(periods.DATA_SUFFIXES) and f.name not in listed]
             if others:
                 shown = ", ".join(others[:20]) + (f" (and {len(others) - 20} more)" if len(others) > 20 else "")
                 text += f"\nOther data files (load them directly with Polars or DuckDB): {shown}"
@@ -706,16 +621,15 @@ def _in_daemon_thread(fn: Callable[..., str]) -> Callable[..., Any]:
 def hailer_tools(
     config: HailerConfig,
     *,
-    server: MarimoServer | None = None,
-    client_factory: ClientFactory | None = None,
+    sandbox: MarimoSandbox | None = None,
     open_url: UrlOpener | None = None,
     session_wait_sec: float = DEFAULT_SESSION_WAIT_SEC,
 ) -> list[Any]:
-    """Hailer's tools as LangChain tools (``TOOL_NAMES`` order), bound to ``config`` and to ``server``,
-    the kernel this process started."""
+    """Hailer's tools as LangChain tools (``TOOL_NAMES`` order), bound to ``config`` and to
+    ``sandbox``, the kernel this process started."""
     from langchain_core.tools import StructuredTool  # lazy: keeps `hailer --help` and friends fast
 
-    impl = HailerTools(config, client_factory, server=server, open_url=open_url, session_wait_sec=session_wait_sec)
+    impl = HailerTools(config, sandbox, open_url=open_url, session_wait_sec=session_wait_sec)
     out: list[Any] = []
     for name in TOOL_NAMES:
         method = getattr(impl, name)

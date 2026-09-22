@@ -10,9 +10,10 @@ helpers add one, and they cope with columns appearing in later months (schema ev
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import polars as pl
@@ -217,12 +218,17 @@ def _schema(pf: PeriodFile) -> dict[str, pl.DataType]:
         raise _malformed(pf.path, err) from err
 
 
-def describe_periods(files: Sequence[PeriodFile]) -> str:
-    """Compact text summary: count, span, common columns, and columns that only appear in some periods."""
+def describe_periods(files: Sequence[PeriodFile], schema: Callable[[PeriodFile], Mapping[str, Any]] | None = None) -> str:
+    """Compact text summary: count, span, common columns, and columns that only appear in some periods.
+
+    ``schema`` reads a file's columns and types (default: the Parquet schema at ``pf.path``); Hailer's
+    ``list_periods`` tool passes one that asks the kernel's sandbox, so it never opens the data folder.
+    """
     if not files:
         return "No period files found (expected names like '25-01 sales.parquet')."
     ordered = sorted(files, key=lambda f: (f.period, f.stem))
-    schemas = [(pf, _schema(pf)) for pf in ordered]
+    read = schema or _schema
+    schemas = [(pf, read(pf)) for pf in ordered]
     stems = sorted({pf.stem for pf in ordered})
     first, last = ordered[0].period.label, ordered[-1].period.label
     lines = [f"{len(ordered)} period file(s) [{', '.join(stems)}]: {first} -> {last}"]

@@ -26,7 +26,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from hailer import secrets as _secrets
 from hailer.errors import AgentError, ConfigError, CredentialsError, HailerError, ProviderError
@@ -43,6 +43,9 @@ from hailer.models import (
     TurnSummary,
 )
 from hailer.statedir import ensure_state_dir, state_dir
+
+if TYPE_CHECKING:  # pragma: no cover - annotations only; the tools import it lazily
+    from hailer.sandbox import MarimoSandbox
 
 log = get_logger("hailer.agent")
 
@@ -502,12 +505,12 @@ class HailerAgent:
         tools: list[Any] | None = None,
         env: Mapping[str, str] | None = None,
         threads_path: Path | None = None,
-        server: MarimoServer | None = None,
+        sandbox: MarimoSandbox | None = None,
     ) -> None:
         self.config = config
         self._bundle = bundle
-        #: The marimo server this process started; the tools use it (``None``: no kernel).
-        self._server = server
+        #: The sandbox (kernel) this process started; the tools use it (``None``: no kernel).
+        self._sandbox = sandbox
         self._environ: Mapping[str, str] = env if env is not None else os.environ
         self._model_factory = model_factory
         self._tools = tools
@@ -632,7 +635,7 @@ class HailerAgent:
         if self._tools is None:
             from hailer.tools import hailer_tools
 
-            self._tools = hailer_tools(self.config, server=self._server)
+            self._tools = hailer_tools(self.config, sandbox=self._sandbox)
         middleware: list[Any] = []
         after = self.config.model.summarize_after_tokens
         if after > 0:
@@ -644,7 +647,7 @@ class HailerAgent:
         self._graph = create_agent(
             model,
             self._tools,
-            system_prompt=system_prompt(self.config, self._bundle, self._server),
+            system_prompt=system_prompt(self.config, self._bundle, self._sandbox.server if self._sandbox is not None else None),
             middleware=middleware,
             checkpointer=self._saver,
         )

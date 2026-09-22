@@ -238,8 +238,8 @@ row, and every start stops on it, `--foreground` included (the same rules, in on
   session creates and holds an operating-system lock on for as long as it runs; the operating system drops
   the lock when the process ends, however it ends. A start waits only for the server that answers with its
   own token, so two sessions that pick the same port never take each other's server. Nothing attaches to a
-  kernel another session started; the chat keeps its own server's token and path mapping in memory,
-  including across notebook and model switches.
+  kernel another session started; the chat keeps its own sandbox (the server's token, and where the
+  container sees the notebooks and data folders) in memory, including across notebook and model switches.
 - **`--foreground`** starts the kernel and follows its log in this terminal, without a chat. Ctrl+C stops
   and removes it; when it ends for another reason, Hailer says why (out of memory, removed from outside,
   exited).

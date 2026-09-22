@@ -1,18 +1,14 @@
 """Typed internal models shared across Hailer modules.
 
 Keep this module dependency-free (standard library only) so every other module
-can import it without side effects. :class:`~hailer.kernel.PathMap` is only named in
-annotations here (a ``TYPE_CHECKING`` import): ``hailer.kernel`` imports this module.
+can import it without side effects.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
-
-if TYPE_CHECKING:  # pragma: no cover - annotations only; hailer.kernel imports this module
-    from hailer.kernel import PathMap
+from typing import Any, Literal
 
 
 # --------------------------------------------------------------------------- #
@@ -32,8 +28,6 @@ class MarimoServer:
     token: str | None = field(default=None, repr=False)
     #: Where the kernel runs: "local" (Hailer's own Python) or "docker".
     runtime: str = "local"
-    #: Host <-> kernel paths; ``None`` means identity (the kernel sees the host's paths).
-    paths: PathMap | None = None
     #: Docker only: whether the kernel was started with ``[kernel] network = true``.
     network_access: bool = False
 
@@ -43,8 +37,11 @@ class MarimoSession:
     """An active kernel session (exists only while the notebook is open in a browser)."""
 
     session_id: str
-    filename: str | None
+    filename: str | None  # as marimo reports them: kernel paths
     path: str | None
+    #: The notebook's name in the notebooks folder (``"q3/review.py"``); ``None`` for an unsaved
+    #: notebook or one outside the folder.
+    name: str | None = None
 
 
 @dataclass

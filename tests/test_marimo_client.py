@@ -13,8 +13,8 @@ import pytest
 
 from fake_marimo import FakeMarimo
 from hailer import marimo_client as mc
-from hailer.errors import MarimoExecutionError, MarimoUnavailableError, NoSessionError, NotebookPathError
-from hailer.models import HailerConfig, MarimoServer, MarimoSession
+from hailer.errors import MarimoExecutionError, MarimoUnavailableError, NoSessionError
+from hailer.models import MarimoServer, MarimoSession
 
 # --------------------------------------------------------------------------- #
 # Fake server (tests/fake_marimo.py)
@@ -36,17 +36,14 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _config(tmp_path: Path, **overrides) -> HailerConfig:
-    base = dict(
-        workspace=tmp_path,
-        notebook=tmp_path / "notebooks" / "analysis.py",
-        data_dir=tmp_path / "data",
-        context_dir=tmp_path / ".config" / "hailer" / "context",
-        skills_dir=tmp_path / ".config" / "hailer" / "skills",
-        prompts_dir=tmp_path / ".config" / "hailer" / "prompts",
-    )
-    base.update(overrides)
-    return HailerConfig(**base)
+def _local_client(fake, tmp_path: Path, **kw) -> mc.MarimoClient:
+    """A client for a local kernel: it knows the notebooks folder by its host path."""
+    return mc.MarimoClient(fake.url, notebooks_path=mc.notebook_file_key(tmp_path / "notebooks"), native_paths=True, **kw)
+
+
+def _docker_client(fake, **kw) -> mc.MarimoClient:
+    """A client for a kernel in a container: it knows the notebooks folder as /work/notebooks."""
+    return mc.MarimoClient(fake.url, notebooks_path="/work/notebooks", **kw)
 
 
 # --------------------------------------------------------------------------- #
@@ -62,11 +59,11 @@ def test_health_true_and_false(fake):
 def test_sessions_parsed(fake, tmp_path):
     nb = tmp_path / "notebooks" / "analysis.py"
     fake.sessions = {"s1": {"filename": "notebooks/analysis.py", "path": str(nb)}, "s2": {"filename": None, "path": None}}
-    sessions = mc.MarimoClient(fake.url).sessions()
-    assert sessions == [
-        MarimoSession("s1", "notebooks/analysis.py", str(nb)),
+    assert _local_client(fake, tmp_path).sessions() == [
+        MarimoSession("s1", "notebooks/analysis.py", str(nb), name="analysis.py"),
         MarimoSession("s2", None, None),
     ]
+    assert mc.MarimoClient(fake.url).sessions()[0].name is None, "no notebooks folder: no names"
 
 
 # --------------------------------------------------------------------------- #
@@ -129,7 +126,7 @@ def test_execute_stream_without_done(fake):
 def test_execute_resolves_session_when_not_given(fake, tmp_path):
     nb = tmp_path / "notebooks" / "analysis.py"
     fake.sessions = {"abc": {"filename": "notebooks/analysis.py", "path": str(nb)}}
-    result = mc.MarimoClient(fake.url, notebook=nb, workspace=tmp_path).execute("1")
+    result = _local_client(fake, tmp_path, notebook="analysis.py").execute("1")
     assert result.success
     assert fake.requests[-1]["headers"]["Marimo-Session-Id"] == "abc"
 
@@ -147,8 +144,7 @@ def test_bearer_token_sent_and_401_mapped(fake):
 
 
 def test_connection_refused_hint_says_how_to_get_a_new_kernel(tmp_path):
-    nb = tmp_path / "notebooks" / "analysis.py"
-    client = mc.MarimoClient(f"http://127.0.0.1:{_free_port()}", notebook=nb, workspace=tmp_path)
+    client = mc.MarimoClient(f"http://127.0.0.1:{_free_port()}", notebooks_path="/work/notebooks", notebook="analysis.py")
     with pytest.raises(MarimoUnavailableError) as exc:
         client.sessions()
     assert exc.value.hint == mc.launch_hint() and "uvx hailer" in exc.value.hint
@@ -208,28 +204,28 @@ def test_shutdown_session_stale_token_is_actionable_and_refetched(fake):
 
 
 def test_resolve_no_sessions(fake, tmp_path):
-    nb = tmp_path / "notebooks" / "analysis.py"
     with pytest.raises(NoSessionError) as exc:
-        mc.MarimoClient(fake.url, notebook=nb, workspace=tmp_path).resolve_session(nb)
+        _local_client(fake, tmp_path).resolve_session("analysis.py")
     assert "not open in a browser" in str(exc.value)
-    assert exc.value.hint.startswith("Open ") and f"?file={mc.notebook_file_key(nb)}" in exc.value.hint
+    key = mc.notebook_file_key(tmp_path / "notebooks" / "analysis.py")
+    assert exc.value.hint.startswith("Open ") and f"?file={quote(key, safe='/:')}" in exc.value.hint
 
 
-def test_resolve_by_absolute_path_and_case(fake, tmp_path):
+def test_resolve_by_name_whatever_the_case_of_the_host_path(fake, tmp_path):
     nb = tmp_path / "notebooks" / "analysis.py"
-    stored = str(nb).upper() if os.name == "nt" else str(nb)
+    stored = str(nb).upper().replace("ANALYSIS.PY", "analysis.py") if os.name == "nt" else str(nb)
     fake.sessions = {"other": {"filename": "x.py", "path": str(tmp_path / "x.py")}, "mine": {"filename": "notebooks/analysis.py", "path": stored}}
-    assert mc.MarimoClient(fake.url).resolve_session(nb).session_id == "mine"
+    client = _local_client(fake, tmp_path)
+    assert client.resolve_session("analysis.py").session_id == "mine"
+    assert {s.session_id: s.name for s in client.sessions()} == {"other": None, "mine": "analysis.py"}, "x.py is outside the folder"
 
 
-def test_resolve_relative_session_path_against_the_workspace(fake, tmp_path):
-    nb = tmp_path / "notebooks" / "analysis.py"
-    fake.sessions = {"mine": {"filename": "notebooks/analysis.py", "path": None}}
-    assert mc.MarimoClient(fake.url, workspace=tmp_path).resolve_session(nb).session_id == "mine"
-    # a bare filename is not the same notebook: no more matching by name alone
-    fake.sessions = {"other": {"filename": "analysis.py", "path": None}}
+def test_relative_or_bare_session_paths_never_match(fake, tmp_path):
+    """marimo reports absolute paths for notebooks opened by an absolute key; a bare or relative
+    filename is not the same notebook (no matching by file name alone)."""
+    fake.sessions = {"other": {"filename": "analysis.py", "path": None}, "rel": {"filename": "notebooks/analysis.py", "path": None}}
     with pytest.raises(NoSessionError):
-        mc.MarimoClient(fake.url, workspace=tmp_path).resolve_session(nb)
+        _local_client(fake, tmp_path).resolve_session("analysis.py")
 
 
 def test_resolve_same_filename_in_two_subfolders(fake, tmp_path):
@@ -237,33 +233,32 @@ def test_resolve_same_filename_in_two_subfolders(fake, tmp_path):
     b = tmp_path / "notebooks" / "b" / "report.py"
     fake.sessions = {"sA": {"filename": "a/report.py", "path": str(a)}}
     with pytest.raises(NoSessionError):
-        mc.MarimoClient(fake.url, workspace=tmp_path).resolve_session(b)
+        _local_client(fake, tmp_path).resolve_session("b/report.py")
     fake.sessions = {"sA": {"filename": "a/report.py", "path": str(a)}, "sB": {"filename": "b/report.py", "path": str(b)}}
-    client = mc.MarimoClient(fake.url, workspace=tmp_path)
-    assert client.resolve_session(a).session_id == "sA"
-    assert client.resolve_session(b).session_id == "sB"
+    client = _local_client(fake, tmp_path)
+    assert client.resolve_session("a/report.py").session_id == "sA"
+    assert client.resolve_session("b/report.py").session_id == "sB"
 
 
-def test_match_session_ignores_untitled_and_prefers_the_latest(tmp_path):
-    nb = tmp_path / "notebooks" / "analysis.py"
+def test_match_session_ignores_untitled_and_prefers_the_latest():
     sessions = [
         MarimoSession("untitled", None, None),
-        MarimoSession("old", "notebooks/analysis.py", str(nb)),
-        MarimoSession("other", "x.py", str(tmp_path / "x.py")),
-        MarimoSession("new", "notebooks/analysis.py", str(nb).upper() if os.name == "nt" else str(nb)),
+        MarimoSession("old", "analysis.py", "/work/notebooks/analysis.py", name="analysis.py"),
+        MarimoSession("outside", "x.py", "/tmp/analysis.py"),
+        MarimoSession("new", "analysis.py", "/work/notebooks/analysis.py", name="analysis.py"),
     ]
-    assert mc.match_session(sessions, nb, tmp_path).session_id == "new"
-    assert mc.match_session(sessions[:1], nb, tmp_path) is None
-    assert mc.match_session([], nb) is None
-    assert mc.match_session([MarimoSession("rel", "notebooks/analysis.py", "notebooks/analysis.py")], nb, tmp_path).session_id == "rel"
-    assert mc.match_session([MarimoSession("rel", "notebooks/analysis.py", "notebooks/analysis.py")], nb, tmp_path / "elsewhere") is None
+    assert mc.match_session(sessions, "analysis.py").session_id == "new"
+    assert mc.match_session(sessions[:1], "analysis.py") is None
+    assert mc.match_session([], "analysis.py") is None
+    assert mc.match_session(sessions, "sub/analysis.py") is None
+    assert mc.match_session(sessions, "ANALYSIS.py") is None, "case matters unless the kernel's paths fold it"
+    assert mc.match_session(sessions, "ANALYSIS.py", fold=True).session_id == "new"
 
 
 def test_resolve_multiple_no_match_lists_sessions(fake, tmp_path):
-    nb = tmp_path / "notebooks" / "analysis.py"
     fake.sessions = {"a": {"filename": "one.py", "path": str(tmp_path / "one.py")}, "b": {"filename": "two.py", "path": str(tmp_path / "two.py")}}
     with pytest.raises(NoSessionError) as exc:
-        mc.MarimoClient(fake.url).resolve_session(nb)
+        _local_client(fake, tmp_path).resolve_session("analysis.py")
     assert "one.py" in exc.value.hint and "two.py" in exc.value.hint
 
 
@@ -294,30 +289,25 @@ def test_notebook_file_key_does_not_resolve_symlinks(tmp_path, monkeypatch):
     assert mc.notebook_file_key(relative) == (Path.cwd() / relative).as_posix()
 
 
-def test_open_notebook_url_defaults_to_app_view(tmp_path):
-    nb = tmp_path / "notebooks" / "my analysis.py"
-    url = mc.open_notebook_url(MarimoServer(url="http://127.0.0.1:2718"), nb, tmp_path)
-    key = mc.notebook_file_key(nb)
-    assert url == f"http://127.0.0.1:2718/?file={quote(key, safe='/:')}&view-as=present"
-    assert "my%20analysis.py" in url and "%5C" not in url, "absolute posix key, no backslashes"
-    # the workspace no longer influences the key (absolute keys work on folder and single-file servers)
-    assert mc.open_notebook_url(MarimoServer(url="http://127.0.0.1:2718"), nb, tmp_path / "elsewhere") == url
-    assert mc.open_notebook_url(MarimoServer(url="http://127.0.0.1:2718"), nb) == url
+def test_open_notebook_url_defaults_to_app_view():
+    url = mc.open_notebook_url(MarimoServer(url="http://127.0.0.1:2718"), "/work/notebooks/my analysis.py")
+    assert url == "http://127.0.0.1:2718/?file=/work/notebooks/my%20analysis.py&view-as=present"
+    key = "C:/Users/ann/notebooks/a.py"
+    assert mc.open_notebook_url(MarimoServer(url="http://127.0.0.1:2718"), key).endswith(f"?file={key}&view-as=present")
 
 
-def test_open_notebook_url_edit_view(tmp_path):
-    nb = tmp_path / "notebooks" / "analysis.py"
+def test_open_notebook_url_edit_view():
     server = MarimoServer(url="http://127.0.0.1:2718/")
-    expected = f"http://127.0.0.1:2718/?file={quote(mc.notebook_file_key(nb), safe='/:')}"
-    assert mc.open_notebook_url(server, nb, tmp_path, view="edit") == expected
+    assert mc.open_notebook_url(server, "/work/notebooks/a.py", view="edit") == "http://127.0.0.1:2718/?file=/work/notebooks/a.py"
     with pytest.raises(ValueError):
-        mc.open_notebook_url(server, nb, tmp_path, view="kiosk")
+        mc.open_notebook_url(server, "/work/notebooks/a.py", view="kiosk")
 
 
 def test_client_notebook_url_uses_app_view(fake, tmp_path):
-    nb = tmp_path / "notebooks" / "analysis.py"
-    client = mc.MarimoClient(fake.url, notebook=nb, workspace=tmp_path)
-    assert client.notebook_url().endswith(f"?file={quote(mc.notebook_file_key(nb), safe='/:')}&view-as=present")
+    client = _local_client(fake, tmp_path, notebook="q3/analysis.py")
+    key = mc.notebook_file_key(tmp_path / "notebooks" / "q3" / "analysis.py")
+    assert client.notebook_url().endswith(f"?file={quote(key, safe='/:')}&view-as=present")
+    assert mc.MarimoClient(fake.url, notebook="x.py").notebook_url() == f"{fake.url}/", "no notebooks folder: the home page"
 
 
 def test_snippets_are_valid_python():
@@ -333,7 +323,7 @@ def test_snippets_are_valid_python():
 
 def test_sessions_server_error_is_actionable(fake, tmp_path):
     fake.mode = "sessions_500"
-    client = mc.MarimoClient(fake.url, notebook=tmp_path / "nb.py", workspace=tmp_path)
+    client = _local_client(fake, tmp_path, notebook="nb.py")
     with pytest.raises(MarimoUnavailableError) as info:
         client.sessions()
     assert "HTTP 500" in str(info.value)
@@ -341,7 +331,7 @@ def test_sessions_server_error_is_actionable(fake, tmp_path):
     assert "Check the marimo server log" in info.value.hint and "uvx hailer again" in info.value.hint
     # resolve_session (used by preflight) must surface the same actionable error, never a raw HTTPError
     with pytest.raises(MarimoUnavailableError):
-        client.resolve_session(tmp_path / "nb.py")
+        client.resolve_session("nb.py")
 
 
 def test_sse_parser_handles_comments_and_multiline_data():
@@ -398,22 +388,19 @@ def test_wait_for_health_stops_early_when_process_died():
     assert len(calls) == 1, "returns as soon as should_stop() is True instead of waiting for the timeout"
 
 
-def test_wait_for_session_returns_when_notebook_opens(fake, tmp_path):
-    nb = tmp_path / "notebooks" / "analysis.py"
-    client = mc.MarimoClient(fake.url, notebook=nb, workspace=tmp_path)
+def test_wait_for_session_returns_when_notebook_opens(fake):
+    client = _docker_client(fake)
 
     def open_tab():
-        fake.sessions["s_new"] = {"filename": str(nb), "path": str(nb)}
+        fake.sessions["s_new"] = {"filename": "/work/notebooks/analysis.py", "path": "/work/notebooks/analysis.py"}
 
     threading.Timer(0.3, open_tab).start()
-    session = mc.wait_for_session(client, nb, timeout=5.0, interval=0.05)
+    session = mc.wait_for_session(client, "analysis.py", timeout=5.0, interval=0.05)
     assert session is not None and session.session_id == "s_new"
 
 
-def test_wait_for_session_none_on_timeout(fake, tmp_path):
-    nb = tmp_path / "notebooks" / "analysis.py"
-    client = mc.MarimoClient(fake.url, notebook=nb, workspace=tmp_path)
-    assert mc.wait_for_session(client, nb, timeout=0.3, interval=0.05) is None
+def test_wait_for_session_none_on_timeout(fake):
+    assert mc.wait_for_session(_docker_client(fake), "analysis.py", timeout=0.3, interval=0.05) is None
 
 
 def test_wait_for_session_cancelled_before_request():
@@ -483,9 +470,9 @@ def test_marimo_server_command_flags(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
-def test_open_notebook_url_signs_in_only_when_asked(tmp_path):
+def test_open_notebook_url_signs_in_only_when_asked():
     """Fail safe: the token is only added on request (a URL the user opens), never by default."""
-    nb = tmp_path / "notebooks" / "analysis.py"
+    nb = "/work/notebooks/analysis.py"
     plain = mc.open_notebook_url(MarimoServer(url="http://127.0.0.1:2718"), nb)
     server = MarimoServer(url="http://127.0.0.1:2718", token="t0k/en+=")
     assert mc.open_notebook_url(server, nb) == plain, "no token unless asked"
@@ -510,69 +497,123 @@ def test_answers_with_token_identifies_the_server_that_holds_it(fake):
     assert not mc.answers_with_token(f"http://127.0.0.1:{_free_port()}", "right-token")
 
 
-def test_client_links_leave_the_token_out_unless_asked(fake, tmp_path):
-    nb = tmp_path / "notebooks" / "analysis.py"
+def test_client_links_leave_the_token_out_unless_asked(fake):
     fake.token = "right-token"
-    for_model = mc.MarimoClient(fake.url, "right-token", notebook=nb, workspace=tmp_path)
+    for_model = _docker_client(fake, token="right-token", notebook="analysis.py")
     with pytest.raises(NoSessionError) as exc:
-        for_model.resolve_session(nb)
+        for_model.resolve_session("analysis.py")
     assert "right-token" not in exc.value.hint and "access_token" not in exc.value.hint
-    for_user = mc.MarimoClient(fake.url, "right-token", notebook=nb, workspace=tmp_path, token_in_links=True)
+    for_user = _docker_client(fake, token="right-token", notebook="analysis.py", token_in_links=True)
     with pytest.raises(NoSessionError) as exc:
-        for_user.resolve_session(nb)
+        for_user.resolve_session("analysis.py")
     assert "&access_token=right-token" in exc.value.hint
 
 
 # --------------------------------------------------------------------------- #
-# Path map at the HTTP boundary (a kernel in a container)
+# Names <-> kernel paths (the runtime layer's only path mapping)
 # --------------------------------------------------------------------------- #
 
 
-def _docker_client(fake, tmp_path, **kw):
-    from hailer.kernel import docker_paths
+def test_name_in_folder_for_a_container():
+    assert mc.name_in_folder("/work/notebooks", "/work/notebooks/team/q2 churn.py", native=False) == "team/q2 churn.py"
+    assert mc.name_in_folder("/work/notebooks/", "/work/notebooks/a.py", native=False) == "a.py"
+    for outside in ("/tmp/scratch.py", "/work/hailer.toml", "/work/notebooksX/a.py", "/work/notebooks", "/work/notebooks/../../etc/passwd", "notebooks/a.py", "", None, 3):
+        assert mc.name_in_folder("/work/notebooks", outside, native=False) is None, outside
+    assert mc.name_in_folder("/work/notebooks", "/work/notebooks/sub/../a.py", native=False) == "a.py", "normalised first"
+    assert mc.name_in_folder("/work/notebooks", "/WORK/notebooks/a.py", native=False) is None, "POSIX paths are case-sensitive"
+    assert mc.name_in_folder(None, "/work/notebooks/a.py", native=False) is None
 
-    config = _config(tmp_path, notebooks_dir=tmp_path / "notebooks")
-    return mc.MarimoClient(fake.url, notebook=config.notebook, workspace=tmp_path, paths=docker_paths(config), **kw)
+
+def test_name_in_folder_for_the_local_kernel(tmp_path):
+    root = mc.notebook_file_key(tmp_path / "notebooks")
+    assert mc.name_in_folder(root, str(tmp_path / "notebooks" / "team" / "r.py"), native=True) == "team/r.py"
+    assert mc.name_in_folder(root, f"{root}/a.py", native=True) == "a.py", "either separator"
+    assert mc.name_in_folder(root, str(tmp_path / "notebooks-old" / "a.py"), native=True) is None, "a sibling is not inside"
+    assert mc.name_in_folder(root, str(tmp_path / "elsewhere.py"), native=True) is None
+    assert mc.name_in_folder(root, "notebooks/a.py", native=True) is None, "relative paths never match"
+    if os.name == "nt":
+        assert mc.name_in_folder(root, str(tmp_path / "NOTEBOOKS" / "A.py").upper(), native=True) == "A.PY", "Windows ignores case"
 
 
-def test_client_maps_kernel_session_paths_back_to_host_paths(fake, tmp_path):
-    nb = tmp_path / "notebooks" / "analysis.py"
-    nested = tmp_path / "notebooks" / "team" / "q2 churn.py"
+def test_name_in_folder_follows_a_link_to_the_notebooks_folder(tmp_path):
+    real = tmp_path / "real"
+    real.mkdir()
+    try:
+        (tmp_path / "linked").symlink_to(real, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("creating symlinks needs a privilege here")
+    root = mc.notebook_file_key(tmp_path / "linked")
+    assert mc.name_in_folder(root, str(real / "a.py"), native=True) == "a.py"
+
+
+def test_the_client_speaks_names_to_a_kernel_in_a_container(fake):
     fake.sessions = {
         "s1": {"filename": "/work/notebooks/analysis.py", "path": "/work/notebooks/analysis.py"},
         "s2": {"filename": "team/q2 churn.py", "path": "/work/notebooks/team/q2 churn.py"},
         "s3": {"filename": "/tmp/scratch.py", "path": "/tmp/scratch.py"},
         "s4": {"filename": None, "path": None},
     }
-    client = _docker_client(fake, tmp_path)
-    by_id = {s.session_id: s for s in client.sessions()}
-    assert Path(by_id["s1"].path) == nb and Path(by_id["s1"].filename) == nb
-    assert Path(by_id["s2"].path) == nested and by_id["s2"].filename == "team/q2 churn.py", "relative names are left as they are"
-    assert by_id["s3"].path == "/tmp/scratch.py", "outside every mount: kept, so it never matches a host notebook"
-    assert by_id["s4"].path is None
-    assert client.resolve_session(nb).session_id == "s1"
-    assert client.resolve_session(nested).session_id == "s2"
-    assert client.execute("1").success  # the configured notebook's session, found through the map
+    client = _docker_client(fake, notebook="analysis.py")
+    assert {s.session_id: s.name for s in client.sessions()} == {"s1": "analysis.py", "s2": "team/q2 churn.py", "s3": None, "s4": None}
+    assert client.resolve_session("team/q2 churn.py").session_id == "s2"
+    assert client.execute("1").success  # the default notebook's session
     assert fake.requests[-1]["headers"]["Marimo-Session-Id"] == "s1"
-
-
-def test_client_sends_kernel_paths_in_the_file_key(fake, tmp_path):
-    nb = tmp_path / "notebooks" / "team" / "q2 churn.py"
-    client = _docker_client(fake, tmp_path)
-    assert client.notebook_url(nb) == f"{fake.url}/?file=/work/notebooks/team/q2%20churn.py&view-as=present"
+    assert client.notebook_url("team/q2 churn.py") == f"{fake.url}/?file=/work/notebooks/team/q2%20churn.py&view-as=present"
     with pytest.raises(NoSessionError) as exc:
-        client.resolve_session(nb)
-    assert "?file=/work/notebooks/team/q2%20churn.py" in exc.value.hint
-    assert str(tmp_path) not in exc.value.hint.split("Open sessions")[0], "no host path in the URL"
-    # a notebook the container cannot see has no URL of its own; the home page is offered instead
-    assert client.notebook_url(tmp_path / "elsewhere" / "x.py") == f"{fake.url}/"
-    server = MarimoServer(url=fake.url, paths=client.paths)
-    with pytest.raises(NotebookPathError):
-        mc.open_notebook_url(server, tmp_path / "elsewhere" / "x.py")
+        client.resolve_session("other.py")
+    assert "?file=/work/notebooks/other.py" in exc.value.hint
+
+
+# --------------------------------------------------------------------------- #
+# marimo's file explorer
+# --------------------------------------------------------------------------- #
+
+
+def test_file_endpoints_send_the_bearer_and_the_server_token(fake, tmp_path):
+    """Like marimo 0.24.2: every file endpoint is @requires("edit") (the bearer token) and needs the
+    skew-protection header; no browser session is involved."""
+    fake.token = "right-token"
+    fake.serve_files(tmp_path)
+    client = _docker_client(fake, token="right-token")
+    created = client.create_file("/work/notebooks/q3", "a.py", b"import marimo\napp = marimo.App()\n")
+    assert created["success"] and created["info"]["path"] == "/work/notebooks/q3/a.py" and created["info"]["isMarimoFile"]
+    assert [e["name"] for e in client.list_files("/work/notebooks")] == ["q3"]
+    assert client.file_details("/work/notebooks/q3/a.py")["contents"].startswith("import marimo")
+    assert client.update_file("/work/notebooks/q3/a.py", "x = 1\n")["success"]
+    assert client.delete_file("/work/notebooks/q3/a.py")["success"]
+    posts = [r for r in fake.requests if r["path"].startswith("/api/files/")]
+    assert len(posts) == 5
+    assert all(r["headers"]["Authorization"] == "Bearer right-token" and r["headers"]["Marimo-Server-Token"] == "skew-token-123" for r in posts)
+    assert posts[0]["headers"]["Content-Type"].startswith("multipart/form-data; boundary=")
+    assert posts[0]["body"] == {"path": "/work/notebooks/q3", "type": "file", "name": "a.py", "file": ("a.py", b"import marimo\napp = marimo.App()\n")}
+
+
+def test_file_endpoints_without_the_tokens_are_refused(fake, tmp_path):
+    fake.token = "right-token"
+    fake.serve_files(tmp_path)
+    with pytest.raises(MarimoUnavailableError) as exc:
+        _docker_client(fake, token="wrong").list_files("/work/notebooks")
+    assert "HTTP 401" in str(exc.value)
+    client = _docker_client(fake, token="right-token")
+    client.server_token()
+    fake.mode = "stale_token"
+    with pytest.raises(MarimoUnavailableError) as exc:
+        client.update_file("/work/notebooks/a.py", "")
+    assert "server token" in str(exc.value) and "restarted" in exc.value.hint
+
+
+def test_file_details_of_a_missing_file_is_an_http_error(fake, tmp_path):
+    import urllib.error
+
+    fake.serve_files(tmp_path)
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _docker_client(fake).file_details("/work/notebooks/missing.py")
+    assert exc.value.code == 500
+    assert _docker_client(fake).list_files("/work/notebooks/missing") == [], "a missing folder lists as empty"
 
 
 def test_unavailable_error_uses_one_command_hint(tmp_path):
-    client = mc.MarimoClient(f"http://127.0.0.1:{_free_port()}", timeout=0.5, notebook=tmp_path / "nbs" / "nb.py", workspace=tmp_path)
+    client = mc.MarimoClient(f"http://127.0.0.1:{_free_port()}", timeout=0.5, notebooks_path="/work/notebooks", notebook="nb.py")
     with pytest.raises(MarimoUnavailableError) as info:
         client.sessions()
     assert info.value.hint == mc.launch_hint()

@@ -1,8 +1,9 @@
 """Where the notebook kernel runs: the kernel runtimes and the pieces they share.
 
 Every ``uvx hailer`` (and ``uvx hailer notebook``) process starts its own marimo server through a
-*runtime*, keeps it in memory for as long as the chat runs, and stops it on exit. Nothing ever
-finds or attaches to a server another process started.
+*runtime*, keeps the :class:`~hailer.sandbox.Sandbox` its start returns in memory for as long as
+the chat runs, and stops it on exit. Nothing ever finds or attaches to a server another process
+started.
 
 - :class:`LocalRuntime` (here) runs marimo in Hailer's own Python, as the user (the default).
   The server gets a random token and an environment without the secrets Hailer can recognise.
@@ -12,20 +13,19 @@ finds or attaches to a server another process started.
 
 Pieces every runtime shares:
 
-- :class:`PathMap`: host folders and the kernel folders they are mounted at. Only
-  :class:`~hailer.marimo_client.MarimoClient` uses it, at the HTTP boundary.
+- :class:`~hailer.sandbox.MarimoSandbox`: the started kernel and its files; each runtime's kernel
+  subclasses it and fills in where the kernel sees the notebooks and data folders.
 - :func:`kernel_environment`: the environment a local marimo server gets.
 - :func:`runtime_prompt_notes`: what the model is told about the kernel it works in.
 
-Import order: this module imports :mod:`hailer.marimo_client`, which names :class:`PathMap` in
-annotations only. :mod:`hailer.kernel_docker` imports this module; this one imports it lazily.
+Import order: this module imports :mod:`hailer.marimo_client` and :mod:`hailer.sandbox`.
+:mod:`hailer.kernel_docker` imports this module; this one imports it lazily.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import posixpath
 import secrets
 import subprocess
 from collections.abc import Callable, Mapping
@@ -45,6 +45,7 @@ from hailer.models import (
     KernelConfig,
     MarimoServer,
 )
+from hailer.sandbox import MarimoSandbox
 from hailer.statedir import ensure_state_dir, state_dir
 
 #: Which runtime last started a server on which notebooks folder (``.hailer/last-kernel.json``).
@@ -99,7 +100,7 @@ DOCKER_NETWORK_PROMPT_NOTES = (
 
 
 # --------------------------------------------------------------------------- #
-# Paths: host <-> kernel
+# Host paths
 # --------------------------------------------------------------------------- #
 
 
@@ -115,67 +116,6 @@ def _same_parts(prefix: tuple[str, ...], parts: tuple[str, ...]) -> bool:
     if len(prefix) > len(parts):
         return False
     return all(os.path.normcase(a) == os.path.normcase(b) for a, b in zip(prefix, parts))
-
-
-@dataclass(frozen=True)
-class PathMap:
-    """Host folders and the kernel folders they are mounted at; no mounts means identity.
-
-    :class:`~hailer.marimo_client.MarimoClient` translates at exactly two places: the ``?file=``
-    key it sends becomes a kernel path (:meth:`to_kernel`) and the session paths marimo reports
-    become host paths (:meth:`to_host`). Everything above the client works in host paths.
-
-    Host paths are normalised like :func:`~hailer.marimo_client.notebook_file_key` and compared
-    case-insensitively on Windows. A subfolder maps to the same subfolder; the longest matching
-    mount wins.
-    """
-
-    mounts: tuple[tuple[Path, PurePosixPath], ...] = ()
-
-    @property
-    def identity(self) -> bool:
-        return not self.mounts
-
-    def to_kernel(self, host: Path | str) -> str:
-        """The path the kernel knows ``host`` by (POSIX). Identity: :func:`notebook_file_key`.
-
-        ``ValueError`` when ``host`` is outside every mounted folder.
-        """
-        if not self.mounts:
-            return notebook_file_key(Path(host))
-        parts = _host_parts(host)
-        best: tuple[int, PurePosixPath, tuple[str, ...]] | None = None
-        for host_root, kernel_root in self.mounts:
-            root = _host_parts(host_root)
-            if _same_parts(root, parts) and (best is None or len(root) > best[0]):
-                best = (len(root), kernel_root, parts[len(root):])
-        if best is None:
-            raise ValueError(f"{notebook_file_key(Path(host))} is outside every folder mounted into the kernel")
-        _length, kernel_root, rest = best
-        return str(kernel_root.joinpath(*rest))
-
-    def to_host(self, kernel: str) -> str | None:
-        """The host path for a path the kernel reported; ``None`` when it is outside every mount
-        (or relative). Identity: ``kernel`` unchanged."""
-        if not self.mounts:
-            return kernel
-        if not kernel or not kernel.startswith("/"):
-            return None
-        parts = PurePosixPath(posixpath.normpath(kernel)).parts
-        best: tuple[int, Path, tuple[str, ...]] | None = None
-        for host_root, kernel_root in self.mounts:
-            prefix = kernel_root.parts
-            if parts[: len(prefix)] == prefix and (best is None or len(prefix) > best[0]):
-                best = (len(prefix), host_root, parts[len(prefix):])
-        if best is None:
-            return None
-        _length, host_root, rest = best
-        return str(Path(os.path.normpath(str(Path(host_root).expanduser().absolute()))).joinpath(*rest))
-
-
-def docker_paths(config: HailerConfig) -> PathMap:
-    """The docker runtime's mounts: the notebooks folder and the data folder."""
-    return PathMap(((config.notebooks_root, KERNEL_NOTEBOOKS_DIR), (config.data_dir, KERNEL_DATA_DIR)))
 
 
 # --------------------------------------------------------------------------- #
@@ -446,33 +386,9 @@ class LocalProcesses:
 
 
 @dataclass
-class RunningKernel:
-    """The marimo server a runtime started for this process.
-
-    ``server`` carries the url, token, runtime and path map every client needs; the chat keeps it
-    in memory and hands it to the agent's tools. ``log_hint`` says where its log is. ``ended``
-    says why :meth:`wait` returned when the kernel stopped by itself (empty after Ctrl+C). Each
-    runtime subclasses it.
-    """
-
-    server: MarimoServer
-    log_hint: str = ""
-    ended: str = ""
-
-    def stop(self) -> None:
-        """Stop the kernel and remove what it left behind. Idempotent, never raises."""
-
-    def log_tail(self, lines: int = 15) -> list[str]:
-        return []
-
-    def wait(self) -> int:
-        """Block while the kernel runs (``--foreground``); Ctrl+C ends the wait. Returns an exit code."""
-        raise NotImplementedError
-
-
-@dataclass
-class LocalKernel(RunningKernel):
-    """The marimo process this Hailer started on this machine (``proc``) and its log."""
+class LocalKernel(MarimoSandbox):
+    """The marimo process this Hailer started on this machine (``proc``) and its log. Its notebooks
+    and data folders are the host's own (``native_paths``)."""
 
     proc: Any = None
     log_path: Path | None = None
@@ -521,7 +437,6 @@ class KernelRuntime(Protocol):
     """Starts and describes the marimo server of one Hailer process."""
 
     name: str  # "local" | "docker"
-    paths: PathMap
 
     def check(self) -> list[Check]:
         """Rows for ``hailer doctor`` and ``hailer notebook``: can this runtime run a kernel here?"""
@@ -533,12 +448,12 @@ class KernelRuntime(Protocol):
         not been done. Raises ``KernelRuntimeError``."""
         ...
 
-    def start(self, port: int, *, foreground: bool = False) -> RunningKernel:
-        """Start a new marimo server on ``127.0.0.1:port`` for this process.
+    def start(self, port: int, *, foreground: bool = False) -> MarimoSandbox:
+        """Start a new marimo server on ``127.0.0.1:port`` for this process; the sandbox it runs.
 
         Waits until this start's own server answers with its own token (never another process's
         server on the same port); ``foreground`` shows the server's output in this terminal (``hailer
-        notebook --foreground``; the caller then blocks in :meth:`RunningKernel.wait`). Raises
+        notebook --foreground``; the caller then blocks in :meth:`MarimoSandbox.wait`). Raises
         ``KernelRuntimeError`` (with the log tail in the hint) when the server does not come up;
         nothing is left running then.
         """
@@ -566,7 +481,6 @@ class LocalRuntime:
         start_timeout: float = START_TIMEOUT_SEC,
     ) -> None:
         self.config = config
-        self.paths = PathMap()
         self.procs = procs if procs is not None else LocalProcesses()
         self._environ = environ
         self._token_factory = token_factory
@@ -607,7 +521,7 @@ class LocalRuntime:
     def describe(self) -> str:
         return describe_runtime(KernelConfig(runtime=KERNEL_RUNTIME_LOCAL))
 
-    def start(self, port: int, *, foreground: bool = False) -> RunningKernel:
+    def start(self, port: int, *, foreground: bool = False) -> MarimoSandbox:
         """Start marimo and wait until it answers with this start's token. A Hailer that is killed
         leaves its (token-protected) marimo running: end it with Task Manager or ``kill``."""
         config = self.config
@@ -630,6 +544,10 @@ class LocalRuntime:
         server = MarimoServer(url=url, pid=getattr(proc, "pid", None), token=token, runtime=self.name)
         kernel = LocalKernel(
             server=server,
+            notebooks_path=notebook_file_key(config.notebooks_root),
+            data_path=str(config.data_dir),
+            data_dir=config.data_dir,
+            native_paths=True,
             log_hint=str(log_path) if log_path is not None else "this terminal",
             proc=proc,
             log_path=log_path,
@@ -683,11 +601,9 @@ __all__ = [
     "KERNEL_NOTEBOOKS_DIR",
     "KERNEL_WORKDIR",
     "KernelRuntime",
+    "LocalKernel",
     "LocalRuntime",
-    "PathMap",
-    "RunningKernel",
     "describe_runtime",
-    "docker_paths",
     "kernel_environment",
     "runtime_for",
     "runtime_prompt_notes",

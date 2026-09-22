@@ -25,7 +25,7 @@ import traceback
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 import typer
 from rich.console import Console
@@ -44,12 +44,14 @@ from hailer.models import (
     Check,
     ContextBundle,
     HailerConfig,
-    MarimoServer,
     MarimoSession,
     ProviderConfig,
     TurnSummary,
 )
 from hailer.startup import StartupTimings
+
+if TYPE_CHECKING:  # pragma: no cover - annotations only; the runtimes import it when a kernel starts
+    from hailer.sandbox import MarimoSandbox
 
 app = typer.Typer(
     add_completion=False,
@@ -105,24 +107,22 @@ def _reconfigure_streams() -> None:
 
 
 def _load_config(opts: CliOptions) -> HailerConfig:
-    """The resolved configuration with ``notebook`` set to the *active* notebook.
-
-    Every subcommand goes through here, so from this point on ``config.notebook`` means the
-    notebook the chat is working in (the state file wins over ``[hailer].notebook``; see
-    :func:`hailer.notebooks.load_active_notebook`). ``HAILER_NOTEBOOK`` is an explicit choice:
-    it is written to the state file so the tool server (a separate process that reads only the
-    file) and later sessions agree with this one.
+    """The resolved configuration. ``config.notebook`` stays the *configured* notebook; the active
+    one is a name in the state file (:func:`hailer.notebooks.load_active_notebook`).
+    ``HAILER_NOTEBOOK`` is an explicit choice: it is written to the state file so the agent's tools
+    (which read only the file) and later sessions agree with this one.
     """
     from hailer.config import load_config
 
     config = load_config(workspace=opts.workspace, config_path=opts.config_path)
     if os.environ.get("HAILER_NOTEBOOK"):
-        try:
-            notebooks.save_active_notebook(config, config.notebook)
-        except OSError:  # pragma: no cover - a read-only workspace must not stop the chat
-            pass
-        return config
-    return replace(config, notebook=notebooks.load_active_notebook(config))
+        name = notebooks.notebook_name(config, config.notebook)
+        if name is not None:
+            try:
+                notebooks.save_active_notebook(config, name)
+            except OSError:  # pragma: no cover - a read-only workspace must not stop the chat
+                pass
+    return config
 
 
 def _validate_config(config: HailerConfig) -> list[str]:
@@ -137,65 +137,23 @@ def _setup_logging(config: HailerConfig, opts: CliOptions) -> None:
     setup_logging(config.log_level, verbose=opts.verbose)
 
 
-def _make_client(server: MarimoServer, config: HailerConfig) -> Any:
-    """A client for ``server`` (the kernel this process started): its token and its path map.
-
-    Links in its error hints carry the token: the CLI prints them for the user and never sends
-    them to the model (the agent's tools build their own clients, without it).
-    """
-    from hailer.marimo_client import MarimoClient
-
-    return MarimoClient(
-        server.url,
-        server.token,
-        notebook=config.notebook,
-        workspace=config.workspace,
-        paths=server.paths,
-        token_in_links=True,
-    )
-
-
-def _notebook_url(server: MarimoServer, config: HailerConfig) -> str:
-    """The active notebook's URL for the user (printed or opened here, never sent to the model);
-    marimo's home page when the kernel cannot see the notebook (:func:`_outside_kernel_note` says why)."""
-    from hailer.errors import NotebookPathError
-    from hailer.marimo_client import open_notebook_url
-
+def _active_notebook(config: HailerConfig, sandbox: MarimoSandbox) -> str:
+    """The active notebook for a session that just started ``sandbox``: the state file's, else the
+    configured one when the sandbox does not have it (it was deleted or renamed; one existence
+    check, not a listing). Saved, so an old state file is converted and the agent's tools read the
+    same name."""
+    active = notebooks.load_active_notebook(config)
     try:
-        return open_notebook_url(server, config.notebook, config.workspace, with_token=True)
-    except NotebookPathError:
-        return _home_url(server)
-
-
-def _outside_kernel_note(server: MarimoServer, config: HailerConfig) -> str | None:
-    """Why the notebook's link is marimo's home page: the (docker) kernel does not mount the folder
-    the notebook is in. ``None`` when the kernel sees it."""
-    paths = server.paths
-    if paths is None or paths.identity:
-        return None
+        exists = sandbox.has_notebook(active)
+    except HailerError:
+        exists = True  # marimo does not answer: keep the choice, the chat reports the kernel
+    if not exists:
+        active = notebooks.default_notebook(config)
     try:
-        paths.to_kernel(config.notebook)
-    except ValueError:
-        return (
-            f"The kernel cannot see {config.notebook}: it mounts only the notebooks and data folders. The link "
-            "opens marimo's home page instead. Keep notebooks in the notebooks folder ([hailer].notebooks_dir)."
-        )
-    return None
-
-
-def _notebook_link(console: Console, server: MarimoServer, config: HailerConfig) -> str:
-    """:func:`_notebook_url`, with a note printed when it had to fall back to the home page."""
-    note = _outside_kernel_note(server, config)
-    if note is not None:
-        console.print(note, style="yellow", markup=False)
-    return _notebook_url(server, config)
-
-
-def _home_url(server: MarimoServer) -> str:
-    """marimo's home page, signed in with the server's token (printed or opened for the user only)."""
-    from hailer.marimo_client import home_url
-
-    return home_url(server, with_token=True)
+        notebooks.save_active_notebook(config, active)
+    except (OSError, HailerError):  # pragma: no cover - a read-only workspace must not stop the chat
+        pass
+    return active
 
 
 def _runtime_for(config: HailerConfig) -> Any:
@@ -266,11 +224,11 @@ def _render_prompt(config: HailerConfig, name: str, args: str) -> str:
     return render_prompt(config, name, args)
 
 
-def _make_agent(config: HailerConfig, bundle: ContextBundle, server: MarimoServer | None = None) -> Any:
-    """The agent; its tools use ``server``, the kernel this process started."""
+def _make_agent(config: HailerConfig, bundle: ContextBundle, sandbox: MarimoSandbox | None = None) -> Any:
+    """The agent; its tools use ``sandbox``, the kernel this process started."""
     from hailer.agent import HailerAgent
 
-    return HailerAgent(config, bundle, server=server)
+    return HailerAgent(config, bundle, sandbox=sandbox)
 
 
 def _start_dependency_warmup() -> None:
@@ -293,7 +251,7 @@ def _find_free_port(preferred: int) -> int:
 
 
 def _wait_for_session(
-    client: Any, notebook: Path, timeout: float, *, should_stop: Callable[[], bool] | None = None
+    client: Any, notebook: str, timeout: float, *, should_stop: Callable[[], bool] | None = None
 ) -> MarimoSession | None:
     from hailer.marimo_client import wait_for_session
 
@@ -371,32 +329,26 @@ def _relative(path: Path, workspace: Path) -> str:
         return str(path)
 
 
-def _same_file(a: Path, b: Path) -> bool:
-    """Path equality that tolerates case and separator differences (Windows)."""
-    try:
-        return os.path.normcase(str(Path(a).resolve())) == os.path.normcase(str(Path(b).resolve()))
-    except OSError:
-        return False
-
-
-def _session_for(sessions: list[MarimoSession], path: Path, workspace: Path | None = None) -> MarimoSession | None:
-    """The kernel session for ``path`` among ``sessions``: exact path match only (no filename fallback,
-    so two notebooks called ``report.py`` in different folders never share a session)."""
+def _session_for(sessions: list[MarimoSession], notebook: str) -> MarimoSession | None:
+    """The kernel session for the notebook ``notebook`` (a name) among ``sessions``: exact name match
+    only (no file-name fallback, so two notebooks called ``report.py`` in different folders never
+    share a session)."""
     from hailer.marimo_client import match_session
 
-    return match_session(sessions, path, workspace)
+    return match_session(sessions, notebook)
 
 
 def _plural(count: int, noun: str) -> str:
     return f"{count} {noun}" + ("" if count == 1 else "s")
 
 
-def _startup_panel(console: Console, config: HailerConfig) -> None:
+def _startup_panel(console: Console, config: HailerConfig, notebook: str | None = None) -> None:
+    """The panel with the settings; ``notebook``: the active notebook (default: the state file's)."""
     body = "\n".join(
         [
             f"Model:      {config.model.name}",
             f"Provider:   {_provider_line(config)}",
-            f"Notebook:   {_relative(config.notebook, config.workspace)}",
+            f"Notebook:   {notebook or notebooks.load_active_notebook(config)}",
             f"Notebooks:  {_relative(config.notebooks_root, config.workspace)}",
             f"Workspace:  {config.workspace}",
             f"Kernel:     {_kernel_line(config)}",
@@ -412,23 +364,21 @@ def _startup_panel(console: Console, config: HailerConfig) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _marimo_state(
-    config: HailerConfig, server: MarimoServer | None
-) -> tuple[MarimoServer | None, MarimoSession | None, HailerError | None]:
-    """(server, session, error) for the kernel this chat started, without raising. ``server`` is
-    ``None`` (and so is the result) when there is none or it does not answer."""
-    if server is None:
+def _marimo_state(sandbox: MarimoSandbox | None, notebook: str) -> tuple[MarimoSandbox | None, MarimoSession | None, HailerError | None]:
+    """(sandbox, session of ``notebook``, error) for the kernel this chat started, without raising.
+    ``sandbox`` is ``None`` (and so is the result) when there is none or it does not answer."""
+    if sandbox is None:
         return None, None, None
     try:
-        client = _make_client(server, config)
+        client = sandbox.client(notebook=notebook, token_in_links=True)
         if not client.health():
             return None, None, None
-        session = client.resolve_session(config.notebook)
-        return server, session, None
+        session = client.resolve_session(notebook)
+        return sandbox, session, None
     except NoSessionError as err:
-        return server, None, err
+        return sandbox, None, err
     except HailerError as err:
-        return server, None, err
+        return sandbox, None, err
 
 
 def kernel_checks(config: HailerConfig, *, starting: bool = False) -> list[Check]:
@@ -468,8 +418,12 @@ def local_checks(config: HailerConfig) -> list[Check]:
     """Config, notebook and credential checks (everything except the kernel runtime)."""
     checks: list[Check] = [_config_check(_validate_config(config))]
 
-    if config.notebook.exists():
-        checks.append(Check("notebook", True, f"{_relative(config.notebook, config.workspace)} (active)"))
+    # Workspace setup is host-side: the active notebook (else the configured one) must be in the folder.
+    active = config.notebooks_root / notebooks.load_active_notebook(config)
+    if active.is_file():
+        checks.append(Check("notebook", True, f"{_relative(active, config.workspace)} (active)"))
+    elif config.notebook.exists():
+        checks.append(Check("notebook", True, f"{_relative(config.notebook, config.workspace)} (configured)"))
     else:
         checks.append(
             Check(
@@ -662,8 +616,8 @@ class _TurnDisplay:
 class ChatLoop(ChatController):
     """Bind the shared controller to the CLI's injectable collaborators."""
 
-    def __init__(self, console: Console, config: HailerConfig, opts: CliOptions, server: MarimoServer | None = None) -> None:
-        super().__init__(console, config, opts, services=sys.modules[__name__], server=server)
+    def __init__(self, console: Console, config: HailerConfig, opts: CliOptions, sandbox: MarimoSandbox | None = None) -> None:
+        super().__init__(console, config, opts, services=sys.modules[__name__], sandbox=sandbox)
 
 
 def run_chat(opts: CliOptions) -> None:
@@ -677,13 +631,13 @@ def _run_chat_loop(
     console: Console,
     config: HailerConfig,
     opts: CliOptions,
-    server: MarimoServer | None = None,
+    sandbox: MarimoSandbox | None = None,
     *,
     prepare_notebook: Callable[[Console], Awaitable[None]] | None = None,
     timings: StartupTimings | None = None,
 ) -> None:
     """Start the agent and run the REPL; exit code 1 when the agent cannot start."""
-    loop = ChatLoop(console, config, opts, server)
+    loop = ChatLoop(console, config, opts, sandbox)
     if _use_composer(opts):
         async def prepare() -> None:
             if prepare_notebook is not None:
@@ -845,7 +799,7 @@ def _run_foreground(console: Console, config: HailerConfig, runtime: Any, port: 
             return 1
         console.print(f"Kernel:     {runtime.describe()}", markup=False)
         console.print(f"Marimo is running at {running.server.url}. Ctrl+C stops it.", markup=False)
-        home = _home_url(running.server)
+        home = running.home_url(with_token=True)
         if open_browser:
             console.print(f"Opening {home} in your browser...", markup=False)
             _open_browser(home)
@@ -877,14 +831,14 @@ def _warn_about_planted_files(console: Console, running: Any) -> None:
 
 def _wait_for_notebook(
     console: Console,
-    config: HailerConfig,
-    server: MarimoServer,
+    sandbox: MarimoSandbox,
+    notebook: str,
     *,
     open_browser: bool,
     should_stop: Callable[[], bool] | None = None,
     show_status: bool = True,
 ) -> None:
-    """Open the notebook and poll its session, stopping between blocking operations.
+    """Open ``notebook`` and poll its session, stopping between blocking operations.
 
     The live composer owns its activity display, so its background preparation
     suppresses the Rich spinner. Cancellation never leaves a later browser open
@@ -893,12 +847,12 @@ def _wait_for_notebook(
     stopped = should_stop or (lambda: False)
     if stopped():
         return
-    client = _make_client(server, config)
-    url = _notebook_link(console, server, config)
+    client = sandbox.client(notebook=notebook, token_in_links=True)
+    url = sandbox.notebook_url(notebook, with_token=True)
     if stopped():
         return
     try:
-        session = client.resolve_session(config.notebook)
+        session = client.resolve_session(notebook)
     except HailerError:
         session = None
     if stopped():
@@ -916,7 +870,7 @@ def _wait_for_notebook(
     console.print(APP_VIEW_HINT, markup=False)
     status = console.status("Waiting for the notebook to open...") if show_status else nullcontext()
     with status:
-        session = _wait_for_session(client, config.notebook, SESSION_TIMEOUT_SEC, should_stop=should_stop)
+        session = _wait_for_session(client, notebook, SESSION_TIMEOUT_SEC, should_stop=should_stop)
     if stopped():
         return
     if session is None:
@@ -929,9 +883,7 @@ def _wait_for_notebook(
         console.print(f"Notebook is open (session {session.session_id}).", markup=False)
 
 
-async def _prepare_notebook(
-    console: Console, config: HailerConfig, server: MarimoServer, *, open_browser: bool
-) -> None:
+async def _prepare_notebook(console: Console, sandbox: MarimoSandbox, notebook: str, *, open_browser: bool) -> None:
     """Wait off the UI loop and settle the worker before the kernel may be stopped.
 
     Cancelling ``to_thread`` alone abandons its work. The stop flag ends polling
@@ -940,7 +892,7 @@ async def _prepare_notebook(
     """
     stop = threading.Event()
     task = asyncio.create_task(asyncio.to_thread(
-        _wait_for_notebook, console, config, server,
+        _wait_for_notebook, console, sandbox, notebook,
         open_browser=open_browser, should_stop=stop.is_set, show_status=False,
     ))
     try:
@@ -973,23 +925,23 @@ def _run_session(console: Console, config: HailerConfig, opts: CliOptions, *, po
     running: Any = None
     try:
         running = _start_kernel(console, _runtime_for(config), port, verbose=opts.verbose)
-        # The chat and the agent's tools keep this server (URL, token, paths) in memory; nothing
-        # else finds it, and it is stopped below whatever happens.
-        server = running.server
+        # The chat and the agent's tools keep this sandbox (endpoint, token, files) in memory;
+        # nothing else finds it, and it is stopped below whatever happens.
         timings.mark("kernel_ready")
+        notebook = _active_notebook(config, running)
         interactive = _use_composer(opts)
         if not interactive:
-            _wait_for_notebook(console, config, server, open_browser=open_browser)
+            _wait_for_notebook(console, running, notebook, open_browser=open_browser)
             timings.mark("notebook_wait_complete")
         console.print()
-        _startup_panel(console, config)
+        _startup_panel(console, config, notebook)
         timings.mark("panel_shown")
 
         async def prepare_notebook(chat_console: Console) -> None:
-            await _prepare_notebook(chat_console, config, server, open_browser=open_browser)
+            await _prepare_notebook(chat_console, running, notebook, open_browser=open_browser)
 
         _run_chat_loop(
-            console, config, opts, server,
+            console, config, opts, running,
             prepare_notebook=prepare_notebook if interactive else None, timings=timings,
         )
     finally:

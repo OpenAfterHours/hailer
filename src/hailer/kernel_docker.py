@@ -4,8 +4,9 @@
 Everything here drives the ``docker`` CLI through a :class:`DockerRunner` (no Docker SDK), so the
 tests check argument lists against a scripted fake. It fails closed: every check raises a
 :class:`~hailer.errors.KernelRuntimeError` with a hint and nothing ever falls back to the local
-runtime. The shared pieces (:class:`~hailer.kernel.PathMap`) live in :mod:`hailer.kernel`;
-``runtime_for`` imports this module only when docker is asked for.
+runtime. The sandbox a start returns (:class:`DockerKernel`) is a
+:class:`~hailer.sandbox.MarimoSandbox` whose kernel knows the folders as ``/work/notebooks`` and
+``/work/data``; ``runtime_for`` imports this module only when docker is asked for.
 
 Each Hailer process starts its own kernel: names are unique per start (the workspace id plus a
 random suffix) and every container and network carries labels for the workspace, its role, the
@@ -42,15 +43,14 @@ from hailer.kernel import (
     KERNEL_NOTEBOOKS_DIR,
     KERNEL_WORKDIR,
     START_TIMEOUT_SEC,
-    RunningKernel,
     describe_runtime,
-    docker_paths,
     mask_token,
     new_token,
     note_kernel_start,
 )
 from hailer.marimo_client import wait_for_health
 from hailer.models import KERNEL_RUNTIME_DOCKER, Check, HailerConfig, KernelConfig, MarimoServer
+from hailer.sandbox import MarimoSandbox
 from hailer.statedir import ensure_state_dir, state_dir
 
 #: marimo's port inside the kernel container; the forwarder listens on the same port in its own.
@@ -640,9 +640,10 @@ def _remove(runner: DockerRunner, kind: str, ident: str, shown: str) -> Removal:
 
 
 @dataclass
-class DockerKernel(RunningKernel):
+class DockerKernel(MarimoSandbox):
     """The containers and network this Hailer started. ``containers`` are names (kernel first),
-    ``container_ids`` the same containers' ids; everything is removed and inspected by id."""
+    ``container_ids`` the same containers' ids; everything is removed and inspected by id.
+    ``notebooks_folder`` is the host folder mounted at ``/work/notebooks``."""
 
     runner: Any = None
     containers: tuple[str, ...] = ()
@@ -651,20 +652,13 @@ class DockerKernel(RunningKernel):
     network_id: str | None = None
     stop_error: str = ""
     owner: OwnerLock | None = None
+    notebooks_folder: Path | None = None
 
     def _name(self, ident: str) -> str:
         for name, known in zip(self.containers, self.container_ids):
             if known == ident:
                 return name
         return ident[:12]
-
-    @property
-    def notebooks_folder(self) -> Path | None:
-        """The host folder this kernel had mounted as its notebooks folder."""
-        paths = self.server.paths
-        if paths is None:
-            return None
-        return next((Path(host) for host, kernel in paths.mounts if kernel == KERNEL_NOTEBOOKS_DIR), None)
 
     def planted(self) -> list[str]:
         """:func:`planted_files` in this kernel's notebooks folder (checked when it stops)."""
@@ -809,7 +803,6 @@ class DockerRuntime:
         suffix: str | None = None,
     ) -> None:
         self.config = config
-        self.paths = docker_paths(config)
         self.runner: DockerRunner = runner if runner is not None else SubprocessDockerRunner()
         self.names = docker_names(config.workspace, suffix)
         self._token_factory = token_factory
@@ -1181,7 +1174,7 @@ class DockerRuntime:
 
     # -- lifecycle ------------------------------------------------------------ #
 
-    def start(self, port: int, *, foreground: bool = False) -> RunningKernel:
+    def start(self, port: int, *, foreground: bool = False) -> MarimoSandbox:
         """Take an :class:`OwnerLock`, remove what owners that are gone left (:meth:`remove_leftovers`;
         a failure there is a warning, since the new names never clash), then create the network, the
         kernel and the forwarder and wait, through the forwarder, until marimo answers with this
@@ -1207,8 +1200,17 @@ class DockerRuntime:
         network_access = config.kernel.network
         token = self._token_factory()
         url = f"http://127.0.0.1:{port}"
-        server = MarimoServer(url=url, token=token, runtime=self.name, paths=self.paths, network_access=network_access)
-        kernel = DockerKernel(server=server, log_hint=f"docker logs {names.kernel}", runner=self.runner, owner=owner)
+        server = MarimoServer(url=url, token=token, runtime=self.name, network_access=network_access)
+        kernel = DockerKernel(
+            server=server,
+            notebooks_path=str(KERNEL_NOTEBOOKS_DIR),
+            data_path=str(KERNEL_DATA_DIR),
+            data_dir=config.data_dir,
+            log_hint=f"docker logs {names.kernel}",
+            runner=self.runner,
+            owner=owner,
+            notebooks_folder=config.notebooks_root,
+        )
         health = self._health if self._health is not None else wait_for_health
         try:
             sweep_owner_locks(workspace)

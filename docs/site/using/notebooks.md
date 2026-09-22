@@ -64,10 +64,11 @@ You > open the regional sales notebook we did last week and add a chart by categ
 You > which notebooks do we have?
 ```
 
-The agent lists the folder, creates `notebooks/q2_churn_review.py` (the name is slugified) or opens the
-existing file, and the browser tab appears by itself. Whatever it switches to becomes the **active
-notebook**: the one every later cell edit, `/status` line and `/exec` call refers to. The chat shows
-`Active notebook is now notebooks/q2_churn_review.py.` when the agent switched.
+The agent lists the folder, creates `q2_churn_review.py` in it (the name is slugified) or opens the
+existing file, and the browser tab appears by itself. Notebooks are named by their path inside the
+notebooks folder (`q2_churn_review.py`, `q3/review.py`). Whatever the agent switches to becomes the
+**active notebook**: the one every later cell edit, `/status` line and `/exec` call refers to. The chat
+shows `Active notebook is now q2_churn_review.py.` when the agent switched.
 
 The same from the prompt, without a model round-trip:
 
@@ -80,7 +81,7 @@ The same from the prompt, without a model round-trip:
 | `/notebook close [name]` | Shut down that notebook's kernel session (the browser tab disconnects); it can be reopened any time. |
 
 After a slash-command switch the next message you send carries a one-line notice such as
-`[Hailer] The active notebook is now notebooks/q2_churn_review.py (reopened, 7 cells). Call notebook_cells
+`[Hailer] The active notebook is now q2_churn_review.py (reopened, 7 cells). Call notebook_cells
 before editing.` so the agent inspects the notebook before touching it. The conversation itself continues;
 use `/new` if you want a clean thread as well.
 
@@ -88,13 +89,17 @@ Where things live:
 
 - Notebooks go in `[hailer].notebooks_dir` (default: the folder of `[hailer].notebook`, i.e. `notebooks/`).
   Only files in that folder can be opened; names are matched case-insensitively and `q2 churn`,
-  `q2_churn`, `q2_churn.py` and `notebooks/q2_churn.py` all mean the same file.
+  `q2_churn`, `q2_churn.py` and `notebooks/q2_churn.py` all mean the same file. The agent and the chat
+  reach notebook files only through the kernel (marimo's own file API), never by reading the folder
+  themselves, so the same commands work wherever the kernel runs.
 - The **starter template** is the same set of cells as `notebooks/analysis.py` (imports, the
   `hailer.periods` helpers, `WORKSPACE`, `DATA_DIR`, `data_files`, `period_files`, a welcome cell with the
   notebook's title and the data files it found), so the agent can start analysing straight away. `--empty` gives marimo's plain empty notebook.
-- The active notebook is remembered in `.hailer/notebook.json` (git-ignored, next to `session.json`), so
-  the next `uvx hailer` or `uvx hailer notebook` resumes where you left off. Delete the file to go
-  back to `[hailer].notebook`. `HAILER_NOTEBOOK=<path>` makes that notebook the active one for this and
+- The active notebook is remembered by name in `.hailer/notebook.json` (git-ignored, next to
+  `session.json`), so the next `uvx hailer` or `uvx hailer notebook` resumes where you left off; if that
+  notebook is gone, the session starts on `[hailer].notebook`. A file written by an older Hailer (host
+  paths) is converted on the first run; entries outside the notebooks folder are dropped. Delete the file
+  to go back to `[hailer].notebook`. `HAILER_NOTEBOOK=<path>` makes that notebook the active one for this and
   later sessions: every Hailer command (`hailer`, `hailer notebook`, `status`, `doctor`)
   writes it to the state file at startup, so the agent's tools see the same notebook.
 - `/notebook` also lists the notebooks you worked in recently (`Recent:`), most recent first.

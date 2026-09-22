@@ -51,28 +51,28 @@ class AsyncFakeAgent(FakeAgent):
 def test_composer_keeps_docker_connection_across_switches(harness):
     from dataclasses import replace
     from test_cli import DOCKER_SERVER, TOKEN
-    from hailer.kernel import docker_paths
     from hailer.models import KernelConfig
 
-    server = replace(DOCKER_SERVER, paths=docker_paths(harness.config))
+    harness.server = DOCKER_SERVER
     harness.config = replace(harness.config, kernel=KernelConfig(runtime="docker"))
     harness.agent = AsyncFakeAgent()
     write_notebook(harness.config, "other")
+    sandbox = harness.sandbox
 
     async def scenario(controller, ui):
-        assert harness.agent_servers == [server]
+        assert harness.agent_sandboxes == [sandbox]
         await ui.submit("/new")
         await ui.submit("/model changed-model")
         await ui.submit("/notebook open other")
         await ui.submit("/status")
         await ui.submit("inspect it")
-        assert controller.server is server
+        assert controller.sandbox is sandbox
         assert harness.opened[-1] == (
-            f"{server.url}/?file=/work/notebooks/other.py&view-as=present&access_token={TOKEN}"
+            f"{DOCKER_SERVER.url}/?file=/work/notebooks/other.py&view-as=present&access_token={TOKEN}"
         )
         assert all(TOKEN not in (preamble or "") for preamble in harness.agent.preambles)
 
-    _controller, _ui, output = run_session(harness, scenario, server=server)
+    _controller, _ui, output = run_session(harness, scenario, sandbox=sandbox)
     assert "docker (hailer-kernel" in output and "no network; data read-only" in output
 
 
@@ -122,12 +122,12 @@ def run_session(
     scenario: Callable[[Any, StubUI], Awaitable[None]],
     *,
     new_thread: bool = False,
-    server: Any = None,
+    sandbox: Any = None,
 ) -> tuple[Any, StubUI, str]:
     output = io.StringIO()
     console = Console(file=output, force_terminal=False, width=120, highlight=False)
-    # The chat's own kernel: the one given, else the harness's (what its fake start hands a chat).
-    controller = cli.ChatLoop(console, h.config, cli.CliOptions(new_thread=new_thread), server=server or h.server)
+    # The chat's own kernel: the sandbox given, else the harness's (what its fake start hands a chat).
+    controller = cli.ChatLoop(console, h.config, cli.CliOptions(new_thread=new_thread), sandbox=sandbox or h.sandbox)
     made: list[StubUI] = []
 
     def factory(console: Console, submit: Any, context: Any) -> StubUI:
@@ -216,7 +216,7 @@ def test_async_prompt_skill_and_reload_share_normal_turn_accounting(harness):
 def test_async_turn_syncs_notebook_after_failure_or_cancellation_and_preserves_notice_rules(harness, cancelled):
     harness.agent = AsyncFakeAgent()
     other = write_notebook(harness.config, "other")
-    harness.agent.on_turn = lambda: notebooks.save_active_notebook(harness.config, other)
+    harness.agent.on_turn = lambda: notebooks.save_active_notebook(harness.config, "other.py")
     harness.agent.fail_with = asyncio.CancelledError() if cancelled else HailerError("endpoint failed", hint="retry")
 
     async def scenario(controller: Any, ui: StubUI) -> None:
@@ -227,8 +227,8 @@ def test_async_turn_syncs_notebook_after_failure_or_cancellation_and_preserves_n
                 await ui.submit("switch notebook")
         else:
             await ui.submit("switch notebook")
-        assert controller.config.notebook == other
-        assert "Notebook: notebooks/other.py" in ui.context()
+        assert controller.notebook == "other.py"
+        assert "Notebook: other.py" in ui.context()
         assert controller._pending_preamble == (None if cancelled else notice)
         assert not ui.answers and controller.state.turns == 0
         harness.agent.fail_with = None
@@ -237,7 +237,7 @@ def test_async_turn_syncs_notebook_after_failure_or_cancellation_and_preserves_n
         assert controller._pending_preamble is None and controller.state.turns == 1
 
     _controller, ui, output = run_session(harness, scenario)
-    assert output.count("Active notebook is now notebooks/other.py.") == 1
+    assert output.count("Active notebook is now other.py.") == 1
     assert harness.opened == [url_for(other)]
     assert ui.answers == ["Answer to: continue"]
     assert ("endpoint failed" in output) is not cancelled
@@ -245,19 +245,19 @@ def test_async_turn_syncs_notebook_after_failure_or_cancellation_and_preserves_n
 
 def test_async_notebook_command_queues_notice_for_next_turn(harness):
     harness.agent = AsyncFakeAgent()
-    other = write_notebook(harness.config, "other")
+    write_notebook(harness.config, "other")
 
     async def scenario(controller: Any, ui: StubUI) -> None:
         await ui.submit("/notebook open other")
-        assert controller.config.notebook == other
-        assert "Notebook: notebooks/other.py" in ui.context()
+        assert controller.notebook == "other.py"
+        assert "Notebook: other.py" in ui.context()
         await ui.submit("inspect it")
         await ui.submit("another question")
 
     _controller, ui, output = run_session(harness, scenario)
-    assert harness.agent.preambles[0].startswith("[Hailer] The active notebook is now notebooks/other.py")
+    assert harness.agent.preambles[0].startswith("[Hailer] The active notebook is now other.py")
     assert harness.agent.preambles[1] is None
-    assert "Active notebook: notebooks/other.py." in output
+    assert "Active notebook: other.py." in output
     assert len(ui.answers) == 2
 
 
@@ -288,18 +288,18 @@ def test_cancelled_notebook_session_wait_stops_worker_and_preserves_switch_notic
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(operation, timeout=3)
         assert stopped.is_set()
-        assert controller.config.notebook == other
-        assert notebooks.load_active_notebook(harness.config) == other
-        assert "Notebook: notebooks/other.py" in ui.context()
-        assert controller._pending_preamble.startswith("[Hailer] The active notebook is now notebooks/other.py")
+        assert controller.notebook == "other.py"
+        assert notebooks.load_active_notebook(harness.config) == "other.py"
+        assert "Notebook: other.py" in ui.context()
+        assert controller._pending_preamble.startswith("[Hailer] The active notebook is now other.py")
         assert "not open in a browser yet" in controller._pending_preamble
         await ui.submit("inspect it")
-        assert harness.agent.preambles[0].startswith("[Hailer] The active notebook is now notebooks/other.py")
+        assert harness.agent.preambles[0].startswith("[Hailer] The active notebook is now other.py")
         assert controller._pending_preamble is None
 
     _controller, ui, output = run_session(harness, scenario)
     assert harness.opened == [url_for(other)]
-    assert "Active notebook: notebooks/other.py." in output
+    assert "Active notebook: other.py." in output
     assert ui.answers == ["Answer to: inspect it"]
 
 

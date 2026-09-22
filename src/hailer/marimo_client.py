@@ -8,6 +8,9 @@ Talks to a handful of endpoints with the standard library only:
                                                ``stdout`` / ``stderr`` / ``done`` events
 - ``GET  {url}/``                             the page; carries the server (skew-protection) token
 - ``POST {url}/api/home/shutdown_session``    close a kernel session (needs the server token)
+- ``POST {url}/api/files/list_files``, ``/file_details``, ``/create`` (multipart), ``/update``,
+  ``/delete``                                 marimo's file explorer, in kernel paths (need the
+                                               server token)
 
 One marimo server hosts every notebook: it is started on the notebooks *folder*, and any
 existing notebook gets its own kernel session when a browser opens ``?file=<absolute path>``.
@@ -17,32 +20,30 @@ the bottom of this module are the canonical patterns.
 
 Hailer only ever talks to the server its own process started (it never looks for others). That
 server carries a random token (``Authorization: Bearer <token>`` for the API,
-``&access_token=<token>`` in a browser URL). A kernel in a container knows files by other paths;
-:class:`MarimoClient` translates them with a :class:`~hailer.kernel.PathMap` at the HTTP boundary.
-``hailer.kernel`` imports this module; this one names :class:`~hailer.kernel.PathMap` in
-annotations only.
+``&access_token=<token>`` in a browser URL). Notebooks are known by *names* relative to the
+notebooks folder (``"sales.py"``, ``"q3/review.py"``); :class:`MarimoClient` turns a name into
+the kernel's path (``notebooks_path`` + name) for ``?file=`` keys and back for the sessions marimo
+reports, so nothing above the runtime layer handles a kernel or host path.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import posixpath
 import re
+import secrets
 import socket
 import sys
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterator, Sequence
-from pathlib import Path
-from typing import TYPE_CHECKING
+from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 
-from hailer.errors import MarimoExecutionError, MarimoUnavailableError, NoSessionError, NotebookPathError
+from hailer.errors import MarimoExecutionError, MarimoUnavailableError, NoSessionError
 from hailer.models import ExecResult, MarimoServer, MarimoSession
-
-if TYPE_CHECKING:  # pragma: no cover - annotations only; hailer.kernel imports this module
-    from hailer.kernel import PathMap
 
 SERVER_TOKEN_HEADER = "Marimo-Server-Token"
 _HEALTH_TIMEOUT = 1.0
@@ -100,9 +101,10 @@ initial UI mode differs. The reader switches to edit mode with Ctrl+. / Cmd+. ("
 
 
 def notebook_file_key(notebook: Path) -> str:
-    """The ``?file=`` key marimo receives for ``notebook``: its absolute path with forward slashes.
+    """A host path as marimo knows it: absolute, with forward slashes (the local runtime's notebooks
+    folder is ``notebook_file_key(config.notebooks_root)``).
 
-    An absolute key works whether the server was started on the notebooks folder (keys would
+    An absolute ``?file=`` key works whether the server was started on the notebooks folder (keys would
     otherwise resolve against that folder) or on a single file (keys would resolve against the
     server's working directory); verified live on marimo 0.24.2 in both modes.
 
@@ -114,40 +116,53 @@ def notebook_file_key(notebook: Path) -> str:
     return Path(absolute).as_posix()
 
 
-def open_notebook_url(
-    server: MarimoServer,
-    notebook: Path,
-    workspace: Path | None = None,
-    *,
-    view: str = "app",
-    paths: PathMap | None = None,
-    with_token: bool = False,
-) -> str:
-    """URL the user should open so the kernel gets a session.
+def kernel_path(folder: str, name: str) -> str:
+    """The kernel's path for ``name``, a POSIX path relative to ``folder`` (a kernel path)."""
+    return f"{folder.rstrip('/')}/{name}"
+
+
+def _parts_under(root: tuple[str, ...], parts: tuple[str, ...], fold: Callable[[str], str]) -> str | None:
+    if len(parts) <= len(root) or any(fold(a) != fold(b) for a, b in zip(root, parts)):
+        return None
+    return "/".join(parts[len(root):])
+
+
+def name_in_folder(folder: str | None, path: object, *, native: bool) -> str | None:
+    """``path`` (a path marimo reported) relative to ``folder`` as a POSIX name; ``None`` when it is
+    empty, relative or outside the folder.
+
+    ``native``: the kernel's paths are this machine's (the local runtime), so both are compared with
+    links and junctions resolved (``os.path.realpath``; case-insensitive on Windows, either
+    separator): a file reached through a link that leaves the folder is outside it, and the name
+    has the file's own spelling where it exists (Windows returns the on-disk case). Otherwise they
+    are POSIX paths inside a container.
+    """
+    if not folder or not isinstance(path, str) or not path:
+        return None
+    if native:
+        if not Path(path).is_absolute():
+            return None
+        root, target = os.path.realpath(folder), os.path.realpath(path)
+        return _parts_under(Path(root).parts, Path(target).parts, os.path.normcase)
+    if not path.startswith("/"):
+        return None
+    root_parts = PurePosixPath(posixpath.normpath(folder)).parts
+    return _parts_under(root_parts, PurePosixPath(posixpath.normpath(path)).parts, lambda part: part)
+
+
+def open_notebook_url(server: MarimoServer, file_key: str, *, view: str = "app", with_token: bool = False) -> str:
+    """URL the user should open so the kernel gets a session for the file at ``file_key`` (the
+    kernel's path, :func:`kernel_path`).
 
     ``view="app"`` (default) opens the notebook in app view so the chat user sees results, not code:
-    ``http://127.0.0.1:2718/?file=C:/work/notebooks/analysis.py&view-as=present``. ``view="edit"``
-    opens the plain editor (no ``view-as`` parameter). ``workspace`` is accepted for
-    compatibility; the key is always the absolute path (see :func:`notebook_file_key`).
-
-    ``paths`` (default: ``server.paths``) turns the key into the path the kernel knows the file by
-    (``/work/notebooks/...`` in a container). ``with_token=True`` (for a URL the user opens) ends it
-    with ``&access_token=<token>`` when the server has one, which signs the browser in; the
+    ``http://127.0.0.1:2718/?file=/work/notebooks/sales.py&view-as=present``. ``view="edit"`` opens
+    the plain editor (no ``view-as`` parameter). ``with_token=True`` (for a URL the user opens) ends
+    it with ``&access_token=<token>`` when the server has one, which signs the browser in; the
     default leaves the token out, so text that goes to the model endpoint never carries it.
-    ``NotebookPathError`` when the kernel cannot see the file.
     """
-    del workspace  # the file key no longer depends on the workspace
     if view not in ("app", "edit"):
         raise ValueError(f"view must be 'app' or 'edit', not {view!r}")
-    mapping = paths if paths is not None else server.paths
-    try:
-        key = mapping.to_kernel(notebook) if mapping is not None else notebook_file_key(notebook)
-    except ValueError as err:
-        raise NotebookPathError(
-            f"{notebook_file_key(notebook)} is outside the folders the kernel can see.",
-            hint="Keep notebooks in the notebooks folder ([hailer].notebooks_dir).",
-        ) from err
-    url = f"{server.url.rstrip('/')}/?file={quote(key, safe='/:')}"
+    url = f"{server.url.rstrip('/')}/?file={quote(file_key, safe='/:')}"
     if view == "app":
         url += f"&{APP_VIEW_PARAM}"
     if with_token and server.token:
@@ -211,7 +226,7 @@ def wait_for_health(
 
 def wait_for_session(
     client: "MarimoClient",
-    notebook: Path | None,
+    notebook: str | None,
     timeout: float = 90.0,
     *,
     interval: float = 0.5,
@@ -293,37 +308,17 @@ def answers_with_token(url: str, token: str | None, timeout: float = _HEALTH_TIM
 # --------------------------------------------------------------------------- #
 
 
-def _normalise_path(value: str | Path) -> str:
-    try:
-        resolved = Path(value).expanduser().resolve()
-    except (OSError, RuntimeError):
-        resolved = Path(value)
-    return os.path.normcase(os.path.normpath(str(resolved)))
+def match_session(sessions: Sequence[MarimoSession], notebook: str, *, fold: bool = False) -> MarimoSession | None:
+    """The session whose notebook is ``notebook`` (a name in the notebooks folder), or ``None``.
 
-
-def _session_path(session: MarimoSession, workspace: Path | None) -> str | None:
-    """The normalised absolute path of a session's notebook; ``None`` for untitled sessions."""
-    raw = session.path or session.filename
-    if not raw:
-        return None
-    path = Path(raw).expanduser()
-    if not path.is_absolute() and workspace is not None:
-        path = Path(workspace) / path
-    return _normalise_path(path)
-
-
-def match_session(sessions: Sequence[MarimoSession], notebook: Path, workspace: Path | None = None) -> MarimoSession | None:
-    """The session whose notebook is ``notebook``, or ``None``.
-
-    A session matches only when its ``path`` (or its ``filename`` when marimo reports no path)
-    names the same file, compared as normalised absolute paths (case-insensitive on Windows).
-    Relative session paths are taken relative to ``workspace``. Untitled sessions never match,
-    and a bare filename never matches a notebook of the same name in another folder. When
-    several sessions name the same file the most recently created one (last in marimo's
-    listing) wins.
+    A session matches only when its ``name`` (its path relative to the notebooks folder, set by
+    :meth:`MarimoClient.sessions`) is ``notebook``, ignoring case with ``fold`` (the kernel's paths
+    are Windows paths). Untitled sessions and notebooks outside the folder never match, and a bare
+    filename never matches a notebook of the same name in another folder. When several sessions
+    name the same file the most recently created one (last in marimo's listing) wins.
     """
-    target = _normalise_path(notebook)
-    matched = [s for s in sessions if _session_path(s, workspace) == target]
+    wanted = notebook.casefold() if fold else notebook
+    matched = [s for s in sessions if s.name is not None and (s.name.casefold() if fold else s.name) == wanted]
     return matched[-1] if matched else None
 
 
@@ -353,13 +348,17 @@ def _iter_sse(raw_lines: Iterator[bytes]) -> Iterator[tuple[str, str]]:
 class MarimoClient:
     """HTTP client for one marimo server.
 
-    ``token`` is sent as ``Authorization: Bearer <token>``. ``paths`` translates between host and
-    kernel paths at exactly two places: the ``?file=`` key of :meth:`notebook_url` and the session
-    paths :meth:`sessions` returns (a kernel path outside every mount is left as it is, so it never
-    matches a host notebook). Callers work in host paths only.
+    ``token`` is sent as ``Authorization: Bearer <token>``. Notebooks are *names* relative to
+    ``notebooks_path``, the kernel's path of the notebooks folder: the client turns a name into a
+    kernel path for ``?file=`` keys (:meth:`notebook_url`) and a reported session path back into a
+    name (:meth:`sessions`); ``native_paths`` says the kernel's paths are this machine's (the local
+    runtime) rather than POSIX paths in a container. ``notebook`` is the default name.
 
     The notebook links in error hints leave the token out unless ``token_in_links`` is set: the
     agent's tools pass those hints to the model endpoint, while the CLI prints them for the user.
+
+    The file methods (:meth:`list_files` ...) are marimo's file explorer, in kernel paths; the
+    sandbox builds notebook operations on them.
     """
 
     def __init__(
@@ -368,19 +367,36 @@ class MarimoClient:
         token: str | None = None,
         *,
         timeout: float = 10.0,
-        notebook: Path | None = None,
-        workspace: Path | None = None,
-        paths: PathMap | None = None,
+        notebooks_path: str | None = None,
+        native_paths: bool = False,
+        notebook: str | None = None,
         token_in_links: bool = False,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.timeout = timeout
+        self.notebooks_path = notebooks_path
+        self.native_paths = native_paths
         self.notebook = notebook
-        self.workspace = workspace
-        self.paths = paths
         self.token_in_links = token_in_links
         self._server_token: str | None = None
+
+    # -- names <-> kernel paths ---------------------------------------------- #
+
+    def file_key(self, name: str) -> str:
+        """The kernel's path of the notebook ``name``; ``ValueError`` without a notebooks folder."""
+        if not self.notebooks_path:
+            raise ValueError("this client has no notebooks folder")
+        return kernel_path(self.notebooks_path, name)
+
+    def name_of(self, path: object) -> str | None:
+        """The name of the file at ``path`` (a kernel path) in the notebooks folder, or ``None``."""
+        return name_in_folder(self.notebooks_path, path, native=self.native_paths)
+
+    @property
+    def folds_case(self) -> bool:
+        """Names ignore case: the kernel's paths are this Windows machine's."""
+        return self.native_paths and os.name == "nt"
 
     # -- low level ---------------------------------------------------------- #
 
@@ -446,21 +462,16 @@ class MarimoClient:
         out: list[MarimoSession] = []
         for sid, info in payload.items():
             info = info if isinstance(info, dict) else {}
+            filename, path = info.get("filename"), info.get("path")
             out.append(
                 MarimoSession(
                     session_id=str(sid),
-                    filename=self._host_path(info.get("filename")),
-                    path=self._host_path(info.get("path")),
+                    filename=filename if isinstance(filename, str) else None,
+                    path=path if isinstance(path, str) else None,
+                    name=self.name_of(path or filename),
                 )
             )
         return out
-
-    def _host_path(self, value: object) -> object:
-        """A path the kernel reported, as the host knows it (unchanged when it maps to nothing)."""
-        if self.paths is None or self.paths.identity or not isinstance(value, str):
-            return value
-        host = self.paths.to_host(value)
-        return host if host is not None else value
 
     def server_token(self) -> str:
         """The server's skew-protection token, read once from the page and cached.
@@ -490,23 +501,54 @@ class MarimoClient:
         self._server_token = match.group(1)
         return self._server_token
 
-    def shutdown_session(self, session_id: str) -> None:
-        """Close the kernel session ``session_id`` (frees its kernel; the browser tab disconnects)."""
-        token = self.server_token()
-        body = json.dumps({"sessionId": session_id}).encode("utf-8")
-        headers = {"Content-Type": "application/json", SERVER_TOKEN_HEADER: token}
+    def _post(self, path: str, body: bytes, content_type: str) -> bytes:
+        """POST ``body`` with the server token; the reply's body. A 401 means the cached server
+        token went stale (the server restarted): it is dropped so the next call refetches it."""
+        headers = {"Content-Type": content_type, SERVER_TOKEN_HEADER: self.server_token()}
         try:
-            with self._open("POST", "/api/home/shutdown_session", body=body, headers=headers) as resp:
-                resp.read()
+            with self._open("POST", path, body=body, headers=headers) as resp:
+                return resp.read()
         except MarimoUnavailableError as err:
             cause = err.__cause__
             if isinstance(cause, urllib.error.HTTPError) and cause.code == 401:
-                self._server_token = None  # stale after a server restart; the next call refetches it
+                self._server_token = None
                 raise MarimoUnavailableError(
                     f"Marimo at {self.base_url} rejected the server token (HTTP 401).",
                     hint="The marimo server was probably restarted, so its token changed; retry once.",
                 ) from cause
             raise
+
+    def _post_json(self, path: str, payload: dict) -> dict:
+        """POST ``payload`` as JSON with the server token; the reply as a dict. ``HTTPError`` (not
+        401/403) propagates for the caller to explain."""
+        raw = self._post(path, json.dumps(payload).encode("utf-8"), "application/json")
+        try:
+            reply = json.loads(raw.decode("utf-8", "replace") or "{}")
+        except ValueError as err:
+            raise MarimoUnavailableError(
+                f"Marimo at {self.base_url} answered {path} with something that is not JSON.",
+                hint="Check that the URL points at a marimo 0.24.x edit server.",
+            ) from err
+        return reply if isinstance(reply, dict) else {}
+
+    def _file_error(self, path: str, err: urllib.error.HTTPError) -> MarimoUnavailableError:
+        detail = _error_detail(err.read())
+        return MarimoUnavailableError(
+            f"Marimo at {self.base_url} answered HTTP {err.code} to {path}" + (f": {detail}" if detail else "."),
+            hint="Check the marimo server log for errors (0.24.x is expected). " + launch_hint(),
+        )
+
+    def _file_post(self, path: str, payload: dict) -> dict:
+        """:meth:`_post_json` for the file endpoints, with any HTTP error as ``MarimoUnavailableError``."""
+        try:
+            return self._post_json(path, payload)
+        except urllib.error.HTTPError as err:
+            raise self._file_error(path, err) from err
+
+    def shutdown_session(self, session_id: str) -> None:
+        """Close the kernel session ``session_id`` (frees its kernel; the browser tab disconnects)."""
+        try:
+            self._post("/api/home/shutdown_session", json.dumps({"sessionId": session_id}).encode("utf-8"), "application/json")
         except urllib.error.HTTPError as err:
             detail = _error_detail(err.read())
             raise MarimoUnavailableError(
@@ -514,19 +556,74 @@ class MarimoClient:
                 hint="Check that the session id is current; GET /api/sessions lists the open ones.",
             ) from err
 
-    def notebook_url(self, notebook: Path | None = None) -> str:
-        """The URL that opens ``notebook`` (token only with ``token_in_links``; see the class docstring)."""
-        nb = notebook or self.notebook
-        server = MarimoServer(url=self.base_url, token=self.token if self.token_in_links else None)
-        if nb is None:
-            return home_url(server, with_token=self.token_in_links)
-        try:
-            return open_notebook_url(server, nb, self.workspace or Path.cwd(), paths=self.paths, with_token=self.token_in_links)
-        except NotebookPathError:
-            return home_url(server, with_token=self.token_in_links)
+    # -- marimo's file explorer (kernel paths) -------------------------------- #
 
-    def resolve_session(self, notebook: Path | None) -> MarimoSession:
-        """Pick the session for ``notebook`` (or the only session when ``notebook`` is None)."""
+    def list_files(self, folder: str) -> list[dict]:
+        """``POST /api/files/list_files``: the entries directly in ``folder`` (marimo's ``FileInfo``:
+        ``path``, ``name``, ``isDirectory``, ``isMarimoFile``, ``lastModified``, ``size``). A missing
+        folder lists as empty (marimo swallows the error); an HTTP error is ``MarimoUnavailableError``."""
+        reply = self._file_post("/api/files/list_files", {"path": folder})
+        files = reply.get("files")
+        return [entry for entry in files if isinstance(entry, dict)] if isinstance(files, list) else []
+
+    def file_details(self, path: str, max_bytes: int | None = None) -> dict:
+        """``POST /api/files/file_details``: ``file`` (FileInfo), ``contents``, ``isBase64`` (not UTF-8)
+        and ``isTooLarge`` (over ``max_bytes``; no contents then). ``HTTPError`` when the file cannot
+        be read (marimo answers 500 for a missing one)."""
+        payload: dict = {"path": path}
+        if max_bytes is not None:
+            payload["maxBytes"] = max_bytes
+        return self._post_json("/api/files/file_details", payload)
+
+    def create_file(self, folder: str, name: str, data: bytes) -> dict:
+        """``POST /api/files/create`` (multipart): a new file ``name`` in ``folder`` (created with its
+        parents) holding ``data``. marimo never overwrites: when ``name`` is taken it picks
+        ``<stem>_1<suffix>``, so the reply's ``info.path`` says where the file went. The reply's
+        ``success`` is false (with ``message``) when marimo refused."""
+        boundary = f"hailer-{secrets.token_hex(16)}"
+        filename = quote(name, safe=" ")  # a header parameter: no quotes, CR or LF
+        parts: list[bytes] = []
+        for key, value in (("path", folder), ("type", "file"), ("name", name)):
+            parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode("utf-8"))
+        parts.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+            "Content-Type: application/octet-stream\r\n\r\n".encode("utf-8") + data + b"\r\n"
+        )
+        parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+        try:
+            raw = self._post("/api/files/create", b"".join(parts), f"multipart/form-data; boundary={boundary}")
+        except urllib.error.HTTPError as err:
+            raise self._file_error("/api/files/create", err) from err
+        try:
+            reply = json.loads(raw.decode("utf-8", "replace") or "{}")
+        except ValueError:
+            reply = {}
+        return reply if isinstance(reply, dict) else {}
+
+    def update_file(self, path: str, contents: str) -> dict:
+        """``POST /api/files/update``: replace the text of the existing file at ``path`` (marimo
+        reloads an open session of it). ``success`` is false (with ``message``) when it failed.
+        marimo writes it with ``Path.write_text``, so a Windows kernel stores ``\\r\\n`` line endings,
+        while :meth:`create_file` stores the bytes as given: compare contents newline-normalised."""
+        return self._file_post("/api/files/update", {"path": path, "contents": contents})
+
+    def delete_file(self, path: str) -> dict:
+        """``POST /api/files/delete``: remove the file (or folder) at ``path``."""
+        return self._file_post("/api/files/delete", {"path": path})
+
+    # -- notebooks and sessions (names) --------------------------------------- #
+
+    def notebook_url(self, notebook: str | None = None) -> str:
+        """The URL that opens ``notebook`` (a name; token only with ``token_in_links``, see the class
+        docstring); marimo's home page without a name or a notebooks folder."""
+        name = notebook or self.notebook
+        server = MarimoServer(url=self.base_url, token=self.token if self.token_in_links else None)
+        if name is None or not self.notebooks_path:
+            return home_url(server, with_token=self.token_in_links)
+        return open_notebook_url(server, self.file_key(name), with_token=self.token_in_links)
+
+    def resolve_session(self, notebook: str | None) -> MarimoSession:
+        """Pick the session for ``notebook``, a name (or the only session when ``notebook`` is None)."""
         sessions = self.sessions()
         if not sessions:
             raise NoSessionError(
@@ -540,24 +637,24 @@ class MarimoClient:
                 "Several notebooks are open; tell Hailer which one via [hailer].notebook.",
                 hint="Open sessions:\n" + self._describe_sessions(sessions),
             )
-        session = match_session(sessions, notebook, self.workspace)
+        session = match_session(sessions, notebook, fold=self.folds_case)
         if session is not None:
             return session
         raise NoSessionError(
-            f"No open session matches {Path(notebook).name}.",
+            f"No open session matches {notebook}.",
             hint=f"Open {self.notebook_url(notebook)} in your browser. Open sessions:\n" + self._describe_sessions(sessions),
         )
 
     @staticmethod
     def _describe_sessions(sessions: Sequence[MarimoSession]) -> str:
-        return "\n".join(f"  {s.session_id}  {s.path or s.filename or '(unsaved notebook)'}" for s in sessions) or "  (none)"
+        return "\n".join(f"  {s.session_id}  {s.name or s.path or s.filename or '(unsaved notebook)'}" for s in sessions) or "  (none)"
 
     def execute(
         self,
         code: str,
         *,
         session_id: str | None = None,
-        notebook: Path | None = None,
+        notebook: str | None = None,
         on_stdout: Callable[[str], None] | None = None,
         on_stderr: Callable[[str], None] | None = None,
         timeout: float = 600.0,
@@ -715,7 +812,9 @@ __all__ = [
     "home_url",
     "launch_hint",
     "marimo_server_command",
+    "kernel_path",
     "match_session",
+    "name_in_folder",
     "notebook_file_key",
     "open_notebook_url",
     "wait_for_health",

@@ -12,7 +12,7 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from urllib.parse import quote
 
 import pytest
@@ -20,6 +20,7 @@ from rich.console import Console
 from typer.testing import CliRunner
 
 import hailer.cli as cli
+from fake_sandbox import FolderSandbox, folder_sandbox, with_folder_files
 from hailer import __version__, kernel_image, notebooks
 from hailer.errors import ConfigError, CredentialsError, HailerError, NoSessionError
 from hailer.models import (
@@ -40,8 +41,7 @@ from hailer.models import (
 from hailer.session import save_session, session_path
 
 runner = CliRunner()
-# The real client and kernel start, captured before the harness replaces them.
-REAL_MAKE_CLIENT = cli._make_client
+# The real kernel start, captured before the harness replaces it.
 REAL_START_KERNEL = cli._start_kernel
 SERVER = MarimoServer(url="http://127.0.0.1:2718")  # the kernel the harness's fake start hands the chat
 TOKEN = "test-token-0123456789"  # what the nb fixture's runtime hands the servers it starts
@@ -72,8 +72,11 @@ INTERNAL = ProviderConfig(
 
 
 def url_for(notebook: Path) -> str:
-    """The URL the real open_notebook_url produces: absolute posix file key, app view."""
-    return f"{SERVER.url}/?file={quote(Path(notebook).resolve().as_posix(), safe='/:')}&view-as=present"
+    """The URL the harness's local kernel gives the notebook at ``notebook`` (its host path): the
+    notebooks folder's file key plus the name, app view."""
+    from hailer.marimo_client import notebook_file_key
+
+    return f"{SERVER.url}/?file={quote(notebook_file_key(Path(notebook)), safe='/:')}&view-as=present"
 
 
 @dataclass
@@ -126,39 +129,49 @@ class FakeAgent:
 
 
 class FakeClient:
-    """Session-aware stand-in for MarimoClient: a notebook has a session only when one was listed
-    for its path (or granted later, the way a browser tab would), matched by the real rule."""
+    """Session-aware stand-in for MarimoClient: a notebook (a name) has a session only when one was
+    listed for it (or granted later, the way a browser tab would), matched by the real rule.
+    Sessions given with a host path get their name from the notebooks folder of the sandbox that
+    made the client (``root``, bound by :meth:`Harness.bound_client`)."""
 
-    def __init__(self, *, healthy=True, session="default", exec_result=None, other_sessions=(), workspace=None):
+    def __init__(self, *, healthy=True, session="default", exec_result=None, other_sessions=()):
         self.healthy = healthy
-        self.workspace = workspace  # bound by the harness's _make_client; relative session paths resolve against it
-        # the configured notebook's session, relative to the workspace like a hand-written entry
-        self.session = MarimoSession("s1", "analysis.py", "notebooks/analysis.py") if session == "default" else session
+        self.root: str | None = None
+        # the configured notebook's session
+        self.session = MarimoSession("s1", "analysis.py", "/nb/analysis.py", name="analysis.py") if session == "default" else session
         self.other_sessions = list(other_sessions)  # sessions for notebooks other than the active one
         self.exec_result = exec_result
         self.codes: list[str] = []
         self.closed: list[str] = []
-        self.granted: list[Path] = []
+        self.granted: list[str] = []
 
     def health(self):
         return self.healthy
 
+    def _named(self, session):
+        if session.name is not None or not self.root:
+            return session
+        from hailer.marimo_client import name_in_folder
+
+        native = os.name == "nt" and not self.root.startswith("/")
+        return replace(session, name=name_in_folder(self.root, session.path, native=native))
+
     def sessions(self):
-        return ([self.session] if self.session is not None else []) + self.other_sessions
+        return [self._named(s) for s in ([self.session] if self.session is not None else []) + self.other_sessions]
 
     def grant(self, notebook, session_id="s9"):
-        """Give ``notebook`` a session (what happens once its browser tab loads)."""
-        self.granted.append(Path(notebook))
-        session = MarimoSession(session_id, Path(notebook).name, str(Path(notebook).resolve()))
+        """Give ``notebook`` (a name) a session (what happens once its browser tab loads)."""
+        self.granted.append(notebook)
+        session = MarimoSession(session_id, notebook.rsplit("/", 1)[-1], f"{self.root}/{notebook}", name=notebook)
         self.other_sessions.append(session)
         return session
 
     def resolve_session(self, notebook):
         from hailer.marimo_client import match_session
 
-        session = match_session(self.sessions(), notebook, self.workspace) if notebook is not None else None
+        session = match_session(self.sessions(), notebook) if notebook is not None else None
         if session is None:
-            url = url_for(notebook) if notebook is not None else SERVER.url
+            url = f"{SERVER.url}/?file={self.root}/{notebook}" if notebook is not None else SERVER.url
             raise NoSessionError("The notebook is not open in a browser.", hint=f"Open {url} in your browser.")
         return session
 
@@ -178,19 +191,6 @@ class FakeClient:
         if on_stderr and result.stderr:
             on_stderr(result.stderr)
         return result
-
-
-@dataclass
-class FakeRunning:
-    """What the harness's fake kernel start returns: the chat's own kernel, stopped on exit."""
-
-    server: MarimoServer
-    log_hint: str = "the log"
-    stop_error: str = ""
-    stopped: int = 0
-
-    def stop(self):
-        self.stopped += 1
 
 
 # --------------------------------------------------------------------------- #
@@ -250,18 +250,33 @@ class Harness:
     stored: list = field(default_factory=list)
     deleted: list = field(default_factory=list)
     key_source: tuple = ("x", "env")
-    server: MarimoServer | None = SERVER
+    server: MarimoServer = SERVER  # the endpoint of the kernel the fake start hands the chat
     bundle: ContextBundle = field(default_factory=ContextBundle)
-    session_waits: list = field(default_factory=list)
+    session_waits: list = field(default_factory=list)  # the notebooks (names) waited for
     waited_session: object = "default"  # what _wait_for_session returns ("default" -> session s9)
-    agent_servers: list = field(default_factory=list)  # the server each agent was handed
+    agent_sandboxes: list = field(default_factory=list)  # the sandbox each agent was handed
     warmups: list = field(default_factory=list)
-    kernel_starts: list = field(default_factory=list)  # the FakeRunning of every kernel the chat started
+    kernel_starts: list = field(default_factory=list)  # the sandbox of every kernel the chat started
     kernels: list = field(default_factory=list)  # what `hailer status` lists as running
+    real_clients: bool = False  # the sandbox's clients talk to ``server`` for real (a fake_marimo)
 
     @property
     def url(self) -> str:
         return url_for(self.config.notebook)
+
+    @property
+    def sandbox(self) -> FolderSandbox:
+        """A sandbox like the one the fake start hands the chat: ``server``, the notebooks folder,
+        ``client`` for every kernel request (a docker server gets the container's paths)."""
+        box = folder_sandbox(self.config, self.server, docker=self.server.runtime == "docker")
+        if not self.real_clients:
+            box.client_factory = lambda **kw: self.bound_client(box)
+        return box
+
+    def bound_client(self, box) -> FakeClient:
+        """``client``, knowing the notebooks folder of the sandbox that made it."""
+        self.client.root = box.notebooks_path
+        return self.client
 
 
 @pytest.fixture
@@ -283,16 +298,10 @@ def harness(tmp_path, monkeypatch):
             raise h.waited_session  # e.g. Ctrl+C while waiting
         return h.waited_session
 
-    def make_client(server, config):
-        if getattr(h.client, "workspace", None) is None:
-            h.client.workspace = config.workspace
-        return h.client
-
     monkeypatch.setattr(cli, "console_factory", lambda: Console(force_terminal=False, width=120, highlight=False, soft_wrap=True, color_system=None))
     monkeypatch.setattr(cli, "_load_config", lambda opts: h.config)
     monkeypatch.setattr(cli, "_validate_config", lambda config: [])
     monkeypatch.setattr(cli, "_setup_logging", lambda config, opts: None)
-    monkeypatch.setattr(cli, "_make_client", make_client)
     monkeypatch.setattr(cli, "_wait_for_session", wait_session)
     monkeypatch.setattr(cli, "_workspace_kernels", lambda config: h.kernels)
     monkeypatch.setattr(cli, "_resolve_key", lambda provider: h.key_source)
@@ -300,13 +309,14 @@ def harness(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "_delete_key", lambda provider: (h.deleted.append(provider.id) or True))
     monkeypatch.setattr(cli, "_load_context", load_context)
     monkeypatch.setattr(cli, "_render_prompt", lambda config, name, args: f"PROMPT[{name}]({args})")
-    monkeypatch.setattr(cli, "_make_agent", lambda config, bundle, server=None: (h.agent_servers.append(server) or h.agent))
+    monkeypatch.setattr(cli, "_make_agent", lambda config, bundle, sandbox=None: (h.agent_sandboxes.append(sandbox) or h.agent))
     monkeypatch.setattr(cli, "_start_dependency_warmup", lambda: h.warmups.append("started"))
     monkeypatch.setattr(cli, "_open_browser", lambda url: h.opened.append(url))
 
     def start_kernel(console, runtime, port, *, verbose):
         """The chat's own kernel, started without a process (the nb fixture runs the real start)."""
-        running = FakeRunning(h.server)
+        running = h.sandbox
+        running.log_hint = "the log"
         h.kernel_starts.append(running)
         return running
 
@@ -349,7 +359,7 @@ def test_interactive_session_enters_composer_before_waiting_for_browser(harness,
 
     async def run_interactive(self, ui_factory=None, *, prepare_notebook=None, timings=None):
         assert harness.opened == [] and harness.session_waits == []
-        assert self.server is SERVER
+        assert self.sandbox is harness.kernel_starts[0] and self.sandbox.server is SERVER
         assert set(timings.milestones) == {"checks_complete", "kernel_ready", "panel_shown"}
         self.console = ui_console
         timings.mark("input_ready")
@@ -363,7 +373,7 @@ def test_interactive_session_enters_composer_before_waiting_for_browser(harness,
     result = chat()
     assert result.exit_code == 0, result.output
     assert harness.opened == [harness.url]
-    assert harness.session_waits == [harness.config.notebook]
+    assert harness.session_waits == ["analysis.py"]
     assert "Notebook is open (session s9)." in ui_output.getvalue()
     assert "Notebook is open" not in result.output
     assert milestones["input_ready"] >= milestones["panel_shown"]
@@ -398,7 +408,7 @@ def test_notebook_preparation_cancel_during_resolve_does_not_open_browser(harnes
 
     async def scenario():
         task = asyncio.create_task(cli._prepare_notebook(
-            Console(file=output), harness.config, SERVER, open_browser=True,
+            Console(file=output), harness.sandbox, "analysis.py", open_browser=True,
         ))
         try:
             async with asyncio.timeout(5):
@@ -423,7 +433,7 @@ def test_notebook_preparation_cancel_during_resolve_does_not_open_browser(harnes
 def test_notebook_preparation_cancel_stops_real_session_poll(harness, monkeypatch):
     from hailer.marimo_client import wait_for_session
 
-    harness.client = FakeClient(session=None, workspace=harness.config.workspace)
+    harness.client = FakeClient(session=None)
     polling = threading.Event()
     output = io.StringIO()
 
@@ -435,7 +445,7 @@ def test_notebook_preparation_cancel_stops_real_session_poll(harness, monkeypatc
 
     async def scenario():
         task = asyncio.create_task(cli._prepare_notebook(
-            Console(file=output), harness.config, SERVER, open_browser=True,
+            Console(file=output), harness.sandbox, "analysis.py", open_browser=True,
         ))
         async with asyncio.timeout(5):
             while not polling.is_set():
@@ -634,9 +644,9 @@ def test_every_chat_starts_its_own_kernel_opens_the_notebook_and_stops_the_kerne
     result = chat()
     assert result.exit_code == 0, result.output
     assert [k.stopped for k in harness.kernel_starts] == [1]
-    assert harness.agent_servers == [SERVER], "the agent's tools get the kernel in memory"
+    assert harness.agent_sandboxes == harness.kernel_starts, "the agent's tools get the kernel in memory"
     assert harness.opened == [harness.url]
-    assert harness.session_waits == [harness.config.notebook]
+    assert harness.session_waits == ["analysis.py"]
     assert "Notebook is open (session s9)." in result.output
     assert "Stopped marimo." in result.output
     result = chat()
@@ -674,10 +684,10 @@ def test_exec_slash_command_dedents_an_indented_paste():
 
     client = Client()
     services = type("S", (), {})()
-    services._marimo_state = lambda config, server: (SERVER, MarimoSession("s1", "a.py", "a.py"), None)
-    services._make_client = lambda server, config: client
+    services._marimo_state = lambda sandbox, notebook: (sandbox, MarimoSession("s1", "a.py", "a.py", name="a.py"), None)
     controller = ChatController.__new__(ChatController)
-    controller.console, controller._cli, controller.config, controller.server = Console(file=StringIO()), services, None, SERVER
+    controller.console, controller._cli, controller.config = Console(file=StringIO()), services, None
+    controller.sandbox, controller.notebook = type("Box", (), {"client": lambda self, **kw: client})(), "a.py"
     controller._stop_event = None
     controller._exec("    x = 1\n    print(x)")
     assert client.codes == ["x = 1\nprint(x)"]
@@ -698,10 +708,9 @@ def test_exec_slash_command_failure_usage_and_no_session(harness):
 def test_exec_slash_command_talks_to_the_real_server_with_its_token(harness, monkeypatch):
     from fake_marimo import serving
 
-    monkeypatch.setattr(cli, "_make_client", REAL_MAKE_CLIENT)
     with serving(token=TOKEN) as srv:
-        srv.sessions = {"s1": {"filename": "notebooks/analysis.py", "path": str(harness.config.notebook.resolve())}}
-        harness.server = MarimoServer(url=srv.url, token=TOKEN)
+        srv.sessions = {"s1": {"filename": "notebooks/analysis.py", "path": str(harness.config.notebook)}}
+        harness.server, harness.real_clients = MarimoServer(url=srv.url, token=TOKEN), True
         result = chat(input_text="/exec print('x')\n/exit\n")
     assert result.exit_code == 0, result.output
     assert "hello world" in result.output and "42" in result.output
@@ -834,7 +843,7 @@ def nb(harness, monkeypatch):
     def wait_session(client, notebook, timeout, *, should_stop=None):
         h.session_waits.append(notebook)
         if h.waited_session == "default":
-            return MarimoSession("s9", "analysis.py", "notebooks/analysis.py")
+            return MarimoSession("s9", "analysis.py", "/nb/analysis.py", name="analysis.py")
         return h.waited_session
 
     procs = LocalProcesses(
@@ -843,7 +852,16 @@ def nb(harness, monkeypatch):
         kill_tree=lambda pid: None,
         wait_for_health=wait_health,
     )
-    monkeypatch.setattr(cli, "_runtime_for", lambda config: LocalRuntime(config, procs=procs, token_factory=lambda: TOKEN))
+
+    class Runtime(LocalRuntime):
+        """The real start; the sandbox it returns serves the notebooks folder without a marimo
+        server behind it, and its clients are the harness's."""
+
+        def start(self, port, *, foreground=False):
+            running = super().start(port, foreground=foreground)
+            return with_folder_files(running, self.config.notebooks_root, lambda **kw: harness.bound_client(running))
+
+    monkeypatch.setattr(cli, "_runtime_for", lambda config: Runtime(config, procs=procs, token_factory=lambda: TOKEN))
     monkeypatch.setattr(cli, "_find_free_port", lambda preferred: h.free_port if h.free_port is not None else preferred)
     monkeypatch.setattr(cli, "_wait_for_session", wait_session)
     return h
@@ -882,7 +900,7 @@ def test_notebook_opens_browser_and_waits_for_session(harness, nb):
     result = notebook_cmd()
     assert result.exit_code == 0, result.output
     assert harness.opened == [signed(harness.url)], "browser opened exactly once, signed in with the server's token"
-    assert nb.session_waits == [harness.config.notebook]
+    assert nb.session_waits == ["analysis.py"]
     assert "Notebook is open (session s9)" in result.output
     assert "app view" in result.output and "Ctrl+." in result.output, "tells the user how to reach the code"
 
@@ -1115,7 +1133,7 @@ def test_init_creates_the_notebook_and_data_folder_so_notebook_can_start(harness
     result = init_cmd(ws)
     assert result.exit_code == 0, result.output
     notebook = ws / "notebooks" / "analysis.py"
-    assert notebooks.is_marimo_notebook(notebook)
+    assert "import marimo" in notebook.read_text(encoding="utf-8") and "marimo.App" in notebook.read_text(encoding="utf-8")
     assert "# Hailer workspace" in notebook.read_text(encoding="utf-8")
     assert (ws / "data").is_dir()
     assert "Created notebooks/analysis.py (starter notebook), data/" in result.output
@@ -1152,7 +1170,7 @@ def test_init_uses_the_notebook_and_data_dir_from_an_existing_config(harness, tm
     result = init_cmd(ws)
     assert result.exit_code == 0, result.output
     assert "already exists" in result.output, "the existing hailer.toml is kept"
-    assert notebooks.is_marimo_notebook(ws / "work" / "q2.py")
+    assert "marimo.App" in (ws / "work" / "q2.py").read_text(encoding="utf-8")
     assert (ws / "inputs").is_dir() and not (ws / "notebooks").exists() and not (ws / "data").exists()
     assert "uvx hailer login internal" in result.output
     assert "inputs/" in result.output
@@ -1349,29 +1367,42 @@ def test_progress_line_shows_the_tool_in_use(harness):
 # --------------------------------------------------------------------------- #
 
 
-def test_load_config_applies_active_notebook_from_state(tmp_path, monkeypatch):
-    """The real _load_config returns the state file's notebook as config.notebook."""
+def test_load_config_keeps_the_configured_notebook_and_hailer_notebook_is_saved_as_a_name(tmp_path, monkeypatch):
+    """config.notebook stays the configured notebook; the active one is a name in the state file.
+    An explicit HAILER_NOTEBOOK is written there, so the tools (which read only the file) and the
+    next session start on the same notebook."""
     base = make_config(tmp_path)
-    other = write_notebook(base, "other")
+    write_notebook(base, "other")
     monkeypatch.delenv("HAILER_NOTEBOOK", raising=False)
     monkeypatch.setattr("hailer.config.load_config", lambda workspace=None, config_path=None: base)
-    assert cli._load_config(cli.CliOptions()).notebook == base.notebook, "no state file: the configured notebook"
-    notebooks.save_active_notebook(base, other)
-    config = cli._load_config(cli.CliOptions())
-    assert config.notebook == other
-    assert config.notebooks_root == base.notebooks_root
-    # An explicit HAILER_NOTEBOOK wins and is written to the state file, so the tool server (which
-    # reads only the file) and the next session start on the same notebook.
+    notebooks.save_active_notebook(base, "other.py")
+    assert cli._load_config(cli.CliOptions()) is base
+    assert notebooks.load_active_notebook(base) == "other.py"
     monkeypatch.setenv("HAILER_NOTEBOOK", "explicit")
-    assert cli._load_config(cli.CliOptions()).notebook == base.notebook, "an explicit override wins"
-    assert active_state(base) == "notebooks/analysis.py"
-    assert notebooks.load_active_notebook(base) == base.notebook
+    assert cli._load_config(cli.CliOptions()).notebook == base.notebook
+    assert active_state(base) == "analysis.py" and notebooks.load_active_notebook(base) == "analysis.py"
+
+
+def test_a_session_converts_an_old_state_file_and_falls_back_from_a_deleted_notebook(harness):
+    """notebook.json from before names held host paths: the first session converts it. An active
+    notebook the sandbox no longer has falls back to the configured one."""
+    write_notebook(harness.config, "q3/review")
+    state = notebooks.state_path(harness.config.workspace)
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.write_text(json.dumps({"active": "notebooks/q3/review.py", "recent": ["notebooks/q3/review.py", "../x.py"]}), encoding="utf-8")
+    result = chat()
+    assert result.exit_code == 0, result.output
+    assert "Notebook:   q3/review.py" in result.output
+    assert json.loads(state.read_text(encoding="utf-8")) == {"version": 2, "active": "q3/review.py", "recent": ["q3/review.py"]}
+    (harness.config.notebooks_root / "q3" / "review.py").unlink()
+    result = chat()
+    assert "Notebook:   analysis.py" in result.output and active_state(harness.config) == "analysis.py"
 
 
 def test_notebook_command_shows_active_folder_and_usage(harness):
     result = chat(input_text="/notebook\n/exit\n")
     out = result.output
-    assert "Notebook:  notebooks/analysis.py (active)" in out
+    assert "Notebook:  analysis.py (active)" in out
     assert "Notebooks: notebooks (1 notebook; /notebook list)" in out
     assert "Marimo:    http://127.0.0.1:2718 (session s1)" in out
     assert harness.url in out
@@ -1387,9 +1418,9 @@ def test_notebook_list_marks_active_and_open_and_skips_non_notebooks(harness):
     cache.mkdir()
     (cache / "cached.py").write_text(NOTEBOOK_SOURCE, encoding="utf-8")
     result = chat(input_text="/notebook list\n/exit\n")
-    lines = [ln for ln in result.output.splitlines() if "notebooks/" in ln]
-    assert any("notebooks/analysis.py" in ln and "active, open" in ln for ln in lines), lines
-    assert any("notebooks/other.py" in ln and "active" not in ln and "open" not in ln for ln in lines), lines
+    lines = [ln for ln in result.output.splitlines() if ".py " in ln]
+    assert any("analysis.py " in ln and "active, open" in ln for ln in lines), lines
+    assert any("other.py " in ln and "active" not in ln and "open" not in ln for ln in lines), lines
     assert "helper.py" not in result.output and "cached.py" not in result.output
     assert "2 notebooks in notebooks." in result.output
 
@@ -1407,17 +1438,17 @@ def test_notebook_new_creates_switches_and_sends_preamble_once(harness):
     assert created.exists()
     source = created.read_text(encoding="utf-8")
     assert "marimo.App" in source and "hailer.periods" in source and "# Q2 Churn" in source
-    assert "Created notebooks/q2_churn.py from the starter template." in result.output
-    assert "Active notebook: notebooks/q2_churn.py." in result.output
-    assert active_state(harness.config) == "notebooks/q2_churn.py"
+    assert "Created q2_churn.py from the starter template." in result.output
+    assert "Active notebook: q2_churn.py." in result.output
+    assert active_state(harness.config) == "q2_churn.py"
     # a freshly created notebook has no session: its app-view URL is opened and the tab is waited for
     assert harness.opened == [url_for(created)]
-    assert harness.session_waits == [created]
-    assert harness.client.granted == [created]
+    assert harness.session_waits == ["q2_churn.py"]
+    assert harness.client.granted == ["q2_churn.py"]
     assert "Notebook is open (session s9)." in result.output
     assert harness.agent.turns == [("hello", None), ("again", None)]
     assert harness.agent.preambles == [
-        "[Hailer] The active notebook is now notebooks/q2_churn.py (created from the starter template, 1 cell). "
+        "[Hailer] The active notebook is now q2_churn.py (created from the starter template, 1 cell). "
         "Call notebook_cells before editing.",
         None,
     ]
@@ -1429,7 +1460,7 @@ def test_notebook_new_empty_template_and_status_panel(harness):
     assert result.exit_code == 0, result.output
     source = (harness.config.notebooks_root / "scratch.py").read_text(encoding="utf-8")
     assert "marimo.App" in source and "hailer.periods" not in source
-    assert "Created notebooks/scratch.py from the empty template." in result.output
+    assert "Created scratch.py from the empty template." in result.output
     assert harness.agent.preambles == [], "no turn was sent, so the notice is still pending"
     status = result.output[result.output.index("Model"):]
     assert "scratch.py" in status and "Notebooks" in status and "notebooks" in status
@@ -1440,7 +1471,7 @@ def test_notebook_new_existing_name_is_an_error_and_keeps_active(harness):
     assert result.exit_code == 0, result.output
     assert "already exists" in result.output
     assert "Usage: /notebook new <name> [--empty]" in result.output
-    assert active_state(harness.config) is None
+    assert active_state(harness.config) == "analysis.py"
     assert harness.agent.preambles == []
 
 
@@ -1451,12 +1482,12 @@ def test_notebook_open_by_name_opens_browser_and_waits_when_no_session(harness):
     assert result.exit_code == 0, result.output
     # startup opened the (then active) analysis notebook; the switch opened other.py and waited for it
     assert harness.opened == [url_for(harness.config.notebook), url_for(other)]
-    assert harness.session_waits == [harness.config.notebook, other]
+    assert harness.session_waits == ["analysis.py", "other.py"]
     assert "Notebook is open (session s9)." in result.output
-    assert "Active notebook: notebooks/other.py." in result.output
-    assert active_state(harness.config) == "notebooks/other.py"
+    assert "Active notebook: other.py." in result.output
+    assert active_state(harness.config) == "other.py"
     assert harness.agent.preambles == [
-        "[Hailer] The active notebook is now notebooks/other.py (reopened, 1 cell). Call notebook_cells before editing."
+        "[Hailer] The active notebook is now other.py (reopened, 1 cell). Call notebook_cells before editing."
     ]
 
 
@@ -1467,7 +1498,7 @@ def test_notebook_open_without_session_after_wait_says_so(harness):
     result = chat(input_text="/notebook open other.py\nhi\n/exit\n")
     assert "No kernel session yet" in result.output
     assert harness.agent.preambles == [
-        "[Hailer] The active notebook is now notebooks/other.py (reopened, not open in a browser yet). "
+        "[Hailer] The active notebook is now other.py (reopened, not open in a browser yet). "
         "Call notebook_cells before editing."
     ]
     assert harness.opened[-1] == url_for(other)
@@ -1475,43 +1506,44 @@ def test_notebook_open_without_session_after_wait_says_so(harness):
 
 def test_notebook_open_active_notebook_is_a_no_op(harness):
     result = chat(input_text="/notebook open analysis\n/exit\n")
-    assert "notebooks/analysis.py is already the active notebook." in result.output
-    assert active_state(harness.config) is None
+    assert "analysis.py is already the active notebook." in result.output
+    assert active_state(harness.config) == "analysis.py"
     assert harness.agent.preambles == []
 
 
 def test_notebook_open_unknown_lists_available(harness):
     result = chat(input_text="/notebook open nope\n/notebook open\n/exit\n")
-    assert "No notebook named 'nope' in notebooks." in result.output
-    assert "Notebooks in notebooks: analysis." in result.output
+    assert "No notebook named 'nope' in the notebooks folder." in result.output
+    assert "Notebooks: analysis.py." in result.output
     assert "Usage: /notebook open <name>" in result.output
-    assert active_state(harness.config) is None
+    assert active_state(harness.config) == "analysis.py"
 
 
 def test_notebook_open_outside_folder_is_refused(harness):
     outside = harness.config.workspace / "elsewhere.py"
     outside.write_text(NOTEBOOK_SOURCE, encoding="utf-8")
-    result = chat(input_text="/notebook open elsewhere.py\n/exit\n")
+    result = chat(input_text="/notebook open ../elsewhere.py\n/notebook open elsewhere.py\n/exit\n")
     assert "outside the notebooks folder" in result.output
-    assert active_state(harness.config) is None
+    assert "No notebook named 'elsewhere.py'" in result.output, "a name is only looked for inside the folder"
+    assert active_state(harness.config) == "analysis.py"
 
 
 def test_notebook_close_shuts_down_the_session(harness, nb):
     result = chat(input_text="/notebook close\n/notebook close\n/exit\n")
     assert result.exit_code == 0, result.output
     assert harness.client.closed == ["s1"]
-    assert "Closed notebooks/analysis.py (session s1)" in result.output
+    assert "Closed analysis.py (session s1)" in result.output
     assert "It stays the active notebook; /notebook open analysis reopens it." in result.output
-    assert "notebooks/analysis.py is not open (no kernel session)." in result.output
+    assert "analysis.py is not open (no kernel session)." in result.output
 
 
 def test_switch_made_by_the_model_is_detected_after_the_turn(harness):
     other = write_notebook(harness.config, "other")
     harness.client = FakeClient(session=None)
-    harness.agent.on_turn = lambda: notebooks.save_active_notebook(harness.config, other)
+    harness.agent.on_turn = lambda: notebooks.save_active_notebook(harness.config, "other.py")
     result = chat(input_text="make a new notebook\n/status\n/exit\n")
     assert result.exit_code == 0, result.output
-    assert "Active notebook is now notebooks/other.py." in result.output
+    assert "Active notebook is now other.py." in result.output
     assert harness.opened == [url_for(harness.config.notebook), url_for(other)], "opened once the switch was seen"
     assert harness.agent.preambles == [None], "the model already knows; no notice is queued"
     status = result.output[result.output.index("Active notebook is now"):]
@@ -1521,9 +1553,9 @@ def test_switch_made_by_the_model_is_detected_after_the_turn(harness):
 def test_switch_made_by_the_model_with_session_does_not_open_browser(harness):
     other = write_notebook(harness.config, "other")
     harness.client = FakeClient(other_sessions=[MarimoSession("s2", "other.py", str(other))])
-    harness.agent.on_turn = lambda: notebooks.save_active_notebook(harness.config, other)
+    harness.agent.on_turn = lambda: notebooks.save_active_notebook(harness.config, "other.py")
     result = chat(input_text="make a new notebook\n/exit\n")
-    assert "Active notebook is now notebooks/other.py." in result.output
+    assert "Active notebook is now other.py." in result.output
     assert harness.opened == []
 
 
@@ -1546,7 +1578,7 @@ def test_notebook_command_opens_the_active_notebook_when_another_is_open(harness
     assert result.exit_code == 0, result.output
     assert len(nb.spawned) == 1, "its own server"
     assert harness.opened == [signed(harness.url)], "the active notebook is opened on it"
-    assert nb.session_waits == [harness.config.notebook]
+    assert nb.session_waits == ["analysis.py"]
 
 
 def test_notebook_command_ignores_sessions_outside_the_folder(harness, nb):
@@ -1577,60 +1609,66 @@ def test_switch_notice_survives_ctrl_c_during_the_wait(harness):
     result = chat(input_text="/notebook open other\nhi\n/exit\n")
     assert result.exit_code == 0, result.output
     assert "Interrupted." in result.output
-    assert "Active notebook: notebooks/other.py." in result.output
-    assert active_state(harness.config) == "notebooks/other.py"
+    assert "Active notebook: other.py." in result.output
+    assert active_state(harness.config) == "other.py"
     assert harness.opened[-1] == url_for(other)
     assert harness.agent.preambles == [
-        "[Hailer] The active notebook is now notebooks/other.py (reopened, not open in a browser yet). "
+        "[Hailer] The active notebook is now other.py (reopened, not open in a browser yet). "
         "Call notebook_cells before editing."
     ]
 
 
 def test_switch_notice_survives_marimo_error_during_the_wait(harness):
-    other = write_notebook(harness.config, "other")
+    write_notebook(harness.config, "other")
     harness.waited_session = HailerError("marimo went away", hint="restart it")
     result = chat(input_text="/notebook open other\nhi\n/exit\n")
     assert result.exit_code == 0, result.output
     assert "marimo went away" in result.output and "restart it" in result.output
-    assert active_state(harness.config) == "notebooks/other.py"
-    assert harness.agent.preambles[0].startswith("[Hailer] The active notebook is now notebooks/other.py (reopened, not open in a browser yet)")
+    assert active_state(harness.config) == "other.py"
+    assert harness.agent.preambles[0].startswith("[Hailer] The active notebook is now other.py (reopened, not open in a browser yet)")
 
 
 def test_switch_made_by_the_model_is_detected_after_ctrl_c(harness):
     """A notebook_open tool call that completed before Ctrl+C is picked up straight away."""
     other = write_notebook(harness.config, "other")
     harness.client = FakeClient(session=None)
-    harness.agent.on_turn = lambda: notebooks.save_active_notebook(harness.config, other)
+    harness.agent.on_turn = lambda: notebooks.save_active_notebook(harness.config, "other.py")
     harness.agent.fail_with = KeyboardInterrupt()
     result = chat(input_text="open the other notebook\n/notebook\n/exit\n")
     assert result.exit_code == 0, result.output
     assert "Interrupted." in result.output
-    assert "Active notebook is now notebooks/other.py." in result.output
+    assert "Active notebook is now other.py." in result.output
     assert harness.opened[-1] == url_for(other), "opened once the switch was seen"
-    assert "Notebook:  notebooks/other.py (active)" in result.output
+    assert "Notebook:  other.py (active)" in result.output
 
 
 def test_switch_made_by_the_model_is_detected_after_a_failed_turn(harness):
-    other = write_notebook(harness.config, "other")
-    harness.agent.on_turn = lambda: notebooks.save_active_notebook(harness.config, other)
+    write_notebook(harness.config, "other")
+    harness.agent.on_turn = lambda: notebooks.save_active_notebook(harness.config, "other.py")
     harness.agent.fail_with = HailerError("the model endpoint hung up", hint="retry")
     result = chat(input_text="open the other notebook\n/status\n/exit\n")
     assert result.exit_code == 0, result.output
     assert "the model endpoint hung up" in result.output
-    assert "Active notebook is now notebooks/other.py." in result.output
+    assert "Active notebook is now other.py." in result.output
     status = result.output[result.output.index("Model"):]
     assert "other.py" in status
 
 
-def test_notebook_and_status_commands_read_fresh_state(harness):
+def test_notebook_and_status_commands_read_fresh_state(harness, monkeypatch):
     """A switch written to the state file behind the CLI's back (a late tool call) is applied
     before /notebook and /status act, without opening a browser tab for it."""
-    other = write_notebook(harness.config, "other")
-    notebooks.save_active_notebook(harness.config, other)  # after _load_config ran (it is faked)
+    write_notebook(harness.config, "other")
+    load_context = cli._load_context
+
+    def late_switch(config):  # once the chat has read the state: a late tool call switches
+        notebooks.save_active_notebook(harness.config, "other.py")
+        return load_context(config)
+
+    monkeypatch.setattr(cli, "_load_context", late_switch)
     result = chat(input_text="/status\n/notebook\n/exit\n")
     assert result.exit_code == 0, result.output
-    assert result.output.count("Active notebook is now notebooks/other.py.") == 1
-    assert "Notebook:  notebooks/other.py (active)" in result.output
+    assert result.output.count("Active notebook is now other.py.") == 1
+    assert "Notebook:  other.py (active)" in result.output
     assert harness.opened == [], "a stale-state refresh never opens a browser"
 
 
@@ -1639,9 +1677,9 @@ def test_notebook_command_lists_recent_notebooks(harness):
     write_notebook(harness.config, "beta")
     result = chat(input_text="/notebook open alpha\n/notebook open beta\n/notebook open analysis\n/notebook\n/exit\n")
     assert result.exit_code == 0, result.output
-    shown = result.output[result.output.rindex("Notebook:  notebooks/analysis.py (active)"):]
-    assert "Recent:    notebooks/beta.py, notebooks/alpha.py" in shown
-    assert "notebooks/analysis.py" not in shown.split("Recent:")[1].splitlines()[0]
+    shown = result.output[result.output.rindex("Notebook:  analysis.py (active)"):]
+    assert "Recent:    beta.py, alpha.py" in shown
+    assert "analysis.py" not in shown.split("Recent:")[1].splitlines()[0]
 
 
 def test_session_matching_is_by_path_not_filename(harness):
@@ -1652,10 +1690,10 @@ def test_session_matching_is_by_path_not_filename(harness):
     result = chat(input_text="/notebook list\n/notebook open b/report.py\n/exit\n")
     assert result.exit_code == 0, result.output
     lines = [ln for ln in result.output.splitlines() if "report.py" in ln]
-    assert any("notebooks/a/report.py" in ln and "open" in ln for ln in lines), lines
-    assert any("notebooks/b/report.py" in ln and "open" not in ln for ln in lines), lines
+    assert any("a/report.py " in ln and "open" in ln for ln in lines), lines
+    assert any("b/report.py " in ln and "open" not in ln.split("report.py", 1)[1] for ln in lines), lines
     assert harness.opened[-1] == url_for(sub_b), "b/report.py had no session of its own, so it was opened"
-    assert harness.session_waits == [harness.config.notebook, sub_b]
+    assert harness.session_waits == ["analysis.py", "b/report.py"]
 
 
 # --------------------------------------------------------------------------- #
@@ -1686,9 +1724,16 @@ def docker(harness, monkeypatch):
     def runtime_for(config):
         if config.kernel.runtime != "docker":
             return local_runtime_for(config)
-        return kernel_docker.DockerRuntime(
+        return Runtime(
             config, runner=fake, token_factory=lambda: TOKEN, health=lambda url, timeout, token=None, should_stop=None: True, user=lambda: None
         )  # fmt: skip
+
+    class Runtime(kernel_docker.DockerRuntime):
+        """The real start; its sandbox serves the notebooks folder and its clients are the harness's."""
+
+        def start(self, port, *, foreground=False):
+            running = super().start(port, foreground=foreground)
+            return with_folder_files(running, self.config.notebooks_root, lambda **kw: harness.bound_client(running))
 
     monkeypatch.setattr(cli, "_runtime_for", runtime_for)
     monkeypatch.setattr(cli, "_docker_runner", lambda: fake)
@@ -1741,32 +1786,18 @@ def test_notebook_with_docker_requested_never_starts_a_local_server(harness, nb,
     assert not docker.commands("run") and not docker.commands("create")
 
 
-def test_a_notebook_the_kernel_cannot_see_gets_the_home_page_and_a_note(harness):
-    """No traceback when the docker kernel mounts other folders than the notebook's."""
-    from hailer.kernel import PathMap
-
-    outside = PathMap(((harness.config.workspace / "old-notebooks", PurePosixPath("/work/notebooks")),))
-    harness.server = replace(DOCKER_SERVER, paths=outside)
-    harness.client = FakeClient(session=None)
-    result = chat()
-    assert result.exit_code == 0, result.output
-    assert "The kernel cannot see" in result.output and "marimo's home page" in result.output
-    assert harness.opened == [f"{DOCKER_SERVER.url}/?access_token={TOKEN}"], "the home page, signed in"
-    assert "Traceback" not in result.output
-
-
-def test_notebook_hands_its_chat_the_server_it_started(harness, nb):
-    """The chat keeps the server (URL, token, paths) in memory; nothing reads it from a file."""
+def test_notebook_hands_its_chat_the_sandbox_it_started(harness, nb):
+    """The chat keeps the sandbox (endpoint, token, files) in memory; nothing reads it from a file."""
     seen: list = []
 
     def on_turn():
-        seen.append(harness.agent_servers[0])
+        seen.append(harness.agent_sandboxes[0])
 
     harness.agent.on_turn = on_turn
     result = notebook_cmd(["--port", "2718"], input_text="hi\n/status\n/exit\n")
     assert result.exit_code == 0, result.output
-    pinned = seen[0]
-    assert pinned is not None and pinned.url == "http://127.0.0.1:2718" and pinned.token == TOKEN, "tools get it in memory"
+    pinned = seen[0].server
+    assert pinned.url == "http://127.0.0.1:2718" and pinned.token == TOKEN, "tools get it in memory"
     assert re.search(r"^Marimo\s+http://127\.0\.0\.1:2718 \(session", result.output, re.M), "/status still knows the server"
 
 
@@ -1776,7 +1807,7 @@ def test_the_prompt_never_carries_the_servers_token(harness, nb, monkeypatch):
     from hailer.agent import system_prompt
 
     captured: list = []
-    monkeypatch.setattr(cli, "_make_agent", lambda config, bundle, server=None: (captured.append((config, server)) or harness.agent))
+    monkeypatch.setattr(cli, "_make_agent", lambda config, bundle, sandbox=None: (captured.append((config, sandbox.server)) or harness.agent))
     result = notebook_cmd()
     assert result.exit_code == 0, result.output
     config, server = captured[0]
@@ -1787,17 +1818,17 @@ def test_the_prompt_never_carries_the_servers_token(harness, nb, monkeypatch):
     assert TOKEN in leaky, "the probe would catch a tokenised URL"
 
 
-def test_cli_clients_carry_the_servers_token_and_paths(tmp_path):
-    from hailer.kernel import docker_paths
+def test_cli_clients_carry_the_servers_token_and_the_kernels_notebooks_folder(tmp_path):
+    from hailer.sandbox import MarimoSandbox
 
-    config = make_config(tmp_path)
-    paths = docker_paths(config)
-    server = MarimoServer(url="http://127.0.0.1:2731", token=TOKEN, runtime="docker", paths=paths)
-    client = cli._make_client(server, config)
-    assert client.token == TOKEN and client.paths is paths and client.token_in_links, "the CLI prints its hints for the user"
-    assert cli._notebook_url(server, config) == (
+    sandbox = MarimoSandbox(MarimoServer(url="http://127.0.0.1:2731", token=TOKEN, runtime="docker"), notebooks_path="/work/notebooks")
+    client = sandbox.client(notebook="q3/review.py", token_in_links=True)
+    assert client.token == TOKEN and client.token_in_links, "the CLI prints its hints for the user"
+    assert client.notebooks_path == "/work/notebooks" and client.notebook == "q3/review.py"
+    assert sandbox.notebook_url("analysis.py", with_token=True) == (
         f"http://127.0.0.1:2731/?file=/work/notebooks/analysis.py&view-as=present&access_token={TOKEN}"
     )
+    assert sandbox.home_url(with_token=True) == f"http://127.0.0.1:2731/?access_token={TOKEN}"
 
 
 def test_config_warnings_show_when_a_session_starts(harness, nb, monkeypatch):
@@ -1828,7 +1859,7 @@ def test_notebook_kernel_docker_runs_the_chat_against_a_container(harness, nb, d
 
     agent_configs: list = []
     labels: list = []
-    monkeypatch.setattr(cli, "_make_agent", lambda config, bundle, server=None: (agent_configs.append((config, server)) or harness.agent))
+    monkeypatch.setattr(cli, "_make_agent", lambda config, bundle, sandbox=None: (agent_configs.append((config, sandbox)) or harness.agent))
     harness.agent.on_turn = lambda: labels.extend(owner_alive(harness.config.workspace, c.labels[LABEL_OWNER]) for c in docker.containers.values())
     harness.client = FakeClient(session=None)  # nobody has the tab open yet
     result = notebook_cmd(["--kernel", "docker", "--port", "2731"], input_text="hi\n/exit\n")
@@ -1842,9 +1873,10 @@ def test_notebook_kernel_docker_runs_the_chat_against_a_container(harness, nb, d
     assert f"Marimo is running at http://127.0.0.1:2731  (log: docker logs {kernel_name})" in result.output
     assert harness.opened == [f"http://127.0.0.1:2731/?file=/work/notebooks/analysis.py&view-as=present&access_token={TOKEN}"]
     assert f"Kernel:     docker (hailer-kernel {CONTRACT}; no network; data read-only)" in result.output
-    config, server = agent_configs[0]
+    config, sandbox = agent_configs[0]
     assert config.kernel.runtime == "docker"
-    assert server.runtime == "docker" and server.token == TOKEN and server.paths is not None, "the chat holds the container"
+    assert sandbox.server.runtime == "docker" and sandbox.server.token == TOKEN, "the chat holds the container"
+    assert sandbox.notebooks_path == "/work/notebooks" and sandbox.data_path == "/work/data"
     assert labels and all(labels), "owned by this live session while the chat runs"
     assert not list((harness.config.workspace / ".hailer").glob("owner-*.lock")), "its lock goes with the kernel"
     assert docker.containers == {} and docker.networks == {}, "removed when the chat ends"

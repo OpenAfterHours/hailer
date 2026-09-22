@@ -336,7 +336,10 @@ tools.py   marimo_execute, marimo_status, notebook_cells, notebook_list,
     │      notebook_create, notebook_open, notebook_close, list_periods,
     │      load_skill, read_skill_file, fetch_page (allow-listed domains only)
     ▼
-marimo_client.py  (pure-Python HTTP + SSE; Bearer token; host <-> kernel paths via kernel.PathMap)
+sandbox.py        (the started kernel: endpoint, stop, notebooks by name, data files; tools know
+    │              files only through it)
+    ▼
+marimo_client.py  (pure-Python HTTP + SSE; Bearer token; notebook names <-> kernel paths; marimo's file API)
     │
     ▼
 marimo edit notebooks   (live kernel on the folder; a token since 2026-09-19)
@@ -446,7 +449,8 @@ hailer/
 ├── src/hailer/
 │   ├── cli.py             Typer app: chat REPL (default), `notebook`, `status`, `doctor`, `login`, `logout`, `init`,
 │   │                      `kernel pull|build|stop`
-│   ├── kernel.py          kernel runtimes: PathMap, the local kernel's environment, LocalRuntime, runtime_for
+│   ├── sandbox.py         the Sandbox contract and MarimoSandbox (notebook files over marimo's file API)
+│   ├── kernel.py          kernel runtimes: the local kernel's environment, LocalRuntime, runtime_for
 │   ├── kernel_docker.py   DockerRuntime (the docker CLI through an injectable runner), owner locks, status, kernel stop
 │   ├── kernel_image.py    the kernel image: kernel contract tag, build context, build, pull, contract label
 │   ├── _forward.py        the asyncio TCP forwarder the docker kernel is reached through
@@ -455,7 +459,7 @@ hailer/
 │   │                      system prompt, error mapping
 │   ├── tools.py           HailerTools (the 11 tools in §2) and hailer_tools(config) → LangChain tools
 │   ├── marimo_client.py   HTTP/SSE client, session resolution, the marimo launch command
-│   ├── notebooks.py       active-notebook state (.hailer/notebook.json), listing, creation from templates
+│   ├── notebooks.py       notebook names, active-notebook state (.hailer/notebook.json), resolution, templates
 │   ├── browser.py         opens a URL in the user's browser (os.startfile first on Windows)
 │   ├── web.py             allow-list matching, fetch_page, HTML to text, truncation
 │   ├── secrets.py         API-key resolution (env var, then keyring); storage for login/logout

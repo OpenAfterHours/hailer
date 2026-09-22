@@ -315,6 +315,7 @@ def test_nothing_the_model_sees_carries_the_marimo_token(tmp_path):
     server with the token; the model sees the server's URL and never the token."""
     from fake_marimo import serving
     from hailer.models import MarimoServer
+    from hailer.sandbox import MarimoSandbox
 
     secret = "kernel-token-never-for-the-model-456"
     with serving(token=secret) as srv:
@@ -322,7 +323,7 @@ def test_nothing_the_model_sees_carries_the_marimo_token(tmp_path):
         model = ScriptedModel(script=[call("marimo_status", {}), say("done")])
         agent = HailerAgent(
             cfg, ContextBundle(), model_factory=lambda provider, name, key: model, env=KEY_ENV,
-            server=MarimoServer(url=srv.url, token=secret),
+            sandbox=MarimoSandbox(MarimoServer(url=srv.url, token=secret), notebooks_path="/work/notebooks"),
         )  # fmt: skip
         try:
             agent.start()

@@ -40,14 +40,21 @@ without agreement (report a needed change instead).
   another module that is not in this contract, write against the contract and note the gap in your report.
 - **Dependencies** are already declared in `pyproject.toml`; do not add any. Report if something is missing.
 - **The active notebook is shared state, not config.** `<workspace>/.hailer/notebook.json` (next to
-  `session.json`) records which notebook the chat is working in. It has two writers in one process: the CLI
-  between turns (slash commands) and the agent's tools during a turn. Every reader re-reads it before use
-  through `hailer.notebooks.load_active_notebook` and never caches it. `load_active_notebook` reads **only the
-  file**: `HAILER_NOTEBOOK` stays set for the whole session, so an env-wins rule would make the tools ignore
-  every switch. Instead the CLI's `_load_config` writes an explicit `HAILER_NOTEBOOK` to the file at startup
-  (`save_active_notebook`), so the CLI, the tools and later sessions agree. Residual race: a tool call still
-  running after Ctrl+C (it finishes on its daemon thread) may write the file later; the CLI re-reads it after
-  every turn (finished, failed or interrupted) and before `/notebook` and `/status`.
+  `session.json`) records which notebook the chat is working in, as a *name* relative to the notebooks folder.
+  It has two writers in one process: the CLI between turns (slash commands) and the agent's tools during a turn.
+  Every reader re-reads it before use through `hailer.notebooks.load_active_notebook` and never caches it.
+  `load_active_notebook` reads **only the file**: `HAILER_NOTEBOOK` stays set for the whole session, so an
+  env-wins rule would make the tools ignore every switch. Instead the CLI's `_load_config` writes an explicit
+  `HAILER_NOTEBOOK` to the file at startup (`save_active_notebook`), so the CLI, the tools and later sessions
+  agree. Residual race: a tool call still running after Ctrl+C (it finishes on its daemon thread) may write the
+  file later; the CLI re-reads it after every turn (finished, failed or interrupted) and before `/notebook` and
+  `/status`.
+- **Files belong to the sandbox.** Everything above the runtime layer (the tools, the chat, the CLI's session
+  code) knows notebooks by name and data files by name and reaches them only through the
+  `hailer.sandbox.MarimoSandbox` the session started; `hailer.tools` never reads or writes the notebooks or data
+  folders itself (`test_the_tools_never_touch_the_notebooks_or_data_folders`). Host paths and kernel paths meet
+  only inside the runtime layer (`MarimoClient`, `MarimoSandbox`). Workspace setup (`uvx hailer init`, the
+  doctor's notebook row) stays host-side.
 
 ## Runtime facts
 
@@ -211,8 +218,8 @@ runs it for docker configs; `DockerRuntime.mount_problems` is exactly this, run 
 on every start path (`--foreground` never validates, and environment variables can move the folders).
 
 Errors added for the notebook feature (`errors.py`): `NotebookExistsError` (create: name taken) and
-`NotebookPathError` (outside the notebooks folder, or not a marimo notebook; also raised by
-`open_notebook_url` when the kernel cannot see the file). For the kernel runtimes: `KernelRuntimeError` (a
+`NotebookPathError` (a reference outside the notebooks folder, a name `notebooks.check_notebook_name` refuses,
+or a notebook that is not UTF-8 text). For the kernel runtimes: `KernelRuntimeError` (a
 runtime cannot start or reach marimo: the process exited, Docker is missing or down, an image problem). Types added to `models.py`: `KernelConfig` (above),
 `KERNEL_RUNTIME_LOCAL` / `KERNEL_RUNTIME_DOCKER` / `VALID_KERNEL_RUNTIMES`, `KERNEL_IMAGE_REPOSITORY`, the
 `MarimoServer` fields listed under `marimo_client.py`, and `HailerConfig.kernel`.
@@ -241,33 +248,49 @@ def answers_with_token(url: str, token: str | None, timeout: float = 1.0) -> boo
     # a record describes. token=None: /health only
 class MarimoClient:
     def __init__(self, base_url: str, token: str | None = None, *, timeout: float = 10.0,
-                 notebook: Path | None = None, workspace: Path | None = None,
-                 paths: PathMap | None = None, token_in_links: bool = False) -> None
-                 # notebook: the one resolve_session()/execute() default to; token: sent as Authorization: Bearer;
-                 # paths: translates at exactly two places (the ?file= key of notebook_url, the session paths
-                 # sessions() returns; a kernel path outside every mount is left as is, so it never matches);
+                 notebooks_path: str | None = None, native_paths: bool = False,
+                 notebook: str | None = None, token_in_links: bool = False) -> None
+                 # notebooks_path: the kernel's path of the notebooks folder; notebooks are names relative to it.
+                 # native_paths: the kernel's paths are this machine's (local runtime), else POSIX paths in a container.
+                 # notebook: the name resolve_session()/execute() default to; token: sent as Authorization: Bearer;
                  # token_in_links: notebook links in error hints carry the token (the CLI sets it, the tools never)
+    def file_key(self, name: str) -> str        # kernel_path(notebooks_path, name); ValueError without a notebooks folder
+    def name_of(self, path: object) -> str | None   # name_in_folder(notebooks_path, path, native=native_paths)
     def health(self) -> bool
-    def sessions(self) -> list[MarimoSession]   # path/filename translated to host paths through `paths`
-    def resolve_session(self, notebook: Path | None) -> MarimoSession   # match_session() below (exact path only); notebook=None → the single session; 0 → NoSessionError with hint to open the notebook URL; no match → NoSessionError listing the open sessions
-    def execute(self, code: str, *, session_id: str | None = None, notebook: Path | None = None,
+    def sessions(self) -> list[MarimoSession]   # filename/path as marimo reports them (path is absolute: os.path.abspath) + name = name_of(path or filename)
+    folds_case: bool                            # property: native_paths on Windows (names ignore case)
+    def resolve_session(self, notebook: str | None) -> MarimoSession   # match_session(fold=folds_case) below; notebook=None → the single session; 0 → NoSessionError with hint to open the notebook URL; no match → NoSessionError listing the open sessions
+    def execute(self, code: str, *, session_id: str | None = None, notebook: str | None = None,
                 on_stdout: Callable[[str], None] | None = None, on_stderr: Callable[[str], None] | None = None,
                 timeout: float = 600.0) -> ExecResult   # SSE parse; missing `done` → MarimoExecutionError
-    def notebook_url(self, notebook: Path | None = None) -> str   # through `paths`; the token only with token_in_links; marimo's home page when the kernel cannot see the notebook
+    def notebook_url(self, notebook: str | None = None) -> str   # the token only with token_in_links; marimo's home page without a name or notebooks folder
     def server_token(self) -> str                       # data-token of <marimo-server-token> in GET /; cached per instance; MarimoUnavailableError if absent
-    def shutdown_session(self, session_id: str) -> None # POST /api/home/shutdown_session {"sessionId": id} + Marimo-Server-Token; 401 → MarimoUnavailableError ("server restarted; retry"), token dropped so the next call refetches it
-def match_session(sessions: Sequence[MarimoSession], notebook: Path, workspace: Path | None = None) -> MarimoSession | None
-    # the session whose path (or filename when marimo reports no path) is the same file as notebook, compared as
-    # normalised absolute paths (case-insensitive on Windows); relative session paths resolve against workspace;
-    # untitled sessions never match; NO bare-filename fallback (a/report.py never matches b/report.py); several
-    # matches → the last one listed. Used by resolve_session, the CLI (/notebook list, close) and the test fakes.
-def notebook_file_key(notebook: Path) -> str          # the ?file= key: absolute, normalised, forward slashes, symlinks/junctions NOT resolved (marimo compares the key against the folder it was started on the same way); works on folder and single-file servers
-def open_notebook_url(server: MarimoServer, notebook: Path, workspace: Path | None = None, *, view: str = "app",
-                      paths: PathMap | None = None, with_token: bool = False) -> str
+    def shutdown_session(self, session_id: str) -> None # POST /api/home/shutdown_session {"sessionId": id}
+    # marimo's file explorer (marimo 0.24.2, @requires("edit"): the bearer token; plus the Marimo-Server-Token
+    # header like every POST but /api/kernel/execute; no browser session needed). Kernel paths, camel-case FileInfo
+    # (path, name, isDirectory, isMarimoFile, lastModified, size):
+    # marimo confines nothing: it reads, writes and follows links on any path it is given (live probe), so the
+    # sandbox checks every path first. list_files/create_file/update_file/delete_file turn an HTTP error into
+    # MarimoUnavailableError; file_details raises HTTPError (read_notebook explains it)
+    def list_files(self, folder: str) -> list[dict]     # POST /api/files/list_files {path}; a missing folder lists as empty; entries' path is os.path.join(folder, name) on the kernel (mixed separators on Windows)
+    def file_details(self, path: str, max_bytes: int | None = None) -> dict   # POST /api/files/file_details {path, maxBytes}: file, contents, isBase64, isTooLarge; HTTPError 500 for a missing file
+    def create_file(self, folder: str, name: str, data: bytes) -> dict        # POST /api/files/create, multipart (path, type=file, name, file); parents created; never overwrites (picks <stem>_1<suffix>: info.path says where it went)
+    def update_file(self, path: str, contents: str) -> dict                   # POST /api/files/update {path, contents}: an existing file; marimo reloads its open session; written with Path.write_text, so CRLF on a Windows kernel (create stores bytes as given)
+    def delete_file(self, path: str) -> dict                                  # POST /api/files/delete {path}
+    # A 401 on any server-token POST → MarimoUnavailableError ("server restarted; retry"), the cached token dropped
+def match_session(sessions: Sequence[MarimoSession], notebook: str, *, fold: bool = False) -> MarimoSession | None
+    # the session whose name is notebook (ignoring case with fold); untitled sessions and files outside the folder never match; NO bare-filename
+    # fallback (a/report.py never matches b/report.py); several matches → the last one listed. Used by
+    # resolve_session, the CLI (/notebook list) and the test fakes.
+def notebook_file_key(notebook: Path) -> str          # a host path as marimo knows it: absolute, normalised, forward slashes, symlinks/junctions NOT resolved; the local runtime's notebooks_path is notebook_file_key(notebooks_root)
+def kernel_path(folder: str, name: str) -> str        # folder + "/" + name: the ?file= key of a notebook
+def name_in_folder(folder: str | None, path: object, *, native: bool) -> str | None
+    # a reported kernel path as a name in folder; None when empty, relative or outside. native: both resolved
+    # (os.path.realpath: a link out of the folder is outside; Windows returns the on-disk spelling), either
+    # separator, case-insensitive on Windows; else POSIX
+def open_notebook_url(server: MarimoServer, file_key: str, *, view: str = "app", with_token: bool = False) -> str
     # http://127.0.0.1:2718/?file=<quoted key>&view-as=present (view="app", default: results only, Ctrl+. toggles the
-    # editor); view="edit" omits the parameter; workspace is accepted but unused. The key is paths (default
-    # server.paths).to_kernel(notebook), i.e. /work/notebooks/... in a container, else notebook_file_key;
-    # NotebookPathError when the kernel cannot see the file. with_token=True appends &access_token=<server.token>
+    # editor); view="edit" omits the parameter. with_token=True appends &access_token=<server.token>
     # (only for URLs a person opens); the default is token-free, for anything that reaches the model
 def home_url(server: MarimoServer, *, with_token: bool = False) -> str   # marimo's home page (the notebooks folder); ?access_token= only with with_token
 def marimo_server_command(notebooks_dir: Path, workspace: Path, port: int) -> list[str]
@@ -281,22 +304,70 @@ def find_free_port(preferred: int = 2718, host: str = "127.0.0.1") -> int   # pr
 def wait_for_health(url: str, timeout: float = 60.0, *, token: str | None = None, interval: float = 0.5, should_stop=None) -> bool
     # each round: should_stop() first (the starting process or container has gone → False), then answers_with_token(url, token)
     # (only /health without a token). Two starts can pick the same free port: another session's server there never passes
-def wait_for_session(client: MarimoClient, notebook: Path | None, timeout: float = 90.0, *, interval: float = 0.5, should_stop: Callable[[], bool] | None = None) -> MarimoSession | None  # None on timeout/cancellation; a request already in flight uses the client's timeout
+def wait_for_session(client: MarimoClient, notebook: str | None, timeout: float = 90.0, *, interval: float = 0.5, should_stop: Callable[[], bool] | None = None) -> MarimoSession | None  # None on timeout/cancellation; a request already in flight uses the client's timeout
 ```
 marimo is always started on the notebooks **folder** (never on a single file) so that every notebook,
 existing or created later, opens on the same server. Connection refused/timeout → `MarimoUnavailableError`
 with `launch_hint()` as the hint. HTTP 401/403 → `MarimoUnavailableError` whose hint says something else may
 answer on that port and to start a new session.
 
-A Hailer process only ever talks to the server it started itself, which the CLI keeps in memory and hands
-to the chat, the agent and its tools; nothing is looked up. `MarimoServer` (models.py) carries
-`url`, `pid` (local), `token` (`repr=False`), `runtime` (`"local"`/`"docker"`), `paths` (`PathMap | None`,
-`None` = identity) and `network_access`.
+A Hailer process only ever talks to the server it started itself; the CLI keeps its sandbox in memory and
+hands it to the chat, the agent and its tools; nothing is looked up. `MarimoServer` (models.py) carries
+`url`, `pid` (local), `token` (`repr=False`), `runtime` (`"local"`/`"docker"`) and `network_access`.
+`MarimoSession` carries `session_id`, `filename`, `path` (as marimo reports them) and `name` (the notebook's
+name in the notebooks folder, or `None`).
+
+## `sandbox.py`  (sandbox contract, 2026-09-22)
+
+A started kernel, as everything above the runtime layer sees it: the server, stopping, a description and
+the files. `MarimoSandbox` is the contract (every runtime runs marimo, so every runtime, a cloud one
+included, subclasses it for its lifecycle). Notebooks are names (POSIX paths relative to the notebooks
+folder: `"sales.py"`, `"q3/review.py"`), data files names relative to the data folder. Imports
+`marimo_client` and `notebooks`; `kernel` imports it. Standard library at import time (`data_schema`
+imports Polars when called).
+
+```python
+MAX_NOTEBOOK_BYTES = 5 * 1024 * 1024       # the largest notebook read_notebook reads
+MAX_NOTEBOOK_DEPTH = 4                     # folder levels a notebook may be below the folder (listing and writing)
+MAX_NOTEBOOKS = 500; MAX_NOTEBOOK_FOLDERS = 200   # the listing's bounds
+SKIPPED_FOLDERS = {"node_modules", "venv", "site-packages"}   # never listed, like folders starting with "." or "__"
+@dataclass(frozen=True) class NotebookFile: name: str; modified: float; size: int   # .stem: the file name without .py
+@dataclass(frozen=True) class DataFile: name: str; modified: float; size: int
+def notebook_digest(source: str) -> str   # sha256 with \r\n normalised to \n (update writes the kernel's line endings)
+@dataclass class MarimoSandbox:
+    server: MarimoServer; notebooks_path: str = ""; data_path: str = ""; data_dir: Path | None = None
+    native_paths: bool = False; log_hint: str = ""; ended: str = ""
+    # notebooks_path / data_path: the folders as notebook code reaches them (/work/notebooks and /work/data in a
+    # container); data_dir: the host folder behind data_path; ended: why wait() returned (empty after Ctrl+C)
+    def describe(self) -> str                                 # the text after "Kernel:" (describe_runtime of the server)
+    def stop(self) -> None                                    # idempotent, never raises (runtimes implement it)
+    def log_tail(self, lines: int = 15) -> list[str]
+    def wait(self) -> int                                     # --foreground: block until the kernel stops or Ctrl+C (runtimes implement it)
+    def client(self, *, notebook: str | None = None, token_in_links: bool = False, timeout: float = 10.0) -> MarimoClient   # knows notebooks by name
+    def notebook_url(self, name: str, *, with_token: bool = False) -> str    # app view; NotebookPathError for a bad name
+    def home_url(self, *, with_token: bool = False) -> str
+    def list_notebooks(self) -> list[NotebookFile]            # marimo .py notebooks, sorted by name (case-insensitive), within the bounds above;
+                                                              # (local kernel) never behind a link or junction that leaves the folder
+    def has_notebook(self, name: str) -> bool                 # one listing of the parent folder (startup's active-notebook check)
+    def read_notebook(self, name: str) -> str                 # for phase D's sync; NotebookNotFoundError; NotebookPathError (not UTF-8, larger than MAX_NOTEBOOK_BYTES, behind a link out of the folder)
+    def write_notebook(self, name: str, source: str, *, replace: bool = True) -> NotebookFile
+        # create (folders too, at most MAX_NOTEBOOK_DEPTH deep) or replace the text; replace=False → NotebookExistsError
+        # for an existing file, which is never touched (a create that loses a race: marimo writes <stem>_1.py, which is
+        # deleted again). A Windows kernel: a case variant is the existing file and the result has the listing's
+        # spelling. A local kernel: refused when the resolved target leaves the folder (marimo follows links)
+    def list_data(self) -> list[DataFile]                     # the files directly in the data folder (not hidden); HailerError "Data directory does not exist: <data_path>"
+    def data_schema(self, name: str) -> dict[str, str]        # a Parquet file's columns and types as text; MalformedParquetError; a name with a separator or a leading dot → HailerError
+    def sync_out(self) -> list[str]                           # copy notebooks the sandbox changed back to the workspace; [] (a no-op) while the notebooks folder is the host's own
+```
+Every name goes through `notebooks.check_notebook_name` before any request (`test_names_are_checked_before_any_request`),
+and `test_hailer_never_sends_a_path_outside_the_notebooks_folder` checks every path `fake_marimo.py` was asked about.
+A docker kernel's paths cannot be resolved from the host, so the link check covers the local runtime only; phase D
+moves the container's notebooks out of the bind mount.
 
 ## `kernel.py`  (owner: docker kernel, 2026-09-19)
 
 Where the notebook kernel runs, and what every runtime shares. Standard library only; imports
-`marimo_client` and imports `kernel_docker` lazily (`runtime_for`), so most runs never load the docker code.
+`marimo_client` and `sandbox`, and imports `kernel_docker` lazily (`runtime_for`), so most runs never load the docker code.
 Every `uvx hailer` / `uvx hailer notebook` process starts its own kernel and stops it on exit; nothing finds
 or attaches to a kernel another process started.
 
@@ -309,14 +380,6 @@ KERNEL_SECRET_SUFFIXES   # SECRET_ENV_SUFFIXES (_KEY _TOKEN _SECRET _PASSWORD) +
 KERNEL_SECRET_NAMES = ("PGPASSWORD", "MYSQL_PWD", "PASSWORD", "SECRET", "TOKEN")
 LOCAL_PROMPT_NOTES; DOCKER_PROMPT_NOTES; DOCKER_NETWORK_PROMPT_NOTES   # what the model is told about the kernel
 
-@dataclass(frozen=True) class PathMap:
-    mounts: tuple[tuple[Path, PurePosixPath], ...] = ()    # () = identity (local)
-    identity: bool                                          # property
-    def to_kernel(self, host: Path | str) -> str            # POSIX kernel path; identity: notebook_file_key; ValueError outside every mount
-    def to_host(self, kernel: str) -> str | None            # None outside every mount (or relative); identity: unchanged
-    # host paths normalised like notebook_file_key, compared with os.path.normcase; subfolders map to the same
-    # subfolder; the longest matching mount wins
-def docker_paths(config: HailerConfig) -> PathMap          # (notebooks_root -> /work/notebooks), (data_dir -> /work/data)
 def new_token() -> str                                     # secrets.token_urlsafe(32)
 def local_log_path(workspace, pid=None) -> Path            # .hailer/marimo-<pid>.log (this process by default)
 def note_kernel_start(workspace, runtime, notebooks_root) -> None       # .hailer/last-kernel.json; never raises
@@ -337,22 +400,17 @@ def mask_token(lines, token) -> list[str]                                 # toke
 def log_tail(path, lines=15, *, token=None) -> list[str]                  # the last lines, masked
 @dataclass class LocalProcesses: spawn, attach, kill_tree, wait_for_health   # the OS layer; tests replace members
 
-@dataclass class RunningKernel:            # the server a runtime started for this process
-    server: MarimoServer; log_hint: str; ended: str   # ended: why wait() returned (empty after Ctrl+C)
-    # LocalKernel.wait: "marimo shut itself down." (exit 0) / "marimo stopped (exit code N): it was ended from outside
-    # this terminal (uvx hailer kernel stop, Task Manager or kill), or it failed; its own output is above."
-    def stop(self) -> None                 # idempotent, never raises; removes what the kernel left behind
-    def log_tail(self, lines: int = 15) -> list[str]
-    def wait(self) -> int                  # --foreground: block until the kernel stops or Ctrl+C
-@dataclass class LocalKernel(RunningKernel): proc; log_path; procs
+@dataclass class LocalKernel(MarimoSandbox): proc; log_path; procs
+    # notebooks_path = notebook_file_key(notebooks_root), data_path = str(data_dir), native_paths = True
     # stop: its process (tree on Windows), then the log (it holds the signed-in URL)
+    # wait: "marimo shut itself down." (exit 0) / "marimo stopped (exit code N): it was ended from outside
+    # this terminal (uvx hailer kernel stop, Task Manager or kill), or it failed; its own output is above."
 
 class KernelRuntime(Protocol):
     name: str                              # "local" | "docker"
-    paths: PathMap
     def check(self) -> list[Check]         # rows for doctor and hailer notebook
     def prepare(self, say: Callable[[str], None] | None = None) -> None   # slow steps and warnings before any spinner (docker: pull a missing image); start() runs it when not done
-    def start(self, port: int, *, foreground: bool = False) -> RunningKernel   # starts a new server on 127.0.0.1:port and waits until it answers with this start's token (its own process/containers checked first); KernelRuntimeError (log tail in the hint) and nothing left running on failure
+    def start(self, port: int, *, foreground: bool = False) -> MarimoSandbox   # starts a new server on 127.0.0.1:port and waits until it answers with this start's token (its own process/containers checked first); KernelRuntimeError (log tail in the hint) and nothing left running on failure
     def describe(self) -> str                                             # the text after "Kernel:"
 class LocalRuntime:                        # LocalRuntime(config, *, procs=None, environ=None, token_factory=new_token, start_timeout=60.0)
     # check: one non-fatal "kernel" row: describe() + how many variables are withheld + pass_env
@@ -415,9 +473,10 @@ def data_path_problems(data_dir, ...) -> list[str]         # folder_problems for
     # "context not found"), and "removal ... is already in progress" (another terminal removing it). "has active
     # endpoints" is retried (NETWORK_RM_RETRIES x NETWORK_RM_RETRY_SEC). Before anything is reported as failed,
     # `docker inspect --type container|network` checks it is still there
-@dataclass class DockerKernel(RunningKernel):
+@dataclass class DockerKernel(MarimoSandbox):
+    # notebooks_path = "/work/notebooks", data_path = "/work/data", data_dir = the host data folder, native_paths = False
     runner; containers; container_ids; network; network_id; owner (OwnerLock)   # what this session started; removed and inspected by id
-    notebooks_folder: Path | None          # the host folder mounted at /work/notebooks (from server.paths)
+    notebooks_folder: Path | None          # the host folder mounted at /work/notebooks
     def planted(self) -> list[str]         # planted_files(notebooks_folder); the CLI prints planted_warning after stop()
     def remove(self) -> Removal            # containers, then the network
     def stop(self) -> None                 # then releases the owner lock; stop_error explains a failure ("... Run uvx hailer kernel stop to retry.")
@@ -427,7 +486,7 @@ def data_path_problems(data_dir, ...) -> list[str]         # folder_problems for
     running: bool                          # state in running/restarting/paused/removing
 class DockerRuntime:
     # DockerRuntime(config, *, runner=None, token_factory=new_token, start_timeout=60.0, health=None, user=linux_host_user, suffix=None)
-    name = "docker"; paths = docker_paths(config); names: DockerNames (unique per object); image: str (config.kernel.effective_image)
+    name = "docker"; names: DockerNames (unique per object); image: str (config.kernel.effective_image)
     owner_id: str                          # the current start's OwnerLock id (its owner label)
     def check(self) -> list[Check]         # kernel; docker ("Docker <v> (Linux engine)" or the error); image (missing = non-fatal warning,
                                            # another kernel contract = fatal; "<image> (kernel contract <c>)"); data (path warnings; no row for a UNC folder: the config row fails it);
@@ -455,7 +514,7 @@ class DockerRuntime:
     def remove_leftovers(self, *, every: bool = False) -> Removal
         # containers, then networks. every=False (a start): those whose owner is not alive (owner_alive), running or not;
         # a live owner's objects always stay. every=True (kernel stop): everything labelled
-    def start(self, port: int, *, foreground: bool = False) -> RunningKernel
+    def start(self, port: int, *, foreground: bool = False) -> MarimoSandbox   # a DockerKernel
         # prepare if needed; mounts again; acquire_owner_lock (the DockerKernel holds it; released on failure or stop);
         # sweep_owner_locks; remove_leftovers() (a failure is a printed warning: the new names never clash); mkdir both folders;
         # network (unless network=true), kernel, forwarder (create, network connect, start); wait_for_health through the
@@ -536,41 +595,54 @@ it.
 
 ## `notebooks.py`  (owner: notebook feature / foundation)
 
-Notebook lifecycle shared by the CLI and the agent's tools. Standard library only; never imports marimo, typer
-or rich. Nothing here talks to the marimo server (that is `marimo_client`); this module owns files and state.
+Notebook names, the active notebook and templates, shared by the CLI and the agent's tools. Standard library
+only; never imports marimo, typer or rich. The files are the sandbox's; the only file this module writes in
+the notebooks folder is the starter notebook of workspace setup (`ensure_notebook`).
 
 ```python
-STATE_FILENAME = "notebook.json"           # <workspace>/.hailer/notebook.json: {"active": "<workspace-relative posix path>", "recent": [...]}
+STATE_FILENAME = "notebook.json"           # <workspace>/.hailer/notebook.json: {"version": 2, "active": "<name>", "recent": ["<name>", ...]}
+STATE_VERSION = 2
 RECENT_LIMIT = 10
+RESERVED_NAMES: frozenset[str]             # Windows device names: con prn aux nul conin$ conout$ com1-9 lpt1-9 com¹²³ lpt¹²³
+NAME_PART_MAX_LEN = 255
+def same_name(a: str, b: str) -> bool      # names ignore case on Windows
 STARTER_TEMPLATE: str; EMPTY_TEMPLATE: str  # __HAILER_VERSION__ / __HAILER_TITLE__ placeholders, filled by render_template
 TEMPLATE_KINDS = ("starter", "empty")
-@dataclass(frozen=True) class NotebookInfo: path: Path (absolute); name: str (stem); modified: float; size: int
+def check_notebook_name(name: str) -> str
+    # either separator accepted, returned with "/"; NotebookPathError unless: relative (no leading "/", no drive),
+    # no "", ".", ".." part, no part starting with "." or "__", none of <>:"|?* or control characters (":" would
+    # name an NTFS stream) or invisible formatting characters (Unicode Cc/Cf), no part ending in "." or " " or longer
+    # than NAME_PART_MAX_LEN, no RESERVED_NAMES stem in any part, a ".py" file name
+def notebook_name(config: HailerConfig, path: Path | str) -> str | None   # a host path (absolute, or workspace-relative) as a name in notebooks_root; path arithmetic only
+def default_notebook(config: HailerConfig) -> str                        # config.notebook as a name (its file name when outside the folder)
 def state_path(workspace: Path) -> Path
-def load_active_notebook(config: HailerConfig) -> Path
-    # ONLY the state file (never the environment; see the ground rule): its "active" entry when it resolves inside
-    # notebooks_root and exists; otherwise (missing/corrupt file, deleted or foreign path) config.notebook.
-def save_active_notebook(config: HailerConfig, notebook: Path) -> None
-    # atomic (tmp + replace); stores the workspace-relative posix path; "recent" most-recent-first, unique, max 10; creates .hailer/ via statedir.ensure_state_dir
-def load_recent(config: HailerConfig) -> list[Path]         # existing notebooks only, absolute, most recent first
-def notebook_display_name(config: HailerConfig, path: Path) -> str   # workspace-relative posix ("notebooks/q2_churn.py"), absolute posix when outside
-def is_marimo_notebook(path: Path) -> bool                 # marimo's rule: .py whose first 1 MB contains "import marimo" and "marimo.App"; errors → False
-def list_notebooks(config: HailerConfig) -> list[NotebookInfo]   # recursive under notebooks_root, skips folders starting with "." or "__", sorted by relative path (case-insensitive)
+def load_active_notebook(config: HailerConfig) -> str
+    # ONLY the state file (never the environment or the notebooks folder; see the ground rule): its valid "active"
+    # name, else default_notebook. A file without "version" is the old format (host paths): entries inside
+    # notebooks_root become names, anything else is dropped. Whether the notebook still exists is the sandbox's to say
+def load_recent(config: HailerConfig) -> list[str]                 # names, most recent first (converted like "active")
+def save_active_notebook(config: HailerConfig, name: str) -> None
+    # checks the name; atomic (tmp + replace); writes the current format (so the first save converts an old file);
+    # "recent" most-recent-first, unique, max 10; creates .hailer/ via statedir.ensure_state_dir
+def notebook_display_name(config: HailerConfig, path: Path) -> str   # a host path, workspace-relative posix ("notebooks/q2_churn.py"), absolute posix when outside
 def slugify(name: str) -> str                              # "Q2 Churn (draft).py" → "q2_churn_draft"; must start with a letter (else "nb_" prefix); ValueError when empty
-def resolve_notebook(config: HailerConfig, ref: str) -> Path
-    # bare name ("q2 churn"), filename, workspace-relative, notebooks_root-relative or absolute; tried as given
-    # (workspace then notebooks_root), then "<slug>.py" under notebooks_root, then a case-insensitive unique
-    # NotebookInfo.name match. Outside notebooks_root or not a notebook → NotebookPathError; nothing → NotebookNotFoundError
-    # (hint lists up to 10 names); several name matches → NotebookNotFoundError listing them.
+def reference_folders(config: HailerConfig, *kernel_paths: str) -> tuple[str, ...]   # prefixes a reference may start with: the kernel's folder paths, the host folder, its workspace-relative form
+def resolve_notebook(ref: str, names: Sequence[str], *, folders: Sequence[str] = ()) -> str
+    # map a reference to one of names (from MarimoSandbox.list_notebooks): a bare name ("q2 churn"), file name, a path inside
+    # the folder (either separator, with or without .py), any of those after one of folders. Tried: exact, ignoring
+    # case, "<slug>.py", then a unique file-name match in any folder. An absolute path or drive left after the folders
+    # or a ".." part → NotebookPathError ("outside the notebooks folder"); nothing → NotebookNotFoundError (hint lists
+    # up to 10 names); several matches → NotebookNotFoundError listing them
 def marimo_version() -> str                                # importlib.metadata.version("marimo"), fallback "0.24.2"
 def render_template(kind: Literal["starter", "empty"], *, title: str, version: str | None = None) -> str
     # starter = the cells of notebooks/analysis.py with the title as heading and WORKSPACE found by walking up to
     # pyproject.toml / hailer.toml; empty = marimo's own empty notebook. Title is made safe for the f-string markdown.
-def create_notebook(config: HailerConfig, name: str, *, kind: Literal["starter", "empty"] = "starter") -> Path
-    # <notebooks_root>/<slug>.py (folder created); NotebookExistsError when it exists; NotebookPathError when the
-    # name has no letters/digits; returns the absolute path. Never touches the state file.
+def new_notebook(name: str, *, kind: Literal["starter", "empty"] = "starter") -> tuple[str, str]
+    # ("<slug>.py", its source); NotebookPathError when the name has no letters/digits. The caller writes it with
+    # MarimoSandbox.write_notebook(..., replace=False)
 def ensure_notebook(path: Path, *, title: str, kind: Literal["starter", "empty"] = "starter") -> bool
-    # `hailer init`: write the template to exactly `path` (parents created) unless something exists there; True
-    # when it wrote. Never overwrites; OSError when it cannot write.
+    # workspace setup (`hailer init`): write the template to exactly `path` (parents created) unless something exists
+    # there; True when it wrote. Never overwrites; OSError when it cannot write.
 ```
 
 ## `browser.py`  (owner: notebook feature)
@@ -602,7 +674,9 @@ def scan_period_files(data_dir: Path, name: str | None = None, *, suffix: str = 
 def load_periods(files: Sequence[PeriodFile], *, columns: Sequence[str] | None = None) -> pl.DataFrame  # adds "period" (str YYYY-MM) column, concat how="diagonal_relaxed"
 def scan_periods(files: Sequence[PeriodFile]) -> pl.LazyFrame        # lazy variant
 def duckdb_periods_view(con: duckdb.DuckDBPyConnection, files: Sequence[PeriodFile], view_name: str = "periods") -> str  # read_parquet([...], union_by_name=true, filename=true) + derived period column; returns view name
-def describe_periods(files: Sequence[PeriodFile]) -> str   # compact text: count, first/last period, per-file schema diff summary
+def describe_periods(files: Sequence[PeriodFile], schema: Callable[[PeriodFile], Mapping[str, Any]] | None = None) -> str
+    # compact text: count, first/last period, per-file schema diff summary; schema reads a file's columns (default: the
+    # Parquet schema at pf.path; list_periods passes the sandbox's data_schema)
 ```
 Century rule: `YY` → `2000 + YY`. A file that fails to read raises `MalformedParquetError` naming the file
 (wrap `polars.exceptions.ComputeError`/`OSError`).
@@ -636,16 +710,18 @@ TOOL_NAMES: tuple[str, ...]      # the 11 names in the table, in the order they 
 DEFAULT_SESSION_WAIT_SEC = 30.0
 NOTEBOOK_LINK_TIP = "The user can also run /notebook in the chat to get the link."
 class HailerTools:               # one plain method per tool, each -> str; the method's docstring is the description the model sees
-    def __init__(self, config: HailerConfig, client_factory: ClientFactory | None = None, *, server: MarimoServer | None = None, open_url: UrlOpener | None = None, session_wait_sec: float = DEFAULT_SESSION_WAIT_SEC) -> None
-def hailer_tools(config: HailerConfig, *, server: MarimoServer | None = None, client_factory: ClientFactory | None = None, open_url: UrlOpener | None = None, session_wait_sec: float = DEFAULT_SESSION_WAIT_SEC) -> list[Any]
+    def __init__(self, config: HailerConfig, sandbox: MarimoSandbox | None = None, *, open_url: UrlOpener | None = None, session_wait_sec: float = DEFAULT_SESSION_WAIT_SEC) -> None
+def hailer_tools(config: HailerConfig, *, sandbox: MarimoSandbox | None = None, open_url: UrlOpener | None = None, session_wait_sec: float = DEFAULT_SESSION_WAIT_SEC) -> list[Any]
     # LangChain StructuredTool.from_function(func=method, coroutine=_in_daemon_thread(method), name=name, description=inspect.getdoc(method)), in TOOL_NAMES order
-    # ClientFactory = Callable[[], tuple[Any, MarimoServer]]; UrlOpener = Callable[[str], bool]
+    # UrlOpener = Callable[[str], bool]
 ```
 
-The marimo server is `server`, the one this session started (kept in memory; nothing is discovered).
-Without one every kernel tool answers `ERROR: marimo is not running: this session has no kernel` with
-`launch_hint()`. The default client uses `server.token` and `server.paths`. **Tool results never carry the token:** every URL in them is
-token-free (`open_notebook_url(..., with_token=False)`), and wherever a tool asks the model to have the user
+The kernel is `sandbox`, the one this session started (kept in memory; nothing is discovered). Without one
+every kernel tool answers `ERROR: marimo is not running: this session has no kernel` with `launch_hint()`.
+Clients come from `sandbox.client(notebook=<active>)` (never `token_in_links`). Every file the tools know
+comes from the sandbox (names; `list_notebooks`, `write_notebook`, `list_data`, `data_schema`): `hailer.tools`
+names neither folder and calls no file-system API. **Tool results never carry the token:** every URL in them
+is token-free (`sandbox.notebook_url(name)`), and wherever a tool asks the model to have the user
 open a URL (a `NoSessionError`, a bring-up without a session, `marimo_status` without a session) the text
 adds `NOTEBOOK_LINK_TIP`. The browser Hailer opens itself gets the signed-in URL.
 `_in_daemon_thread(fn)` is the async path the agent uses: the blocking call runs on a daemon thread
@@ -654,8 +730,8 @@ executor the thread would be joined when the loop closes and at interpreter exit
 Ctrl+C waited 7 s for a call with 7 s left). So a cancelled turn and process exit never wait for a kernel
 call; the abandoned call ends in the background and its result is dropped.
 
-The **active notebook is re-read from `.hailer/notebook.json` on every call** (`HailerTools._active_config()`
-returns the config with `notebook` replaced by `notebooks.load_active_notebook`); nothing about it is cached.
+The **active notebook is re-read from `.hailer/notebook.json` on every call** (`HailerTools._active()` =
+`notebooks.load_active_notebook`, a name); nothing about it is cached. Notebooks appear in results by name.
 Every kernel tool acts on the active notebook. Nothing is raised into the agent loop: a `HailerError` becomes
 `ERROR: <message>` plus the hint, anything else `ERROR: unexpected <Type>: <message>`. Tools (all return plain
 text, truncated to `config.max_tool_output_chars` with head/tail and a `[... truncated N chars ...]` marker):
@@ -663,19 +739,19 @@ text, truncated to `config.max_tool_output_chars` with head/tail and a `[... tru
 | tool | args | behaviour |
 |---|---|---|
 | `marimo_execute` | `code: str` | run in the scratchpad against the active notebook's session; returns stdout/output/stderr (rich mimetypes such as text/html or application/json are replaced by a short placeholder, so HTML never reaches the model); a failed run starts `Execution failed.`; `MarimoUnavailableError`/`NoSessionError` become `ERROR:` text with the hint, not exceptions |
-| `marimo_status` | none | server url; `kernel: <describe_runtime of the server in use>` and `kernel paths: notebooks folder ..., data folder ...` (`/work/notebooks` (writable) and `/work/data` (read-only) for a docker kernel, "use these in code"; host paths for local); `active notebook: <workspace-relative> -> session <id> (ready)` or `... has NO session. Ask the user to open <url>`; every session with its notebook and a marker: `(active notebook)`, `(another notebook in the notebooks folder; notebook_open switches to it)`, `(outside the notebooks folder)`, `(unsaved)`; when marimo is down (factory raises, or the session's kernel stopped and the first request raises `MarimoUnavailableError`) the text is `marimo: not running` / `active notebook: <name>` / error / hint, so the active notebook is always named |
+| `marimo_status` | none | server url; `kernel: <sandbox.describe()>` and `kernel paths: notebooks folder <notebooks_path>, data folder <data_path>; use these in code` (`/work/...` for a docker kernel, host paths for local); `active notebook: <name> -> session <id> (ready)` or `... has NO session. Ask the user to open <url>`; every session with its notebook and a marker: `(active notebook)`, `(another notebook in the notebooks folder; notebook_open switches to it)`, `(outside the notebooks folder)`, `(unsaved)`; when marimo is down (no sandbox, or the session's kernel stopped and the first request raises `MarimoUnavailableError`) the text is `marimo: not running` / `active notebook: <name>` / error / hint, so the active notebook is always named |
 | `notebook_cells` | `pattern: str = ""` | runs `marimo_client.LIST_CELLS_CODE`, a `cm` snippet listing the active notebook's cells (id, name, status, error count, first line); optional case-insensitive substring filter |
-| `notebook_list` | none | `notebooks.list_notebooks`: one line per notebook `  - <name>  modified YYYY-MM-DD HH:MM  <size>  [active] [open]` (`[open]` = has a session; when marimo is unreachable the files are still listed and a trailing line says sessions are unknown); empty folder → `No notebooks in <folder> yet. Create one with notebook_create(name).` |
-| `notebook_create` | `name: str, template: str = "starter"` | `notebooks.create_notebook` (+ `save_active_notebook`), then bring-up (below); text: `Created <name> from the <kind> template; it is now the active notebook.` + session line + a reminder of what the template defines; unknown template → `ERROR: unknown template ...`; existing name / unusable name → the `NotebookExistsError` / `NotebookPathError` text |
-| `notebook_open` | `notebook: str` | a reference starting with `/` is mapped from the kernel path to the host path through the server's `PathMap` (the model sees `/work/notebooks/...` in docker mode), then `notebooks.resolve_notebook` (+ `save_active_notebook`), bring-up, then when a session exists the cell listing (`Cells (id, name, status, errors, first line):`); text starts `<name> is now the active notebook.`; unknown / outside-folder references → the `NotebookNotFoundError` / `NotebookPathError` text and the active notebook is unchanged |
-| `notebook_close` | `notebook: str = ""` | resolve (empty = active; like `notebook_open`, a kernel path such as `/work/notebooks/x.py` is mapped back to the host path first), `client.resolve_session`, `client.shutdown_session(id)`; says the kernel is freed and, for the active notebook, that it stays active but must be reopened; no session → `<name> is not open (no kernel session), so there is nothing to close.`; marimo down → `marimo is not running, so <name> has no kernel session to close.` + error + hint |
-| `list_periods` | `name: str = ""` | `describe_periods(scan_period_files(config.data_dir, name or None))`, plus a line naming the other `list_data_files` entries (at most 20); runs on the host, but names the data folder as notebook code reaches it (`/work/data` for docker) |
+| `notebook_list` | none | `sandbox.list_notebooks()`: `Notebooks in <notebooks_path> (...)`, then one line per notebook `  - <name>  modified YYYY-MM-DD HH:MM  <size>  [active] [open]` (`[open]` = has a session; when marimo is unreachable for sessions a trailing line says so with the error and hint); empty folder → `No notebooks in <notebooks_path> yet. Create one with notebook_create(name).` |
+| `notebook_create` | `name: str, template: str = "starter"` | `notebooks.new_notebook` + `sandbox.write_notebook(..., replace=False)` (+ `save_active_notebook`), then bring-up (below); text: `Created <name> from the <kind> template; it is now the active notebook.` + session line + a reminder of what the template defines; unknown template → `ERROR: unknown template ...`; existing name / unusable name → the `NotebookExistsError` / `NotebookPathError` text |
+| `notebook_open` | `notebook: str` | `notebooks.resolve_notebook(ref, <sandbox.list_notebooks() names>, folders=notebooks.reference_folders(config, sandbox.notebooks_path))` (the model sees `/work/notebooks/...` in docker mode and may pass it back) (+ `save_active_notebook`), bring-up, then when a session exists the cell listing (`Cells (id, name, status, errors, first line):`); text starts `<name> is now the active notebook.`; unknown / outside-folder references → the `NotebookNotFoundError` / `NotebookPathError` text and the active notebook is unchanged |
+| `notebook_close` | `notebook: str = ""` | resolve like `notebook_open` (empty = active), `client.resolve_session`, `client.shutdown_session(id)`; says the kernel is freed and, for the active notebook, that it stays active but must be reopened; no session → `<name> is not open (no kernel session), so there is nothing to close.`; marimo down → `marimo is not running, so <name> has no kernel session to close.` + error + hint |
+| `list_periods` | `name: str = ""` | the `YY-MM <dataset>.parquet` names in `sandbox.list_data()` (optionally one dataset), summarised by `periods.describe_periods(..., schema=<sandbox.data_schema>)` (count, span, common columns, columns in some periods, type changes), plus a line naming the other data files with a `periods.DATA_SUFFIXES` type (at most 20); names the data folder as notebook code reaches it (`data_path`: `/work/data` for docker); a missing folder → `ERROR: Data directory does not exist: <data_path>` |
 | `load_skill` | `name: str` | `read_skill` |
 | `read_skill_file` | `name: str, path: str` | `read_skill_file` |
 | `fetch_page` | `url: str` | `web.fetch_page`; denial text lists allowed domains |
 
 Bring-up (`HailerTools._bring_up(notebook)`): if the notebook already has a session it is reused and the browser is
-not opened; otherwise the signed-in `open_notebook_url(server, notebook, with_token=True)` is opened (the
+not opened; otherwise the signed-in `sandbox.notebook_url(name, with_token=True)` is opened (the
 outcome text reports the token-free URL) through `HailerTools.open_url` (default:
 `hailer.browser.open_url`, i.e. `os.startfile` first on Windows and stdio-silenced launchers elsewhere, so
 nothing writes into the chat) and `wait_for_session` polls for up to `HailerTools.session_wait_sec` (default 30 s).
@@ -727,8 +803,8 @@ def system_prompt(config: HailerConfig, bundle: ContextBundle, server: MarimoSer
     # package-install rule lives in the local (and docker network=true) notes, not in system.md
 def map_exception(exc: BaseException, config: HailerConfig, *, model: str | None = None, provider: str | None = None) -> Exception
 class HailerAgent:
-    def __init__(self, config: HailerConfig, bundle: ContextBundle, *, model_factory: ModelFactory | None = None, tools: list[Any] | None = None, env: Mapping[str, str] | None = None, threads_path: Path | None = None, server: MarimoServer | None = None) -> None
-        # undeclared provider → ConfigError. server: the marimo server this session started; the tools use it (hailer_tools(config, server=server)) and the prompt names its URL.
+    def __init__(self, config: HailerConfig, bundle: ContextBundle, *, model_factory: ModelFactory | None = None, tools: list[Any] | None = None, env: Mapping[str, str] | None = None, threads_path: Path | None = None, sandbox: MarimoSandbox | None = None) -> None
+        # undeclared provider → ConfigError. sandbox: the kernel this session started; the tools use it (hailer_tools(config, sandbox=sandbox)) and the prompt names its server's URL.
         # For tests: model_factory(provider, model, key) replaces build_model, tools replaces hailer_tools(config), env replaces os.environ, threads_path replaces <workspace>/.hailer/threads.sqlite
     def start(self, *, resume_thread_id: str | None = None, forget_thread_id: str | None = None) -> str   # the thread id: resume_thread_id when the store has it, else a new one; forget_thread_id (`hailer --new`: the conversation the user chose not to resume) is deleted from the store
     def new_thread(self) -> str        # a new id; the previous thread is deleted from the store (private _forget, shared with start: Hailer only ever resumes the latest)
@@ -831,9 +907,14 @@ browser-session waiting run concurrently. Plain/piped mode retains the notebook 
 `_run_session` (and `_run_foreground`) whatever ends the chat: `_start_kernel` is called inside that guarded
 block, and it stops a kernel the runtime returned if Ctrl+C arrives before it hands it over.
 
-Both plain and interactive chat receive the `MarimoServer` object through `ChatController`, `HailerAgent`
-and the tools; nothing reads it back from a file, so `/new`, `/model` and notebook switches keep it. The
-prompt gets a token-free URL.
+Both plain and interactive chat receive the sandbox the runtime started through `ChatController`,
+`HailerAgent` and the tools; nothing reads it back from a file, so `/new`, `/model` and notebook switches keep
+it. The prompt gets a token-free URL. Once the kernel answers, `_active_notebook(config, sandbox)` picks the
+active notebook (the state file's, else `default_notebook` when `sandbox.has_notebook` says it is gone: one
+request, not a listing) and saves it, which converts an old `notebook.json`; the startup panel shows that
+name. The CLI and the chat take clients from `sandbox.client(notebook=..., token_in_links=True)` and links
+from `sandbox.notebook_url(name, with_token=True)` / `sandbox.home_url(with_token=True)`: they are printed or
+opened for the user, never sent to the model. `_marimo_state(sandbox, notebook)` is the seam the chat uses.
 
 `notebook --foreground` prepares and starts the runtime, prints its signed-in home URL ("Ctrl+C stops it"),
 waits for exit or Ctrl+C, and stops it; only the browser uses that kernel. Every Docker start checks
@@ -849,8 +930,9 @@ credentials, the runtime: Docker, the image, the folders) and never starts, prob
 model endpoint; `init [--force] [--kernel local|docker]` creates the workspace; `login` and `logout` manage
 provider credentials; `kernel pull`, `kernel build [--tag]` and `kernel stop` manage the image and every kernel
 of the workspace. Global options include `--verbose/-v`, `--config`, `--workspace`, `--new`, `--plain` and
-`--version`. Human-facing links include the token; tool-result links omit it. A notebook the kernel cannot
-see gets a note and the server's home-page link.
+`--version`. Human-facing links include the token; tool-result links omit it. The doctor's `notebook` row is
+host-side: the active notebook's file in the notebooks folder (`(active)`), else the configured one
+(`(configured)`).
 
 Agent start (`ChatLoop.start`):
 `HailerAgent(config, bundle)`, then `start(resume_thread_id=<thread in session.json>)`, or with `--new`
@@ -903,21 +985,24 @@ providers. `/reload` assigns a freshly read context bundle for the next turn. Co
 information refreshes on each render; startup reports the agent's actual model/provider rather than stale
 session metadata. `/clear` affects the display only.
 
-Notebook switching (`ChatLoop`): `/notebook` shows the active notebook, folder, `Recent:` (from
-`notebooks.load_recent`, excluding the active one), marimo state, URL and `NOTEBOOK_USAGE`;
-`/notebook list` marks `active` / `open` (sessions matched with `marimo_client.match_session`); `/notebook new
-<name> [--empty]` = `notebooks.create_notebook` then switch; `/notebook open <ref>` = `notebooks.resolve_notebook`
-then switch (the active one only re-ensures its session); `/notebook close [ref]` = `client.shutdown_session`.
-A switch (`_switch_notebook`) writes the state file, replaces `self.config.notebook`, queues
+Notebook switching (`ChatLoop`), by name throughout (`ChatController.notebook`): `/notebook` shows the active
+notebook, folder, `Recent:` (from `notebooks.load_recent`, excluding the active one and names the sandbox does
+not list), marimo state, URL and `NOTEBOOK_USAGE`; `/notebook list` = `sandbox.list_notebooks()` marking
+`active` / `open` (sessions matched with `marimo_client.match_session`); `/notebook new <name> [--empty]` =
+`notebooks.new_notebook` + `sandbox.write_notebook(..., replace=False)` then switch; `/notebook open <ref>` =
+`notebooks.resolve_notebook` over the sandbox's names (`reference_folders`: the kernel's folder, the host folder,
+`notebooks/...`) then switch (the active one only re-ensures its session); `/notebook close [ref]` =
+`client.shutdown_session`. Without a sandbox, list/new/open say marimo is not running.
+A switch (`_switch_notebook`) writes the state file, sets `self.notebook`, queues
 `_pending_preamble` **before** waiting for the tab, then `_ensure_session` (opens the URL through
 `hailer.browser` when there is no session and waits `SWITCH_SESSION_TIMEOUT_SEC` = 30 s), then refines the
 notice; Ctrl+C or a marimo error during the wait leaves the notice queued. Exact notice:
-`[Hailer] The active notebook is now <workspace-relative> (<detail>). Call notebook_cells before editing.` with
+`[Hailer] The active notebook is now <name> (<detail>). Call notebook_cells before editing.` with
 `<detail>` = `created from the starter template` | `created from the empty template` | `reopened`, followed by
 `, N cell(s)` when a session exists or `, not open in a browser yet` when none. It is passed once as
 `run_turn(..., preamble=...)` with the next message and cleared (also on Ctrl+C; kept when the turn raised an
 error). `_sync_active_notebook()` runs in the `finally` of every turn (finished, failed, interrupted) and,
-without opening a browser, at the start of `/notebook` and `/status`: on a change it updates `self.config`,
+without opening a browser, at the start of `/notebook` and `/status`: on a change it updates `self.notebook`,
 prints `Active notebook is now <name>.` and (turn end only) opens the URL once when the notebook has no session;
 no preamble is queued because the model made the switch itself. `COMMANDS["notebook"]` =
 `Show or switch the active notebook. Usage: /notebook [list | new <name> [--empty] | open <name> | close [name]]`.
@@ -942,11 +1027,19 @@ package-install rule) are appended by `agent.system_prompt`. Loaded with
 ## Tests (each owner writes their own; `uv run pytest` must pass offline)
 
 - `test_config.py`, `test_log.py`: A
-- `test_marimo_client.py` (fake SSE server on 127.0.0.1), `test_periods.py` (tiny parquet files in tmp_path): B
+- `test_marimo_client.py` (fake SSE server on 127.0.0.1; names <-> kernel paths; the file endpoints with their
+  tokens), `test_periods.py` (tiny parquet files in tmp_path): B
+- `test_sandbox.py`: `MarimoSandbox` over `fake_marimo.py`'s file endpoints for a docker-like and a local-like
+  kernel (listing rules and bounds, read limits, create/replace, a create that loses a race never overwrites,
+  names refused before any request, no path outside the notebooks folder ever sent, a junction/symlink out of
+  the folder never followed, case variants on Windows, both tokens on every request, HTTP errors as
+  `HailerError`s, the normalised digest) and the data folder
 - `test_web.py`, `test_context.py`: C. `test_notebooks.py`, `test_browser.py`: notebook feature
-- `test_tools.py`: LangChain migration. Tool methods called directly with a fake marimo client, plus the
-  `hailer_tools` registration: names, schemas, docstring descriptions, in-process `invoke`, the daemon-thread
-  `ainvoke` path, and a cancelled call that does not wait for a blocked tool
+- `test_tools.py`: LangChain migration. Tool methods called directly against `fake_sandbox.py`'s `FolderSandbox`
+  (the contract over a tmp folder, clients faked), plus the `hailer_tools` registration: names, schemas,
+  docstring descriptions, in-process `invoke`, the daemon-thread `ainvoke` path, a cancelled call that does not
+  wait for a blocked tool, an end-to-end pass over a real `MarimoSandbox` and `fake_marimo.py`, and a source
+  check that `hailer.tools` touches neither folder
 - `test_secrets.py`: D. `test_agent.py`: LangChain migration. Unit tests drive `HailerAgent` through
   `model_factory=` with `ScriptedModel` (a `BaseChatModel` replaying messages, exceptions or callables) and
   two toy tools: `build_model` kwargs, tracing, system prompt, error mapping, lifecycle (resume after a
@@ -960,22 +1053,24 @@ package-install rule) are appended by `agent.system_prompt`. Loaded with
   assert the exact request fields, headers and query, and one request per 4xx
 - `test_session.py`, `test_cli.py` (Typer `CliRunner`; slash commands; preflight messages with fakes; a
   `FakeAgent` with the `HailerAgent` surface the CLI uses): E
-- Kernel runtimes (docker kernel, 2026-09-19), none of which start anything: `test_kernel.py` (`PathMap` on
-  Windows and POSIX paths, the withheld variables and `pass_env`, prompt notes, `LocalRuntime` with
+- Kernel runtimes (docker kernel, 2026-09-19), none of which start anything: `test_kernel.py` (the withheld
+  variables and `pass_env`, the local sandbox's folders and URLs, prompt notes, `LocalRuntime` with
   `LocalProcesses` faked, and a start that never adopts another server on its port), `test_kernel_docker.py`
   (`DockerRuntime` argument lists and labels, fail-closed checks, owner locks and leftovers, sessions side
   by side, `workspace_kernels`, `stop_workspace_kernels`, folder checks, the subprocess runner) against `fake_docker.py` (`FakeDocker`: a stateful scripted docker CLI with ids, unique names,
   `--filter label=...`, Docker 29's answers for missing objects, scripted failures and timeouts),
   `test_kernel_image.py`, `test_forward.py` (real sockets on 127.0.0.1), `test_build_kernel_image.py` (the
   buildx command; `subprocess.run` replaced). Shared helpers: `fake_kernel.py` (`make_config`, a fake
-  process layer) and `fake_marimo.py` (a loopback marimo that checks the token).
+  process layer), `fake_marimo.py` (a loopback marimo that checks the tokens and, like marimo, serves the file
+  endpoints without confining paths, recording each one) and `fake_sandbox.py` (`FolderSandbox`, `with_folder_files` for CLI tests of a real runtime).
 - `test_docker_integration.py`: opt-in (`HAILER_DOCKER_TESTS=1` skips with the reason when Docker, the
   image or Chrome is missing, `strict` fails instead; `HAILER_TEST_CHROME` picks the browser,
   `HAILER_KERNEL_IMAGE` the image; it never pulls). One module-scoped real `DockerRuntime` kernel for a
   temporary workspace with sample sales data, a session held open by headless Chrome on a real clock
   until fixture teardown (DevTools captures the diagnostic screenshot), then: code runs as
   non-root in `/work` on the mounted data and the starter notebook ran on open; a code-mode cell is saved in
-  the host notebook; data writes, network and DNS are refused; neither a host secret nor the token is in the
+  the host notebook; notebooks are listed, created, read and replaced through marimo's file API in the
+  container; data writes, network and DNS are refused; neither a host secret nor the token is in the
   kernel's environment or `docker inspect`; the containers carry this session's live owner lock and the
   contract label; stopping leaves no container, network or token folder. The *Docker kernel* job in `.github/workflows/test.yml` builds the image for the checkout
   (`scripts/build_kernel_image.py --load`) and runs it with `strict`.
