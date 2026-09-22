@@ -1,12 +1,15 @@
-"""The docker kernel runtime: marimo in a Linux container that sees only the notebooks folder
-(read-write) and the data folder (read-only), with no network and none of the host's secrets.
+"""The docker kernel runtime: marimo in a Linux container with a notebooks folder of its own (in
+memory) and the data folder (read-only), with no network and none of the host's secrets.
 
 Everything here drives the ``docker`` CLI through a :class:`DockerRunner` (no Docker SDK), so the
 tests check argument lists against a scripted fake. It fails closed: every check raises a
 :class:`~hailer.errors.KernelRuntimeError` with a hint and nothing ever falls back to the local
 runtime. The sandbox a start returns (:class:`DockerKernel`) is a
 :class:`~hailer.sandbox.MarimoSandbox` whose kernel knows the folders as ``/work/notebooks`` and
-``/work/data``; ``runtime_for`` imports this module only when docker is asked for.
+``/work/data``; ``runtime_for`` imports this module only when docker is asked for. Nothing in the
+container can write to this machine: the workspace's notebooks are copied in when the kernel starts
+and the ones it changed are copied back through marimo's file API (:mod:`hailer.notebook_sync`,
+marimo notebooks with plain names only).
 
 Each Hailer process starts its own kernel: names are unique per start (the workspace id plus a
 random suffix) and every container and network carries labels for the workspace, its role, the
@@ -36,8 +39,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
 from hailer import kernel_image
-from hailer.config import NOTEBOOK_CONTROL_FILES, is_unc_path, notebook_control_files
-from hailer.errors import HailerError, KernelRuntimeError
+from hailer.config import is_unc_path
+from hailer.errors import HailerError, KernelRuntimeError, NotebookPathError
 from hailer.kernel import (
     KERNEL_DATA_DIR,
     KERNEL_NOTEBOOKS_DIR,
@@ -50,7 +53,9 @@ from hailer.kernel import (
 )
 from hailer.marimo_client import wait_for_health
 from hailer.models import KERNEL_RUNTIME_DOCKER, Check, HailerConfig, KernelConfig, MarimoServer
-from hailer.sandbox import MarimoSandbox
+from hailer.notebook_sync import NotebookSync, sync_refusal
+from hailer.notebooks import check_notebook_name
+from hailer.sandbox import MarimoSandbox, NotebookFile
 from hailer.statedir import ensure_state_dir, state_dir
 
 #: marimo's port inside the kernel container; the forwarder listens on the same port in its own.
@@ -59,6 +64,9 @@ KERNEL_PORT = 2718
 IMAGE_UID = 1000
 IMAGE_GID = 1000
 KERNEL_HOME = "/home/analyst"
+#: The size cap of the kernel's notebooks folder, a tmpfs owned by the kernel's user (it counts
+#: against the container's memory as it fills; marimo keeps its ``__marimo__`` caches there too).
+NOTEBOOKS_TMPFS_SIZE = "512m"
 #: Where the kernel reads its marimo token (``--token-password-file``): a read-only single-file
 #: mount, so the token is never in ``docker run``'s arguments or environment (``docker inspect``).
 KERNEL_TOKEN_FILE = PurePosixPath("/run/secrets/hailer-token")
@@ -103,10 +111,6 @@ _ACTIVE_ENDPOINTS = "active endpoints"
 #: How often, and how far apart, ``network rm`` is retried while containers are still detaching.
 NETWORK_RM_RETRIES = 6
 NETWORK_RM_RETRY_SEC = 0.5
-#: Files in the notebooks tree that make other programs run code on this machine
-#: (git hooks and settings, editor and dev-container settings) or mark another workspace. The
-#: docker kernel can write them there, so they are reported (never removed) when a kernel stops.
-PLANTABLE_FILES = NOTEBOOK_CONTROL_FILES
 #: Container states that mean "running" for the leftover rule (a paused kernel still holds its work).
 _RUNNING_STATES = ("running", "restarting", "paused", "removing")
 
@@ -449,9 +453,10 @@ def sweep_owner_locks(workspace: Path, *, grace: float = OWNER_LOCK_GRACE_SEC) -
 
 
 def linux_host_user() -> tuple[int, int] | None:
-    """The uid and gid the kernel runs as on a Linux host, so the files marimo saves stay the
-    user's; ``None`` (the image's own user) elsewhere, where Docker Desktop maps ownership itself,
-    and for root, since the kernel never runs as root."""
+    """The uid and gid the kernel runs as on a Linux host, so it reads the data folder the way the
+    user can (files and folders only their owner may read, such as ``0600`` exports, stay readable
+    through the read-only mount); ``None`` (the image's own user) elsewhere, where Docker Desktop
+    maps ownership itself, and for root, since the kernel never runs as root."""
     if not sys.platform.startswith("linux"):
         return None
     uid, gid = os.getuid(), os.getgid()  # type: ignore[attr-defined]  # POSIX only
@@ -522,62 +527,33 @@ def _links_outside(folder: Path, limit: int = LINK_SCAN_LIMIT) -> list[str]:
     return found
 
 
-def folder_problems(
-    folder: Path, what: str, setting: str, *, windows: bool | None = None, drive_type: Callable[[str], int] | None = None, links: bool = False
-) -> list[str]:
-    """Reasons the kernel container may not see all of ``folder`` (the ``what`` folder, set by
-    ``setting``), each with its fix (empty: none). Warnings only.
+def data_path_problems(data_dir: Path, *, windows: bool | None = None, drive_type: Callable[[str], int] | None = None) -> list[str]:
+    """Reasons the kernel container may not see all of the data folder, each with its fix (empty:
+    none). Warnings only.
 
     On Windows: a mapped network drive, which Docker Desktop usually cannot mount. (A UNC path is
     fatal, not a warning: :func:`hailer.config.docker_mount_problems` reports it, so nothing is
-    said here.) With ``links``: symlinks or junctions inside the folder that point outside it,
-    which do not resolve in the container (only the folder itself is mounted).
+    said here.) Everywhere: symlinks or junctions inside the folder that point outside it, which do
+    not resolve in the container (only the folder itself is mounted).
     """
-    text = str(folder)
+    text = str(data_dir)
     if windows if windows is not None else _on_windows():
         where = network_location(text, drive_type or _drive_type)
         if where == UNC_PATH:  # fatal elsewhere, and never walked over the network
             return []
         if where is not None:  # no link scan: it would walk the share over the network, and the fix is the same
             return [
-                f"The {what} folder {text} is on {where}; Docker Desktop usually cannot mount it. "
-                f"Copy it to a folder on a local disk and point {setting} at it."
+                f"The data folder {text} is on {where}; Docker Desktop usually cannot mount it. "
+                "Copy it to a folder on a local disk and point [hailer].data_dir at it."
             ]
-    found = _links_outside(Path(folder)) if links else []
+    found = _links_outside(Path(data_dir))
     if not found:
         return []
     shown = ", ".join(found[:3]) + (f" and {len(found) - 3} more" if len(found) > 3 else "")
     return [
-        f"{len(found)} link(s) in the {what} folder point outside it ({shown}); they do not resolve in the "
-        f"container. Copy those files into the {what} folder."
+        f"{len(found)} link(s) in the data folder point outside it ({shown}); they do not resolve in the "
+        "container. Copy those files into the data folder."
     ]
-
-
-def data_path_problems(data_dir: Path, *, windows: bool | None = None, drive_type: Callable[[str], int] | None = None) -> list[str]:
-    """:func:`folder_problems` for the data folder, links included."""
-    return folder_problems(data_dir, "data", "[hailer].data_dir", windows=windows, drive_type=drive_type, links=True)
-
-
-def planted_files(notebooks: Path | None) -> list[str]:
-    """The :data:`PLANTABLE_FILES` in the notebooks tree (sorted relative paths; empty when none,
-    or when the folder cannot be read)."""
-    if notebooks is None:
-        return []
-    try:
-        return notebook_control_files(Path(notebooks))
-    except OSError:
-        return []
-
-
-def planted_warning(notebooks: Path, names: Sequence[str]) -> str:
-    """The warning for :func:`planted_files` (printed when a docker kernel stops, and by doctor)."""
-    return (
-        f"WARNING: the notebooks folder {notebooks} contains {', '.join(names)}. The docker kernel "
-        "can write there, so treat them as untrusted: git hooks and settings (core.fsmonitor), editor and "
-        "dev-container settings run commands on this machine, and a hailer.toml makes the folder look like "
-        "another workspace. Unless you put them there yourself, delete them before you run git in that folder, "
-        "open it in an editor, or run Hailer from inside it."
-    )
 
 
 # --------------------------------------------------------------------------- #
@@ -643,7 +619,8 @@ def _remove(runner: DockerRunner, kind: str, ident: str, shown: str) -> Removal:
 class DockerKernel(MarimoSandbox):
     """The containers and network this Hailer started. ``containers`` are names (kernel first),
     ``container_ids`` the same containers' ids; everything is removed and inspected by id.
-    ``notebooks_folder`` is the host folder mounted at ``/work/notebooks``."""
+    ``sync`` copies notebooks between the workspace and the container's own notebooks folder
+    (``None`` until the start set it up, and again once :meth:`stop` made the last copy)."""
 
     runner: Any = None
     containers: tuple[str, ...] = ()
@@ -652,7 +629,7 @@ class DockerKernel(MarimoSandbox):
     network_id: str | None = None
     stop_error: str = ""
     owner: OwnerLock | None = None
-    notebooks_folder: Path | None = None
+    sync: NotebookSync | None = None
 
     def _name(self, ident: str) -> str:
         for name, known in zip(self.containers, self.container_ids):
@@ -660,9 +637,23 @@ class DockerKernel(MarimoSandbox):
                 return name
         return ident[:12]
 
-    def planted(self) -> list[str]:
-        """:func:`planted_files` in this kernel's notebooks folder (checked when it stops)."""
-        return planted_files(self.notebooks_folder)
+    def write_notebook(self, name: str, source: str, *, replace: bool = True) -> NotebookFile:
+        """:meth:`MarimoSandbox.write_notebook` for a name that is copied back to the workspace: one
+        :func:`~hailer.notebook_sync.sync_refusal` refuses (``conftest.py``, ``test_*.py``, deeper
+        than four folders) would stay in the container and be lost when it stops, so it is a
+        ``NotebookPathError`` before anything is written."""
+        clean = check_notebook_name(name)
+        reason = sync_refusal(clean)
+        if reason is not None:
+            raise NotebookPathError(
+                f"{clean} would stay in the docker kernel and be lost when it stops ({reason}).",
+                hint="Pick a plain notebook name such as sales.py or q3/review.py (not conftest.py, test_*.py or *_test.py).",
+            )
+        return super().write_notebook(clean, source, replace=replace)
+
+    def sync_soon(self) -> None:
+        if self.sync is not None:
+            self.sync.soon()
 
     def remove(self) -> Removal:
         """Remove this kernel's containers, then its network, by id. Raises only what the runner
@@ -675,10 +666,17 @@ class DockerKernel(MarimoSandbox):
         return outcome
 
     def stop(self) -> None:
-        """Remove the containers and the network, then release the owner lock; ``stop_error`` says
-        what could not be removed (ownerless now, the next start or ``uvx hailer kernel stop``
-        removes it)."""
+        """Copy the notebooks back a last time (after the periodic copy stopped), remove the
+        containers and the network, then release the owner lock; ``stop_error`` says what could not
+        be removed (ownerless now, the next start or ``uvx hailer kernel stop`` removes it). Ctrl+C
+        during the last copy skips it, with a warning, and the containers are still removed."""
         self.stop_error = ""
+        sync, self.sync = self.sync, None
+        if sync is not None:
+            try:
+                sync.close(final=True)
+            except KeyboardInterrupt:
+                self.notify("Warning: stopped before the notebooks were copied back; the kernel's changes since the last copy are lost.")
         try:
             outcome = self.remove()
         except Exception as err:  # noqa: BLE001 - best effort on the way out
@@ -768,8 +766,9 @@ class Labelled:
 
 
 class DockerRuntime:
-    """marimo in a Linux container that sees only the notebooks folder (read-write) and the data
-    folder (read-only), without network access or any of the host's secrets.
+    """marimo in a Linux container with its own notebooks folder (a tmpfs the workspace's notebooks
+    are copied into and back from) and the data folder (read-only), without network access or any
+    of the host's secrets.
 
     Each start gets (names from :func:`docker_names`, unique per runtime object; every one
     labelled with the workspace, its role, the kernel contract and its :class:`OwnerLock` id):
@@ -777,7 +776,7 @@ class DockerRuntime:
     - ``hailer-net-<id>-<suffix>``: an ``--internal`` network, with no route out.
     - ``hailer-kernel-<id>-<suffix>``: ``marimo edit`` on that network only, hardened (read-only
       root, no capabilities, pid, memory (no swap on top) and CPU limits), no port published
-      (Docker ignores ``-p`` on an internal network).
+      (Docker ignores ``-p`` on an internal network). Its notebooks folder is a size-capped tmpfs.
     - ``hailer-fwd-<id>-<suffix>``: :mod:`hailer._forward` from the same image, published on
       ``127.0.0.1:<port>`` and joined to both networks; it only ever connects to the kernel.
 
@@ -835,11 +834,10 @@ class DockerRuntime:
     # -- checks -------------------------------------------------------------- #
 
     def check(self) -> list[Check]:
-        """Rows ``kernel``, ``docker`` (CLI, engine, version), ``image`` (present, version),
-        ``data`` (path warnings) and, when there is something to say, ``notebooks`` (Docker may not
-        see it; files at its top that other programs run code from). An image that is not
-        downloaded yet is only a warning: ``prepare`` downloads it. The layouts that are never
-        mounted are ``config`` problems (:func:`hailer.config.docker_mount_problems`)."""
+        """Rows ``kernel``, ``docker`` (CLI, engine, version), ``image`` (present, version) and
+        ``data`` (path warnings). An image that is not downloaded yet is only a warning: ``prepare``
+        downloads it. The data folders that are never mounted are ``config`` problems
+        (:func:`hailer.config.docker_mount_problems`)."""
         rows = [Check("kernel", True, self.describe(), fatal=False)]
         try:
             version = self.engine_version()
@@ -851,13 +849,6 @@ class DockerRuntime:
         data = self._data_check()
         if data is not None:
             rows.append(data)
-        notebooks = folder_problems(self.config.notebooks_root, "notebooks", "[hailer].notebooks_dir")
-        if notebooks:
-            rows.append(Check("notebooks", False, "the container may not see the notebooks folder", hint="\n".join(notebooks), fatal=False))
-        planted = planted_files(self.config.notebooks_root)
-        if planted and ".git" not in planted:  # .git: the config row already refuses the folder
-            summary = f"{', '.join(planted)} in the notebooks folder"
-            rows.append(Check("notebooks", False, summary, hint=planted_warning(self.config.notebooks_root, planted), fatal=False))
         return rows
 
     def _image_check(self) -> Check:
@@ -982,8 +973,7 @@ class DockerRuntime:
         return self._download()
 
     def mount_problems(self) -> list[str]:
-        """Why the notebooks or data folder must not be mounted (empty: both are fine). Every rule
-        lives in :func:`hailer.config.docker_mount_problems`, which ``validate()`` reports too;
+        """Why the data folder must not be mounted (empty: it is fine). Every rule lives in :func:`hailer.config.docker_mount_problems`, which ``validate()`` reports too;
         this runs on every start path, ``--foreground`` included (it never validates)."""
         from hailer.config import docker_mount_problems  # lazy: config does not import the runtimes
 
@@ -995,7 +985,7 @@ class DockerRuntime:
             raise KernelRuntimeError(problems[0], hint="\n".join(problems[1:]))
 
     def prepare(self, say: Callable[[str], None] | None = None) -> None:
-        """Docker runs a Linux engine, the folders are safe to mount, and the image of this Hailer's
+        """Docker runs a Linux engine, the data folder is safe to mount, and the image of this Hailer's
         kernel contract is here: downloaded now (with docker's progress in this terminal) when it is
         missing. A ``[kernel].cpus`` above
         what Docker has is lowered, with a note. Raises ``KernelRuntimeError``."""
@@ -1048,11 +1038,13 @@ class DockerRuntime:
         return ["network", "create", "--internal", *self._labels("network"), self.names.network]
 
     def kernel_command(self, port: int, token_file: Path) -> list[str]:
-        """``docker run`` for the kernel. Nothing is mounted but the notebooks folder (read-write),
-        the data folder (read-only) and ``token_file`` (read-only, at :data:`KERNEL_TOKEN_FILE`,
-        where marimo reads its token): not the workspace root, ``.hailer/``, ``.config/hailer/``,
-        the home folder or the Docker socket. The token itself is never an argument or an
-        environment variable. ``--memory-swap`` equal to ``--memory``: no swap on top."""
+        """``docker run`` for the kernel. Nothing of this machine is mounted but the data folder
+        (read-only) and ``token_file`` (read-only, at :data:`KERNEL_TOKEN_FILE`, where marimo
+        reads its token): not the notebooks folder (the kernel's own is a tmpfs owned by its user,
+        at most :data:`NOTEBOOKS_TMPFS_SIZE`), the workspace root, ``.hailer/``,
+        ``.config/hailer/``, the home folder or the Docker socket. The token itself is never an
+        argument or an environment variable. ``--memory-swap`` equal to ``--memory``: no swap on
+        top."""
         kernel = self.config.kernel
         user = self._user()
         uid, gid = user if user is not None else (IMAGE_UID, IMAGE_GID)
@@ -1061,7 +1053,11 @@ class DockerRuntime:
             cmd += ["-p", f"127.0.0.1:{port}:{KERNEL_PORT}"]
         else:
             cmd += ["--network", self.names.network]
-        cmd += ["--init", "--read-only", "--tmpfs", "/tmp", "--tmpfs", f"{KERNEL_HOME}:uid={uid},gid={gid}"]
+        cmd += [
+            "--init", "--read-only", "--tmpfs", "/tmp",
+            "--tmpfs", f"{KERNEL_HOME}:uid={uid},gid={gid}",
+            "--tmpfs", f"{KERNEL_NOTEBOOKS_DIR}:uid={uid},gid={gid},mode=0700,size={NOTEBOOKS_TMPFS_SIZE}",
+        ]  # fmt: skip
         if user is not None:
             cmd += ["--user", f"{uid}:{gid}", "-e", f"HOME={KERNEL_HOME}"]
         cmd += [
@@ -1073,7 +1069,6 @@ class DockerRuntime:
             "--cpus", f"{self._cpus:g}",
             "-w", str(KERNEL_WORKDIR),
             *self._labels("kernel"),
-            "--mount", mount_arg(self.config.notebooks_root, KERNEL_NOTEBOOKS_DIR),
             "--mount", mount_arg(self.config.data_dir, KERNEL_DATA_DIR, readonly=True),
             "--mount", mount_arg(token_file, KERNEL_TOKEN_FILE, readonly=True),
             self.image,
@@ -1179,9 +1174,11 @@ class DockerRuntime:
         a failure there is a warning, since the new names never clash), then create the network, the
         kernel and the forwarder and wait, through the forwarder, until marimo answers with this
         start's token (the containers are checked first). The token reaches marimo in a file
-        (:func:`write_token_file`) that is deleted once the wait is over. ``foreground`` changes
-        nothing here: the containers run detached either way, and :meth:`DockerKernel.wait` follows
-        the kernel's log."""
+        (:func:`write_token_file`) that is deleted once the wait is over. Then the workspace's
+        notebooks are copied in (before anything can open one) and the periodic copy back starts
+        (:class:`~hailer.notebook_sync.NotebookSync`); Ctrl+C meanwhile stops the kernel.
+        ``foreground`` changes nothing here: the containers run detached either way, and
+        :meth:`DockerKernel.wait` follows the kernel's log."""
         del foreground
         config = self.config
         workspace = Path(config.workspace)
@@ -1209,7 +1206,6 @@ class DockerRuntime:
             log_hint=f"docker logs {names.kernel}",
             runner=self.runner,
             owner=owner,
-            notebooks_folder=config.notebooks_root,
         )
         health = self._health if self._health is not None else wait_for_health
         try:
@@ -1217,11 +1213,10 @@ class DockerRuntime:
             leftovers = self.remove_leftovers()
             if leftovers.failed:
                 _say("Warning: Docker could not remove what an earlier kernel left behind: " + "; ".join(leftovers.failed))
-            for folder in (config.notebooks_root, config.data_dir):
-                try:
-                    folder.mkdir(parents=True, exist_ok=True)  # before Docker creates a missing one owned by root
-                except OSError as err:
-                    raise KernelRuntimeError(f"Could not create {folder}: {err}", hint="Check the folder's permissions.") from err
+            try:
+                config.data_dir.mkdir(parents=True, exist_ok=True)  # before Docker creates a missing one owned by root
+            except OSError as err:
+                raise KernelRuntimeError(f"Could not create {config.data_dir}: {err}", hint="Check the folder's permissions.") from err
             try:
                 token_file = write_token_file(workspace, token)
             except OSError as err:
@@ -1272,6 +1267,15 @@ class DockerRuntime:
             if tail:
                 hint += "\n" + "\n".join(f"    {line}" for line in tail)
             raise KernelRuntimeError(message, hint=hint)
+        sync = NotebookSync(kernel, config.notebooks_root, workspace)
+        try:
+            sync.sync_in()
+            sync.start()
+        except BaseException:  # Ctrl+C while copying in: the caller never got the kernel
+            sync.close(final=False)
+            kernel.stop()
+            raise
+        kernel.sync = sync
         note_kernel_start(workspace, self.name, config.notebooks_root)
         return kernel
 
@@ -1307,12 +1311,10 @@ def workspace_kernels(config: HailerConfig, runner: DockerRunner | None = None) 
 
 @dataclass
 class StopReport:
-    """What ``uvx hailer kernel stop`` did (``done``), what it could not do (``failed``) and what
-    the user must look at now (``warnings``: files a docker kernel may have planted)."""
+    """What ``uvx hailer kernel stop`` did (``done``) and what it could not do (``failed``)."""
 
     done: list[str] = field(default_factory=list)
     failed: list[str] = field(default_factory=list)
-    warnings: list[str] = field(default_factory=list)
 
 
 def stop_workspace_kernels(config: HailerConfig, runner: DockerRunner | None = None) -> StopReport:
@@ -1332,9 +1334,6 @@ def stop_workspace_kernels(config: HailerConfig, runner: DockerRunner | None = N
     else:
         if leftovers.removed:
             report.done.append("Removed " + ", ".join(leftovers.removed) + ".")
-            planted = planted_files(config.notebooks_root)
-            if planted:
-                report.warnings.append(planted_warning(config.notebooks_root, planted))
         report.failed += [f"Could not remove {failure}" for failure in leftovers.failed]
     if docker_error is not None and str(docker_error) == DOCKER_NOT_RUNNING:
         report.done.append(

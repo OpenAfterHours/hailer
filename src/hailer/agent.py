@@ -298,7 +298,7 @@ def _workspace_section(config: HailerConfig, server: MarimoServer | None = None)
     """Where things are, as the kernel sees them, plus the runtime's notes.
 
     ``config.kernel`` is the runtime the chat's kernel was started with. A docker
-    kernel knows the folders by their mount points, so the model gets those, never host paths it
+    kernel knows the folders by its own paths, so the model gets those, never host paths it
     would copy into code that cannot reach them. The active notebook is deliberately absent: it
     changes with /notebook and the notebook tools during a conversation; the model learns it from
     marimo_status() and from CLI notices. The Marimo URL never carries the server's token.
@@ -307,8 +307,8 @@ def _workspace_section(config: HailerConfig, server: MarimoServer | None = None)
 
     if config.kernel.runtime == KERNEL_RUNTIME_DOCKER:
         lines = [
-            f"- Workspace: {KERNEL_WORKDIR} (in the kernel; only the two folders below are mounted)",
-            f"- Notebooks folder: {KERNEL_NOTEBOOKS_DIR} (writable; the only place files persist)",
+            f"- Workspace: {KERNEL_WORKDIR} (in the kernel; only the two folders below are yours)",
+            f"- Notebooks folder: {KERNEL_NOTEBOOKS_DIR} (writable; only marimo notebooks are copied back to the user)",
             f"- Data directory: {KERNEL_DATA_DIR} (read-only)",
         ]
     else:

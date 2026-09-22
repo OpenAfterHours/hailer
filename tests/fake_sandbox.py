@@ -19,7 +19,7 @@ from typing import Any
 from hailer.errors import NotebookExistsError, NotebookNotFoundError
 from hailer.models import MarimoServer
 from hailer.notebooks import check_notebook_name
-from hailer.sandbox import MarimoSandbox, NotebookFile
+from hailer.sandbox import MarimoSandbox, NotebookFile, SandboxEntry
 
 
 def _is_notebook(path: Path) -> bool:
@@ -63,6 +63,20 @@ class FolderSandbox(MarimoSandbox):
                     found.append(NotebookFile(path.relative_to(root).as_posix(), stat.st_mtime, stat.st_size))
         return sorted(found, key=lambda info: info.name.lower())
 
+    def list_tree(self) -> list[SandboxEntry]:
+        """Every file and folder (not looking into ``.``/``__`` folders), as marimo's listing gives them."""
+        root = Path(self.folder)
+        found: list[SandboxEntry] = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            for dirname in dirnames:
+                found.append(SandboxEntry((Path(dirpath) / dirname).relative_to(root).as_posix(), True))
+            dirnames[:] = [d for d in dirnames if not d.startswith((".", "__"))]
+            for filename in filenames:
+                path = Path(dirpath) / filename
+                stat = path.stat()
+                found.append(SandboxEntry(path.relative_to(root).as_posix(), False, stat.st_mtime, stat.st_size))
+        return sorted(found, key=lambda item: item.name)
+
     def has_notebook(self, name: str) -> bool:
         return (Path(self.folder) / check_notebook_name(name)).is_file()
 
@@ -89,6 +103,7 @@ def with_folder_files(box: MarimoSandbox, folder: Path, client_factory: Callable
     marimo server behind it."""
     view = FolderSandbox(server=box.server, notebooks_path=box.notebooks_path, folder=folder, client_factory=client_factory)
     box.list_notebooks = view.list_notebooks  # type: ignore[method-assign]
+    box.list_tree = view.list_tree  # type: ignore[method-assign]
     box.read_notebook = view.read_notebook  # type: ignore[method-assign]
     box.has_notebook = view.has_notebook  # type: ignore[method-assign]
     box.write_notebook = view.write_notebook  # type: ignore[method-assign]

@@ -7,9 +7,9 @@ started.
 
 - :class:`LocalRuntime` (here) runs marimo in Hailer's own Python, as the user (the default).
   The server gets a random token and an environment without the secrets Hailer can recognise.
-- :class:`~hailer.kernel_docker.DockerRuntime` runs it in a Linux container that sees only the
-  notebooks folder and, read-only, the data folder, with no network. It fails closed: it never
-  falls back to the local runtime.
+- :class:`~hailer.kernel_docker.DockerRuntime` runs it in a Linux container with a notebooks
+  folder of its own (the workspace's notebooks are copied in and back) that sees only the data
+  folder, read-only, with no network. It fails closed: it never falls back to the local runtime.
 
 Pieces every runtime shares:
 
@@ -56,8 +56,8 @@ LOCAL_LOG_PREFIX = "marimo-"
 START_TIMEOUT_SEC = 60.0
 #: How long ``--foreground`` gives marimo to shut itself down after Ctrl+C before it is killed.
 FOREGROUND_GRACE_SEC = 10.0
-#: Where the docker runtime mounts the notebooks folder (read-write) and the data folder (read-only).
-#: The image's working directory, ``/work``, holds marimo's user configuration (``.marimo.toml``:
+#: The docker kernel's notebooks folder (a tmpfs of its own) and where it mounts the data folder
+#: (read-only). The image's working directory, ``/work``, holds marimo's user configuration (``.marimo.toml``:
 #: a notebook's cells run when it opens) and an empty ``hailer.toml``, so the starter notebook
 #: finds ``WORKSPACE = /work`` and ``DATA_DIR = /work/data``.
 KERNEL_WORKDIR = PurePosixPath("/work")
@@ -80,6 +80,8 @@ LOCAL_PROMPT_NOTES = (
 _DOCKER_ISOLATION_NOTE = (
     "- The kernel runs in an isolated Linux container that sees only the notebooks folder and the data "
     "folder above; always use those paths in code.\n"
+    "- Only marimo notebooks in the notebooks folder are copied back to the user's machine; any other file "
+    "notebook code writes there (or anywhere in the container) is gone when the kernel stops.\n"
 )
 _DOCKER_TMP_NOTE = (
     "- /tmp is scratch space in memory, shared by every notebook in the container and wiped when the kernel stops."
@@ -176,7 +178,8 @@ def note_kernel_start(workspace: Path, runtime: str, notebooks_root: Path) -> No
 
 def docker_wrote_notebooks(workspace: Path, notebooks_root: Path) -> bool:
     """True when the last server Hailer started on ``notebooks_root`` was a docker kernel: code the
-    container wrote into those notebooks would now run on this machine."""
+    container wrote into those notebooks (copied back when it stopped) would now run on this
+    machine."""
     try:
         raw = json.loads(_last_kernel_path(workspace).read_text(encoding="utf-8"))
     except (OSError, ValueError):

@@ -126,7 +126,8 @@ class WebConfig:
 
 
 #: Where the notebook kernel runs: in Hailer's own Python, as the user (the default), or in a
-#: Docker container that sees only the notebooks folder and, read-only, the data folder.
+#: Docker container with its own notebooks folder (copied to and from the workspace's) that sees
+#: only the data folder, read-only.
 KERNEL_RUNTIME_LOCAL = "local"
 KERNEL_RUNTIME_DOCKER = "docker"
 VALID_KERNEL_RUNTIMES = (KERNEL_RUNTIME_LOCAL, KERNEL_RUNTIME_DOCKER)

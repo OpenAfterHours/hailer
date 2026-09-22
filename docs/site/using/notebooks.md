@@ -28,6 +28,13 @@ prompt) it stops the marimo server it started.
   left behind are removed by the next start or `uvx hailer kernel stop`.
 - **Where the code runs.** By default the kernel runs in Hailer's own Python, as you. To run it in an
   isolated container instead, add `--kernel docker` or see [Isolated kernel (Docker)](../security/docker.md#isolated-kernel-docker).
+- **Docker works on copies.** A docker kernel has a notebooks folder of its own. Hailer copies your
+  notebooks into it when it starts and copies the ones that changed back after every turn, every 15
+  seconds and when the session ends; only marimo notebooks with plain names travel, never other files
+  (see [Notebook copies](../security/docker.md#notebook-copies)). If you edit a notebook in another editor
+  while a docker session runs, and the kernel changes it too, your version is kept in
+  `.hailer/notebook-backups/`. Files notebook code writes next to the notebooks (an export, say) stay in
+  the container and are gone when it stops.
 
 The notebook opens in marimo's **app view**: you see the results, tables and charts the agent produces,
 not the code behind them (the URL carries `view-as=present`). To see or edit the code, press `Ctrl+.`

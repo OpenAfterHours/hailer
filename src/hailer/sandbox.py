@@ -11,7 +11,10 @@ subclasses :class:`MarimoSandbox` for its lifecycle (stop, log, wait).
 
 Notebook files go through marimo's own file API (:class:`~hailer.marimo_client.MarimoClient`), so
 they work the same wherever the kernel runs; the data folder, a host folder in both runtimes today,
-is listed on this machine.
+is listed on this machine. A sandbox whose notebooks are not the host's own (the docker kernel's
+in-memory folder) copies them in when it starts and back out while it runs and when it stops
+(:mod:`hailer.notebook_sync`); for the local kernel the two are one folder and the ``sync_*``
+methods do nothing.
 
 Standard library only at import time (``data_schema`` imports Polars when it is called).
 """
@@ -21,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import re
 import urllib.error
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,17 +36,19 @@ from hailer.errors import (
     NotebookNotFoundError,
     NotebookPathError,
 )
-from hailer.marimo_client import MarimoClient, home_url, kernel_path, name_in_folder, open_notebook_url
+from hailer.marimo_client import MAX_NOTEBOOK_BYTES, MarimoClient, home_url, kernel_path, name_in_folder, open_notebook_url
 from hailer.models import MarimoServer
 from hailer.notebooks import check_notebook_name
 
-#: The largest notebook :meth:`MarimoSandbox.read_notebook` reads (marimo's own limit is far higher).
-MAX_NOTEBOOK_BYTES = 5 * 1024 * 1024
+#: MAX_NOTEBOOK_BYTES (from marimo_client, which sizes replies from it): the largest notebook
+#: :meth:`MarimoSandbox.read_notebook` reads (marimo's own limit is far higher).
 #: How many folder levels below the notebooks folder a notebook may be (listing and writing).
 MAX_NOTEBOOK_DEPTH = 4
 #: At most this many notebooks are listed, and at most this many folders are looked into.
 MAX_NOTEBOOKS = 500
 MAX_NOTEBOOK_FOLDERS = 200
+#: At most this many files and folders are listed by :meth:`MarimoSandbox.list_tree`.
+MAX_TREE_ENTRIES = 5000
 #: Folders never looked into, besides those starting with ``.`` (``.git``, ``.venv``) or ``__``
 #: (``__marimo__``, ``__pycache__``).
 SKIPPED_FOLDERS = frozenset({"node_modules", "venv", "site-packages"})
@@ -72,6 +78,18 @@ class DataFile:
     size: int = 0
 
 
+@dataclass(frozen=True)
+class SandboxEntry:
+    """A file or folder in the sandbox's notebooks folder, whatever it holds
+    (:meth:`MarimoSandbox.list_tree`)."""
+
+    name: str  # POSIX path relative to the notebooks folder
+    folder: bool = False
+    modified: float = 0.0
+    size: int = 0
+    marimo: bool = False  # marimo's listing says it is a notebook (``import marimo`` and ``marimo.App``)
+
+
 def notebook_digest(source: str) -> str:
     """The sha256 of a notebook's text with its line endings normalised to ``\\n``: marimo's
     ``update`` writes ``\\r\\n`` on a Windows kernel while ``create`` stores the bytes as given, so
@@ -87,6 +105,10 @@ def _check_data_name(name: str) -> str:
     return text
 
 
+def _print(text: str) -> None:
+    print(text, flush=True)
+
+
 def _skipped(folder: str) -> bool:
     return folder.startswith((".", "__")) or folder.lower() in SKIPPED_FOLDERS
 
@@ -97,10 +119,12 @@ class MarimoSandbox:
 
     ``server`` has the URL and the token. ``notebooks_path`` is the kernel's path of the notebooks
     folder (the local runtime: the host folder as :func:`~hailer.marimo_client.notebook_file_key`
-    writes it; docker: ``/work/notebooks``) and ``native_paths`` says the kernel's paths are this
-    machine's; ``data_path`` is the data folder as notebook code reaches it and ``data_dir`` the host
-    folder behind it (a read-only mount in a container). ``log_hint`` says where the kernel's log
-    is; ``ended`` why :meth:`wait` returned when the kernel stopped by itself (empty after Ctrl+C).
+    writes it; docker: ``/work/notebooks``, the container's own) and ``native_paths`` says the
+    kernel's paths are this machine's; ``data_path`` is the data folder as notebook code reaches it
+    and ``data_dir`` the host folder behind it (a read-only mount in a container). ``log_hint``
+    says where the kernel's log is; ``ended`` why :meth:`wait` returned when the kernel stopped by
+    itself (empty after Ctrl+C). ``notice`` shows a warning line (the chat points it at its own
+    console; default: print); the notebook copies call it from any thread.
     """
 
     server: MarimoServer
@@ -110,6 +134,7 @@ class MarimoSandbox:
     native_paths: bool = False
     log_hint: str = ""
     ended: str = ""
+    notice: Callable[[str], None] | None = None
 
     # -- the kernel ---------------------------------------------------------- #
 
@@ -149,45 +174,67 @@ class MarimoSandbox:
     def home_url(self, *, with_token: bool = False) -> str:
         return home_url(self.server, with_token=with_token)
 
+    def notify(self, text: str) -> None:
+        """Show the warning line ``text`` through :attr:`notice` (never raises)."""
+        try:
+            (self.notice or _print)(text)
+        except Exception:  # noqa: BLE001 - a warning must never break what reported it
+            pass
+
     # -- notebooks ----------------------------------------------------------- #
 
     def list_notebooks(self) -> list[NotebookFile]:
-        """Every marimo notebook (``.py``) under the notebooks folder, sorted by name.
-
-        Bounded: at most :data:`MAX_NOTEBOOK_DEPTH` folder levels, :data:`MAX_NOTEBOOK_FOLDERS`
-        folders and :data:`MAX_NOTEBOOKS` notebooks; folders starting with ``.`` or ``__`` and
-        :data:`SKIPPED_FOLDERS` are not looked into, nor (local kernel) a link or junction that
-        leads out of the notebooks folder. ``MarimoUnavailableError`` when marimo cannot list.
-        """
-        client = self.client()
+        """Every marimo notebook (``.py``) under the notebooks folder, sorted by name, from
+        :meth:`list_tree` (so within its bounds; at most :data:`MAX_NOTEBOOKS`); nothing in a folder
+        starting with ``.`` or ``__`` or in :data:`SKIPPED_FOLDERS`, nor (local kernel) behind a link
+        or junction that leads out of the notebooks folder. ``MarimoUnavailableError`` when marimo
+        cannot list."""
         found: list[NotebookFile] = []
+        for entry in self.list_tree():
+            if entry.folder or not entry.marimo or not entry.name.lower().endswith(".py"):
+                continue
+            parts = entry.name.split("/")
+            if any(part.startswith((".", "__")) or part.lower() in SKIPPED_FOLDERS for part in parts):
+                continue
+            try:
+                check_notebook_name(entry.name)
+            except NotebookPathError:
+                continue
+            found.append(NotebookFile(entry.name, entry.modified, entry.size))
+        return sorted(found, key=lambda info: info.name.lower())[:MAX_NOTEBOOKS]
+
+    def list_tree(self) -> list[SandboxEntry]:
+        """Every file and folder in the notebooks folder, whatever it holds, sorted by name: what
+        :meth:`list_notebooks` and copying notebooks out look at. Folders are looked into at most
+        :data:`MAX_NOTEBOOK_DEPTH` levels deep, at most :data:`MAX_NOTEBOOK_FOLDERS` of them, and
+        never one starting with ``.`` or ``__`` (``.git``, ``__marimo__``) or in
+        :data:`SKIPPED_FOLDERS`: those are listed themselves. At most :data:`MAX_TREE_ENTRIES`
+        entries. A local kernel's names never lead out of the folder through a link or junction.
+        ``MarimoUnavailableError`` when marimo cannot list."""
+        client = self.client()
+        found: list[SandboxEntry] = []
         pending: list[tuple[str, int]] = [(self.notebooks_path, 0)]
         folders = 0
-        while pending and folders < MAX_NOTEBOOK_FOLDERS and len(found) < MAX_NOTEBOOKS:
+        while pending and folders < MAX_NOTEBOOK_FOLDERS and len(found) < MAX_TREE_ENTRIES:
             folder, depth = pending.pop(0)
             folders += 1
             for entry in client.list_files(folder):
-                label = str(entry.get("name") or "")
                 path = entry.get("path")
-                if not isinstance(path, str):
+                name = client.name_of(path) if isinstance(path, str) else None
+                if not name:
                     continue
-                if entry.get("isDirectory"):
-                    if depth < MAX_NOTEBOOK_DEPTH and not _skipped(label) and client.name_of(path) is not None:
-                        pending.append((path, depth + 1))
-                    continue
-                if label.startswith((".", "__")) or not entry.get("isMarimoFile") or not label.lower().endswith(".py"):
-                    continue
-                name = client.name_of(path)
-                if name is None:
-                    continue
-                try:
-                    check_notebook_name(name)
-                except NotebookPathError:
-                    continue
-                found.append(NotebookFile(name, float(entry.get("lastModified") or 0.0), int(entry.get("size") or 0)))
-                if len(found) >= MAX_NOTEBOOKS:
+                directory = bool(entry.get("isDirectory"))
+                found.append(
+                    SandboxEntry(
+                        name, directory, float(entry.get("lastModified") or 0.0), int(entry.get("size") or 0),
+                        marimo=not directory and bool(entry.get("isMarimoFile")),
+                    )
+                )  # fmt: skip
+                if directory and depth < MAX_NOTEBOOK_DEPTH and not _skipped(name.rsplit("/", 1)[-1]):
+                    pending.append((path, depth + 1))
+                if len(found) >= MAX_TREE_ENTRIES:
                     break
-        return sorted(found, key=lambda info: info.name.lower())
+        return sorted(found, key=lambda item: item.name)
 
     def _inside(self, client: MarimoClient, name: str) -> str:
         """The kernel path of ``name`` after refusing, for a local kernel, one whose resolved target
@@ -226,8 +273,8 @@ class MarimoSandbox:
         return entry is not None and not entry.get("isDirectory")
 
     def read_notebook(self, name: str) -> str:
-        """The text of the notebook ``name``, for copying it out of the sandbox (phase D's sync
-        reads it; nothing reads it yet). ``NotebookNotFoundError`` when there is no such file,
+        """The text of the notebook ``name``, for copying it out of the sandbox.
+        ``NotebookNotFoundError`` when there is no such file,
         ``NotebookPathError`` when it is not UTF-8 text, larger than :data:`MAX_NOTEBOOK_BYTES` or
         (local kernel) reached through a link out of the folder."""
         name = check_notebook_name(name)
@@ -290,10 +337,11 @@ class MarimoSandbox:
         info = reply.get("info") if isinstance(reply.get("info"), dict) else {}
         return NotebookFile(name, float(info.get("lastModified") or 0.0), int(info.get("size") or 0))
 
-    def sync_out(self) -> list[str]:
-        """Copy notebooks the sandbox changed back to the workspace; the names copied. Nothing to do
-        while the notebooks folder is the host's own (both runtimes today)."""
-        return []
+    def sync_soon(self) -> None:
+        """Ask for the sandbox's notebooks to be copied back to the workspace in the background
+        (after a turn, on a notebook switch); returns at once. Nothing to do while the notebooks
+        folder is the host's own (the local kernel); the docker kernel wakes its
+        :class:`~hailer.notebook_sync.NotebookSync`."""
 
     # -- data ---------------------------------------------------------------- #
 
@@ -339,9 +387,11 @@ __all__ = [
     "MAX_NOTEBOOK_DEPTH",
     "MAX_NOTEBOOK_FOLDERS",
     "MAX_NOTEBOOKS",
+    "MAX_TREE_ENTRIES",
     "SKIPPED_FOLDERS",
     "DataFile",
     "MarimoSandbox",
     "NotebookFile",
+    "SandboxEntry",
     "notebook_digest",
 ]

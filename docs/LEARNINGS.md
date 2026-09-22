@@ -254,3 +254,62 @@ while `create` stores the bytes as given: compare contents with `sandbox.noteboo
 without a `version` is the old host-path format: entries inside the notebooks folder are converted, everything
 else is dropped (`test_an_old_state_file_is_converted_to_names`). Workspace setup (`uvx hailer init`, the
 doctor's notebook row) may stay host-side.
+
+## 13. A sandbox writes to the host only through the notebook allow-list
+
+Until 2026-09-22 the docker kernel's `/work/notebooks` was a writable bind mount of the host's notebooks
+folder. Notebook code could then plant files that other programs on the host run: git hooks and
+`core.fsmonitor`, `.vscode`/`.idea`/`.devcontainer` settings, a `hailer.toml`, and for Python tools
+`conftest.py`, `test_*.py` (pytest collects them), `sitecustomize.py`. Defending that took mount-layout
+refusals (no `.git` or `hailer.toml` anywhere in the notebooks tree, not the workspace, not inside
+`.hailer`), a scan for planted control files at every stop and in `doctor`, and warnings that could not stop
+an editor acting while the kernel ran. Now the kernel's notebooks folder is a size-capped tmpfs of its own
+(`--tmpfs /work/notebooks:uid=U,gid=G,mode=0700,size=512m`, not a volume: nothing to clean up) and
+`hailer.notebook_sync.NotebookSync` copies notebooks through marimo's file API: in at start (after health,
+before `_active_notebook` and the browser), back after every turn, on a notebook switch, every 15 s from a
+daemon thread, and in `DockerKernel.stop` before the containers are removed, which the `finally` of every
+session path reaches (`/exit`, EOF, Ctrl+C, errors, `--foreground`).
+
+Keep these properties; each has a test in `tests/test_notebook_sync.py` unless named:
+
+- **One allow-list for both directions**, `sync_refusal(name, text)`: a name `check_notebook_name` accepts
+  (so no dot or dunder part), `.py` exactly, no 8.3 short-name part (`~` and a digit), at most four folders,
+  no `TOOLING_NAMES` match (test, task and packaging runners, Sphinx/Django/gunicorn/IPython/Jupyter
+  configuration, start-up hooks; one casefolded pattern list), no part named like a module Python would import
+  instead (`module_names()`: stdlib, Hailer's site-packages, the image's packages, common ones such as pandas;
+  a `json.py` next to a script shadows `json`), UTF-8 without NUL, at most 5 MiB, containing `import marimo`
+  and `marimo.App(`; at most 500 files. `module_names()` scans site-packages instead of calling
+  `importlib.metadata.packages_distributions()`, which took about 3 s on Windows (it reads every RECORD). Widen it only with a reason a host tool will not run the new kind of file
+  (`test_the_allow_list_refuses_everything_else`). Case-insensitive duplicates are copied once.
+  `DockerKernel.write_notebook` refuses a name the allow-list refuses, so the agent cannot create a notebook
+  that would silently stay in the container (`test_a_docker_kernel_refuses_to_create_a_notebook_that_would_never_come_back`).
+- **Host writes** are atomic (`write_atomically`: temp file in the same folder + `os.replace`), stay inside
+  the notebooks folder and never pass through a symlink or junction, and never delete anything
+  (`test_a_write_never_goes_through_a_link_or_junction`, `test_writes_here_are_atomic_and_leave_nothing_behind`).
+- **Conflicts**: the digest (`notebook_digest`, newline-normalised) last copied in or out is remembered per
+  name, in memory. A host file that differs from it is saved to `.hailer/notebook-backups/<name>.<time>.py`
+  before it is replaced; if the backup fails, nothing is written.
+- **Kernel code can replace the marimo server**, so every `/api/files` reply may be forged. Replies are
+  capped (`marimo_client.MAX_REPLY_BYTES`, sized from the notebook cap; `Content-Length` checked, then a
+  bounded chunked read) and every copy runs under one thread-local monotonic deadline
+  (`marimo_client.request_deadline`), checked before each request and between reads, so a trickling server
+  cannot hold the exit: 30 s for the copy in and the last copy back, 10 s and 50 MiB read per background
+  pass. On the deadline Hailer warns, keeps the host copies and goes on (at stop: to container removal).
+  Evidence: `test_a_trickling_reply_ends_at_the_deadline`, `test_a_reply_larger_than_the_cap_is_refused_without_reading_it`,
+  `test_the_last_copy_has_one_deadline_whatever_the_server_does`, `test_a_pass_stops_at_its_deadline_or_byte_budget_and_leaves_the_rest`.
+- **Failures warn, never raise**, and repeat once per message (a dead kernel does not print every 15 s). The
+  chat routes `sandbox.notice` to its own console, which the composer queues from any thread.
+- **Ordering**: sync-in runs inside `DockerRuntime.start`, so the chat and the browser never see an empty
+  folder, and a Ctrl+C there stops the kernel. This costs one list + create per notebook on loopback before
+  the composer renders (LEARNINGS §10); keep it bounded rather than moving it after `_active_notebook`. Stop
+  joins the thread (a pass ends within 10 s) before the final copy; Ctrl+C during that copy skips it with a warning and the
+  containers are still removed (`test_ctrl_c_during_the_last_copy_still_removes_the_containers`).
+
+Linux UID mapping (`--user <uid>:<gid>`) stays: nothing is written through a mount any more, but the kernel
+still reads the data folder as the user, and files only the owner may read (`0600` exports) would otherwise be
+unreadable. The notebooks-folder mount rules and the planted-file scan are gone; the data-folder rules
+(`config.docker_mount_problems`) remain. The unsafe local runtime keeps the simple "last run by the isolated
+docker kernel" warning (`kernel.docker_wrote_notebooks`): a notebook is code wherever it came from. Evidence at
+the Docker level: `test_the_notebooks_folder_is_the_containers_own_and_only_notebooks_come_back` and
+`test_stop_copies_the_last_edit_back_and_leaves_no_containers_network_or_token` in
+`tests/test_docker_integration.py` (Windows 11, Docker Desktop 29.4.3, 2026-09-22, `HAILER_DOCKER_TESTS=strict`).

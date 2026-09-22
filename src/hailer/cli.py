@@ -811,22 +811,10 @@ def _run_foreground(console: Console, config: HailerConfig, runtime: Any, port: 
         return code
     finally:
         if running is not None:
-            running.stop()
-            _warn_about_planted_files(console, running)
+            running.stop()  # a docker kernel copies its notebooks back first
             if getattr(running, "stop_error", ""):
                 console.print(running.stop_error, style="red", markup=False)
                 raise typer.Exit(code=1)
-
-
-def _warn_about_planted_files(console: Console, running: Any) -> None:
-    """After a docker kernel stopped: files at the top of its notebooks folder that git or an
-    editor would run code from (the kernel could write them there). Loud, and never removed."""
-    planted = getattr(running, "planted", None)
-    names = planted() if callable(planted) else []
-    if names:
-        from hailer.kernel_docker import planted_warning
-
-        console.print(planted_warning(running.notebooks_folder, names), style="bold red", markup=False)
 
 
 def _wait_for_notebook(
@@ -946,10 +934,9 @@ def _run_session(console: Console, config: HailerConfig, opts: CliOptions, *, po
         )
     finally:
         if running is not None:
-            running.stop()
+            running.stop()  # a docker kernel copies its notebooks back first, on every way out
             if not getattr(running, "stop_error", ""):
                 console.print("Stopped marimo.", markup=False)
-            _warn_about_planted_files(console, running)
             if getattr(running, "stop_error", ""):
                 console.print(running.stop_error, style="red", markup=False)
                 raise typer.Exit(code=1)
@@ -1178,8 +1165,6 @@ def kernel_stop(ctx: typer.Context) -> None:
         console.print(line, markup=False)
     for line in report.failed:
         console.print(line, style="red", markup=False)
-    for line in report.warnings:
-        console.print(line, style="bold red", markup=False)
     if report.failed:
         raise typer.Exit(code=1)
 

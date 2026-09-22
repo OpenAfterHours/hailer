@@ -19,8 +19,11 @@ Run it with ``HAILER_DOCKER_TESTS=1 uv run pytest tests/test_docker_integration.
 One module-scoped kernel serves every test: :class:`~hailer.kernel.DockerRuntime` starts it for a
 temporary workspace holding sample sales data, headless Chrome stays connected to the notebook,
 and the tests talk to it through
-the sandbox's :class:`~hailer.marimo_client.MarimoClient` by notebook name, as the agent's tools do. The last test
-stops it and checks that nothing is left behind (by the ids Docker gave it and the workspace label).
+the sandbox's :class:`~hailer.marimo_client.MarimoClient` by notebook name, as the agent's tools do. The
+kernel's notebooks folder is its own tmpfs: the workspace's notebooks are copied in at the start and
+notebook edits come back through the sandbox's copies (:mod:`hailer.notebook_sync`), never anything
+else notebook code writes there. The last test stops it and checks that the last edit came back and
+nothing is left behind (by the ids Docker gave it and the workspace label).
 """
 
 from __future__ import annotations
@@ -208,7 +211,7 @@ class Kernel:
 
     @property
     def notebook(self) -> Path:
-        """The notebook's file on the host (the notebooks folder is a bind mount)."""
+        """The notebook's file on the host (edits reach it through the sandbox's copies back)."""
         return self.config.notebook
 
     def run(self, code: str) -> ExecResult:
@@ -330,12 +333,13 @@ def test_excel_can_be_read_in_the_container_without_installing_packages(docker_k
     assert result.stdout.splitlines() == ["['Sales', 'Budget']", "3 200.5 001", "250"]
 
 
-def test_a_code_mode_cell_is_saved_in_the_host_notebook(docker_kernel: Kernel):
+def test_a_code_mode_cell_is_copied_back_to_the_host_notebook(docker_kernel: Kernel):
     code = "ci_total = 6 * 7\nci_total"
     result = docker_kernel.run(build_create_cell_code(code, name="ci_total"))
     assert result.success, result.stderr + docker_kernel.diagnostics()
 
     def saved() -> bool:
+        docker_kernel.kernel.sync.sync_out()  # what a finished agent turn asks for
         return "ci_total = 6 * 7" in docker_kernel.notebook.read_text(encoding="utf-8")
 
     assert _poll(saved, SAVE_TIMEOUT_SEC), "the new cell never reached " + str(docker_kernel.notebook)
@@ -434,21 +438,78 @@ def test_notebook_files_go_through_marimos_file_api_in_the_container(docker_kern
     assert default_notebook(docker_kernel.config) in [f.name for f in kernel.list_notebooks()]
     source = render_template("empty", title="File API")
     assert kernel.write_notebook("api/check.py", source, replace=False).name == "api/check.py"
-    assert (docker_kernel.config.notebooks_root / "api" / "check.py").read_bytes() == source.encode("utf-8")
+    assert not (docker_kernel.config.notebooks_root / "api" / "check.py").exists(), "in the container only, until copied back"
     assert kernel.read_notebook("api/check.py") == source
     with pytest.raises(NotebookExistsError):
         kernel.write_notebook("api/check.py", source, replace=False)
     kernel.write_notebook("api/check.py", source + "# again\n")
     assert kernel.read_notebook("api/check.py").endswith("# again\n")
     assert "api/check.py" in [f.name for f in kernel.list_notebooks()]
+    assert "api/check.py" in kernel.sync.sync_out()
+    assert (docker_kernel.config.notebooks_root / "api" / "check.py").read_text(encoding="utf-8") == source + "# again\n"
 
 
-def test_stop_leaves_no_containers_network_or_token(docker_kernel: Kernel):
+#: What notebook code writes into its notebooks folder: (path, text, comes back to the host).
+PLANTED = [
+    (".git/config", "[core]\n\tfsmonitor = echo owned\n", False),
+    (".git/hooks/post-checkout", "#!/bin/sh\necho owned\n", False),
+    (".vscode/settings.json", "{}\n", False),
+    ("conftest.py", "import marimo\napp = marimo.App()\n", False),
+    ("q3/test_review.py", "import marimo\napp = marimo.App()\n", False),
+    ("helper.py", "import os\nos.system('echo owned')\n", False),
+    ("hailer.toml", '[kernel]\nruntime = "local"\n', False),
+    ("json.py", "import marimo\napp = marimo.App()\n", False),  # would shadow json for a script in that folder
+    ("q3/planted_ok.py", "import marimo\n\napp = marimo.App()\n", True),
+]
+
+
+def test_the_notebooks_folder_is_the_containers_own_and_only_notebooks_come_back(docker_kernel: Kernel):
+    """Nothing of the host's notebooks folder is mounted: the kernel's is a tmpfs, and of what notebook
+    code writes there only marimo notebooks with plain names reach this machine."""
+    kernel = docker_kernel.kernel
+    mounts = json.loads(docker_kernel.docker("inspect", "--format", "{{json .Mounts}}", kernel.container_ids[0])[0])
+    assert sorted(m["Destination"] for m in mounts) == ["/run/secrets/hailer-token", "/work/data"], mounts
+    assert all(m.get("RW") is False for m in mounts), "both read-only"
+    result = docker_kernel.run(
+        "print([line.split()[2] for line in open('/proc/mounts') if line.split()[1] == '/work/notebooks'])"
+    )
+    assert result.success and result.stdout.strip() == "['tmpfs']", result.stdout + result.stderr
+
+    code = "import pathlib\nroot = pathlib.Path('/work/notebooks')\n"
+    for name, text, _back in PLANTED:
+        code += f"(root / {name!r}).parent.mkdir(parents=True, exist_ok=True)\n(root / {name!r}).write_text({text!r})\n"
+    code += "print('PLANTED')"
+    result = docker_kernel.run(code)
+    assert result.success and result.stdout.strip() == "PLANTED", result.stderr
+    said: list[str] = []
+    kernel.notice = said.append
+    try:
+        assert "q3/planted_ok.py" in kernel.sync.sync_out()
+    finally:
+        kernel.notice = None
+    root = docker_kernel.config.notebooks_root
+    for name, text, back in PLANTED:
+        assert (root / name).exists() is back, name
+    assert (root / "q3" / "planted_ok.py").read_text(encoding="utf-8") == "import marimo\n\napp = marimo.App()\n"
+    assert not (root / ".git").exists() and not (root / ".vscode").exists()
+    assert any(".git/" in line and "conftest.py" in line for line in said), said
+
+
+def test_stop_copies_the_last_edit_back_and_leaves_no_containers_network_or_token(docker_kernel: Kernel):
     workspace = Path(docker_kernel.config.workspace)
     server = docker_kernel.kernel.server
     names = docker_kernel.runtime.names
+    result = docker_kernel.run(
+        "import pathlib\n"
+        "pathlib.Path('/work/notebooks/last.py').write_text('import marimo\\n\\napp = marimo.App()\\n# last edit\\n')\n"
+        "print('WRITTEN')"
+    )
+    assert result.success and result.stdout.strip() == "WRITTEN", result.stderr
 
     docker_kernel.kernel.stop()
+    last = docker_kernel.config.notebooks_root / "last.py"
+    assert last.read_text(encoding="utf-8").endswith("# last edit\n"), "the last copy ran before the container went"
+    assert not (docker_kernel.config.notebooks_root / "conftest.py").exists(), "and it copied nothing else"
 
     label = f"label={LABEL_WORKSPACE}={docker_kernel.runtime.workspace_label}"
     assert docker_kernel.docker("ps", "-a", "--filter", label, "--format", "{{.Names}}") == []

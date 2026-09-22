@@ -555,15 +555,26 @@ def test_kernel_bad_values_are_fatal(tmp_path: Path, text: str, env: dict, fragm
     assert len(errors) == 1 and fragment in errors[0], errors
 
 
-@pytest.mark.parametrize("data_dir", ["notebooks", "notebooks/data", "NOTEBOOKS/Data"])
-def test_docker_refuses_data_inside_the_notebooks_folder(tmp_path: Path, data_dir: str) -> None:
-    if data_dir != data_dir.lower() and not Path(str(tmp_path).upper()).exists():
-        pytest.skip("case-insensitive file system only")
-    ws = _make_workspace(tmp_path, f'[hailer]\ndata_dir = "{data_dir}"\n[kernel]\nruntime = "docker"\n')
+@pytest.mark.parametrize(
+    "text",
+    [
+        '[hailer]\ndata_dir = "notebooks/data"\n',
+        '[hailer]\nnotebooks_dir = "."\nnotebook = "analysis.py"\n',
+        '[hailer]\nnotebooks_dir = ".config/hailer/context"\nnotebook = ".config/hailer/context/a.py"\n',
+        '[hailer]\nnotebooks_dir = ".hailer/nb"\nnotebook = ".hailer/nb/a.py"\n',
+    ],
+    ids=["data-inside-notebooks", "workspace", "context-folder", "inside-.hailer"],
+)
+def test_docker_never_mounts_the_notebooks_folder_so_its_place_is_no_error(tmp_path: Path, text: str) -> None:
+    """The docker kernel's notebooks folder is its own; only allow-listed notebooks are copied back
+    (hailer.notebook_sync), so where the workspace keeps them no longer exposes anything."""
+    ws = _make_workspace(tmp_path, text + '[kernel]\nruntime = "docker"\n')
+    for name in ("analysis.py", ".config/hailer/context/a.py", ".hailer/nb/a.py"):
+        _write(ws / name, "import marimo\n")
     (ws / "notebooks" / "data").mkdir(exist_ok=True)
-    errors = _errors(validate(load_config(workspace=ws, env={})))
-    assert len(errors) == 1 and "[hailer].data_dir" in errors[0] and "writable" in errors[0]
-    assert _errors(validate(load_config(workspace=ws, env={"HAILER_KERNEL": "local"}))) == [], "local mounts nothing"
+    (ws / "notebooks" / ".git").mkdir()  # a git repository: fine too, nothing but notebooks is written there
+    config = load_config(workspace=ws, env={})
+    assert docker_mount_problems(config) == [] and _errors(validate(config)) == []
 
 
 def test_docker_allows_notebooks_inside_the_data_folder(tmp_path: Path) -> None:
@@ -680,17 +691,15 @@ def test_validate_provider_key_typo_is_an_unknown_key_warning(tmp_path: Path) ->
 @pytest.mark.parametrize(
     ("text", "fragment"),
     [
-        ('[hailer]\nnotebook = "analysis.py"\n', "The notebooks folder ({ws}) is the workspace folder"),
-        ('[hailer]\nnotebooks_dir = "."\n', "The notebooks folder ({ws}) is the workspace folder"),
         ('[hailer]\ndata_dir = "."\n', "The data folder ({ws}) is the workspace folder"),
         ('[hailer]\ndata_dir = ".hailer"\n', "The data folder ({ws}{sep}.hailer) is Hailer's .hailer folder"),
-        ('[hailer]\nnotebooks_dir = ".config/hailer/context"\nnotebook = ".config/hailer/context/a.py"\n', "is the context folder"),
-        ('[hailer]\nnotebooks_dir = ".hailer/nb"\nnotebook = ".hailer/nb/a.py"\n', "is inside Hailer's .hailer folder"),
+        ('[hailer]\ndata_dir = ".config/hailer/context"\n', "is the context folder"),
+        ('[hailer]\ndata_dir = ".config"\n', "contains the context folder"),
     ],
 )
 def test_docker_refuses_mounts_that_expose_hailers_own_files(tmp_path: Path, text: str, fragment: str) -> None:
-    """The kernel could rewrite hailer.toml (switch to local), read .hailer/ (the kernel's token,
-    conversations) or plant context. Fatal in docker mode only: the local runtime mounts nothing."""
+    """Notebook code would read hailer.toml, .hailer/ (the conversations) or the context through the
+    read-only data mount. Fatal in docker mode only: the local runtime mounts nothing."""
     ws = _make_workspace(tmp_path, text + '[kernel]\nruntime = "docker"\n')
     for name in ("analysis.py", ".config/hailer/context/a.py", ".hailer/nb/a.py"):
         _write(ws / name, "import marimo\n")
@@ -791,14 +800,6 @@ def test_docker_refuses_appdata_on_windows_but_not_the_temporary_folder(tmp_path
     assert not any("credentials" in p for p in docker_mount_problems(config, windows=False)), "Windows only"
 
 
-def test_docker_refuses_a_notebooks_folder_that_is_a_git_repository(tmp_path: Path) -> None:
-    ws = _make_workspace(tmp_path, '[kernel]\nruntime = "docker"\n')
-    (ws / "notebooks" / ".git").mkdir()
-    errors = _errors(validate(load_config(workspace=ws, env={})))
-    assert any(e.startswith(f"The notebooks folder ({(ws / 'notebooks').resolve()}) is a git repository") for e in errors), errors
-    assert not _errors(validate(load_config(workspace=ws, env={"HAILER_KERNEL": "local"}))), "local mode mounts nothing"
-
-
 def test_docker_refuses_unc_folders_as_errors(tmp_path: Path) -> None:
     ws = _make_workspace(tmp_path, '[kernel]\nruntime = "docker"\n')
     config = load_config(workspace=ws, env={})
@@ -811,13 +812,13 @@ def test_docker_refuses_unc_folders_as_errors(tmp_path: Path) -> None:
     ]
 
 
-def test_a_notebooks_folder_that_is_the_workspace_is_reported_once_in_docker_mode(tmp_path: Path) -> None:
+def test_a_notebooks_folder_that_is_the_workspace_is_one_warning_in_either_runtime(tmp_path: Path) -> None:
     ws = _make_workspace(tmp_path, '[hailer]\nnotebooks_dir = "."\nnotebook = "analysis.py"\n[kernel]\nruntime = "docker"\n')
     _write(ws / "analysis.py", "import marimo\n")
-    problems = validate(load_config(workspace=ws, env={}))
-    assert sum("is the workspace" in p for p in problems) == 1, problems
-    local = validate(load_config(workspace=ws, env={"HAILER_KERNEL": "local"}))
-    assert any(p.startswith("Warning: the notebooks folder is the workspace itself") for p in local), "the local warning stays"
+    for env in ({}, {"HAILER_KERNEL": "local"}):
+        problems = validate(load_config(workspace=ws, env=env))
+        assert sum("is the workspace" in p for p in problems) == 1, problems
+        assert any(p.startswith("Warning: the notebooks folder is the workspace itself") for p in problems)
 
 
 def test_pass_env_naming_hailers_own_secrets_is_a_warning(tmp_path: Path) -> None:

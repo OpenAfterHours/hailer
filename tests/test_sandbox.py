@@ -184,8 +184,28 @@ def test_urls_and_describe(fake, tmp_path):
     assert box.notebook_url("q3/r.py") == f"{fake.url}/?file=/work/notebooks/q3/r.py&view-as=present"
     assert box.notebook_url("q3/r.py", with_token=True).endswith(f"&access_token={TOKEN}")
     assert box.describe().startswith("docker (hailer-kernel ")
-    assert box.sync_out() == [], "a no-op until notebooks live in the sandbox"
+    assert box.sync_soon() is None, "the shared part copies nothing"
     box.stop()  # nothing to stop in the shared part; runtimes override it
+
+
+def test_list_tree_lists_everything_but_never_looks_into_dot_or_dunder_folders(box, tmp_path):
+    root = tmp_path / "notebooks"
+    _write(root / "sales.py")
+    _write(root / "q3" / "review.py")
+    _write(root / "out.csv", "a\n")
+    _write(root / ".git" / "config", "[core]\n")
+    _write(root / "__marimo__" / "session" / "sales.py.json", "{}\n")
+    _write(root / "a" / "b" / "c" / "d" / "e" / "deep.py")
+    tree = box.list_tree()
+    assert [(e.name, e.folder) for e in tree] == [
+        (".git", True), ("__marimo__", True), ("a", True), ("a/b", True), ("a/b/c", True), ("a/b/c/d", True),
+        ("a/b/c/d/e", True), ("out.csv", False), ("q3", True), ("q3/review.py", False), ("sales.py", False),
+    ]  # fmt: skip
+    assert next(e for e in tree if e.name == "sales.py").size == len(NB.encode())
+    notices: list[str] = []
+    box.notice = notices.append
+    box.notify("careful")
+    assert notices == ["careful"]
 
 
 def _inside_root(box: sb.MarimoSandbox, paths: list[str]) -> bool:

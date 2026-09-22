@@ -35,10 +35,12 @@ import re
 import secrets
 import socket
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 
@@ -46,6 +48,34 @@ from hailer.errors import MarimoExecutionError, MarimoUnavailableError, NoSessio
 from hailer.models import ExecResult, MarimoServer, MarimoSession
 
 SERVER_TOKEN_HEADER = "Marimo-Server-Token"
+#: The largest notebook Hailer reads or copies (the sandbox's limit; defined here so replies can be
+#: sized from it).
+MAX_NOTEBOOK_BYTES = 5 * 1024 * 1024
+#: The largest reply body Hailer reads from marimo (a notebook's text escaped in JSON, plus room for
+#: the listing around it). A longer reply is an error, never read to the end: whatever runs in the
+#: kernel can replace the marimo server and answer anything.
+MAX_REPLY_BYTES = 3 * MAX_NOTEBOOK_BYTES + 1024 * 1024
+#: How much of a reply is read at once (the deadline is checked between reads).
+_READ_CHUNK = 64 * 1024
+_deadlines = threading.local()
+
+
+@contextmanager
+def request_deadline(seconds: float) -> Iterator[None]:
+    """Every marimo request this thread makes inside the block, connecting, headers and the whole
+    body, must finish within ``seconds`` in total (``time.monotonic``); one past it fails with
+    ``MarimoUnavailableError`` ("out of time"). Nested blocks keep the earlier deadline."""
+    previous = getattr(_deadlines, "at", None)
+    at = time.monotonic() + seconds
+    _deadlines.at = at if previous is None else min(previous, at)
+    try:
+        yield
+    finally:
+        _deadlines.at = previous
+
+
+def _deadline() -> float | None:
+    return getattr(_deadlines, "at", None)
 _HEALTH_TIMEOUT = 1.0
 _SERVER_TOKEN_RE = re.compile(r"<marimo-server-token[^>]*\bdata-token=[\"']([^\"']+)[\"']", re.IGNORECASE)
 
@@ -408,6 +438,39 @@ class MarimoClient:
             headers.update(extra)
         return headers
 
+    def _read(self, resp, path: str, limit: int | None = None) -> bytes:
+        """The body of ``resp``, at most ``limit`` bytes (a larger ``Content-Length``, or more data,
+        is ``MarimoUnavailableError`` without reading on), read in chunks against this thread's
+        :func:`request_deadline`, so a server that trickles its answer cannot hold Hailer."""
+        limit = MAX_REPLY_BYTES if limit is None else limit
+        length = resp.headers.get("Content-Length")
+        if length is not None and length.strip().isdigit() and int(length) > limit:
+            raise self._too_large(path, limit)
+        deadline = _deadline()
+        chunks: list[bytes] = []
+        size = 0
+        while True:
+            if deadline is not None and time.monotonic() > deadline:
+                raise self._unavailable("out of time")
+            try:
+                chunk = resp.read1(_READ_CHUNK)
+            except (socket.timeout, TimeoutError) as err:
+                raise self._unavailable("timed out") from err
+            except OSError as err:
+                raise self._unavailable(str(err)) from err
+            if not chunk:
+                return b"".join(chunks)
+            size += len(chunk)
+            if size > limit:
+                raise self._too_large(path, limit)
+            chunks.append(chunk)
+
+    def _too_large(self, path: str, limit: int) -> MarimoUnavailableError:
+        return MarimoUnavailableError(
+            f"Marimo at {self.base_url} answered {path} with more than {limit // (1024 * 1024)} MiB; Hailer stopped reading.",
+            hint="A notebook this large is not copied or read. " + launch_hint(),
+        )
+
     def _unavailable(self, reason: str) -> MarimoUnavailableError:
         return MarimoUnavailableError(
             f"Marimo is not running at {self.base_url} ({reason}).",
@@ -425,8 +488,15 @@ class MarimoClient:
 
     def _open(self, method: str, path: str, body: bytes | None = None, headers: dict[str, str] | None = None, timeout: float | None = None):
         req = urllib.request.Request(f"{self.base_url}{path}", data=body, method=method, headers=self._headers(headers))
+        timeout = timeout if timeout is not None else self.timeout
+        deadline = _deadline()
+        if deadline is not None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise self._unavailable("out of time")
+            timeout = min(timeout, left)
         try:
-            return urllib.request.urlopen(req, timeout=timeout if timeout is not None else self.timeout)  # noqa: S310
+            return urllib.request.urlopen(req, timeout=timeout)  # noqa: S310
         except urllib.error.HTTPError as err:
             if err.code in (401, 403):
                 raise self._auth_error(err.code) from err
@@ -449,10 +519,10 @@ class MarimoClient:
     def sessions(self) -> list[MarimoSession]:
         try:
             with self._open("GET", "/api/sessions") as resp:
-                payload = json.loads(resp.read().decode("utf-8", "replace") or "{}")
+                payload = json.loads(self._read(resp, "/api/sessions").decode("utf-8", "replace") or "{}")
         except urllib.error.HTTPError as err:
             # 401/403 are already mapped by _open; anything else (500, 404 on an old marimo) lands here.
-            detail = _error_detail(err.read())
+            detail = _error_detail(err.read(65536))
             raise MarimoUnavailableError(
                 f"Marimo at {self.base_url} answered HTTP {err.code} to /api/sessions" + (f": {detail}" if detail else "."),
                 hint="Check the marimo server log for errors (0.24.x is expected). " + launch_hint(),
@@ -507,7 +577,7 @@ class MarimoClient:
         headers = {"Content-Type": content_type, SERVER_TOKEN_HEADER: self.server_token()}
         try:
             with self._open("POST", path, body=body, headers=headers) as resp:
-                return resp.read()
+                return self._read(resp, path)
         except MarimoUnavailableError as err:
             cause = err.__cause__
             if isinstance(cause, urllib.error.HTTPError) and cause.code == 401:
@@ -532,7 +602,7 @@ class MarimoClient:
         return reply if isinstance(reply, dict) else {}
 
     def _file_error(self, path: str, err: urllib.error.HTTPError) -> MarimoUnavailableError:
-        detail = _error_detail(err.read())
+        detail = _error_detail(err.read(65536))
         return MarimoUnavailableError(
             f"Marimo at {self.base_url} answered HTTP {err.code} to {path}" + (f": {detail}" if detail else "."),
             hint="Check the marimo server log for errors (0.24.x is expected). " + launch_hint(),
@@ -550,7 +620,7 @@ class MarimoClient:
         try:
             self._post("/api/home/shutdown_session", json.dumps({"sessionId": session_id}).encode("utf-8"), "application/json")
         except urllib.error.HTTPError as err:
-            detail = _error_detail(err.read())
+            detail = _error_detail(err.read(65536))
             raise MarimoUnavailableError(
                 f"Marimo refused to close session {session_id} (HTTP {err.code})" + (f": {detail}" if detail else "."),
                 hint="Check that the session id is current; GET /api/sessions lists the open ones.",
@@ -666,7 +736,7 @@ class MarimoClient:
         try:
             resp = self._open("POST", "/api/kernel/execute", body=body, headers=headers, timeout=timeout)
         except urllib.error.HTTPError as err:
-            detail = _error_detail(err.read())
+            detail = _error_detail(err.read(65536))
             raise MarimoExecutionError(
                 f"Marimo refused the execute request (HTTP {err.code}): {detail}",
                 hint="Check that the notebook is still open in the browser and that the session id is current.",

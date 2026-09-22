@@ -1711,30 +1711,35 @@ def docker_config(config: HailerConfig) -> HailerConfig:
 
 
 @pytest.fixture
-def docker(harness, monkeypatch):
+def docker(harness, monkeypatch, tmp_path):
     """The real DockerRuntime (and ``hailer kernel ...``) driving a scripted docker CLI with state:
-    nothing runs. Local configs still get whatever runtime was set up before (list ``nb`` first
-    to fake it)."""
+    nothing runs. The kernel's own notebooks folder is ``fake.notebooks`` (a folder standing in for
+    the container's tmpfs; the real start copies the workspace's notebooks in and back), and its
+    clients are the harness's. Local configs still get whatever runtime was set up before (list
+    ``nb`` first to fake it)."""
     from fake_docker import FakeDocker
-    from hailer import kernel_docker
+    from hailer import kernel_docker, notebook_sync
 
     fake = FakeDocker()
+    fake.notebooks = tmp_path / "kernel-notebooks"
+    fake.notebooks.mkdir()
     local_runtime_for = cli._runtime_for
+    real_kernel = kernel_docker.DockerKernel
 
     def runtime_for(config):
         if config.kernel.runtime != "docker":
             return local_runtime_for(config)
-        return Runtime(
-            config, runner=fake, token_factory=lambda: TOKEN, health=lambda url, timeout, token=None, should_stop=None: True, user=lambda: None
+        return kernel_docker.DockerRuntime(
+            config, runner=fake, token_factory=lambda: TOKEN, health=lambda url, timeout, token=None, should_stop=None: True,
+            user=lambda: None,
         )  # fmt: skip
 
-    class Runtime(kernel_docker.DockerRuntime):
-        """The real start; its sandbox serves the notebooks folder and its clients are the harness's."""
+    def folder_kernel(**fields):
+        kernel = real_kernel(**fields)
+        return with_folder_files(kernel, fake.notebooks, lambda **kw: harness.bound_client(kernel))
 
-        def start(self, port, *, foreground=False):
-            running = super().start(port, foreground=foreground)
-            return with_folder_files(running, self.config.notebooks_root, lambda **kw: harness.bound_client(running))
-
+    monkeypatch.setattr(kernel_docker, "DockerKernel", folder_kernel)
+    monkeypatch.setattr(notebook_sync, "SYNC_INTERVAL_SEC", 3600.0)  # copies come from turns and the stop only
     monkeypatch.setattr(cli, "_runtime_for", runtime_for)
     monkeypatch.setattr(cli, "_docker_runner", lambda: fake)
     monkeypatch.setattr(kernel_docker, "_sleep", lambda seconds: None)  # network rm retries
@@ -2135,61 +2140,96 @@ def test_init_kernel_flag_with_an_existing_config(harness, tmp_path, monkeypatch
 
 
 # --------------------------------------------------------------------------- #
-# Final fix pass: one rule set on every start path, planted files, status, wording
+# Final fix pass: one rule set on every start path, notebook copies, status, wording
 # --------------------------------------------------------------------------- #
 
 
-def test_foreground_refuses_data_inside_the_notebooks_folder(harness, nb, docker):
-    """--foreground never runs validate(): the start itself refuses, before any container, instead of
-    starting a kernel whose "read-only" data sits in the writable notebooks mount."""
-    config = docker_config(harness.config)
-    harness.config = replace(config, data_dir=config.notebooks_root / "data")
+def test_foreground_refuses_a_data_folder_that_exposes_hailers_files(harness, nb, docker):
+    """--foreground never runs validate(): the start itself refuses, before any container, to mount
+    a data folder that is the workspace (notebook code would read hailer.toml and .hailer/)."""
+    harness.config = replace(docker_config(harness.config), data_dir=harness.config.workspace)
     result = notebook_cmd(["--foreground", "--no-browser"])
     assert result.exit_code == 1
-    assert f"[hailer].data_dir ({config.notebooks_root / 'data'}) is inside the notebooks folder" in result.output
+    assert f"The data folder ({harness.config.workspace}) is the workspace folder" in result.output
     assert not docker.commands("run") and not docker.commands("network", "create") and not docker.streams
 
 
-def test_foreground_refuses_a_notebooks_folder_that_is_a_git_repository(harness, nb, docker):
-    harness.config = docker_config(harness.config)
-    (harness.config.notebooks_root / ".git").mkdir()
-    result = notebook_cmd(["--foreground", "--no-browser"])
-    assert result.exit_code == 1 and "is a git repository (it has .git at its top level)" in result.output
-    assert not docker.commands("run")
+def _plant(folder: Path) -> None:
+    """What notebook code in the container could write into its notebooks folder."""
+    for name, text in {
+        ".git/config": "[core]\n\tfsmonitor = echo owned\n",
+        ".vscode/settings.json": "{}\n",
+        "conftest.py": NOTEBOOK_SOURCE,
+        "helper.py": "import os\n",
+    }.items():
+        (folder / name).parent.mkdir(parents=True, exist_ok=True)
+        (folder / name).write_text(text, encoding="utf-8")
 
 
-def test_a_chat_that_stops_its_docker_kernel_warns_about_planted_files(harness, nb, docker):
-    def plant():
-        (harness.config.notebooks_root / ".vscode").mkdir(exist_ok=True)  # what notebook code could do
-        (harness.config.notebooks_root / ".git").mkdir(exist_ok=True)
+PLANTED_NOTICE = (
+    "Not copied back from the kernel (only marimo notebooks with plain names are; everything else stays in the "
+    "kernel and is gone when it stops): .git/, .vscode/, conftest.py, helper.py."
+)
 
-    harness.agent.on_turn = plant
+
+@pytest.mark.parametrize("input_text", ["hi\n/exit\n", "hi\n"], ids=["exit", "eof"])
+def test_a_docker_chat_copies_notebook_edits_back_and_nothing_else(harness, nb, docker, input_text):
+    """The workspace's notebooks go into the kernel's own folder at start; the kernel's edits come
+    back when the chat ends, however it ends, before the containers are removed; what notebook
+    code plants there never reaches this machine."""
+    root = harness.config.notebooks_root
+    (root / ".git").mkdir()  # the notebooks may live in a git repository now: nothing but notebooks is written there
+    (root / "test_helpers.py").write_text(NOTEBOOK_SOURCE, encoding="utf-8")
+    edited = NOTEBOOK_SOURCE + "# edited in the kernel\n"
+
+    def turn():
+        assert (docker.notebooks / "analysis.py").read_text(encoding="utf-8") == NOTEBOOK_SOURCE, "copied in at start"
+        assert not (docker.notebooks / "test_helpers.py").exists(), "a name test runners collect is never copied"
+        (docker.notebooks / "analysis.py").write_text(edited, encoding="utf-8")
+        _plant(docker.notebooks)
+
+    harness.agent.on_turn = turn
+    result = notebook_cmd(["--kernel", "docker"], input_text=input_text)
+    assert result.exit_code == 0, result.output
+    assert "Not copied into the kernel (only marimo notebooks with plain names are): test_helpers.py." in result.output
+    assert (root / "analysis.py").read_text(encoding="utf-8") == edited
+    assert sorted(p.relative_to(root).as_posix() for p in root.rglob("*") if ".git" not in p.parts) == ["analysis.py", "test_helpers.py"]
+    assert list((root / ".git").iterdir()) == [], "the repository here is untouched"
+    assert result.output.index(PLANTED_NOTICE) < result.output.index("Stopped marimo."), "copied back before the kernel went"
+    assert docker.containers == {} and docker.networks == {}
+
+
+def test_a_turn_asks_for_a_copy_back_at_once(harness, nb, docker):
+    copies: list[str] = []
+
+    def turn():
+        sandbox = harness.agent_sandboxes[-1]
+        real = sandbox.sync_soon
+        sandbox.sync_soon = lambda: (copies.append("soon"), real())[1]
+
+    harness.agent.on_turn = turn
     result = notebook_cmd(["--kernel", "docker"], input_text="hi\n/exit\n")
     assert result.exit_code == 0, result.output
-    stopped = result.output.index("Stopped marimo.")
-    warning = f"WARNING: the notebooks folder {harness.config.notebooks_root} contains .git, .vscode."
-    assert warning in result.output[stopped:], result.output
-    assert "delete them before you run git in that folder, open it in an editor" in result.output
+    assert copies, "after a turn the periodic copy is woken instead of waiting its interval"
 
 
-def test_foreground_end_warns_about_planted_files(harness, nb, docker):
-    def plant_then_ctrl_c(args):
+def test_foreground_end_copies_notebook_edits_back_and_nothing_else(harness, nb, docker):
+    edited = NOTEBOOK_SOURCE + "# edited in the browser\n"
+
+    def edit_then_ctrl_c(args):
         if args[:2] == ["logs", "-f"]:
-            (harness.config.notebooks_root / ".devcontainer").mkdir()
+            (docker.notebooks / "analysis.py").write_text(edited, encoding="utf-8")
+            _plant(docker.notebooks)
             raise KeyboardInterrupt
 
-    docker.stream_hook = plant_then_ctrl_c
+    docker.stream_hook = edit_then_ctrl_c
     result = notebook_cmd(["--kernel", "docker", "--foreground", "--no-browser"])
     assert result.exit_code == 0, result.output
-    assert f"WARNING: the notebooks folder {harness.config.notebooks_root} contains .devcontainer." in result.output
-
-
-def test_kernel_stop_prints_the_planted_files_warning(harness, docker):
-    docker.add_container("hailer-kernel-a-1", workspace=str(harness.config.workspace))
-    (harness.config.notebooks_root / ".idea").mkdir()
-    result = runner.invoke(cli.app, ["kernel", "stop"], catch_exceptions=False)
-    assert result.exit_code == 0, result.output
-    assert f"WARNING: the notebooks folder {harness.config.notebooks_root} contains .idea." in result.output
+    root = harness.config.notebooks_root
+    assert (root / "analysis.py").read_text(encoding="utf-8") == edited
+    assert sorted(p.name for p in root.iterdir()) == ["analysis.py"]
+    assert PLANTED_NOTICE in result.output
+    assert docker.containers == {} and docker.networks == {}
 
 
 def test_a_local_foreground_server_ended_from_outside_says_so(harness, nb):

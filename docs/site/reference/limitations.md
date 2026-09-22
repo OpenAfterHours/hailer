@@ -23,8 +23,13 @@
   and small businesses, but larger organisations need a paid subscription (check Docker's current terms),
   and managed machines often block Docker Desktop, WSL2 or Hyper-V. That is why `local` stays the default
   and fully supported.
-- Reading large files through a Windows bind mount is slower than reading them from a local folder; how
-  much slower for large Parquet files has not been measured yet.
+- Reading large data files through a Windows bind mount is slower than reading them from a local folder;
+  how much slower for large Parquet files has not been measured yet.
+- A docker kernel works on copies of the notebooks (see [Notebook copies](../security/docker.md#notebook-copies)):
+  only marimo notebooks with plain names travel, at most 500 of up to 5 MB each; other files notebook code
+  writes next to them are gone when the kernel stops; edits made on your machine during a session reach the
+  kernel only at the next start; and if Hailer is killed, the kernel's changes since the last copy (at most
+  about 15 seconds of browser edits, or the current turn) are lost.
 - The release workflow builds the `linux/arm64` kernel image (Apple Silicon, ARM Linux), but the CI
   integration test only covers amd64. Podman is not supported.
 - The docker kernel has only the packages in the image (marimo, Polars, fastexcel, DuckDB, altair, plotly); anything

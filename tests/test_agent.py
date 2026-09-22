@@ -363,8 +363,8 @@ def test_system_prompt_for_a_docker_kernel_gives_kernel_paths_and_its_limits(tmp
     workspace = text[text.index("## Workspace") :]
     assert workspace.startswith(
         "## Workspace\n\n"
-        "- Workspace: /work (in the kernel; only the two folders below are mounted)\n"
-        "- Notebooks folder: /work/notebooks (writable; the only place files persist)\n"
+        "- Workspace: /work (in the kernel; only the two folders below are yours)\n"
+        "- Notebooks folder: /work/notebooks (writable; only marimo notebooks are copied back to the user)\n"
         "- Data directory: /work/data (read-only)\n"
         "- Marimo URL: http://127.0.0.1:2731\n"
     )

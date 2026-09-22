@@ -36,10 +36,31 @@ def healthy(url, timeout, token=None, should_stop=None):
     return True
 
 
+class NoSync:
+    """No marimo answers behind these starts: the notebook copies are tests/test_notebook_sync.py's."""
+
+    def __init__(self, *args, **kwargs):
+        self.closed = []
+
+    def sync_in(self):
+        return []
+
+    def start(self, interval=None):
+        pass
+
+    def soon(self):
+        pass
+
+    def close(self, *, final=True):
+        self.closed.append(final)
+        return []
+
+
 @pytest.fixture(autouse=True)
 def _no_waiting(monkeypatch):
-    """Retries of `network rm` do not sleep in tests."""
+    """Retries of `network rm` do not sleep in tests, and nothing is copied."""
     monkeypatch.setattr(kd, "_sleep", lambda seconds: None)
+    monkeypatch.setattr(kd, "NotebookSync", NoSync)
 
 
 def docker_runtime(tmp_path: Path, fake: FakeDocker, *, kernel: dict | None = None, config=None, **kw) -> kd.DockerRuntime:
@@ -228,25 +249,21 @@ def test_cpus_above_what_docker_has_are_lowered_with_a_note(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# Folders that must never be mounted (S1, S2) and folders Docker cannot mount
+# The data folder: never one that exposes Hailer's files; folders Docker cannot mount
 # --------------------------------------------------------------------------- #
 
 
 @pytest.mark.parametrize(
     ("notebooks", "data", "fragment"),
     [
-        ("", "data", "The notebooks folder ({ws}) is the workspace folder"),  # notebook = "analysis.py"
         ("notebooks", "", "The data folder ({ws}) is the workspace folder"),
-        (".hailer/nb", "data", "is inside Hailer's .hailer folder"),
-        (".config/hailer", "data", "contains the context folder"),
         ("notebooks", ".hailer", "is Hailer's .hailer folder"),
-        ("notebooks", "notebooks/data", "[hailer].data_dir ({ws}{sep}notebooks{sep}data) is inside the notebooks folder"),
-        ("notebooks", "notebooks", "[hailer].data_dir ({ws}{sep}notebooks) is inside the notebooks folder"),
+        ("notebooks", ".config/hailer", "contains the context folder"),
     ],
 )
 def test_start_refuses_mounts_that_expose_hailers_own_files(tmp_path, notebooks, data, fragment):
     """Checked on every start path, from the one rule set (config.docker_mount_problems): --foreground
-    never validates hailer.toml, and HAILER_NOTEBOOKS_DIR / HAILER_DATA_DIR can move the folders."""
+    never validates hailer.toml, and HAILER_DATA_DIR can move the folder."""
     config = make_config(
         tmp_path,
         notebooks_dir=tmp_path / notebooks if notebooks else tmp_path,
@@ -264,32 +281,23 @@ def test_start_refuses_mounts_that_expose_hailers_own_files(tmp_path, notebooks,
     assert not fake.streams and not fake.commands("run") and not fake.commands("network", "create"), "refused before any pull or container"
 
 
-def test_start_refuses_a_notebooks_folder_that_is_a_git_repository(tmp_path):
-    """Notebook code could add git hooks or core.fsmonitor there, which run on this machine the next
-    time git or an editor (VS Code scans nested repositories) touches it."""
-    (tmp_path / "notebooks" / ".git").mkdir(parents=True)
+@pytest.mark.parametrize("notebooks", ["", "notebooks/.git", ".hailer/nb", ".config/hailer/context", "unc"])
+def test_the_notebooks_folder_is_never_mounted_so_no_layout_of_it_is_refused(tmp_path, monkeypatch, notebooks):
+    """The kernel's notebooks folder is its own tmpfs: a notebooks folder that is the workspace, a
+    git repository, inside .hailer or the context folder, or on a network share starts, and no
+    part of it reaches the container (only allow-listed notebooks are copied back)."""
+    monkeypatch.setattr(kd, "_on_windows", lambda: notebooks == "unc")
+    if notebooks == "unc":
+        folder = Path(r"\\fileserver\team\notebooks")
+    else:
+        folder = (tmp_path / notebooks).parent if notebooks.endswith(".git") else tmp_path / notebooks
+        (tmp_path / notebooks).mkdir(parents=True, exist_ok=True)
+    config = make_config(tmp_path, notebooks_dir=folder, notebook=folder / "analysis.py", kernel=KernelConfig(runtime="docker"))
     fake = FakeDocker()
-    with pytest.raises(KernelRuntimeError) as exc:
-        docker_runtime(tmp_path, fake).start(2731)
-    assert str(exc.value).startswith(f"The notebooks folder ({tmp_path / 'notebooks'}) is a git repository (it has .git at its top level).")
-    assert "core.fsmonitor" in str(exc.value) and "plain subfolder of your repository" in str(exc.value)
-    (tmp_path / "notebooks" / ".git").rmdir()
-    (tmp_path / "notebooks" / ".git").write_text("gitdir: ../elsewhere\n", encoding="utf-8")  # a worktree's .git file
-    with pytest.raises(KernelRuntimeError):
-        docker_runtime(tmp_path, fake).start(2731)
-    assert not fake.commands("run")
-
-
-def test_unc_folders_are_refused_before_docker_run(tmp_path, monkeypatch):
-    """Docker Desktop answers a UNC mount with "%!(EXTRA string=is not a valid Windows path)"."""
-    monkeypatch.setattr(kd, "_on_windows", lambda: True)
-    share = Path(r"\\fileserver\team\notebooks")
-    config = make_config(tmp_path, notebooks_dir=share, notebook=share / "analysis.py", kernel=KernelConfig(runtime="docker"))
-    fake = FakeDocker()
-    with pytest.raises(KernelRuntimeError) as exc:
-        docker_runtime(tmp_path, fake, config=config).start(2731)
-    assert str(exc.value).startswith(f"The notebooks folder {share} is on a network share (UNC path), which Docker cannot mount.")
-    assert "[hailer].notebooks_dir" in str(exc.value) and not fake.commands("run")
+    docker_runtime(tmp_path, fake, config=config).start(2731)
+    run = " ".join(fake.commands("run")[0])
+    assert f"source={folder}," not in run and "target=/work/notebooks" not in run
+    assert "--tmpfs /work/notebooks:uid=1000,gid=1000,mode=0700,size=512m" in run
 
 
 @pytest.mark.parametrize("path", [r"\\fileserver\team\sales", r"\\?\UNC\fileserver\team\sales", "//fileserver/team/sales"])
@@ -323,23 +331,13 @@ def test_mapped_network_drives_are_flagged_and_local_drives_are_not(monkeypatch)
     assert kd.data_path_problems(Path(r"\\?\C:\sales"), windows=True, drive_type=lambda root: drives.get(root, 0)) == []
 
 
-def test_a_notebooks_folder_on_a_mapped_drive_gets_the_same_warning(tmp_path, monkeypatch):
+def test_doctor_has_no_notebooks_row_in_docker_mode(tmp_path, monkeypatch):
+    """Nothing about the notebooks folder can stop or weaken a docker kernel: it is never mounted."""
     monkeypatch.setattr(kd, "_on_windows", lambda: True)
     monkeypatch.setattr(kd, "_drive_type", lambda root: kd.DRIVE_REMOTE if root == "Z:\\" else 3)
-    rt = docker_runtime(tmp_path, FakeDocker(), config=make_config(tmp_path, notebooks_dir=Path("Z:/team/notebooks"), kernel=KernelConfig(runtime="docker")))
-    row = next(r for r in rt.check() if r.name == "notebooks")
-    assert not row.ok and not row.fatal and "a mapped network drive (Z:)" in row.hint and "[hailer].notebooks_dir" in row.hint
-
-
-def test_doctor_warns_about_files_other_programs_run_code_from(tmp_path):
-    notebooks = tmp_path / "notebooks"
-    (notebooks / ".vscode").mkdir(parents=True)
-    (notebooks / "hailer.toml").write_text("", encoding="utf-8")
-    row = next(r for r in docker_runtime(tmp_path, FakeDocker()).check() if r.name == "notebooks")
-    assert not row.ok and not row.fatal and row.summary == ".vscode, hailer.toml in the notebooks folder"
-    assert row.hint.startswith(f"WARNING: the notebooks folder {notebooks} contains .vscode, hailer.toml.")
-    assert "delete them before you run git in that folder, open it in an editor" in row.hint
-    assert kd.planted_files(notebooks) == [".vscode", "hailer.toml"] and kd.planted_files(None) == []
+    (tmp_path / "notebooks" / ".vscode").mkdir(parents=True)
+    config = make_config(tmp_path, notebooks_dir=Path("Z:/team/notebooks"), kernel=KernelConfig(runtime="docker"))
+    assert "notebooks" not in [r.name for r in docker_runtime(tmp_path, FakeDocker(), config=config).check()]
 
 
 def _link(link: Path, target: Path) -> None:
@@ -399,9 +397,9 @@ def test_start_runs_the_hardened_kernel_offline_behind_a_forwarder(tmp_path):
     assert fake.commands("run") == [[
         "run", "-d", "--pull", "never", "--name", names.kernel, "--network", names.network,
         "--init", "--read-only", "--tmpfs", "/tmp", "--tmpfs", "/home/analyst:uid=1000,gid=1000",
+        "--tmpfs", "/work/notebooks:uid=1000,gid=1000,mode=0700,size=512m",
         "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "256",
         "--memory", "4g", "--memory-swap", "4g", "--cpus", "2", "-w", "/work", *labels(tmp_path, "kernel", rt.owner_id),
-        "--mount", f"type=bind,source={tmp_path / 'notebooks'},target=/work/notebooks",
         "--mount", f"type=bind,source={tmp_path / 'data'},target=/work/data,readonly",
         "--mount", f"type=bind,source={token_file},target=/run/secrets/hailer-token,readonly",
         IMAGE, "marimo", "edit", "notebooks", "--host", "0.0.0.0", "--port", "2718",
@@ -419,26 +417,28 @@ def test_start_runs_the_hardened_kernel_offline_behind_a_forwarder(tmp_path):
 
     run = fake.commands("run")[0]
     assert "-p" not in run and "--publish" not in run, "no port on the kernel: the forwarder publishes it"
-    assert run.count("--mount") == 3 and not {"-v", "--volume", "--privileged", "--user"} & set(run), "nothing else is mounted"
+    assert run.count("--mount") == 2 and not {"-v", "--volume", "--privileged", "--user"} & set(run), "nothing else is mounted"
     assert "docker.sock" not in " ".join(run) and f"source={tmp_path}," not in " ".join(run), "not the workspace, not the Docker socket"
+    assert f"source={tmp_path / 'notebooks'}" not in " ".join(run), "the notebooks folder is copied, never mounted"
     assert all(TOKEN not in " ".join(c) for c in fake.calls), "the token is in no docker argument (docker inspect shows them)"
     assert waits == [("http://127.0.0.1:2731", k.START_TIMEOUT_SEC, False)], "should_stop: both containers run"
-    assert (tmp_path / "data").is_dir() and (tmp_path / "notebooks").is_dir(), "created before Docker could create them"
+    assert (tmp_path / "data").is_dir(), "created before Docker could create it"
 
     assert isinstance(running, kd.DockerKernel)
     assert running.server == MarimoServer(url="http://127.0.0.1:2731", token=TOKEN, runtime="docker")
-    # the sandbox: the kernel knows the folders by their mount points; data is listed on the host
+    # the sandbox: the kernel knows the folders by its own paths; data is listed on the host
     assert running.notebooks_path == "/work/notebooks" and running.data_path == "/work/data" and not running.native_paths
-    assert running.data_dir == tmp_path / "data" and running.notebooks_folder == tmp_path / "notebooks"
+    assert running.data_dir == tmp_path / "data" and isinstance(running.sync, NoSync), "the start set up the copies"
     assert running.notebook_url("q3/r.py") == "http://127.0.0.1:2731/?file=/work/notebooks/q3/r.py&view-as=present"
     assert running.describe() == f"docker (hailer-kernel {CONTRACT}; no network; data read-only)"
-    assert running.sync_out() == [], "a no-op while the notebooks folder is a bind mount"
     assert running.log_hint == f"docker logs {names.kernel}"
     assert running.containers == (names.kernel, names.forwarder) and running.container_ids == (kernel_c.id, forwarder_c.id)
     assert running.network == names.network and running.network_id == network.id
     assert [p.name for p in (tmp_path / ".hailer").glob("*.json")] == ["last-kernel.json"], "no kernel record: the chat holds it in memory"
 
+    sync = running.sync
     running.stop()
+    assert sync.closed == [True] and running.sync is None, "the last copy back, before removal"
     assert fake.calls[-3:] == [["rm", "-f", kernel_c.id], ["rm", "-f", forwarder_c.id], ["network", "rm", network.id]], "by id"
     assert fake.containers == {} and fake.networks == {}
     running.stop()  # idempotent: "No such container" is not an error
@@ -448,7 +448,10 @@ def test_start_on_a_linux_host_runs_the_kernel_as_the_user(tmp_path):
     fake = FakeDocker()
     started(tmp_path, fake, user=lambda: (1234, 5678))
     run = fake.commands("run")[0]
-    assert follows(run, ["--tmpfs", "/home/analyst:uid=1234,gid=5678", "--user", "1234:5678", "-e", "HOME=/home/analyst"])
+    assert follows(run, [
+        "--tmpfs", "/home/analyst:uid=1234,gid=5678", "--tmpfs", "/work/notebooks:uid=1234,gid=5678,mode=0700,size=512m",
+        "--user", "1234:5678", "-e", "HOME=/home/analyst",
+    ])  # fmt: skip
     assert "--user" not in fake.commands("create")[0], "the forwarder touches no files"
 
 
@@ -842,18 +845,6 @@ def test_kernel_stop_reports_what_it_could_not_remove(tmp_path):
     names = kd.docker_names(tmp_path, SUFFIX)
     assert report.done == [f"Removed {names.kernel}, {names.forwarder}."]
     assert report.failed and all(line.startswith(f"Could not remove {names.network}: docker said:") for line in report.failed)
-
-
-def test_kernel_stop_warns_about_files_planted_in_the_notebooks_folder(tmp_path):
-    fake = FakeDocker()
-    _rt, running = started(tmp_path, fake)
-    (tmp_path / "notebooks" / ".git").mkdir()  # written by notebook code during the session
-    (tmp_path / "notebooks" / ".vscode").mkdir()
-    report = kd.stop_workspace_kernels(make_config(tmp_path), runner=fake)
-    assert report.done[0].startswith("Removed hailer-kernel-") and report.failed == []
-    assert report.warnings == [kd.planted_warning(tmp_path / "notebooks", [".git", ".vscode"])]
-    assert running.planted() == [".git", ".vscode"] and running.notebooks_folder == tmp_path / "notebooks"
-    assert kd.stop_workspace_kernels(make_config(tmp_path), runner=fake).warnings == [], "nothing was stopped"
 
 
 def test_kernel_stop_with_docker_down_or_missing(tmp_path):

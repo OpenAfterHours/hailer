@@ -546,31 +546,6 @@ def _is_drive_root(folder: Path) -> bool:
 CREDENTIAL_FOLDERS: tuple[str, ...] = (".config", ".ssh", ".aws", ".azure", ".gnupg", ".docker", ".kube")
 #: On Windows also these (applications keep their logins and browser profiles there).
 CREDENTIAL_FOLDER_VARS: tuple[str, ...] = ("APPDATA", "LOCALAPPDATA")
-NOTEBOOK_CONTROL_FILES = (".git", ".vscode", ".idea", ".devcontainer", "hailer.toml")
-
-
-def notebook_control_files(folder: Path) -> list[str]:
-    """Relative paths of repository, editor and workspace controls in a notebooks tree.
-
-    Inspect names only, never load their contents or follow symlinks/junctions. A missing root
-    is safe to create; other read errors propagate so startup cannot approve an unchecked tree.
-    """
-    found: list[str] = []
-    pending = [Path(folder)]
-    while pending:
-        current = pending.pop()
-        try:
-            with os.scandir(current) as entries:
-                for entry in entries:
-                    path = Path(entry.path)
-                    if entry.name.lower() in NOTEBOOK_CONTROL_FILES:
-                        found.append(path.relative_to(folder).as_posix())
-                    if entry.name.lower() != ".git" and entry.is_dir(follow_symlinks=False) and not path.is_junction():
-                        pending.append(path)
-        except FileNotFoundError:
-            if current != Path(folder):
-                raise  # the tree changed while checked: retry startup
-    return sorted(found)
 
 
 def _on_windows() -> bool:
@@ -606,113 +581,63 @@ def _in_temp(folder: Path) -> bool:
 
 
 def docker_mount_problems(config: HailerConfig, *, windows: bool | None = None) -> list[str]:
-    """Every reason, in docker mode, not to mount the notebooks folder or the data folder (at most
-    one per folder, plus the data-inside-notebooks rule; empty when both are fine). The one place
-    for these rules: ``validate()`` reports them and :class:`~hailer.kernel_docker.DockerRuntime`
-    refuses to start on them, on every start path (``--foreground`` never runs ``validate()``, and
-    environment variables can move the folders after hailer.toml was read).
+    """Every reason, in docker mode, not to mount the data folder (at most one; empty when it is
+    fine). The one place for these rules: ``validate()`` reports them and
+    :class:`~hailer.kernel_docker.DockerRuntime` refuses to start on them, on every start path
+    (``--foreground`` never runs ``validate()``, and environment variables can move the folder
+    after hailer.toml was read). The data folder is the only folder of this machine a docker kernel
+    sees (read-only); its notebooks folder is the container's own, copied to and from the
+    workspace's (:mod:`hailer.notebook_sync`).
 
     - Windows: a UNC path (a network share): Docker cannot mount it.
-    - Neither mount may be a whole drive, or be or contain the home folder, the workspace folder,
-      Hailer's ``.hailer`` folder (the kernel's token, the conversations), the config file or the
-      context, skills and prompts folders: notebook code would read Hailer's own files and,
-      through the writable notebooks folder, change them (switch the runtime back to local, plant
-      context sent to the model). The notebooks folder may not sit inside ``.hailer`` or those
-      folders either.
-    - Neither mount may be, contain or sit inside a folder that holds credentials
+    - It may not be a whole drive, or be or contain the home folder, the workspace folder, Hailer's
+      ``.hailer`` folder (the conversations), the config file or the context, skills and prompts
+      folders: notebook code would read Hailer's own files.
+    - It may not be, contain or sit inside a folder that holds credentials
       (:data:`CREDENTIAL_FOLDERS` under home; on Windows %APPDATA% and %LOCALAPPDATA%, outside the
       temporary folder).
-    - The data folder may not be, or sit inside, the notebooks folder (it would become writable).
-    - The notebooks folder may not be a git repository (``.git`` at its top level): notebook code
-      could add hooks or ``core.fsmonitor`` to it, which run on this machine the next time git or
-      an editor touches the repository.
     """
     windows = _on_windows() if windows is None else windows
+    folder = config.data_dir
     workspace = Path(config.workspace)
-    hailer_dir = workspace / ".hailer"
-    guarded: list[tuple[Path, str]] = [(workspace, "the workspace folder"), (hailer_dir, "Hailer's .hailer folder")]
+    guarded: list[tuple[Path, str]] = [(workspace, "the workspace folder"), (workspace / ".hailer", "Hailer's .hailer folder")]
     try:
         guarded.insert(0, (Path.home(), "your home folder"))
     except RuntimeError:  # no home folder to protect
         pass
     if config.config_path is not None:
         guarded.append((config.config_path, f"the config file {config.config_path.name}"))
-    private = [(config.context_dir, "the context folder"), (config.skills_dir, "the skills folder"), (config.prompts_dir, "the prompts folder")]
-    guarded += private
-    credentials = _credential_folders(windows)
+    guarded += [(config.context_dir, "the context folder"), (config.skills_dir, "the skills folder"), (config.prompts_dir, "the prompts folder")]
     docker = '[kernel] runtime = "docker"'
-    problems: list[str] = []
-    mounts = (
-        (config.notebooks_root, "notebooks folder", "writable ", "change", "[hailer].notebooks_dir (or the folder of [hailer].notebook)", "notebooks/"),
-        (config.data_dir, "data folder", "", "read", "[hailer].data_dir", "data/"),
-    )
-    for folder, what, writable, verb, setting, example in mounts:
-        fix = f"Keep the {what} a folder of its own, such as {example}, and point {setting} at it."
-        if windows and is_unc_path(folder):  # first: resolving a share's path can wait on the network
-            problems.append(
-                f"The {what} {folder} is on a network share (UNC path), which Docker cannot mount. "
-                f"Copy it to a folder on a local disk and point {setting} at it."
-            )
-            continue
-        if _is_drive_root(folder):
-            problems.append(f"The {what} ({folder}) is a whole drive. With {docker} it is mounted {writable}into the container. {fix}")
-            continue
-        found = next(((target, name) for target, name in guarded if _inside_or_equal(target, folder)), None)
-        if found is not None:
-            target, name = found
-            relation = "is" if _same_folder(target, folder) else "contains"
-            problems.append(
-                f"The {what} ({folder}) {relation} {name}. With {docker} it is mounted {writable}into the container, "
-                f"so notebook code could {verb} Hailer's own files. {fix}"
-            )
-            continue
-        secret = next((target for target in credentials if _inside_or_equal(target, folder)), None)
-        if secret is None:
-            appdata = [Path(os.environ[var]) for var in CREDENTIAL_FOLDER_VARS if windows and os.environ.get(var)]
-            secret = next((target for target in credentials if _inside_or_equal(folder, target)
-                           and not (_in_temp(folder) and any(_same_folder(target, app) for app in appdata))), None)
-        if secret is not None:
-            relation = "is" if _same_folder(secret, folder) else ("contains" if _inside_or_equal(secret, folder) else "is inside")
-            problems.append(
-                f"The {what} ({folder}) {relation} {secret}, a folder that holds credentials. With {docker} it is "
-                f"mounted {writable}into the container, so notebook code could {verb} them. {fix}"
-            )
-            continue
-        if writable:
-            inside = next(((target, name) for target, name in [(hailer_dir, "Hailer's .hailer folder"), *private] if _inside_or_equal(folder, target)), None)
-            if inside is not None:
-                problems.append(
-                    f"The {what} ({folder}) is inside {inside[1]}. With {docker} it is writable from notebook code, "
-                    f"so notebook code could change Hailer's own files. {fix}"
-                )
-                continue
-            if os.path.lexists(Path(folder) / ".git"):
-                problems.append(
-                    f"The notebooks folder ({folder}) is a git repository (it has .git at its top level). With {docker} "
-                    "it is writable from notebook code, which could add git hooks or settings (core.fsmonitor) that run "
-                    "on this machine the next time git or an editor touches the repository. Keep the notebooks in a "
-                    "plain subfolder of your repository (such as notebooks/), or remove the nested repository."
-                )
-                continue
-            try:
-                controls = notebook_control_files(Path(folder))
-            except OSError as err:
-                problems.append(f"Cannot inspect the notebooks folder ({folder}) for nested repositories or workspaces: {err}. {fix}")
-                continue
-            unsafe = [name for name in controls if Path(name).name.lower() in (".git", "hailer.toml")]
-            if unsafe:
-                problems.append(
-                    f"The notebooks folder ({folder}) contains repository or workspace controls: {', '.join(unsafe)}. "
-                    "Notebook code could change their hooks or settings and run commands on this machine later. "
-                    "Move those repositories or workspaces outside the notebooks folder before using Docker."
-                )
-        elif _inside_or_equal(folder, config.notebooks_root):
-            problems.append(
-                f"[hailer].data_dir ({folder}) is inside the notebooks folder ({config.notebooks_root}). "
-                f"With {docker} the notebooks folder is writable from notebook code, so the data would be too. "
-                "Keep the data in its own folder (the default is data/ next to notebooks/)."
-            )
-    return problems
+    fix = "Keep the data folder a folder of its own, such as data/, and point [hailer].data_dir at it."
+    if windows and is_unc_path(folder):  # first: resolving a share's path can wait on the network
+        return [
+            f"The data folder {folder} is on a network share (UNC path), which Docker cannot mount. "
+            "Copy it to a folder on a local disk and point [hailer].data_dir at it."
+        ]
+    if _is_drive_root(folder):
+        return [f"The data folder ({folder}) is a whole drive. With {docker} it is mounted into the container. {fix}"]
+    found = next(((target, name) for target, name in guarded if _inside_or_equal(target, folder)), None)
+    if found is not None:
+        target, name = found
+        relation = "is" if _same_folder(target, folder) else "contains"
+        return [
+            f"The data folder ({folder}) {relation} {name}. With {docker} it is mounted into the container, "
+            f"so notebook code could read Hailer's own files. {fix}"
+        ]
+    credentials = _credential_folders(windows)
+    secret = next((target for target in credentials if _inside_or_equal(target, folder)), None)
+    if secret is None:
+        appdata = [Path(os.environ[var]) for var in CREDENTIAL_FOLDER_VARS if windows and os.environ.get(var)]
+        secret = next((target for target in credentials if _inside_or_equal(folder, target)
+                       and not (_in_temp(folder) and any(_same_folder(target, app) for app in appdata))), None)
+    if secret is not None:
+        relation = "is" if _same_folder(secret, folder) else ("contains" if _inside_or_equal(secret, folder) else "is inside")
+        return [
+            f"The data folder ({folder}) {relation} {secret}, a folder that holds credentials. With {docker} it is "
+            f"mounted into the container, so notebook code could read them. {fix}"
+        ]
+    return []
 
 
 def _kernel_problems(config: HailerConfig) -> list[str]:
@@ -795,7 +720,7 @@ def validate(config: HailerConfig) -> list[str]:
         folder_is_workspace = root.resolve() == Path(config.workspace).resolve()
     except OSError:
         folder_is_workspace = False
-    if folder_is_workspace and config.kernel.runtime != KERNEL_RUNTIME_DOCKER:  # docker mode: fatal, reported once below
+    if folder_is_workspace:
         problems.append(
             f"Warning: the notebooks folder is the workspace itself ({root}); marimo would scan the whole "
             "workspace (including .venv) for notebooks. Keep notebooks in a subfolder such as notebooks/ and "

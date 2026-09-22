@@ -8,8 +8,8 @@ stay on your machine; only marimo and the notebook code move into the container.
 | | `local` (the default) | `docker` |
 |---|---|---|
 | Where marimo and notebook code run | Hailer's own Python, as you | A Linux container, as a non-root user |
-| Files notebook code can read | Everything your account can | The notebooks folder and the data folder, nothing else |
-| Files it can change | Everything your account can | The notebooks folder only; data is read-only |
+| Files notebook code can read | Everything your account can | Its own copy of your notebooks and the data folder, nothing else |
+| Files it can change | Everything your account can | Its copy of the notebooks only; data is read-only, and only marimo notebooks are [copied back](#notebook-copies) |
 | Network | Yours | None, unless `network = true` |
 | Your environment variables | All except secret-looking names (see [Security](data-handling.md#security)) | None |
 | Needs | Nothing | Docker Desktop (Windows, macOS) or Docker Engine (Linux), and the kernel image |
@@ -47,7 +47,7 @@ runtime  = "docker"   # "local" (default) or "docker"
   Each session starts its own kernel with the settings in effect when it starts, so the line always
   describes the kernel this chat uses.
 - **Docker mode fails closed.** Docker missing or not running, Docker Desktop set to Windows containers,
-  an image of another kernel contract, or a folder layout it refuses (below): Hailer stops and says how to
+  an image of another kernel contract, or a data folder it refuses (below): Hailer stops and says how to
   fix it (see [Troubleshooting](../reference/troubleshooting.md#troubleshooting)). It never runs notebook code on this machine instead.
 
 ## First run: the kernel image
@@ -174,10 +174,11 @@ context; the command refers to their original paths.
 
 ## What notebook code can and cannot do in the container
 
-- **Two folders.** It sees the notebooks folder as `/work/notebooks` (read-write, the only place files
-  persist) and the data folder as `/work/data` (read-only). Nothing else of your machine: not the
-  workspace, `.hailer/`, `.config/hailer/`, your home folder or the Docker socket. The data files are read
-  in place through the mount, never copied. The starter notebook finds `WORKSPACE = /work` and
+- **Two folders.** It sees its own notebooks folder as `/work/notebooks` (in memory, at most 512 MB,
+  holding [copies](#notebook-copies) of your notebooks) and the data folder as `/work/data` (read-only).
+  The data folder is the only folder of your machine it sees: not your notebooks folder, the workspace,
+  `.hailer/`, `.config/hailer/`, your home folder or the Docker socket. The data files are read in place
+  through the mount, never copied. The starter notebook finds `WORKSPACE = /work` and
   `DATA_DIR = /work/data`, the model is told those paths, and notebooks need no changes.
 - **No network.** No internet, no DNS, no route to this machine. Installing packages (`ctx.packages.add()`)
   and DuckDB's `INSTALL` fail. The image has marimo, Polars, fastexcel, DuckDB, altair and plotly; anything else
@@ -186,10 +187,12 @@ context; the command refers to their original paths.
   runs in it but the notebook helpers (`hailer.periods`) and the forwarder: no LangChain, no keyring, no
   API key.
 - **Limits.** A non-root user with no Linux capabilities, a read-only root file system, at most 256
-  processes, and the memory and CPU limits from `[kernel]` (memory without extra swap). On a Linux host
-  the kernel runs with your user and group id, so files marimo saves stay yours.
-- **Scratch space.** `/tmp` and the home folder are in memory, shared by every notebook in the container,
-  and wiped when the kernel stops.
+  processes, and the memory and CPU limits from `[kernel]` (memory without extra swap; the notebooks
+  folder counts towards it as it fills). On a Linux host the kernel runs with your user and group id, so it
+  can read data files only you may read.
+- **Scratch space.** `/tmp`, the home folder and the notebooks folder are in memory, shared by every
+  notebook in the container, and wiped when the kernel stops. A file notebook code writes (an export, a
+  chart) is gone then too, unless it is a notebook; write results to show in a notebook's output instead.
 - **Cells run when a notebook opens**, so the starter notebook's `DATA_DIR`, `data_files` and
   `period_files` exist before anyone runs a cell.
 
@@ -198,30 +201,79 @@ context; the command refers to their original paths.
 and other containers. Everything else above still holds, and the `Kernel:` line says
 `network on: the internet and this machine`.
 
-## Which folders can be mounted
+## Notebook copies
 
-In docker mode Hailer refuses a layout that would hand notebook code Hailer's own files, your
-credentials, or a way to run code on this machine later. `uvx hailer doctor` reports it in the `config`
-row, and every start stops on it, `--foreground` included (the same rules, in one place):
+A docker kernel never writes to your machine. When it starts, Hailer copies your notebooks into the
+kernel's own notebooks folder, before the browser opens one; while it runs, marimo, the agent and the
+browser change those copies; and Hailer copies the notebooks that changed back into your notebooks folder:
 
-- Neither the notebooks folder nor the data folder may be, or contain, a drive root, your home folder,
-  the workspace folder, `.hailer/`, the config file, or the context, skills and prompts folders.
-- Neither may be, contain or sit inside a folder that holds credentials: `~/.config`, `~/.ssh`, `~/.aws`,
+- after every agent turn and when the chat switches notebooks,
+- every 15 seconds while the kernel runs (edits made in the browser),
+- once more when the kernel stops, before its container is removed: when the chat ends (`/exit`,
+  Ctrl+D, Ctrl+C, an error) and when `--foreground` ends.
+
+**Only marimo notebooks with plain names are copied, in either direction.** A file is copied when all of
+these hold; everything else stays where it is, and Hailer names what it left in one line
+(`Not copied into the kernel ...`, `Not copied back from the kernel ...`):
+
+- a `.py` file (that spelling) with a relative name, at most four folders deep, and no part of its path
+  starting with `.` or `__` (so nothing in `.git/`, `.vscode/`, `.idea/`, `.devcontainer/`,
+  `__marimo__/` or `__pycache__/`, and no `__init__.py`);
+- not a name other tools run: `conftest.py`, `test_*.py`, `*_test.py`, `setup.py`, `noxfile.py`,
+  `tasks.py`, `fabfile.py`, `dodo.py`, `conf.py`, `manage.py`, `gunicorn.conf.py`, `ipython_config.py`,
+  `jupyter_*_config.py`, `sitecustomize.py`, `usercustomize.py`, `__main__.py` (any case);
+- no folder or file named like a Python module that a script in that folder would import instead: the
+  standard library (`json.py`, `csv.py`, `calendar.py`), what Hailer has installed and the kernel's packages
+  (`polars.py`, `marimo.py`), and common ones such as `pandas.py` (any case; the warning names the module);
+- no part that looks like a Windows short name (`~` and a digit, such as `SALES~1.py`);
+- UTF-8 text of at most 5 MB that contains `import marimo` and `marimo.App(`;
+- at most 500 notebooks.
+
+**Deadlines.** Whatever runs in the kernel can replace its marimo server, so Hailer trusts none of its
+answers: a reply is read in pieces up to about 16 MB (three times the notebook limit), the whole copy at
+the start and the last copy at the end each finish within 30 seconds, and a background copy stops after
+10 seconds or 50 MB read (the rest follows on the next pass). When a copy is cut short, Hailer says so,
+keeps the files on your machine as they were and, at the end of a session, goes on to remove the
+container.
+
+So notebook code cannot plant git hooks or settings, editor or dev-container settings, a `hailer.toml`,
+test-runner hooks or Python modules in your notebooks folder: those stay in the container and are gone when
+it stops. A notebook itself is still code: open one the kernel wrote only in a runtime you trust with it
+(the docker kernel, or `local` if you read it first). A copy back is written atomically (a temporary file
+replaced into place) inside the notebooks folder only, never through a symlink or junction; a failed copy is
+a warning, and the file on your machine stays as it was.
+
+**Conflicts.** Hailer remembers what it last copied for each notebook. If the file on your machine changed
+since then (you edited it in another editor while the chat ran) and the kernel's copy changed too, your
+version is first saved as `.hailer/notebook-backups/<name>.<date-time>.py`, then replaced, with a warning.
+A notebook deleted in the kernel is never deleted on your machine. Edits you make on your machine while a
+kernel runs are not copied into it; the next session picks them up.
+
+What is not copied back: files that are not notebooks (see above), and the kernel's changes since the
+last copy when Hailer is killed or a second Ctrl+C interrupts the last copy (it says so).
+
+## Which data folder can be mounted
+
+The data folder is the only folder of your machine a docker kernel sees (read-only). Hailer refuses one
+that would hand notebook code Hailer's own files or your credentials. `uvx hailer doctor` reports it in the
+`config` row, and every start stops on it, `--foreground` included (the same rules, in one place):
+
+- It may not be, or contain, a drive root, your home folder, the workspace folder, `.hailer/`, the config
+  file, or the context, skills and prompts folders.
+- It may not be, contain or sit inside a folder that holds credentials: `~/.config`, `~/.ssh`, `~/.aws`,
   `~/.azure`, `~/.gnupg`, `~/.docker`, `~/.kube`, and on Windows `%APPDATA%` and `%LOCALAPPDATA%` (the
   temporary folder inside it is fine).
-- The notebooks folder may not sit inside `.hailer/` or those folders either, and the data folder may not
-  sit inside the notebooks folder (it would become writable).
-- The notebooks folder may not contain `.git` or `hailer.toml`, including in subfolders: notebook code
-  could change repository hooks or another workspace's settings. Keep notebooks in a plain subfolder of
-  your repository, such as `notebooks/`, and move nested repositories and workspaces outside that folder.
-  Hailer checks names without following symlinks or junctions; an unreadable subtree stops startup.
-- The default layout, `notebooks/` and `data/` in the workspace, passes. The data folder can be anywhere
-  else on the machine: set `[hailer].data_dir` to an absolute path and it is mounted read-only where it is.
-- Windows: a folder on a network share (a UNC path such as `\\server\share\sales`) cannot be mounted: it
-  is an error in `doctor`'s `config` row and stops the start, with the same message. A mapped network drive
-  gets a warning (`doctor` rows `data` and `notebooks`): Docker Desktop usually cannot see it. Symlinks and
-  junctions inside the data folder that point outside it do not resolve in the container; `doctor` lists
-  them. Copy such data to a folder on a local disk.
+- The default, `data/` in the workspace, passes. The data folder can be anywhere else on the machine: set
+  `[hailer].data_dir` to an absolute path and it is mounted read-only where it is.
+- Windows: a data folder on a network share (a UNC path such as `\\server\share\sales`) cannot be mounted:
+  it is an error in `doctor`'s `config` row and stops the start, with the same message. A mapped network
+  drive gets a `data` warning: Docker Desktop usually cannot see it. Symlinks and junctions inside the data
+  folder that point outside it do not resolve in the container; `doctor` lists them. Copy such data to a
+  folder on a local disk.
+
+The notebooks folder is never mounted, so any notebooks folder works in docker mode, including one inside
+a git repository or on a network share: only [copies](#notebook-copies) of allow-listed notebooks are
+written there.
 
 ## Starting and stopping
 
@@ -239,7 +291,7 @@ row, and every start stops on it, `--foreground` included (the same rules, in on
   the lock when the process ends, however it ends. A start waits only for the server that answers with its
   own token, so two sessions that pick the same port never take each other's server. Nothing attaches to a
   kernel another session started; the chat keeps its own sandbox (the server's token, and where the
-  container sees the notebooks and data folders) in memory, including across notebook and model switches.
+  container sees its notebooks and the data folder) in memory, including across notebook and model switches.
 - **`--foreground`** starts the kernel and follows its log in this terminal, without a chat. Ctrl+C stops
   and removes it; when it ends for another reason, Hailer says why (out of memory, removed from outside,
   exited).
@@ -252,12 +304,9 @@ row, and every start stops on it, `--foreground` included (the same rules, in on
   when Docker is not running (so leftovers could not be checked), and exits 1 when a removal failed (a
   container another terminal is removing at the same moment counts as removed, and a network whose
   containers are still detaching is retried for a few seconds).
-- **Files the kernel may have planted.** When a docker kernel stops (the chat ends, `--foreground` ends,
-  `uvx hailer kernel stop`), Hailer scans the notebooks folder and its subfolders for `.git`, `.vscode`,
-  `.idea`, `.devcontainer` and `hailer.toml` and prints a loud `WARNING` naming them: notebook code can
-  write there, and git or an editor would run commands from them. Delete them (unless you put them there
-  yourself) before you run git in that folder or open it in an editor. `uvx hailer doctor` shows the
-  same as a `notebooks` warning. Nothing is removed for you.
+- **Notebooks at stop.** The session copies its kernel's changed notebooks back before it removes the
+  containers (see [Notebook copies](#notebook-copies)). `uvx hailer kernel stop` and the leftover cleanup
+  of a later start remove containers without copying: a killed session's last changes are lost.
 - **Logs.** `docker logs hailer-kernel-<id>-<suffix>`. A failed start prints its last lines.
 
 ## Platforms

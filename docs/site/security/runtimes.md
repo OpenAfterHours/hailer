@@ -7,7 +7,7 @@ stay in Hailer's own process in either mode.
 |---|---|---|
 | Setup | Included with Hailer | Requires Docker and a kernel image |
 | Python execution | Hailer's Python, under your account | A non-root user in a Linux container |
-| File access | Your account's file access | Notebooks read-write; data read-only |
+| File access | Your account's file access | Its own copy of the notebooks; data read-only |
 | Network access | Your account's network access | Disabled by default; configurable |
 | Environment | Secret-looking variables withheld; selected variables can be passed through | No host environment variables |
 | Notebook outputs sent to the model | Yes | Yes |
@@ -37,8 +37,11 @@ Or choose it when creating a workspace:
 uvx hailer init --kernel docker
 ```
 
-Hailer pulls the version-matched kernel image if needed. For configuration, corporate mirrors,
-mount restrictions and platform details, follow [Docker setup and operations](docker.md).
+Hailer pulls the version-matched kernel image if needed. The kernel works on copies of your notebooks:
+Hailer copies them in when it starts and copies changed notebooks back after each turn, every 15 seconds
+and when it stops, and only marimo notebooks (see [Notebook copies](docker.md#notebook-copies)). For
+configuration, corporate mirrors, the data-folder rules and platform details, follow
+[Docker setup and operations](docker.md).
 
 Docker limits the kernel's access to your machine. It does not stop the model receiving notebook tool outputs,
 and notebook code written in Docker later has your account's access if you run it locally.
@@ -46,7 +49,7 @@ and notebook code written in Docker later has your account's access if you run i
 ## Check the runtime in use
 
 `/status` inside a conversation, or `uvx hailer status` in a terminal, shows the runtime.
-`uvx hailer doctor` checks the configuration, Docker, the kernel image and the folders without starting a
+`uvx hailer doctor` checks the configuration, Docker, the kernel image and the data folder without starting a
 kernel or calling the model endpoint.
 
 Each session starts its own kernel, so changed Docker settings apply from the next `uvx hailer`. To remove

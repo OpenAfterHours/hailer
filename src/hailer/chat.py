@@ -37,7 +37,10 @@ class ChatController:
         self.config = config
         self.opts = opts
         #: The kernel this chat started (:class:`~hailer.sandbox.Sandbox`); ``None``: no kernel.
+        #: Its warnings (notebook copies, from any thread) go to this chat's current console.
         self.sandbox = sandbox
+        if sandbox is not None:
+            sandbox.notice = lambda text: self.console.print(text, style="yellow", markup=False)
         #: The active notebook's name (the state file is the truth; see _sync_active_notebook).
         self.notebook: str = notebooks.load_active_notebook(config)
         self.state: SessionState = load_session(config.workspace)
@@ -263,6 +266,7 @@ class ChatController:
         finally:
             # A tool may have switched notebooks before cancellation or failure.
             await self._blocking(self._sync_active_notebook)
+            self._copy_notebooks_back()
 
     # -- REPL -------------------------------------------------------------- #
 
@@ -318,6 +322,13 @@ class ChatController:
             # Also after Ctrl+C or a failed turn: a notebook_create/notebook_open tool call may have
             # completed (and switched the state file) before the turn was cut short.
             self._sync_active_notebook()
+            self._copy_notebooks_back()
+
+    def _copy_notebooks_back(self) -> None:
+        """After a turn and on a notebook switch: the sandbox copies changed notebooks back to the
+        workspace in the background (a no-op when its notebooks are the workspace's)."""
+        if self.sandbox is not None:
+            self.sandbox.sync_soon()
 
     def _record_turn(self, summary: TurnSummary) -> None:
         self.state.turns += 1
@@ -645,6 +656,7 @@ class ChatController:
         """Make ``name`` the active notebook for this chat, the agent's tools and the next session."""
         notebooks.save_active_notebook(self.config, name)
         self.notebook = name
+        self._copy_notebooks_back()
         # Queue the notice first: if the wait for the browser tab is interrupted (Ctrl+C) or marimo
         # fails, the switch has still happened and the model must hear about it.
         self._pending_preamble = self._switch_notice(name, f"{how}, not open in a browser yet")

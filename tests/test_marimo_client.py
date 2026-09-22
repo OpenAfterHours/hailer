@@ -617,3 +617,87 @@ def test_unavailable_error_uses_one_command_hint(tmp_path):
     with pytest.raises(MarimoUnavailableError) as info:
         client.sessions()
     assert info.value.hint == mc.launch_hint()
+
+
+# --------------------------------------------------------------------------- #
+# Replies are bounded in size and time (kernel code can replace the server)
+# --------------------------------------------------------------------------- #
+
+
+def _forged_server(reply_head: bytes, body_chunks: list[bytes], delay: float = 0.0) -> tuple[str, threading.Event]:
+    """A one-shot HTTP server answering every request with ``reply_head`` and then ``body_chunks``,
+    ``delay`` seconds apart (a server that trickles), until ``done`` is set."""
+    import time
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+    done = threading.Event()
+
+    def serve() -> None:
+        listener.settimeout(0.2)
+        while not done.is_set():
+            try:
+                conn, _addr = listener.accept()
+            except OSError:
+                continue
+            with conn:
+                conn.settimeout(1)
+                try:
+                    conn.recv(65536)
+                    conn.sendall(reply_head)
+                    for chunk in body_chunks:
+                        if done.is_set():
+                            break
+                        time.sleep(delay)
+                        conn.sendall(chunk)
+                    done.wait(5)  # closing with the request unread would reset the connection first
+                except OSError:
+                    pass
+        listener.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return f"http://127.0.0.1:{listener.getsockname()[1]}", done
+
+
+def test_a_reply_larger_than_the_cap_is_refused_without_reading_it(monkeypatch):
+    head = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {mc.MAX_REPLY_BYTES + 1}\r\n\r\n".encode()
+    url, done = _forged_server(head, [b"{" + b" " * 1024])
+    try:
+        client = mc.MarimoClient(url, "t")
+        client._server_token = "skew"
+        with pytest.raises(MarimoUnavailableError, match="more than 16 MiB"):
+            client.list_files("/work/notebooks")
+    finally:
+        done.set()
+
+
+def test_a_reply_without_a_length_is_cut_off_at_the_cap(monkeypatch):
+    monkeypatch.setattr(mc, "MAX_REPLY_BYTES", 100_000)
+    head = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+    url, done = _forged_server(head, [b" " * 65536] * 400)  # more than it reads: it stops at the cap
+    try:
+        client = mc.MarimoClient(url, "t")
+        client._server_token = "skew"
+        with pytest.raises(MarimoUnavailableError, match="Hailer stopped reading"):
+            client.file_details("/work/notebooks/sales.py")
+    finally:
+        done.set()
+
+
+def test_a_trickling_reply_ends_at_the_deadline():
+    import time
+
+    head = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n"
+    url, done = _forged_server(head, [b" "] * 1000, delay=0.05)  # each byte well within the socket timeout
+    try:
+        client = mc.MarimoClient(url, "t", timeout=10)
+        client._server_token = "skew"
+        started = time.monotonic()
+        with mc.request_deadline(0.5), pytest.raises(MarimoUnavailableError, match="out of time"):
+            client.list_files("/work/notebooks")
+        assert time.monotonic() - started < 3
+        with mc.request_deadline(0), pytest.raises(MarimoUnavailableError, match="out of time"):
+            client.list_files("/work/notebooks")  # nothing is sent past the deadline
+    finally:
+        done.set()

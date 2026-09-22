@@ -32,12 +32,13 @@ makes the analysis possible. What the code can reach depends on the kernel runti
 
   Notebook code can still read the OS credential store and every file you can, which is why the `Kernel:`
   line says `not isolated`.
-- **`docker`: isolated.** The kernel runs in a container that sees only the notebooks folder (read-write)
-  and the data folder (read-only), with no network, none of your environment variables, as a non-root user
-  with resource limits (see [Isolated kernel (Docker)](docker.md#isolated-kernel-docker)). Hailer refuses to mount
-  a folder that would expose its own files or your credentials (`~/.ssh`, `~/.aws`, `%APPDATA%`, ...), a
-  data folder inside the notebooks folder, and a notebooks folder that is a git repository, on every start
-  path (see [Which folders can be mounted](docker.md#which-folders-can-be-mounted)).
+- **`docker`: isolated.** The kernel runs in a container with its own copy of your notebooks and the data
+  folder (read-only), with no network, none of your environment variables, as a non-root user with
+  resource limits (see [Isolated kernel (Docker)](docker.md#isolated-kernel-docker)). It cannot write to your
+  machine: Hailer copies notebooks back, and only marimo notebooks with plain names (see
+  [Notebook copies](docker.md#notebook-copies)). Hailer refuses to mount a data folder that would expose its
+  own files or your credentials (`~/.ssh`, `~/.aws`, `%APPDATA%`, ...), on every start path (see
+  [Which data folder can be mounted](docker.md#which-data-folder-can-be-mounted)).
 
 The instructions forbid destructive file operations and sending data anywhere, but instructions are not an
 enforcement boundary: use an endpoint and model you trust, keep the data folder to data the agent may read,
@@ -47,19 +48,14 @@ and press Ctrl+C if a turn goes somewhere you did not intend.
 
 - *Output goes to the model.* Anything notebook code prints or returns is a tool result and is sent to the
   model endpoint, in either runtime.
-- *Notebooks are code.* A notebook the container wrote runs on your machine, as you, if it is later opened
-  with the local runtime (or with marimo directly). Hailer warns on the first local start after a docker
-  kernel used the notebooks folder. Keep the notebooks folder inside your project's git repository (a plain
-  subfolder, not a repository of its own), so every change is a diff you can review.
-- *Other files in the notebooks folder can run code later.* Notebook code can write anything into the
-  notebooks folder, including a `.git` folder (hooks and settings such as `core.fsmonitor` run when git
-  or an editor that scans nested repositories, like VS Code, touches it), `.vscode`, `.idea` or
-  `.devcontainer` settings, or a `hailer.toml` that makes the folder look like another workspace. Hailer
-  refuses existing repositories and nested Hailer workspaces anywhere in the notebooks tree. At stop
-  and in `doctor`, it warns about repository, editor and workspace controls in that tree. These checks
-  do not prevent an editor from acting on a new file while the kernel is running. Disable automatic
-  repository discovery and automatic editor tasks for folders holding untrusted notebooks. Review new
-  control files before opening them; Hailer never removes them for you.
+- *Notebooks are code.* A notebook the container wrote is copied back to your notebooks folder, and it
+  runs on your machine, as you, if it is later opened with the local runtime (or with marimo directly, or
+  imported by a script: marimo runs a notebook's setup cell on import). Hailer warns on the first local
+  start after a docker kernel used the notebooks folder. Keep the notebooks folder inside your project's git
+  repository, so every change is a diff you can review. Only notebooks come back: git and editor settings,
+  test-runner hooks (`conftest.py`, `test_*.py`), Python start-up hooks and other files notebook code writes
+  stay in the container (see [Notebook copies](docker.md#notebook-copies)). A notebook named like a module
+  your own scripts import (`pandas.py`, say) could still shadow it when you run Python in that folder.
 - *The token reaches marimo in a file, not on the command line.* Hailer writes it to a folder under
   `.hailer` that only you can open, mounts that one file read-only into the container, and deletes it once
   the kernel answers, so `docker inspect` and the container's process list do not show it. Anyone who can
@@ -88,5 +84,6 @@ replaces it. While a local kernel runs, `.hailer/marimo-<pid>.log` holds its out
 signed-in URL; it is deleted when the kernel stops, also after a failed start. The kernel's token is kept
 in memory only. A docker kernel's token file exists only while the kernel starts, and
 `.hailer/owner-<id>.lock` marks a running docker session (it holds no secret). `.hailer/last-kernel.json` notes which runtime last used the
-notebooks folder. On macOS and Linux these files are readable by you only. `.hailer/` is never mounted into a docker kernel and is
+notebooks folder, and `.hailer/notebook-backups/` keeps your versions of notebooks a docker kernel's copy
+replaced (see [Notebook copies](docker.md#notebook-copies)). On macOS and Linux these files are readable by you only. `.hailer/` is never mounted into a docker kernel and is
 kept out of git by its own `.gitignore` containing `*`; Hailer never edits your repository's `.gitignore`.
