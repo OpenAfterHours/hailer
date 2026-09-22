@@ -1391,17 +1391,17 @@ def _docker_runtime(config: HailerConfig) -> Any:
 
 @kernel_app.command("pull")
 def kernel_pull(ctx: typer.Context) -> None:
-    """Download the kernel image for this Hailer version (or \\[kernel].image) ahead of the first start."""
+    """Download the kernel image for this Hailer's kernel contract (or \\[kernel].image) ahead of the first start."""
     opts = _opts(ctx)
     console = console_factory()
     config = _config_or_exit(console, opts)
     runtime = _docker_runtime(config)
     try:
-        version = runtime.pull(say=lambda text: console.print(text, markup=False))
+        contract = runtime.pull(say=lambda text: console.print(text, markup=False))
     except HailerError as err:
         _print_error(console, err, verbose=opts.verbose)
         raise typer.Exit(code=1)
-    console.print(f"{runtime.image} is ready (Hailer {version}).", markup=False)
+    console.print(f"{runtime.image} is ready (kernel contract {contract}).", markup=False)
 
 
 @kernel_app.command("build")
@@ -1410,7 +1410,7 @@ def kernel_build(
     tag: str | None = typer.Option(
         None,
         "--tag",
-        help="Name and tag for the image (default: \\[kernel].image, else ghcr.io/openafterhours/hailer-kernel:<version>).",
+        help="Name and tag for the image (default: \\[kernel].image, else ghcr.io/openafterhours/hailer-kernel:<kernel contract>).",
         show_default=False,
     ),
     base_image: str | None = typer.Option(
@@ -1444,7 +1444,7 @@ def kernel_build(
         runtime.engine_version()
         args = kernel_image.build_args()
         console.print(
-            f"Building {image} for Hailer {args['HAILER_VERSION']} (marimo {args['MARIMO_VERSION']}, "
+            f"Building {image} for kernel contract {args['KERNEL_CONTRACT']} (marimo {args['MARIMO_VERSION']}, "
             f"Polars {args['POLARS_VERSION']}, DuckDB {args['DUCKDB_VERSION']}) ...",
             markup=False,
         )

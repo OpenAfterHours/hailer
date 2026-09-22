@@ -1,11 +1,11 @@
-# The Hailer kernel image: marimo, Polars, fastexcel, DuckDB, altair and plotly, plus the hailer package
-# (the notebook helpers in hailer.periods and the forwarder in hailer._forward; nothing else of
-# Hailer runs in here: no LangChain, no keyring, no API key).
+# The Hailer kernel image: marimo, Polars, fastexcel, DuckDB, altair and plotly, plus a few hailer
+# modules (the notebook helpers in hailer.periods, the errors they raise and the forwarder in
+# hailer._forward; nothing else of Hailer runs in here: no LangChain, no keyring, no API key).
 #
-# Build it with `uvx hailer kernel build`: that copies this file and the installed hailer package
-# into a temporary context and passes the build args below from the versions Hailer runs with
-# (hailer.kernel_image.prepare_context). The version label must equal the Hailer version, or
-# Hailer refuses to use the image.
+# Build it with `uvx hailer kernel build`: that writes this file and those modules into a temporary
+# context and passes the build args below: the exact versions of the kernel contract
+# (hailer.kernel_image). The contract label must equal the contract Hailer needs, or Hailer refuses
+# to use the image. This file is part of the contract: any change to it gives the image a new tag.
 ARG BASE_IMAGE=python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
 FROM ${BASE_IMAGE}
 
@@ -18,9 +18,9 @@ ARG MARIMO_VERSION
 ARG POLARS_VERSION
 ARG FASTEXCEL_VERSION
 ARG DUCKDB_VERSION
-ARG HAILER_VERSION
-ARG ALTAIR_VERSION=6.3.0
-ARG PLOTLY_VERSION=7.1.0
+ARG ALTAIR_VERSION
+ARG PLOTLY_VERSION
+ARG KERNEL_CONTRACT
 
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 
@@ -31,7 +31,8 @@ RUN python3 -c 'import sys; assert sys.version_info >= (3, 12), "Hailer needs Py
 ENV PATH="/opt/hailer-venv/bin:${PATH}"
 
 RUN --mount=type=secret,id=pip_config --mount=type=secret,id=pip_cert \
-    test -n "$MARIMO_VERSION" && test -n "$POLARS_VERSION" && test -n "$FASTEXCEL_VERSION" && test -n "$DUCKDB_VERSION" && test -n "$HAILER_VERSION" \
+    test -n "$MARIMO_VERSION" && test -n "$POLARS_VERSION" && test -n "$FASTEXCEL_VERSION" && test -n "$DUCKDB_VERSION" \
+    && test -n "$ALTAIR_VERSION" && test -n "$PLOTLY_VERSION" && test -n "$KERNEL_CONTRACT" \
     || { echo "Missing build args: build with uvx hailer kernel build (see hailer.kernel_image)." >&2; exit 1; }; \
     if [ -f /run/secrets/pip_config ]; then \
         unset PIP_INDEX_URL PIP_EXTRA_INDEX_URL PIP_TRUSTED_HOST PIP_NO_INDEX PIP_FIND_LINKS PIP_PROXY PIP_CERT PIP_TIMEOUT PIP_RETRIES; \
@@ -67,5 +68,5 @@ ENV HOME=/home/analyst
 USER 1000:1000
 WORKDIR /work
 
-LABEL org.opencontainers.image.version=${HAILER_VERSION} \
+LABEL org.openafterhours.hailer.kernel-contract=${KERNEL_CONTRACT} \
       org.opencontainers.image.source=https://github.com/OpenAfterHours/hailer

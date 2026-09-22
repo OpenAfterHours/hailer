@@ -564,13 +564,15 @@ def kernel_environment(config: HailerConfig, environ: Mapping[str, str]) -> dict
     return {name: value for name, value in environ.items() if name not in withheld}
 
 
-def describe_runtime(kernel: KernelConfig, *, version: str = __version__) -> str:
+def describe_runtime(kernel: KernelConfig) -> str:
     """The text after ``Kernel:`` in the startup panel, ``hailer status`` and ``/status``."""
     if kernel.runtime == KERNEL_RUNTIME_LOCAL:
         return "local (runs as you; not isolated)"
     if kernel.runtime == KERNEL_RUNTIME_DOCKER:
+        from hailer.kernel_image import contract_tag  # lazy: only the docker runtime needs it
+
         network = "network on: the internet and this machine" if kernel.network else "no network"
-        return f"docker (hailer-kernel {version}; {network}; data read-only)"
+        return f"docker (hailer-kernel {contract_tag()}; {network}; data read-only)"
     return f"{kernel.runtime} (unknown runtime)"
 
 

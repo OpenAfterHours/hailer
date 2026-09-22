@@ -97,7 +97,20 @@ translated faithfully. Evidence: `tests/test_kernel_packages.py`, `tests/test_ke
 `tests/test_build_kernel_image.py` and the kernel-build tests in `tests/test_cli.py`.
 
 Keep credentials out of prompts, logs and errors. Use Hailer's credential resolution and redaction
-helpers; do not move keys into subprocess arguments or new plaintext config files.
+helpers; do not move keys into subprocess arguments or new plaintext config files. The same holds for
+the marimo token: the local kernel reads it from stdin, the Docker kernel from a read-only single-file
+mount (`--token-password-file`), because `docker inspect` shows a container's arguments and environment.
+The file is deleted once marimo answers (it reads it as its CLI starts). On Docker Desktop for Windows
+(29.4.3, 2026-09-22) the file then also disappears inside the container; on Linux the mount keeps the
+deleted inode readable there, which gives notebook code nothing it lacks. Evidence:
+`test_the_token_reaches_marimo_in_a_file_that_is_gone_once_it_started` and the Docker integration test
+`test_the_token_is_not_in_docker_inspect_or_the_kernels_command_lines`.
+
+The kernel image is versioned by its kernel contract (`hailer.kernel_image`), not by Hailer's version, so
+a CLI-only release publishes no image. The tag is computed from the image's inputs (a sha256 prefix): a
+hand-maintained contract number was rejected in review because updating a stored fingerprint without
+bumping the number would let a changed image reuse a published tag. `--if-missing` fails closed on any
+registry answer other than "not found" and never overwrites a published tag.
 
 ## 7. Report structured errors and test visible warnings
 

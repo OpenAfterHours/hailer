@@ -22,6 +22,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -57,6 +58,7 @@ from hailer.kernel import (
 )
 from hailer.marimo_client import wait_for_health
 from hailer.models import KERNEL_RUNTIME_DOCKER, Check, HailerConfig, KernelConfig, MarimoServer
+from hailer.statedir import ensure_state_dir, state_dir
 
 #: marimo's port inside the kernel container; the forwarder listens on the same port in its own.
 KERNEL_PORT = 2718
@@ -64,6 +66,11 @@ KERNEL_PORT = 2718
 IMAGE_UID = 1000
 IMAGE_GID = 1000
 KERNEL_HOME = "/home/analyst"
+#: Where the kernel reads its marimo token (``--token-password-file``): a read-only single-file
+#: mount, so the token is never in ``docker run``'s arguments or environment (``docker inspect``).
+KERNEL_TOKEN_FILE = PurePosixPath("/run/secrets/hailer-token")
+#: The folders under ``.hailer`` that hold a token file while a kernel starts.
+TOKEN_FOLDER_PREFIX = "kernel-token-"
 #: Labels on every container and network Hailer creates, so it finds its own (and strays).
 LABEL_PREFIX = "org.openafterhours.hailer"
 LABEL_WORKSPACE = f"{LABEL_PREFIX}.workspace"
@@ -281,6 +288,40 @@ def mount_arg(source: Path | str, target: PurePosixPath | str, *, readonly: bool
     missing source instead of creating it, unlike ``-v``)."""
     fields = ["type=bind", f"source={source}", f"target={target}", *(["readonly"] if readonly else [])]
     return ",".join(_csv_field(item) for item in fields)
+
+
+def write_token_file(workspace: Path, token: str) -> Path:
+    """Write ``token`` where the kernel container can read it and return the file.
+
+    The file sits in a new ``.hailer/kernel-token-<random>`` folder. On POSIX that folder is
+    ``0700``, so no other user of this machine reaches the file; on Windows the mode is ignored and
+    the folder inherits the workspace's ACL. The file itself is ``0644``: the kernel's user in the
+    container can be another uid (a root host, rootless Docker), and Docker mounts the file, not its
+    folder. :func:`remove_token_folder` deletes it once marimo has read it (at start); a folder left
+    by a Hailer that was killed while starting goes with :func:`sweep_token_folders`.
+    """
+    folder = Path(tempfile.mkdtemp(prefix=TOKEN_FOLDER_PREFIX, dir=ensure_state_dir(workspace)))
+    path = folder / "token"
+    path.write_text(token, encoding="utf-8")
+    os.chmod(path, 0o644)  # whatever the umask took away
+    return path
+
+
+def remove_token_folder(folder: Path) -> str | None:
+    """Delete a token folder; a warning line when that fails (it still holds a kernel token)."""
+    try:
+        shutil.rmtree(folder)
+    except FileNotFoundError:
+        return None
+    except OSError as err:
+        return f"Warning: could not delete {folder} ({err}). It holds a kernel token: delete it yourself."
+    return None
+
+
+def sweep_token_folders(workspace: Path) -> list[str]:
+    """Delete every token folder in ``.hailer`` (none should outlive a start); the warnings."""
+    folders = sorted(state_dir(workspace).glob(TOKEN_FOLDER_PREFIX + "*"))
+    return [warning for folder in folders if (warning := remove_token_folder(folder))]
 
 
 def linux_host_user() -> tuple[int, int] | None:
@@ -763,7 +804,7 @@ class DockerRuntime:
 
     def _image_check(self) -> Check:
         try:
-            found = self._image_version()
+            found = self._image_contract()
         except KernelRuntimeError as err:
             return Check("image", False, str(err), hint=err.hint)
         if found is None:
@@ -774,10 +815,10 @@ class DockerRuntime:
                 hint="uvx hailer kernel pull downloads it now; uvx hailer kernel build builds it on this machine instead.",
                 fatal=False,
             )
-        if found != __version__:
+        if found != kernel_image.contract_tag():
             err = self._mismatch(found)
             return Check("image", False, str(err), hint=err.hint)
-        return Check("image", True, f"{self.image} (Hailer {found})", fatal=False)
+        return Check("image", True, f"{self.image} (kernel contract {found})", fatal=False)
 
     def _data_check(self) -> Check | None:
         if _on_windows() and is_unc_path(self.config.data_dir):
@@ -823,9 +864,9 @@ class DockerRuntime:
             return None
         return count if count > 0 else None
 
-    def _image_version(self) -> str | None:
+    def _image_contract(self) -> str | None:
         try:
-            return kernel_image.image_version(self.image, self.runner)
+            return kernel_image.image_contract(self.image, self.runner)
         except subprocess.TimeoutExpired as err:
             raise KernelRuntimeError(
                 f"Docker did not answer within {int(err.timeout or 0)} s when asked about {self.image}.",
@@ -834,10 +875,12 @@ class DockerRuntime:
 
     def _mismatch(self, found: str) -> KernelRuntimeError:
         return KernelRuntimeError(
-            f"The kernel image {self.image} is for Hailer {found or '(no version label)'}; this is Hailer {__version__}.",
+            f"The kernel image {self.image} has kernel contract {found or '(no contract label)'}; "
+            f"this Hailer needs {kernel_image.contract_tag()}.",
             hint=(
-                "The image must match this Hailer (another marimo would break code mode). Download the matching "
-                "image with `uvx hailer kernel pull`, or build it on this machine with `uvx hailer kernel build`. "
+                "The image must match this Hailer's kernel contract (another marimo would break code mode). "
+                "Download the matching image with `uvx hailer kernel pull`, or build it on this machine with "
+                "`uvx hailer kernel build`. "
                 "[kernel].image in hailer.toml (or HAILER_KERNEL_IMAGE) picks another image."
             ),
         )
@@ -845,7 +888,7 @@ class DockerRuntime:
     def _pull_failed(self, detail: str = "") -> KernelRuntimeError:
         if any(sign in detail.lower() for sign in _UNPUBLISHED_SIGNS):
             return KernelRuntimeError(
-                f"The kernel image for Hailer {__version__} is not published (or not visible to you): {self.image}.",
+                f"The kernel image {kernel_image.contract_tag()} is not published (or not visible to you): {self.image}.",
                 hint=(
                     "Build it on this machine with: uvx hailer kernel build (it downloads the base image and the "
                     "Python packages once). Or set [kernel].image in hailer.toml (or HAILER_KERNEL_IMAGE) to a copy "
@@ -866,16 +909,16 @@ class DockerRuntime:
         result = kernel_image.pull(self.image, self.runner)
         if result.returncode != 0:
             raise self._pull_failed(result.stderr or "")
-        found = self._image_version()
+        found = self._image_contract()
         if found is None:
             raise self._pull_failed()
-        if found != __version__:
+        if found != kernel_image.contract_tag():
             raise self._mismatch(found)
         return found
 
     def pull(self, say: Callable[[str], None] | None = None) -> str:
         """``uvx hailer kernel pull``: download the image (docker's progress in this terminal) even
-        when a copy is here, and check its version. Returns that version."""
+        when a copy is here, and check its contract label. Returns that contract."""
         self.engine_version()
         (say or _say)(f"Downloading {self.image} ...")
         return self._download()
@@ -898,18 +941,18 @@ class DockerRuntime:
 
     def prepare(self, say: Callable[[str], None] | None = None) -> None:
         """Docker runs a Linux engine, the folders are safe to mount, no kernel Hailer started for
-        this workspace is still running, and the image for this Hailer is here: downloaded now
+        this workspace is still running, and the image of this Hailer's kernel contract is here: downloaded now
         (with docker's progress in this terminal) when it is missing. A ``[kernel].cpus`` above
         what Docker has is lowered, with a note. Raises ``KernelRuntimeError``."""
         out = say or _say
         self._check_mounts()
         self.engine_version()
         refuse_live_kernel(Path(self.config.workspace), probe=self._probe, gone=self._gone)
-        found = self._image_version()
+        found = self._image_contract()
         if found is None:
             out(f"Downloading the kernel image {self.image} (first use; this can take a few minutes) ...")
             found = self._download()
-        if found != __version__:
+        if found != kernel_image.contract_tag():
             raise self._mismatch(found)
         wanted = self.config.kernel.cpus
         available = self.engine_cpus()
@@ -949,10 +992,12 @@ class DockerRuntime:
     def network_command(self) -> list[str]:
         return ["network", "create", "--internal", *self._labels("network"), self.names.network]
 
-    def kernel_command(self, port: int, token: str) -> list[str]:
-        """``docker run`` for the kernel. Nothing is mounted but the notebooks folder (read-write)
-        and the data folder (read-only): not the workspace root, ``.hailer/``, ``.config/hailer/``,
-        the home folder or the Docker socket. ``--memory-swap`` equal to ``--memory``: no swap on top."""
+    def kernel_command(self, port: int, token_file: Path) -> list[str]:
+        """``docker run`` for the kernel. Nothing is mounted but the notebooks folder (read-write),
+        the data folder (read-only) and ``token_file`` (read-only, at :data:`KERNEL_TOKEN_FILE`,
+        where marimo reads its token): not the workspace root, ``.hailer/``, ``.config/hailer/``,
+        the home folder or the Docker socket. The token itself is never an argument or an
+        environment variable. ``--memory-swap`` equal to ``--memory``: no swap on top."""
         kernel = self.config.kernel
         user = self._user()
         uid, gid = user if user is not None else (IMAGE_UID, IMAGE_GID)
@@ -975,13 +1020,14 @@ class DockerRuntime:
             *self._labels("kernel"),
             "--mount", mount_arg(self.config.notebooks_root, KERNEL_NOTEBOOKS_DIR),
             "--mount", mount_arg(self.config.data_dir, KERNEL_DATA_DIR, readonly=True),
+            "--mount", mount_arg(token_file, KERNEL_TOKEN_FILE, readonly=True),
             self.image,
             "marimo", "edit", KERNEL_NOTEBOOKS_DIR.name,
             "--host", "0.0.0.0",
             "--port", str(KERNEL_PORT),
             "--headless",
             "--skip-update-check",
-            "--token-password", token,
+            "--token-password-file", str(KERNEL_TOKEN_FILE),
         ]  # fmt: skip
         return cmd
 
@@ -1109,7 +1155,8 @@ class DockerRuntime:
 
     def start(self, port: int, *, foreground: bool = False) -> RunningKernel:
         """Create the network, the kernel and the forwarder, wait for ``/health`` through the
-        forwarder and write ``kernel.json`` (with the ids Docker gave them). ``foreground``
+        forwarder and write ``kernel.json`` (with the ids Docker gave them). The token reaches
+        marimo in a file (:func:`write_token_file`) that is deleted once the wait is over. ``foreground``
         changes nothing here: the containers run detached either way, and
         :meth:`DockerKernel.wait` follows the kernel's log."""
         del foreground
@@ -1123,6 +1170,8 @@ class DockerRuntime:
         if leftovers.failed:
             raise KernelRuntimeError("Docker could not remove what an earlier kernel left behind.", hint="\n".join(leftovers.failed))
         delete_kernel_state(workspace)  # only now: whatever an old record named has been removed
+        for warning in sweep_token_folders(workspace):  # left by a Hailer killed while starting
+            _say(warning)
         for folder in (config.notebooks_root, config.data_dir):
             try:
                 folder.mkdir(parents=True, exist_ok=True)  # before Docker creates a missing one owned by root
@@ -1139,10 +1188,17 @@ class DockerRuntime:
         kernel = self._kernel(server)
         health = self._health if self._health is not None else wait_for_health
         try:
+            token_file = write_token_file(workspace, token)
+        except OSError as err:
+            raise KernelRuntimeError(
+                f"Could not write the kernel's token file in {workspace / '.hailer'}: {err}",
+                hint="Check the permissions and free space in .hailer, then try again.",
+            ) from err
+        try:
             if not network_access:
                 created = self._docker(self.network_command(), what="create the kernel's internal network")
                 kernel.network, kernel.network_id = names.network, self._created_id(created, names.network)
-            created = self._docker(self.kernel_command(port, token), what="start the kernel container")
+            created = self._docker(self.kernel_command(port, token_file), what="start the kernel container")
             kernel.containers, kernel.container_ids = (names.kernel,), (self._created_id(created, names.kernel),)
             if not network_access:
                 created = self._docker(self.forwarder_command(port), what="create the forwarder container")
@@ -1155,6 +1211,10 @@ class DockerRuntime:
         except BaseException:  # a docker error, or Ctrl+C while waiting: never leave containers behind
             kernel.stop()
             raise
+        finally:  # marimo reads the file as it starts: answering, or gone, it no longer needs it
+            warning = remove_token_folder(token_file.parent)
+            if warning:
+                _say(warning)
         if not healthy:
             stopped = self._stopped(kernel.container_ids)
             kernel_id = kernel.container_ids[0]
@@ -1286,6 +1346,7 @@ def stop_workspace_kernels(
                 report.done.append("Removed " + ", ".join(leftovers.removed) + ".")
                 docker_notebooks = docker_notebooks or config.notebooks_root
             report.failed += [f"Could not remove {failure}" for failure in leftovers.failed]
+    report.warnings += sweep_token_folders(workspace)
     planted = planted_files(docker_notebooks)
     if planted and docker_notebooks is not None:
         report.warnings.append(planted_warning(docker_notebooks, planted))
@@ -1309,6 +1370,9 @@ __all__ = [
     "data_path_problems",
     "docker_names",
     "mismatch_error",
+    "remove_token_folder",
     "settings_mismatch",
     "stop_workspace_kernels",
+    "sweep_token_folders",
+    "write_token_file",
 ]

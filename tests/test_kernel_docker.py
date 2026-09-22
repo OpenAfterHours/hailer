@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from fake_docker import FakeDocker
+from fake_docker import CONTRACT, FakeDocker
 from fake_kernel import LIVE, TOKEN, Procs, answers, make_config
 from hailer import __version__
 from hailer import kernel as k
@@ -22,7 +22,7 @@ from hailer import kernel_docker as kd
 from hailer.errors import KernelRuntimeError
 from hailer.models import KernelConfig, MarimoServer
 
-IMAGE = f"ghcr.io/openafterhours/hailer-kernel:{__version__}"
+IMAGE = f"ghcr.io/openafterhours/hailer-kernel:{CONTRACT}"
 
 
 def healthy(url, timeout, should_stop=None):
@@ -97,7 +97,7 @@ def test_linux_host_user(monkeypatch):
 
 def test_docker_runtime_describes_itself(tmp_path):
     rt = kd.DockerRuntime(make_config(tmp_path), runner=FakeDocker())  # built for `kernel stop` from a local config
-    assert rt.name == "docker" and rt.describe() == f"docker (hailer-kernel {__version__}; no network; data read-only)"
+    assert rt.name == "docker" and rt.describe() == f"docker (hailer-kernel {CONTRACT}; no network; data read-only)"
     assert rt.paths.to_kernel(tmp_path / "data" / "a.csv") == "/work/data/a.csv"
     assert not hasattr(rt, "prompt_notes"), "one prompt path: runtime_prompt_notes"
 
@@ -111,7 +111,7 @@ def test_check_rows_when_docker_is_ready(tmp_path):
     rows = docker_runtime(tmp_path, FakeDocker()).check()
     assert [(r.name, r.ok) for r in rows] == [("kernel", True), ("docker", True), ("image", True), ("data", True)]
     assert rows[1].summary == "Docker 29.4.3 (Linux engine)"
-    assert rows[2].summary == f"{IMAGE} (Hailer {__version__})"
+    assert rows[2].summary == f"{IMAGE} (kernel contract {CONTRACT})"
 
 
 @pytest.mark.parametrize(
@@ -147,7 +147,7 @@ def test_engine_down_hint_quotes_docker_and_a_hung_engine_counts_as_down(tmp_pat
 
 
 def test_missing_image_is_a_warning_and_is_pulled_with_progress_before_anything_starts(tmp_path):
-    fake = FakeDocker(image_version=None)
+    fake = FakeDocker(image_contract=None)
     rt = docker_runtime(tmp_path, fake)
     image_row = next(r for r in rt.check() if r.name == "image")
     assert not image_row.ok and not image_row.fatal and "uvx hailer kernel pull" in image_row.hint
@@ -162,7 +162,7 @@ def test_missing_image_is_a_warning_and_is_pulled_with_progress_before_anything_
 
 
 def test_a_failed_pull_names_the_build_command_and_the_image_setting(tmp_path):
-    fake = FakeDocker(image_version=None, pull_code=1, pull_error="Error response from daemon: Get https://ghcr.io/v2/: dial tcp: lookup ghcr.io: no such host")
+    fake = FakeDocker(image_contract=None, pull_code=1, pull_error="Error response from daemon: Get https://ghcr.io/v2/: dial tcp: lookup ghcr.io: no such host")
     with pytest.raises(KernelRuntimeError) as exc:
         docker_runtime(tmp_path, fake).start(2731)
     assert str(exc.value) == f"Could not download the kernel image {IMAGE}."
@@ -173,21 +173,22 @@ def test_a_failed_pull_names_the_build_command_and_the_image_setting(tmp_path):
 @pytest.mark.parametrize("said", ["Error response from daemon: error from registry: denied\ndenied", "manifest unknown", "unauthorized: authentication required"])
 def test_an_unpublished_image_says_so_and_how_to_build_it(tmp_path, said):
     """The first docker start before the release that publishes the image."""
-    fake = FakeDocker(image_version=None, pull_code=1, pull_error=said)
+    fake = FakeDocker(image_contract=None, pull_code=1, pull_error=said)
     with pytest.raises(KernelRuntimeError) as exc:
         docker_runtime(tmp_path, fake).start(2731)
-    assert str(exc.value) == f"The kernel image for Hailer {__version__} is not published (or not visible to you): {IMAGE}."
+    assert str(exc.value) == f"The kernel image {CONTRACT} is not published (or not visible to you): {IMAGE}."
     assert exc.value.hint.startswith("Build it on this machine with: uvx hailer kernel build") and "[kernel].image" in exc.value.hint
 
 
-@pytest.mark.parametrize(("present", "pulled"), [("0.1.0", __version__), (None, "0.1.0"), ("", __version__)])
-def test_an_image_for_another_hailer_version_is_refused(tmp_path, present, pulled):
-    fake = FakeDocker(image_version=present, pulled_version=pulled)
+@pytest.mark.parametrize(("present", "pulled"), [("marimo0.24.2-000000000000", CONTRACT), (None, "marimo0.23.0-000000000000"), ("", CONTRACT)])
+def test_an_image_of_another_kernel_contract_is_refused(tmp_path, present, pulled):
+    """A different marimo would break code mode; "" is an image without the label (from before contracts)."""
+    fake = FakeDocker(image_contract=present, pulled_contract=pulled)
     rt = docker_runtime(tmp_path, fake)
     with pytest.raises(KernelRuntimeError) as exc:
         rt.start(2731)
     shown = present if present is not None else pulled
-    assert f"is for Hailer {shown or '(no version label)'}; this is Hailer {__version__}." in str(exc.value)
+    assert f"has kernel contract {shown or '(no contract label)'}; this Hailer needs {CONTRACT}." in str(exc.value)
     assert "uvx hailer kernel pull" in exc.value.hint and "uvx hailer kernel build" in exc.value.hint
     assert not fake.commands("run")
     if present is not None:
@@ -234,7 +235,7 @@ def test_start_refuses_mounts_that_expose_hailers_own_files(tmp_path, notebooks,
         kernel=KernelConfig(runtime="docker"),
         config_path=tmp_path / "hailer.toml",
     )
-    fake = FakeDocker(image_version=None)
+    fake = FakeDocker(image_contract=None)
     rt = docker_runtime(tmp_path, fake, config=config)
     for step in (rt.prepare, lambda: rt.start(2731)):
         with pytest.raises(KernelRuntimeError) as exc:
@@ -368,6 +369,7 @@ def test_start_runs_the_hardened_kernel_offline_behind_a_forwarder(tmp_path):
 
     names = kd.docker_names(tmp_path)
     rt, running = started(tmp_path, fake, health=health)
+    token_file = next(Path(p.split("source=")[1].split(",")[0]) for p in fake.commands("run")[0] if "hailer-token" in p)
 
     assert [c[:2] for c in fake.calls if c[0] != "inspect"] == [
         ["version", "--format"], ["image", "inspect"], ["info", "--format"], ["ps", "-a"], ["network", "ls"],
@@ -381,8 +383,9 @@ def test_start_runs_the_hardened_kernel_offline_behind_a_forwarder(tmp_path):
         "--memory", "4g", "--memory-swap", "4g", "--cpus", "2", "-w", "/work", *labels(tmp_path, "kernel"),
         "--mount", f"type=bind,source={tmp_path / 'notebooks'},target=/work/notebooks",
         "--mount", f"type=bind,source={tmp_path / 'data'},target=/work/data,readonly",
+        "--mount", f"type=bind,source={token_file},target=/run/secrets/hailer-token,readonly",
         IMAGE, "marimo", "edit", "notebooks", "--host", "0.0.0.0", "--port", "2718",
-        "--headless", "--skip-update-check", "--token-password", TOKEN,
+        "--headless", "--skip-update-check", "--token-password-file", "/run/secrets/hailer-token",
     ]]  # fmt: skip
     assert fake.commands("create") == [[
         "create", "--pull", "never", "--name", names.forwarder, "-p", "127.0.0.1:2731:2718",
@@ -396,9 +399,9 @@ def test_start_runs_the_hardened_kernel_offline_behind_a_forwarder(tmp_path):
 
     run = fake.commands("run")[0]
     assert "-p" not in run and "--publish" not in run, "no port on the kernel: the forwarder publishes it"
-    assert run.count("--mount") == 2 and not {"-v", "--volume", "--privileged", "--user"} & set(run), "nothing else is mounted"
+    assert run.count("--mount") == 3 and not {"-v", "--volume", "--privileged", "--user"} & set(run), "nothing else is mounted"
     assert "docker.sock" not in " ".join(run) and f"source={tmp_path}," not in " ".join(run), "not the workspace, not the Docker socket"
-    assert all(TOKEN not in " ".join(c) for c in fake.calls if c[0] != "run"), "the token only reaches marimo"
+    assert all(TOKEN not in " ".join(c) for c in fake.calls), "the token is in no docker argument (docker inspect shows them)"
     assert waits == [("http://127.0.0.1:2731", k.START_TIMEOUT_SEC, False)], "should_stop: both containers run"
     assert (tmp_path / "data").is_dir() and (tmp_path / "notebooks").is_dir(), "created before Docker could create them"
 
@@ -429,11 +432,91 @@ def test_start_on_a_linux_host_runs_the_kernel_as_the_user(tmp_path):
     assert "--user" not in fake.commands("create")[0], "the forwarder touches no files"
 
 
+def test_the_token_reaches_marimo_in_a_file_that_is_gone_once_it_started(tmp_path):
+    """F7: never on the command line or in the environment, so ``docker inspect`` (Args, Env,
+    Cmd) and the container's process list do not show it."""
+    fake = FakeDocker()
+    seen: dict = {}
+
+    def health(url, timeout, should_stop=None):
+        run = fake.commands("run")[0]
+        seen["file"] = Path(next(m for m in run if "hailer-token" in m).split("source=")[1].split(",")[0])
+        seen["exists"] = seen["file"].is_file()
+        return True
+
+    rt, running = started(tmp_path, fake, health=health)
+    kernel_c = fake.container(running.container_ids[0])
+    assert kernel_c.files["/run/secrets/hailer-token"] == TOKEN, "marimo reads it with --token-password-file"
+    assert follows(kernel_c.argv, ["--token-password-file", "/run/secrets/hailer-token"])
+    assert "--token-password" not in kernel_c.argv and not {"-e", "--env", "--env-file"} & set(kernel_c.argv)
+    assert all(TOKEN not in arg for call in fake.calls for arg in call), "not in any docker argument"
+    token_file = seen["file"]
+    assert seen["exists"] and token_file.parent.parent == tmp_path / ".hailer", "there while marimo starts, in .hailer"
+    assert token_file.parent.name.startswith("kernel-token-") and token_file.name == "token"
+    assert not token_file.parent.exists(), "deleted once marimo answered"
+    assert follows(kernel_c.argv, ["--mount", f"type=bind,source={token_file},target=/run/secrets/hailer-token,readonly"])
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX modes")
+def test_the_token_file_is_in_a_folder_only_this_user_can_open(tmp_path):
+    old = os.umask(0o077)
+    try:
+        path = kd.write_token_file(tmp_path, TOKEN)
+    finally:
+        os.umask(old)
+    assert path.read_text(encoding="utf-8") == TOKEN
+    assert path.parent.stat().st_mode & 0o777 == 0o700, "other users cannot reach the file"
+    assert path.stat().st_mode & 0o777 == 0o644, "the kernel's user may be another uid (root host, rootless Docker)"
+    assert kd.remove_token_folder(path.parent) is None and not path.parent.exists()
+    assert kd.remove_token_folder(path.parent) is None, "quietly: already gone"
+
+
+def test_a_token_folder_that_cannot_be_deleted_is_a_warning(tmp_path, monkeypatch, capsys):
+    def refuse(path):
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr(kd.shutil, "rmtree", refuse)
+    folder = tmp_path / ".hailer" / "kernel-token-x"
+    assert kd.remove_token_folder(folder) == f"Warning: could not delete {folder} ([Errno 13] Access is denied). It holds a kernel token: delete it yourself."
+    folder.mkdir(parents=True)
+    docker_runtime(tmp_path, FakeDocker()).start(2731)
+    assert f"could not delete {folder}" in capsys.readouterr().out, "said at start, never silently ignored"
+
+
+def test_stale_token_folders_are_swept_at_start_and_by_kernel_stop(tmp_path):
+    """Left by a Hailer killed while its kernel was starting."""
+    stale = tmp_path / ".hailer" / "kernel-token-stale"
+    stale.mkdir(parents=True)
+    (stale / "token").write_text("old-token", encoding="utf-8")
+    fake = FakeDocker()
+    docker_runtime(tmp_path, fake).start(2731)
+    assert not stale.exists()
+    stale.mkdir()
+    report = kd.stop_workspace_kernels(make_config(tmp_path, kernel=KernelConfig(runtime="docker")), runner=fake, probe=answers())
+    assert not stale.exists() and not report.warnings
+
+
+@pytest.mark.parametrize("failure", ["docker", "unhealthy", "interrupt"])
+def test_the_token_file_is_removed_when_a_start_fails(tmp_path, failure):
+    fake = FakeDocker()
+    if failure == "docker":
+        fake.fail[("run",)] = (125, "docker: Error response from daemon: oops")
+
+    def health(url, timeout, should_stop=None):
+        if failure == "interrupt":
+            raise KeyboardInterrupt
+        return failure != "unhealthy"
+
+    with pytest.raises((KernelRuntimeError, KeyboardInterrupt)):
+        docker_runtime(tmp_path, fake, health=health).start(2731)
+    assert not list((tmp_path / ".hailer").glob("kernel-token-*")), "no token left behind"
+
+
 def test_start_with_network_access_publishes_the_kernel_directly(tmp_path):
     fake = FakeDocker()
     names = kd.docker_names(tmp_path)
     rt = docker_runtime(tmp_path, fake, kernel={"network": True, "memory": "8G", "cpus": 1.5})
-    assert rt.describe() == f"docker (hailer-kernel {__version__}; network on: the internet and this machine; data read-only)"
+    assert rt.describe() == f"docker (hailer-kernel {CONTRACT}; network on: the internet and this machine; data read-only)"
     running = rt.start(2731)
     run = fake.commands("run")[0]
     assert follows(run, ["--name", names.kernel, "-p", "127.0.0.1:2731:2718", "--init"])
@@ -448,7 +531,7 @@ def test_start_with_network_access_publishes_the_kernel_directly(tmp_path):
 
 def test_start_refuses_to_orphan_a_live_local_server(tmp_path):
     k.write_kernel_state(tmp_path, k.KernelState(runtime="local", url=LIVE, port=2718, token=TOKEN, pid=77))
-    fake = FakeDocker(image_version=None)
+    fake = FakeDocker(image_contract=None)
     with pytest.raises(KernelRuntimeError) as exc:
         docker_runtime(tmp_path, fake, probe=answers((LIVE, TOKEN))).start(2731)
     assert str(exc.value) == f"A local marimo server Hailer started for this workspace is still running at {LIVE}."

@@ -19,7 +19,7 @@ stay on your machine; only marimo and the notebook code move into the container.
 ```toml
 [kernel]
 runtime  = "docker"   # "local" (default) or "docker"
-# image   = ""        # docker: default ghcr.io/openafterhours/hailer-kernel:<hailer version>
+# image   = ""        # docker: default ghcr.io/openafterhours/hailer-kernel:marimo<version>-<fingerprint>
 # memory  = "4g"      # docker: memory limit, no swap on top
 # cpus    = 2         # docker: CPU limit (lowered to what Docker has, with a note)
 # network = false     # docker: true lets notebook code reach the internet, this machine and other containers
@@ -36,48 +36,53 @@ runtime  = "docker"   # "local" (default) or "docker"
   the environment. The flag wins over the variable, the variable over the file. `HAILER_KERNEL_IMAGE`
   overrides `image`.
 - **Which one is in use** shows in the startup panel, `uvx hailer status`, `/status` and `uvx hailer doctor`
-  (`X.Y.Z` is Hailer's version):
+  (`marimo0.24.2-64a6b78f25cf` is the kernel contract, below):
 
   ```text
   Kernel:     local (runs as you; not isolated)
-  Kernel:     docker (hailer-kernel X.Y.Z; no network; data read-only)
-  Kernel:     docker (hailer-kernel X.Y.Z; network on: the internet and this machine; data read-only)
+  Kernel:     docker (hailer-kernel marimo0.24.2-64a6b78f25cf; no network; data read-only)
+  Kernel:     docker (hailer-kernel marimo0.24.2-64a6b78f25cf; network on: the internet and this machine; data read-only)
   ```
 
   A docker kernel Hailer started for this workspace is the one in use whatever the file says: `uvx hailer` attaches to it when its mounted folders match and the line says `docker`.
 - **Docker mode fails closed.** Docker missing or not running, Docker Desktop set to Windows containers,
-  an image for another Hailer version, or a folder layout it refuses (below): Hailer stops and says how to
+  an image of another kernel contract, or a folder layout it refuses (below): Hailer stops and says how to
   fix it (see [Troubleshooting](../reference/troubleshooting.md#troubleshooting)). It never runs notebook code on this machine instead.
 
 ## First run: the kernel image
 
-The first `uvx hailer notebook` in docker mode downloads `ghcr.io/openafterhours/hailer-kernel:<version>`,
-where the tag is Hailer's own version (about 200 MB to download, 900 MB on disk), with docker's progress
-in the terminal. After that a start takes a few seconds (4.3 s measured on Windows 11 with Docker
+The first `uvx hailer notebook` in docker mode downloads
+`ghcr.io/openafterhours/hailer-kernel:marimo<version>-<fingerprint>` (for example `marimo0.24.2-64a6b78f25cf`; about
+200 MB to download, 900 MB on disk), with docker's progress in the terminal. After that a start takes a few seconds (4.3 s measured on Windows 11 with Docker
 Desktop). `uvx hailer kernel pull` downloads it ahead of time.
 
 - `uvx hailer kernel build` builds the image on this machine instead, from the Dockerfile that ships inside
-  Hailer, with the marimo, Polars, fastexcel and DuckDB versions this Hailer runs. By default it uses Docker Hub
+  Hailer, with the package versions of the kernel contract. By default it uses Docker Hub
   (the base image) and PyPI (the packages); [corporate mirrors](docker.md#building-with-corporate-mirrors) work too.
-  Use it where the registry is out of reach, or for a Hailer version that has
-  no published image (development versions never do). `--tag <name>` builds under another name; Hailer
+  Use it where the registry is out of reach, or for a kernel contract that has
+  no published image yet (a development checkout that changed the image). `--tag <name>` builds under another name; Hailer
   then says to set `image` under `[kernel]` to use it.
 - `[kernel].image` (or `HAILER_KERNEL_IMAGE`) points Hailer at another copy, such as a company mirror.
-- The image's version label must equal Hailer's version, because a different marimo would break the
-  notebook API Hailer drives. After upgrading Hailer, the next start downloads the matching image; a copy
-  for another version stops the start with the pull and build commands.
+- **The kernel contract.** An image is defined by its Dockerfile, the few Hailer modules it holds (the
+  notebook helpers and the forwarder) and its exact package versions, with marimo equal to the version
+  Hailer drives. The tag names that contract: the marimo version plus the first 12 characters of a
+  sha256 over all of it, so any change to the image is a new tag. The image's
+  `org.openafterhours.hailer.kernel-contract` label must equal the contract this Hailer needs, because a
+  different marimo would break the notebook API Hailer drives. Hailer releases that keep the contract share
+  one image, so upgrading Hailer downloads a new image only when the contract changed; a copy of another
+  contract stops the start with the pull and build commands.
 
 ## Building with corporate mirrors
 
 You can build from an approved Python image and install the kernel packages from your company's PyPI
 mirror. No source checkout is needed. Install Hailer itself through your normal corporate Python
 package setup first (for example, `python -m pip install hailer` with your host pip configuration).
-`hailer kernel build` automatically discovers the host's pip mirror settings, falling back to uv
+`uvx hailer kernel build` automatically discovers the host's pip mirror settings, falling back to uv
 when pip has no index settings. The same discovery runs in `scripts.build_kernel_image`. For an
 existing mirror setup, you can normally run:
 
 ```text
-hailer kernel build
+uvx hailer kernel build
 ```
 
 Hailer reads the standard system, user and virtual-environment pip configuration files, including
@@ -117,7 +122,7 @@ extra-index-url =
 Then build using your registry's Python image:
 
 ```text
-hailer kernel build --tag hailer-kernel:company --base-image registry.company.example/python:3.13-slim --pip-config company-pip.ini --no-cache
+uvx hailer kernel build --tag hailer-kernel:company --base-image registry.company.example/python:3.13-slim --pip-config company-pip.ini --no-cache
 ```
 
 If pip needs your company's CA bundle, append `--pip-cert company-ca.pem`. This accepts a PEM CA
@@ -137,11 +142,12 @@ image = "hailer-kernel:company"
   environment; the base does not need Hailer, marimo, pip on PATH, or `useradd`. Installation runs as
   root during the build; the finished image runs as UID/GID 1000 with `/home/analyst` as its home.
   An inherited entrypoint is cleared so Hailer can launch marimo and its forwarder.
-- **Packages:** the mirror must provide marimo, Polars and DuckDB at the versions installed alongside
-  host Hailer, plus Altair 6.3.0, Plotly 7.1.0 and their dependencies, compatible with the base's Python
-  and architecture. Use a base/platform with matching wheels, or provide the build tools needed for
-  source distributions. Hailer's own package is copied from the host installation, so it does not need
-  to be downloaded again inside Docker. Rebuild after upgrading Hailer.
+- **Packages:** the mirror must provide marimo, Polars, fastexcel, DuckDB, Altair and Plotly at the
+  kernel contract's versions (`IMAGE_PACKAGES` in `hailer.kernel_image`; `uvx hailer kernel build` prints the main
+  ones) and their dependencies, compatible with the base's Python and architecture. Use a base/platform
+  with matching wheels, or provide the build tools needed for source distributions. Hailer's image modules
+  are copied from the host installation, so Hailer itself is not downloaded inside Docker. Rebuild when an
+  upgrade changes the kernel contract (the start says so).
 - **Configuration and authentication:** `--pip-config` and `--pip-cert` are optional. They use
   [BuildKit secret mounts](https://docs.docker.com/build/building/secrets/); their contents are not
   copied into the build context or image. An authenticated index URL can go in the pip file; keep
@@ -161,7 +167,7 @@ image = "hailer-kernel:company"
   packages are installed at build time.
 
 From a checkout, `python -m scripts.build_kernel_image` accepts the same build options alongside
-`--load`, `--push` and `--dry-run`. Its `--context DIR --dry-run` exports the Dockerfile, Hailer package
+`--load`, `--push`, `--if-missing` and `--dry-run`. Its `--context DIR --dry-run` exports the Dockerfile, Hailer modules
 and a build command for teams that need to adapt the build further. Secret files stay outside that
 context; the command refers to their original paths.
 

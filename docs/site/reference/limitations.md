@@ -27,6 +27,6 @@
 - The release workflow builds the `linux/arm64` kernel image (Apple Silicon, ARM Linux), but the CI
   integration test only covers amd64. Podman is not supported.
 - The docker kernel has only the packages in the image (marimo, Polars, fastexcel, DuckDB, altair, plotly); anything
-  else needs an image of your own, built `FROM` Hailer's (so it keeps the version label) and named in
+  else needs an image of your own, built `FROM` Hailer's (so it keeps the kernel contract label) and named in
   `[kernel].image`. There is one kernel per workspace, and
   changing `[kernel]` settings while one is kept running needs `uvx hailer kernel stop` first.

@@ -125,8 +125,10 @@ For marimo verification, see PLAN.md §1. For LangChain lessons and maintained r
   in, 91 out). Still owed: a physical Ctrl+C in a Windows console, and a run by one of the users the Codex
   runtime failed for.
 - Tokens (marimo 0.24.2, verified live 2026-09-18/19): `marimo edit ... --token-password-file -` reads the
-  token from stdin (EOF ends it), so it is never on a command line; `--token-password <t>` takes it as an
-  argument (the docker runtime uses this). Without the token `GET /api/sessions` and `POST
+  token from stdin (EOF ends it), so it is never on a command line; `--token-password-file <path>` reads it
+  from a file as the CLI starts (the docker runtime mounts one, verified 2026-09-22 with Docker Desktop
+  29.4.3: the token is then in neither `docker inspect` nor the process list); `--token-password <t>` takes
+  it as an argument (Hailer never uses it). Without the token `GET /api/sessions` and `POST
   /api/kernel/execute` answer 401; `Authorization: Bearer <t>` is accepted by the API, and
   `access_token=<t>` in a page URL signs a browser in (marimo prints that URL in its banner, so the log
   holds the token). A server with a token writes no registry entry. `/health` needs no token.
@@ -180,7 +182,8 @@ domains are well-formed.
 
 `[kernel]` maps to `KernelConfig` (models.py): `runtime` (`"local"` default | `"docker"`; `HAILER_KERNEL`
 overrides it, then `--kernel` in the CLI; stored lower-cased), `image` (`HAILER_KERNEL_IMAGE` overrides; `""`
-= the default, `KernelConfig.effective_image` = `ghcr.io/openafterhours/hailer-kernel:<hailer version>`),
+= the default, `KernelConfig.effective_image` = `kernel_image.default_image()`,
+`ghcr.io/openafterhours/hailer-kernel:marimo<marimo version>-<fingerprint>`),
 `memory` (`"4g"`, docker `--memory` format, kept as written), `cpus` (number, `2`), `network` (`false`),
 `pass_env` (list of names, local runtime only). A wrong type is a `ConfigError` that quotes the value as
 written (`must be a number, not "2" (str)`). `validate` adds: `runtime` known, `memory` matches
@@ -364,9 +367,9 @@ def withheld_variables(config: HailerConfig, environ: Mapping[str, str]) -> list
     # variable, HAILER_MARIMO_TOKEN, KERNEL_SECRET_NAMES, and names ending in KERNEL_SECRET_SUFFIXES (any case);
     # never a name in config.kernel.pass_env. Exact names compare case-insensitively on Windows
 def kernel_environment(config, environ) -> dict[str, str]                # environ minus withheld_variables
-def describe_runtime(kernel: KernelConfig, *, version=__version__) -> str
-    # "local (runs as you; not isolated)" | "docker (hailer-kernel <v>; no network; data read-only)" |
-    # "docker (hailer-kernel <v>; network on: the internet and this machine; data read-only)"
+def describe_runtime(kernel: KernelConfig) -> str   # <contract> is kernel_image.contract_tag()
+    # "local (runs as you; not isolated)" | "docker (hailer-kernel <contract>; no network; data read-only)" |
+    # "docker (hailer-kernel <contract>; network on: the internet and this machine; data read-only)"
 def runtime_prompt_notes(kernel: KernelConfig) -> str                     # LOCAL_ / DOCKER_ / DOCKER_NETWORK_PROMPT_NOTES; never touches Docker
 def attach_runtime(config: HailerConfig, server: MarimoServer | None) -> HailerConfig
     # a docker server sets config.kernel.runtime="docker" and .network=server.network_access (the prompt, paths and
@@ -410,6 +413,7 @@ The docker runtime. Imports `kernel` and `kernel_image`; imported only when dock
 
 ```python
 KERNEL_PORT = 2718; IMAGE_UID = IMAGE_GID = 1000; KERNEL_HOME = "/home/analyst"
+KERNEL_TOKEN_FILE = PurePosixPath("/run/secrets/hailer-token")   # where the kernel reads its marimo token
 LABEL_WORKSPACE = "org.openafterhours.hailer.workspace"; LABEL_VERSION = "...version"; LABEL_ROLE = "...role"   # on every container and network
 DOCKER_TIMEOUT_SEC = 60.0; DOCKER_PROBE_TIMEOUT_SEC = 20.0
 DOCKER_NOT_INSTALLED = "Docker is not installed."; DOCKER_NOT_RUNNING = "Docker is not running."
@@ -424,6 +428,12 @@ def workspace_id(workspace) -> str         # 10 hex chars of sha256(normcase(res
 def docker_names(workspace) -> DockerNames # hailer-kernel-<id>, hailer-fwd-<id>, hailer-net-<id>
 def mount_arg(source, target, *, readonly=False) -> str   # --mount type=bind,source=...,target=...[,readonly] (CSV-quoted)
 def linux_host_user() -> tuple[int, int] | None           # (uid, gid) on a Linux host unless root; None elsewhere
+def write_token_file(workspace, token) -> Path            # .hailer/kernel-token-<random>/token: folder 0700 on POSIX (on Windows the
+                                                          # mode is ignored; the workspace's ACL is inherited), file 0644 (the kernel's
+                                                          # uid may differ: root host, rootless Docker)
+def remove_token_folder(folder) -> str | None             # deletes it; a warning line when that fails (quiet when already gone)
+def sweep_token_folders(workspace) -> list[str]           # every .hailer/kernel-token-* (left by a Hailer killed while starting): the warnings.
+                                                          # Run by start() (printed) and stop_workspace_kernels (StopReport.warnings)
 def network_location(path, drive_type=...) -> str | None   # Windows: UNC_PATH ("a network share (UNC path)") or "a mapped network drive (Z:)" (GetDriveTypeW == 4)
 def folder_problems(folder, what, setting, *, windows=None, drive_type=None, links=False) -> list[str]
     # warnings with the fix: a mapped network drive; links: symlinks/junctions leading outside (first 5000 entries).
@@ -454,21 +464,24 @@ class DockerRuntime:
     # DockerRuntime(config, *, runner=None, token_factory=new_token, start_timeout=60.0, health=None, user=linux_host_user, probe=None)
     name = "docker"; paths = docker_paths(config); names: DockerNames; image: str (config.kernel.effective_image)
     def check(self) -> list[Check]         # kernel; docker ("Docker <v> (Linux engine)" or the error); image (missing = non-fatal warning,
-                                           # other version = fatal); data (path warnings; no row for a UNC folder: the config row fails it);
+                                           # another kernel contract = fatal; "<image> (kernel contract <c>)"); data (path warnings; no row for a UNC folder: the config row fails it);
                                            # notebooks (warnings: a mapped network drive; planted files other than .git, which is fatal)
     def engine_version(self) -> str        # docker version --format "{{.Server.Version}} {{.Server.Os}}"; not installed / not running / non-Linux engine → KernelRuntimeError
     def engine_cpus(self) -> int | None
-    def pull(self, say=None) -> str        # hailer kernel pull: always downloads, then checks the version label
+    def pull(self, say=None) -> str        # hailer kernel pull: always downloads, then checks the contract label; returns it
     def mount_problems(self) -> list[str]  # config.docker_mount_problems(config, windows=os.name == "nt"): the same rules as validate()
     def prepare(self, say=None) -> None    # mounts; engine; refuse_live_kernel; the image (pulled with progress when missing: "Downloading the
-                                           # kernel image <image> (first use; this can take a few minutes) ..."), its version label; cpus clamped to engine_cpus with a note
+                                           # kernel image <image> (first use; this can take a few minutes) ..."), its contract label
+                                           # (another: "The kernel image <image> has kernel contract <c>; this Hailer needs <c'>."); cpus clamped to engine_cpus with a note
     def network_command(self) -> list[str] # network create --internal + labels
-    def kernel_command(self, port: int, token: str) -> list[str]
+    def kernel_command(self, port: int, token_file: Path) -> list[str]
         # run -d --pull never --name hailer-kernel-<id> (--network hailer-net-<id> | -p 127.0.0.1:<port>:2718 with network=true)
         # --init --read-only --tmpfs /tmp --tmpfs /home/analyst:uid=U,gid=G [--user U:G -e HOME=/home/analyst on Linux]
         # --cap-drop ALL --security-opt no-new-privileges --pids-limit 256 --memory M --memory-swap M --cpus C -w /work
-        # labels --mount <notebooks_root>:/work/notebooks --mount <data_dir>:/work/data,readonly <image>
-        # marimo edit notebooks --host 0.0.0.0 --port 2718 --headless --skip-update-check --token-password <token>
+        # labels --mount <notebooks_root>:/work/notebooks --mount <data_dir>:/work/data,readonly
+        # --mount <token_file>:/run/secrets/hailer-token,readonly <image>
+        # marimo edit notebooks --host 0.0.0.0 --port 2718 --headless --skip-update-check --token-password-file /run/secrets/hailer-token
+        # The token is never an argument or environment variable (docker inspect shows both)
     def forwarder_command(self, port: int) -> list[str]
         # create --pull never --name hailer-fwd-<id> -p 127.0.0.1:<port>:2718 --init --read-only --cap-drop ALL
         # --security-opt no-new-privileges --pids-limit 64 --memory 64m labels <image> python -m hailer._forward hailer-kernel-<id> 2718 2718
@@ -480,7 +493,8 @@ class DockerRuntime:
     def start(self, port: int, *, foreground: bool = False) -> RunningKernel
         # prepare if needed; mounts again; refuse_live_kernel; remove_leftovers(); only then delete the old record; mkdir both folders;
         # network (unless network=true), kernel, forwarder (create, network connect, start); wait for /health through the
-        # forwarder (stops early when a container exits); KernelState with names, ids and settings; note_kernel_start.
+        # forwarder (stops early when a container exits); the token file is deleted once that wait ends (success, failure
+        # or Ctrl+C: marimo read it as it started); KernelState with names, ids and settings; note_kernel_start.
         # Any failure or Ctrl+C removes what was created. foreground changes nothing (DockerKernel.wait follows the log)
 @dataclass class StopReport: done: list[str]; failed: list[str]; warnings: list[str]
 def stop_workspace_kernels(config, runner=None, *, procs=None, probe=None) -> StopReport
@@ -491,28 +505,41 @@ def stop_workspace_kernels(config, runner=None, *, procs=None, probe=None) -> St
     # cannot be reached (kernel.json kept, even when its server does not answer). The CLI prints done, failed (red, exit 1) and warnings (bold red)
 ```
 
-## `kernel_image.py`  (owner: docker kernel, 2026-09-19)
+## `kernel_image.py`  (owner: docker kernel, 2026-09-19; kernel contract 2026-09-22)
+
+An image is defined by its **kernel contract**, not by Hailer's version, so a release that changes nothing in
+the image reuses the published one.
 
 ```python
-VERSION_LABEL = "org.opencontainers.image.version"     # must equal hailer.__version__
-PINNED_DISTRIBUTIONS = {"MARIMO_VERSION": "marimo", "POLARS_VERSION": "polars", "FASTEXCEL_VERSION": "fastexcel", "DUCKDB_VERSION": "duckdb"}
-def default_image() -> str                  # ghcr.io/openafterhours/hailer-kernel:<hailer version> (models.KERNEL_IMAGE_REPOSITORY)
-def package_dir() -> Path                   # the installed hailer package
-def build_args() -> dict[str, str]          # the installed marimo, Polars, fastexcel, DuckDB versions + HAILER_VERSION
-def prepare_context(dest: Path) -> dict[str, str]   # dest gets Dockerfile (LF endings) and hailer/ (no __pycache__); returns build_args(); dest must not hold hailer/
+MARIMO_VERSION = "0.24.2"                   # equal to the marimo pin in pyproject.toml (checked by a test)
+IMAGE_PACKAGES = {"marimo": MARIMO_VERSION, "polars": ..., "fastexcel": ..., "duckdb": ..., "altair": ..., "plotly": ...}  # exact versions, one place
+IMAGE_MODULES = ("errors.py", "periods.py", "_forward.py")   # the hailer modules the image gets (they import no other hailer module)
+IMAGE_INIT: str                             # the image's hailer/__init__.py (a docstring: no __version__)
+CONTRACT_LABEL = "org.openafterhours.hailer.kernel-contract"  # must equal contract_tag() before Hailer uses an image
+def contract_tag() -> str                   # "marimo<MARIMO_VERSION>-<contract_fingerprint()[:12]>", e.g. "marimo0.24.2-64a6b78f25cf"
+def default_image() -> str                  # ghcr.io/openafterhours/hailer-kernel:<contract_tag()> (models.KERNEL_IMAGE_REPOSITORY)
+def package_dir() -> Path                   # the installed hailer package (where IMAGE_MODULES come from)
+def context_files() -> dict[str, bytes]     # "Dockerfile", "hailer/__init__.py" and hailer/<IMAGE_MODULES>, LF endings
+def contract_fingerprint() -> str           # sha256 over context_files() and IMAGE_PACKAGES (line endings do not count)
+def build_args() -> dict[str, str]          # <NAME>_VERSION per IMAGE_PACKAGES entry + KERNEL_CONTRACT=contract_tag(); never the host's versions
+def prepare_context(dest: Path) -> dict[str, str]   # writes context_files() into dest; returns build_args(); dest must not hold hailer/
 def build_command(tag, context, args) -> list[str]  # ["build", "--tag", tag, "--build-arg", ..., context]
 def build(tag: str, runner: DockerRunner, *, base_image=None, pip_config=None, pip_cert=None, no_cache=False, no_host_config=False, say=None) -> int
 def configured_build_options(*, base_image=None, pip_config=None, pip_cert=None, no_cache=False, no_host_config=False, say=None, dry_run=False)  # context manager yielding Docker options; owns temporary secrets
 def pull(image: str, runner: DockerRunner) -> CompletedProcess[str]   # docker pull streamed, errors kept
-def image_version(image: str, runner: DockerRunner) -> str | None    # the label; "" when absent; None when the image is not on this machine
+def image_contract(image: str, runner: DockerRunner) -> str | None   # CONTRACT_LABEL; "" when absent (an image from before contracts); None when not on this machine
 ```
 
 `src/hailer/docker/Dockerfile` is package data: `python:3.12-slim` pinned by digest, `pip install` of
-marimo, Polars, fastexcel and DuckDB at the build args plus altair and plotly at pinned defaults, the `hailer`
-package copied into site-packages without dependencies, user `analyst` (uid 1000), `/work/.marimo.toml`
-(`[runtime] auto_instantiate = true`) and an empty `/work/hailer.toml`, `WORKDIR /work`, and the version
-label. `scripts/build_kernel_image.py` builds the same context with `docker buildx` (`--platform`, `--tag`,
-`--push` / `--load`, `--context`, `--dry-run`, arguments after `--` passed on) for CI and the release.
+marimo, Polars, fastexcel, DuckDB, altair and plotly at the build args (no defaults), the image modules
+under `/opt/hailer-package` on the venv's path, user `analyst` (uid 1000), `/work/.marimo.toml`
+(`[runtime] auto_instantiate = true`) and an empty `/work/hailer.toml`, `WORKDIR /work`, and the contract
+label. Any change to an input (even a comment) is a new tag. `scripts/build_kernel_image.py` builds the same context
+with `docker buildx` (`--platform`, `--tag` (default `default_image()`), `--push` / `--load`,
+`--if-missing` (needs `--push`; `docker buildx imagetools inspect --format "{{json .Manifest}}"`: every tag
+published with every `--platform` → build nothing; the registry says none exists ("not found", "manifest
+unknown") → build; any other error, a tag missing a platform, or only some tags published → exit 1 without
+building, so a published tag is never overwritten), `--context`, `--dry-run`, arguments after `--` passed on) for CI and the release.
 
 `kernel_packages.discover()` reads portable pip settings (environment over merged global/user/site
 files), falling back to a single uv default index (environment over system/user/nearest-project
@@ -591,7 +618,12 @@ stdio discarded, because a launcher that inherited the terminal would write into
 
 ## `periods.py`  (owner: wave 1 / B)
 
+An image module (`kernel_image.IMAGE_MODULES`): it imports only `hailer.errors` of Hailer, so it defines its
+own types (they lived in `models.py` before the kernel contract).
+
 ```python
+@dataclass(frozen=True, order=True) class Period: year: int; month: int   # .label "2025-03", .short "25-03"
+@dataclass(frozen=True) class PeriodFile: path: Path; period: Period; stem: str   # stem lower-cased, e.g. "sales"
 PERIOD_RE: re.Pattern            # ^(?P<yy>\d{2})-(?P<mm>\d{2})\s+(?P<stem>.+)$ on the file stem
 DATA_SUFFIXES: tuple[str, ...]   # .csv .tsv .parquet .json .jsonl .ndjson .xlsx .xls .xlsb .arrow .feather .ipc
 def list_data_files(data_dir: Path) -> list[Path]  # every data file directly in data_dir, any name, sorted by name; [] when missing

@@ -1,12 +1,19 @@
 """The kernel image the docker runtime runs: which one, and how to build or pull it.
 
-``src/hailer/docker/Dockerfile`` ships inside the package, so ``uvx hailer kernel build`` works
-from any installed Hailer (a checkout, uvx or pip) without a wheel or PyPI:
-:func:`prepare_context` copies that Dockerfile and the installed ``hailer`` package into a build
-context and returns the build args, taken from the versions this Hailer runs with. The release
-workflow reuses it for the published multi-arch image, with the same arguments::
+An image is defined by its **kernel contract**, not by Hailer's version: the packaged Dockerfile,
+the few hailer modules copied into it (:data:`IMAGE_MODULES` and a minimal ``hailer/__init__.py``)
+and the package versions it installs (:data:`IMAGE_PACKAGES`, marimo equal to Hailer's own pin).
+:func:`contract_tag` names it from its content, ``marimo<version>-<first 12 hex of the sha256 of
+the inputs>``: the default image's tag and the image's :data:`CONTRACT_LABEL`, which Hailer compares
+before using an image. Any change to an input (even a comment) is a new tag, which the next release
+publishes; a release that changes none of them reuses the published image.
 
-    args = prepare_context(Path("ctx"))  # {"MARIMO_VERSION": ..., "HAILER_VERSION": ...}
+``src/hailer/docker/Dockerfile`` ships inside the package, so ``uvx hailer kernel build`` works
+from any installed Hailer (a checkout, uvx or pip) without a wheel or PyPI: :func:`prepare_context`
+writes the build context and returns the build args. The release workflow reuses it for the
+published multi-arch image, with the same arguments::
+
+    args = prepare_context(Path("ctx"))  # {"MARIMO_VERSION": ..., "KERNEL_CONTRACT": "marimo0.24.2-0123456789ab"}
     # docker buildx build --platform linux/amd64,linux/arm64 --tag <image>
     #     --build-arg MARIMO_VERSION=... (one per entry of args) ctx
 
@@ -18,12 +25,11 @@ from __future__ import annotations
 
 import configparser
 import csv
-import importlib.metadata
+import hashlib
 import importlib.resources
 import io
 import json
 import os
-import shutil
 import subprocess
 import tempfile
 from collections.abc import Callable, Iterator
@@ -31,55 +37,96 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from hailer import __version__, kernel_packages
+from hailer import kernel_packages
 from hailer.errors import KernelRuntimeError
 from hailer.models import KERNEL_IMAGE_REPOSITORY
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only; hailer.kernel_docker imports this module
     from hailer.kernel_docker import DockerRunner
 
-#: The image label that must equal ``hailer.__version__`` (a different marimo would break code mode).
-VERSION_LABEL = "org.opencontainers.image.version"
-#: Distributions whose installed versions the image pins (build arg -> distribution name).
-PINNED_DISTRIBUTIONS = {
-    "MARIMO_VERSION": "marimo",
-    "POLARS_VERSION": "polars",
-    "FASTEXCEL_VERSION": "fastexcel",
-    "DUCKDB_VERSION": "duckdb",
+#: marimo inside the image: equal to Hailer's own pin in pyproject.toml (code mode is a private
+#: marimo API, so the kernel's marimo must be the one Hailer drives).
+MARIMO_VERSION = "0.24.2"
+#: What the image installs (distribution -> exact version), in one place: an image is defined by its
+#: contract, never by the versions installed on the machine that builds it.
+IMAGE_PACKAGES = {
+    "marimo": MARIMO_VERSION,
+    "polars": "1.44.2",
+    "fastexcel": "0.21.0",
+    "duckdb": "1.5.5",
+    "altair": "6.3.0",
+    "plotly": "7.1.0",
 }
-_SKIPPED = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo")
+#: The hailer modules the image gets: the notebook helpers, the errors they raise and the forwarder.
+IMAGE_MODULES = ("errors.py", "periods.py", "_forward.py")
+#: The image's ``hailer/__init__.py``: not the real one, whose version changes every release.
+IMAGE_INIT = '"""Hailer in the kernel image: the notebook helpers (hailer.periods) and the forwarder (hailer._forward)."""\n'
+#: The image label that must equal :func:`contract_tag` before Hailer uses an image.
+CONTRACT_LABEL = "org.openafterhours.hailer.kernel-contract"
 _IMAGE_TIMEOUT_SEC = 30.0
 
 
-def default_image() -> str:
-    """``ghcr.io/openafterhours/hailer-kernel:<hailer version>``."""
-    return f"{KERNEL_IMAGE_REPOSITORY}:{__version__}"
-
-
 def package_dir() -> Path:
-    """The folder of the installed ``hailer`` package (what the image gets as source)."""
+    """The folder of the installed ``hailer`` package (where the image modules come from)."""
     return Path(__file__).resolve().parent
 
 
+def _lf(data: bytes) -> bytes:
+    # LF endings whatever the checkout did (git's autocrlf on Windows): the Dockerfile's RUN lines
+    # continue with "\", and the fingerprint must not depend on the platform.
+    return data.replace(b"\r\n", b"\n")
+
+
+def context_files() -> dict[str, bytes]:
+    """The build context (POSIX path -> contents): ``Dockerfile``, then ``hailer/__init__.py``
+    (:data:`IMAGE_INIT`) and :data:`IMAGE_MODULES`, all with LF endings."""
+    dockerfile = importlib.resources.files("hailer").joinpath("docker/Dockerfile")
+    files = {"Dockerfile": _lf(dockerfile.read_bytes()), "hailer/__init__.py": IMAGE_INIT.encode("utf-8")}
+    for name in IMAGE_MODULES:
+        files[f"hailer/{name}"] = _lf((package_dir() / name).read_bytes())
+    return files
+
+
+def contract_fingerprint() -> str:
+    """The sha256 of the contract's inputs: :func:`context_files` and :data:`IMAGE_PACKAGES`."""
+    digest = hashlib.sha256()
+    for path, data in sorted(context_files().items()):
+        digest.update(f"file {path} {len(data)}\n".encode())
+        digest.update(data)
+    for name, version in sorted(IMAGE_PACKAGES.items()):
+        digest.update(f"package {name}=={version}\n".encode())
+    return digest.hexdigest()
+
+
+def contract_tag() -> str:
+    """``marimo<MARIMO_VERSION>-<contract_fingerprint()[:12]>``: the default image's tag and its
+    contract label. Computed from the content, so a changed input can never reuse an old tag."""
+    return f"marimo{MARIMO_VERSION}-{contract_fingerprint()[:12]}"
+
+
+def default_image() -> str:
+    """``ghcr.io/openafterhours/hailer-kernel:marimo<version>-<fingerprint>``."""
+    return f"{KERNEL_IMAGE_REPOSITORY}:{contract_tag()}"
+
+
 def build_args() -> dict[str, str]:
-    """The Dockerfile's build args: the installed kernel dependencies and this Hailer."""
-    args = {arg: importlib.metadata.version(dist) for arg, dist in PINNED_DISTRIBUTIONS.items()}
-    args["HAILER_VERSION"] = __version__
+    """The Dockerfile's build args: ``<NAME>_VERSION`` per image package and ``KERNEL_CONTRACT``
+    (:func:`contract_tag`, which becomes the image's contract label)."""
+    args = {f"{name.upper()}_VERSION": version for name, version in IMAGE_PACKAGES.items()}
+    args["KERNEL_CONTRACT"] = contract_tag()
     return args
 
 
 def prepare_context(dest: Path) -> dict[str, str]:
-    """Fill ``dest`` with a build context and return the build args for it.
+    """Fill ``dest`` with :func:`context_files` and return the build args for it.
 
-    ``dest`` gets ``Dockerfile`` and ``hailer/`` (the installed package without ``__pycache__``);
-    it is created when missing and must not already hold a ``hailer`` folder.
+    ``dest`` is created when missing and must not already hold a ``hailer`` folder.
     """
     dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
-    dockerfile = importlib.resources.files("hailer").joinpath("docker/Dockerfile")
-    # LF endings whatever the checkout did (git's autocrlf on Windows): its RUN lines continue with "\".
-    (dest / "Dockerfile").write_bytes(dockerfile.read_bytes().replace(b"\r\n", b"\n"))
-    shutil.copytree(package_dir(), dest / "hailer", ignore=_SKIPPED)
+    (dest / "hailer").mkdir()
+    for path, data in context_files().items():
+        (dest / path).write_bytes(data)
     return build_args()
 
 
@@ -189,9 +236,9 @@ def pull(image: str, runner: DockerRunner) -> subprocess.CompletedProcess[str]:
     return runner.stream(["pull", image], keep_errors=True)
 
 
-def image_version(image: str, runner: DockerRunner) -> str | None:
-    """The Hailer version ``image`` was built for (``""`` without the label); ``None`` when the image
-    is not on this machine."""
+def image_contract(image: str, runner: DockerRunner) -> str | None:
+    """The kernel contract ``image`` was built for (its :data:`CONTRACT_LABEL`; ``""`` without the
+    label); ``None`` when the image is not on this machine."""
     result = runner.run(["image", "inspect", "--format", "{{json .Config.Labels}}", image], timeout=_IMAGE_TIMEOUT_SEC)
     if result.returncode != 0:
         return None
@@ -201,19 +248,25 @@ def image_version(image: str, runner: DockerRunner) -> str | None:
         return ""
     if not isinstance(labels, dict):
         return ""
-    return str(labels.get(VERSION_LABEL) or "")
+    return str(labels.get(CONTRACT_LABEL) or "")
 
 
 __all__ = [
-    "PINNED_DISTRIBUTIONS",
-    "VERSION_LABEL",
+    "CONTRACT_LABEL",
+    "IMAGE_INIT",
+    "IMAGE_MODULES",
+    "IMAGE_PACKAGES",
+    "MARIMO_VERSION",
     "build",
     "build_args",
     "build_command",
     "build_options",
     "configured_build_options",
+    "context_files",
+    "contract_fingerprint",
+    "contract_tag",
     "default_image",
-    "image_version",
+    "image_contract",
     "package_dir",
     "prepare_context",
     "pull",

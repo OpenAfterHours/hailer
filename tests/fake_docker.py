@@ -17,14 +17,18 @@ Nothing is ever run.
 from __future__ import annotations
 
 import hashlib
+import csv
 import json
 import re
 import subprocess
 from dataclasses import dataclass, field
+from pathlib import Path
 
-from hailer import __version__
 from hailer.kernel_docker import LABEL_ROLE, LABEL_WORKSPACE, docker_not_installed
-from hailer.kernel_image import VERSION_LABEL
+from hailer.kernel_image import CONTRACT_LABEL, contract_tag
+
+#: The kernel contract this Hailer needs (the label of the image the fake has by default).
+CONTRACT = contract_tag()
 
 TOKEN = "unit-test-token-0123456789"
 
@@ -39,6 +43,8 @@ class Container:
     oom: bool = False
     networks: list[str] = field(default_factory=list)
     argv: list[str] = field(default_factory=list)
+    #: What each single-file bind mount held when the container was created (target -> text).
+    files: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -52,6 +58,19 @@ def _labels_of(args: list[str]) -> dict[str, str]:
     return dict(args[i + 1].split("=", 1) for i, a in enumerate(args) if a == "--label")
 
 
+def _mounted_files(args: list[str]) -> dict[str, str]:
+    """The bind mounts whose source is a file, read now (as Docker would see them at create)."""
+    files = {}
+    for i, arg in enumerate(args):
+        if arg != "--mount":
+            continue
+        fields = dict(item.split("=", 1) for item in next(csv.reader([args[i + 1]])) if "=" in item)
+        source = Path(fields.get("source", ""))
+        if fields.get("type") == "bind" and source.is_file():
+            files[fields["target"]] = source.read_text(encoding="utf-8")
+    return files
+
+
 class FakeDocker:
     def __init__(
         self,
@@ -59,8 +78,8 @@ class FakeDocker:
         installed: bool = True,
         engine: str | None = "29.4.3 linux",
         ncpu: int = 16,
-        image_version: str | None = __version__,
-        pulled_version: str = __version__,
+        image_contract: str | None = CONTRACT,
+        pulled_contract: str = CONTRACT,
         pull_code: int = 0,
         pull_error: str = "",
         build_code: int = 0,
@@ -68,8 +87,8 @@ class FakeDocker:
         self.installed = installed
         self.engine = engine  # None: the engine is down
         self.ncpu = ncpu
-        self.image_version = image_version  # None: the image is not on this machine
-        self.pulled_version = pulled_version
+        self.image_contract = image_contract  # None: the image is not on this machine
+        self.pulled_contract = pulled_contract
         self.pull_code = pull_code
         self.pull_error = pull_error
         self.build_code = build_code
@@ -160,9 +179,9 @@ class FakeDocker:
         if head == "info":
             return self._done(args, 0, f"{self.ncpu}\n")
         if args[:2] == ["image", "inspect"]:
-            if self.image_version is None:
+            if self.image_contract is None:
                 return self._done(args, 1, "", f"Error response from daemon: No such image: {args[-1]}")
-            return self._done(args, 0, json.dumps({VERSION_LABEL: self.image_version}) + "\n")
+            return self._done(args, 0, json.dumps({CONTRACT_LABEL: self.image_contract}) + "\n")
         if head == "ps":
             return self._ps(args)
         if args[:2] == ["network", "ls"]:
@@ -197,6 +216,7 @@ class FakeDocker:
             if self.container(name) is not None:
                 return self._done(args, 125, "", f'docker: Error response from daemon: Conflict. The container name "/{name}" is already in use.')
             container = Container(self._new_id("container"), name, _labels_of(args), state="running" if head == "run" else "created", argv=args)
+            container.files = _mounted_files(args)
             if "--network" in args:
                 network = self.network(args[args.index("--network") + 1])
                 if network is None:
@@ -304,7 +324,7 @@ class FakeDocker:
             self.stream_hook(args)
         if args[0] == "pull":
             if self.pull_code == 0:
-                self.image_version = self.pulled_version
+                self.image_contract = self.pulled_contract
             return self._done(args, self.pull_code, None, self.pull_error if keep_errors else "")
         if args[0] == "build":
             return self._done(args, self.build_code, None, "")

@@ -60,9 +60,12 @@ and press Ctrl+C if a turn goes somewhere you did not intend.
   do not prevent an editor from acting on a new file while the kernel is running. Disable automatic
   repository discovery and automatic editor tasks for folders holding untrusted notebooks. Review new
   control files before opening them; Hailer never removes them for you.
-- *The token is on the container's command line*, so `docker inspect` shows it. Anyone who can use Docker
-  on the machine can already `docker exec` into the container, so hiding it would gain nothing.
-- *The image is trusted by name.* Hailer checks its tag and version label, not a signature, and runs
+- *The token reaches marimo in a file, not on the command line.* Hailer writes it to a folder under
+  `.hailer` that only you can open, mounts that one file read-only into the container, and deletes it once
+  the kernel answers, so `docker inspect` and the container's process list do not show it. Anyone who can
+  use Docker on the machine can still `docker exec` into the container, and notebook code has the kernel's
+  own powers.
+- *The image is trusted by name.* Hailer checks its tag and kernel contract label, not a signature, and runs
   whatever `[kernel].image` names. The image pins marimo, Polars, fastexcel, DuckDB, altair, plotly and its base
   image, but not their dependencies.
 - *It is a choice, not a policy.* Anyone can switch back to `local`. An organisation that must enforce

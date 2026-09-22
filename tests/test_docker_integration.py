@@ -41,7 +41,7 @@ from pathlib import Path
 import pytest
 
 from fake_excel import write_workbook
-from hailer import __version__, kernel_image
+from hailer import kernel_image
 from hailer.config import load_config
 from hailer.errors import KernelRuntimeError
 from hailer.kernel import kernel_state_path
@@ -257,12 +257,13 @@ def docker_kernel(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Kernel]:
             runtime.engine_version()
         except KernelRuntimeError as err:
             _unavailable(f"Docker cannot be used: {err} {err.hint or ''}".strip())
-        found = kernel_image.image_version(runtime.image, runtime.runner)
+        found = kernel_image.image_contract(runtime.image, runtime.runner)
         build = "uv run python -m scripts.build_kernel_image --load (or uvx hailer kernel build)"
         if found is None:
             _unavailable(f"the kernel image {runtime.image} is not on this machine; build it with {build}")
-        if found != __version__:
-            _unavailable(f"{runtime.image} is for Hailer {found or '(no label)'}, this is {__version__}; rebuild it with {build}")
+        if found != kernel_image.contract_tag():
+            needed = kernel_image.contract_tag()
+            _unavailable(f"{runtime.image} has kernel contract {found or '(no label)'}, this Hailer needs {needed}; rebuild it with {build}")
 
         ensure_notebook(config.notebook, title="Sales")
         kernel = runtime.start(find_free_port(PREFERRED_PORT))
@@ -392,6 +393,26 @@ def test_host_secrets_are_not_in_the_kernel(docker_kernel: Kernel):
     assert result.success, result.stderr
     assert SECRET_NAME not in result.stdout and SECRET_VALUE not in result.stdout
     assert docker_kernel.kernel.server.token not in result.stdout, "the server token is not in the kernel's environment"
+
+
+def test_the_token_is_not_in_docker_inspect_or_the_kernels_command_lines(docker_kernel: Kernel):
+    """F7: marimo reads the token from a mounted file, so neither ``docker inspect`` (Args, Cmd,
+    Env) nor a process list shows it; the file on this machine is gone once the kernel answered."""
+    token = docker_kernel.kernel.server.token
+    kernel_id = docker_kernel.kernel.container_ids[0]
+    inspected = docker_kernel.runtime.runner.run(["inspect", kernel_id], timeout=30)
+    assert inspected.returncode == 0 and "--token-password-file" in inspected.stdout, inspected.stderr
+    assert token not in inspected.stdout, "the token is not in docker inspect"
+    workspace = Path(docker_kernel.config.workspace)
+    assert not list((workspace / ".hailer").glob("kernel-token-*")), "the token file was deleted after the start"
+    result = docker_kernel.run(
+        "import pathlib\n"
+        "lines = [p.read_bytes().replace(b'\\0', b' ').decode(errors='replace') for p in pathlib.Path('/proc').glob('[0-9]*/cmdline')]\n"
+        "print(len(lines))\n"
+        "print('\\n'.join(lines))"
+    )
+    assert result.success, result.stderr
+    assert "marimo" in result.stdout and token not in result.stdout, "no process shows the token"
 
 
 def test_the_record_holds_the_ids_docker_gave_the_kernel(docker_kernel: Kernel):

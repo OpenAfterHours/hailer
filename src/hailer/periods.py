@@ -11,13 +11,13 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 import duckdb
 import polars as pl
 
 from hailer.errors import MalformedParquetError
-from hailer.models import Period, PeriodFile
 
 PERIOD_RE = re.compile(r"^(?P<yy>\d{2})-(?P<mm>\d{2})\s+(?P<stem>.+)$")
 
@@ -27,6 +27,41 @@ _READ_ERRORS: tuple[type[BaseException], ...] = (pl.exceptions.PolarsError, OSEr
 DATA_SUFFIXES: tuple[str, ...] = (
     ".csv", ".tsv", ".parquet", ".json", ".jsonl", ".ndjson", ".xlsx", ".xls", ".xlsb", ".arrow", ".feather", ".ipc",
 )
+
+
+# --------------------------------------------------------------------------- #
+# Periods
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True, order=True)
+class Period:
+    """A reporting month encoded in a filename as ``YY-MM``."""
+
+    year: int
+    month: int
+
+    @property
+    def label(self) -> str:
+        """Long form, e.g. ``2025-03``."""
+        return f"{self.year:04d}-{self.month:02d}"
+
+    @property
+    def short(self) -> str:
+        """Filename form, e.g. ``25-03``."""
+        return f"{self.year % 100:02d}-{self.month:02d}"
+
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        return self.label
+
+
+@dataclass(frozen=True)
+class PeriodFile:
+    """A data file whose period is encoded in its name, e.g. ``25-03 sales.parquet``."""
+
+    path: Path
+    period: Period
+    stem: str  # the dataset name after the period, lower-cased, e.g. "sales"
 
 
 # --------------------------------------------------------------------------- #

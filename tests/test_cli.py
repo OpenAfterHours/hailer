@@ -22,7 +22,7 @@ from rich.console import Console
 from typer.testing import CliRunner
 
 import hailer.cli as cli
-from hailer import notebooks, __version__
+from hailer import __version__, kernel_image, notebooks
 from hailer.errors import ConfigError, CredentialsError, HailerError, NoSessionError
 from hailer.models import (
     AgentEvent,
@@ -1649,7 +1649,8 @@ def test_session_matching_is_by_path_not_filename(harness):
 
 LOCAL_LINE = "local (runs as you; not isolated)"
 DOCKER_SERVER = MarimoServer(url="http://127.0.0.1:2731", server_id="127.0.0.1:2731", source="kernel", token=TOKEN, runtime="docker")
-IMAGE = f"ghcr.io/openafterhours/hailer-kernel:{__version__}"
+CONTRACT = kernel_image.contract_tag()
+IMAGE = f"ghcr.io/openafterhours/hailer-kernel:{CONTRACT}"
 
 
 def docker_config(config: HailerConfig) -> HailerConfig:
@@ -1957,7 +1958,7 @@ def test_notebook_kernel_docker_runs_the_chat_against_a_container(harness, nb, d
     assert docker.commands("create")[0][4:7] == [names.forwarder, "-p", "127.0.0.1:2731:2718"]
     assert f"Marimo is running at http://127.0.0.1:2731  (log: docker logs {names.kernel})" in result.output
     assert harness.opened == [f"http://127.0.0.1:2731/?file=/work/notebooks/analysis.py&view-as=present&access_token={TOKEN}"]
-    assert f"Kernel:     docker (hailer-kernel {__version__}; no network; data read-only)" in result.output
+    assert f"Kernel:     docker (hailer-kernel {CONTRACT}; no network; data read-only)" in result.output
     config, server = agent_configs[0]
     assert config.kernel.runtime == "docker" and config.marimo_url == "http://127.0.0.1:2731"
     assert server.runtime == "docker" and server.token == TOKEN and server.paths is not None, "the chat is pinned to the container"
@@ -1989,7 +1990,7 @@ def test_notebook_downloads_a_missing_image_before_the_spinner_without_warning_f
 
     monkeypatch.setattr(cli, "console_factory", lambda: RecordingConsole(force_terminal=False, width=120, highlight=False, soft_wrap=True, color_system=None))
     monkeypatch.setattr(cli, "_chat_console", lambda opts: cli.console_factory())
-    docker.image_version = None
+    docker.image_contract = None
     docker.stream_hook = lambda args: events.append(args[0])
     result = notebook_cmd(["--kernel", "docker"])
     assert result.exit_code == 0, result.output
@@ -2049,7 +2050,7 @@ def test_notebook_foreground_in_docker_mode_follows_the_log_and_removes_the_cont
     result = notebook_cmd(["--kernel", "docker", "--foreground", "--no-browser", "--port", "2731"])
     assert result.exit_code == 0, result.output
     assert "Starting marimo in Docker on http://127.0.0.1:2731 (Ctrl+C stops it) ..." in result.output
-    assert f"Kernel:     docker (hailer-kernel {__version__}; no network; data read-only)" in result.output
+    assert f"Kernel:     docker (hailer-kernel {CONTRACT}; no network; data read-only)" in result.output
     assert f"Open http://127.0.0.1:2731/?access_token={TOKEN} in your browser." in result.output
     kernel_id = docker.streams[0][-1]
     assert docker.streams == [["logs", "-f", "--tail", "0", kernel_id]] and ["rm", "-f", kernel_id] in docker.calls, "by id"
@@ -2099,7 +2100,7 @@ def test_kernel_pull(harness, docker):
     result = runner.invoke(cli.app, ["kernel", "pull"], catch_exceptions=False)
     assert result.exit_code == 0, result.output
     assert docker.streams == [["pull", IMAGE]], "pulled even though a copy is here: it may be stale"
-    assert f"Downloading {IMAGE} ..." in result.output and f"{IMAGE} is ready (Hailer {__version__})." in result.output
+    assert f"Downloading {IMAGE} ..." in result.output and f"{IMAGE} is ready (kernel contract {CONTRACT})." in result.output
     docker.pull_code, docker.pull_error = 1, "dial tcp: lookup ghcr.io: no such host"
     result = runner.invoke(cli.app, ["kernel", "pull"], catch_exceptions=False)
     assert result.exit_code == 1 and "Could not download the kernel image" in result.output and "uvx hailer kernel build" in result.output
@@ -2112,7 +2113,7 @@ def test_kernel_pull_of_an_image_that_is_not_published(harness, docker):
     docker.pull_code, docker.pull_error = 1, "Error response from daemon: error from registry: denied\ndenied"
     result = runner.invoke(cli.app, ["kernel", "pull"], catch_exceptions=False)
     assert result.exit_code == 1
-    assert f"The kernel image for Hailer {__version__} is not published (or not visible to you): {IMAGE}." in result.output
+    assert f"The kernel image {CONTRACT} is not published (or not visible to you): {IMAGE}." in result.output
     assert "Build it on this machine with: uvx hailer kernel build" in result.output
 
 
@@ -2124,7 +2125,7 @@ def test_kernel_build(harness, docker, isolated_package_settings):
     build = docker.streams[0]
     assert build[:3] == ["build", "--tag", IMAGE]
     assert build[3:-1] == [part for name, value in build_args().items() for part in ("--build-arg", f"{name}={value}")]
-    assert f"Building {IMAGE} for Hailer {__version__} (marimo 0.24.2, Polars " in result.output and f"Built {IMAGE}." in result.output
+    assert f"Building {IMAGE} for kernel contract {CONTRACT} (marimo 0.24.2, Polars " in result.output and f"Built {IMAGE}." in result.output
     result = runner.invoke(cli.app, ["kernel", "build", "--tag", "hailer-kernel:dev"], catch_exceptions=False)
     assert docker.streams[-1][:3] == ["build", "--tag", "hailer-kernel:dev"]
     assert 'set image = "hailer-kernel:dev" under [kernel] in hailer.toml' in result.output

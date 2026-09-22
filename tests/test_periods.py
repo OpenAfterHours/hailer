@@ -10,7 +10,7 @@ import pytest
 
 from hailer import periods as pf
 from hailer.errors import MalformedParquetError
-from hailer.models import Period, PeriodFile
+from hailer.periods import Period, PeriodFile
 
 # --------------------------------------------------------------------------- #
 # parsing

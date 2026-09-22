@@ -16,41 +16,6 @@ if TYPE_CHECKING:  # pragma: no cover - annotations only; hailer.kernel imports 
 
 
 # --------------------------------------------------------------------------- #
-# Data / periods
-# --------------------------------------------------------------------------- #
-
-
-@dataclass(frozen=True, order=True)
-class Period:
-    """A reporting month encoded in a filename as ``YY-MM``."""
-
-    year: int
-    month: int
-
-    @property
-    def label(self) -> str:
-        """Long form, e.g. ``2025-03``."""
-        return f"{self.year:04d}-{self.month:02d}"
-
-    @property
-    def short(self) -> str:
-        """Filename form, e.g. ``25-03``."""
-        return f"{self.year % 100:02d}-{self.month:02d}"
-
-    def __str__(self) -> str:  # pragma: no cover - trivial
-        return self.label
-
-
-@dataclass(frozen=True)
-class PeriodFile:
-    """A data file whose period is encoded in its name, e.g. ``25-03 sales.parquet``."""
-
-    path: Path
-    period: Period
-    stem: str  # the dataset name after the period, lower-cased, e.g. "sales"
-
-
-# --------------------------------------------------------------------------- #
 # Marimo
 # --------------------------------------------------------------------------- #
 
@@ -171,7 +136,7 @@ class WebConfig:
 KERNEL_RUNTIME_LOCAL = "local"
 KERNEL_RUNTIME_DOCKER = "docker"
 VALID_KERNEL_RUNTIMES = (KERNEL_RUNTIME_LOCAL, KERNEL_RUNTIME_DOCKER)
-#: The published kernel image; the tag is the Hailer version (see ``KernelConfig.effective_image``).
+#: The published kernel image; the tag is the kernel contract (see ``hailer.kernel_image``).
 KERNEL_IMAGE_REPOSITORY = "ghcr.io/openafterhours/hailer-kernel"
 
 
@@ -180,7 +145,7 @@ class KernelConfig:
     """The ``[kernel]`` table: where notebook code runs. Only ``runtime`` matters for ``local``."""
 
     runtime: str = KERNEL_RUNTIME_LOCAL  # one of VALID_KERNEL_RUNTIMES (validate() reports others)
-    image: str | None = None  # None: the image for this Hailer version
+    image: str | None = None  # None: the published image for this Hailer's kernel contract
     memory: str = "4g"  # docker --memory format: <number>[b|k|m|g], as written (any case)
     cpus: float = 2.0
     network: bool = False  # docker only: True puts the kernel on the default bridge network
@@ -189,10 +154,10 @@ class KernelConfig:
 
     @property
     def effective_image(self) -> str:
-        """``image``, else ``ghcr.io/openafterhours/hailer-kernel:<hailer version>``."""
-        from hailer import __version__  # the package root: plain constant, no side effects
+        """``image``, else ``ghcr.io/openafterhours/hailer-kernel:marimo<version>-<fingerprint>``."""
+        from hailer.kernel_image import default_image  # lazy: kernel_image imports this module
 
-        return self.image or f"{KERNEL_IMAGE_REPOSITORY}:{__version__}"
+        return self.image or default_image()
 
 
 @dataclass(frozen=True)

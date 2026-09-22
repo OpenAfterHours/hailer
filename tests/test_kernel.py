@@ -20,6 +20,7 @@ from fake_kernel import LIVE, TOKEN, FakeProc, Procs, answers, make_config
 from hailer import __version__
 from hailer import kernel as k
 from hailer.errors import ConfigError, KernelRuntimeError
+from hailer.kernel_image import contract_tag
 from hailer.models import KernelConfig, MarimoServer, ModelConfig, ProviderConfig
 
 # --------------------------------------------------------------------------- #
@@ -340,15 +341,14 @@ def test_kernel_environment_names_ignore_case_on_windows(tmp_path):
 
 def test_describe_runtime():
     assert k.describe_runtime(KernelConfig()) == "local (runs as you; not isolated)"
-    assert k.describe_runtime(KernelConfig(runtime="docker"), version="0.2.5") == "docker (hailer-kernel 0.2.5; no network; data read-only)"
-    assert k.describe_runtime(KernelConfig(runtime="docker", network=True), version="0.2.5") == (
-        "docker (hailer-kernel 0.2.5; network on: the internet and this machine; data read-only)"
+    assert k.describe_runtime(KernelConfig(runtime="docker")) == f"docker (hailer-kernel {contract_tag()}; no network; data read-only)"
+    assert k.describe_runtime(KernelConfig(runtime="docker", network=True)) == (
+        f"docker (hailer-kernel {contract_tag()}; network on: the internet and this machine; data read-only)"
     )
-    assert f"hailer-kernel {__version__};" in k.describe_runtime(KernelConfig(runtime="docker"))
 
 
 def test_effective_image():
-    assert KernelConfig().effective_image == f"ghcr.io/openafterhours/hailer-kernel:{__version__}"
+    assert KernelConfig().effective_image == f"ghcr.io/openafterhours/hailer-kernel:{contract_tag()}"
     assert KernelConfig(image="registry.example/hailer-kernel:dev").effective_image == "registry.example/hailer-kernel:dev"
 
 
