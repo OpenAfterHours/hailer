@@ -11,8 +11,8 @@
 Terminal ─────► │  conversation   │   (create_agent + ChatOpenAI), Hailer's system
  uvx hailer     │  + tools        │   prompt, the conversation kept in .hailer/
                 │                 │
-                │  marimo_execute, marimo_status, notebook_cells, notebook_list,
-                │  notebook_create, notebook_open, notebook_close,
+                │  marimo_execute, marimo_status, notebook_cells, notebook_check,
+                │  notebook_list, notebook_create, notebook_open, notebook_close,
                 │  list_periods, load_skill, read_skill_file, fetch_page
                 └────────┬────────┘
                          │ HTTP + SSE  (/api/sessions, /api/kernel/execute),
@@ -27,11 +27,13 @@ Terminal ─────► │  conversation   │   (create_agent + ChatOpenAI
 ```
 
 The CLI runs the agent in its own process, with the model and provider taken from `hailer.toml`. The agent
-has exactly the eleven tools above and nothing else: no shell, no file editing. The tools talk to the
+has exactly the twelve tools above and nothing else: no shell, no file editing. The tools talk to the
 running marimo server over plain HTTP. Code from the agent runs in marimo's *scratchpad*, a temporary
 namespace that can read every notebook variable, and durable changes (new cells, edits, runs) go through
 marimo's code-mode API so they appear immediately in the browser. The notebook file on disk is written by
-marimo itself, never edited behind the kernel's back.
+marimo itself, never edited behind the kernel's back. Cells the agent creates or edits are formatted with
+ruff by code mode before they run, and checked afterwards with ruff and ty on the Hailer side; the findings
+go back to the model with the tool result (see [Formatting and code checks](../using/notebooks.md#code-checks)).
 
 Where marimo and its kernel run is the *kernel runtime*, set by `[kernel] runtime`: `local` (the default)
 starts marimo in Hailer's own Python, `docker` starts it in a container (see

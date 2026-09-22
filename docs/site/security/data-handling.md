@@ -8,11 +8,15 @@ notebooks and data folders by path (with the docker kernel, the container's `/wo
 to the `base_url` you configured, and nowhere else: when older turns are summarised, the same endpoint and
 model write the summary.
 
+The findings of the [code checks](../using/notebooks.md#code-checks) are tool results too: each names a
+cell and quotes the code line it is about. ruff and ty run on this machine; notebook code is never sent
+anywhere else to be checked.
+
 **Not sent:** your data files or any dataframe, unless code explicitly prints or returns it (the agent is
 instructed to inspect schemas, samples and aggregates and to keep outputs compact); API keys or other
 secrets (the key stays inside the Hailer process and is masked in logs).
 
-**What the agent can do:** it has Hailer's eleven tools and nothing else: no shell, no file tools, no
+**What the agent can do:** it has Hailer's twelve tools and nothing else: no shell, no file tools, no
 tools from other software on your machine. Nothing asks for approval before a tool runs. The tool that
 matters is `marimo_execute`: it runs the Python the model writes in the notebook kernel. That is what
 makes the analysis possible. What the code can reach depends on the kernel runtime:
@@ -63,7 +67,7 @@ and press Ctrl+C if a turn goes somewhere you did not intend.
 - *The token is on the container's command line*, so `docker inspect` shows it. Anyone who can use Docker
   on the machine can already `docker exec` into the container, so hiding it would gain nothing.
 - *The image is trusted by name.* Hailer checks its tag and version label, not a signature, and runs
-  whatever `[kernel].image` names. The image pins marimo, Polars, fastexcel, DuckDB, altair, plotly and its base
+  whatever `[kernel].image` names. The image pins marimo, Polars, fastexcel, DuckDB, altair, plotly, ruff and its base
   image, but not their dependencies.
 - *It is a choice, not a policy.* Anyone can switch back to `local`. An organisation that must enforce
   isolation should run Hailer itself in a managed virtual machine or dev container.

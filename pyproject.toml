@@ -24,6 +24,11 @@ dependencies = [
     "prompt-toolkit>=3.0.53,<4",
     # OS credential store (Windows Credential Manager on Windows) for API keys.
     "keyring>=25.6",
+    # Checks for the cells the agent writes (hailer.code_checks): ruff lints them and, in the
+    # kernel, formats them as code mode writes them; ty type-checks them. Both are pre-1.0 and
+    # change their rules and messages between minor versions, so the ranges stay narrow.
+    "ruff>=0.16.8,<0.17",
+    "ty>=0.0.83,<0.0.84",
 ]
 
 [project.scripts]

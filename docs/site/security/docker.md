@@ -173,7 +173,7 @@ context; the command refers to their original paths.
   in place through the mount, never copied. The starter notebook finds `WORKSPACE = /work` and
   `DATA_DIR = /work/data`, the model is told those paths, and notebooks need no changes.
 - **No network.** No internet, no DNS, no route to this machine. Installing packages (`ctx.packages.add()`)
-  and DuckDB's `INSTALL` fail. The image has marimo, Polars, fastexcel, DuckDB, altair and plotly; anything else
+  and DuckDB's `INSTALL` fail. The image has marimo, Polars, fastexcel, DuckDB, altair, plotly and ruff (which formats the agent's cells); anything else
   needs an image of your own (see [Known limitations](../reference/limitations.md#known-limitations)).
 - **No secrets.** None of your environment variables reach the container, and nothing of Hailer's own
   runs in it but the notebook helpers (`hailer.periods`) and the forwarder: no LangChain, no keyring, no

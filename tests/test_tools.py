@@ -4,15 +4,16 @@ registration the agent uses (offline)."""
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import threading
 from pathlib import Path
 
 import pytest
 
-from hailer import notebooks
+from hailer import code_checks, notebooks
 from hailer.errors import MarimoUnavailableError, NoSessionError
-from hailer.models import ExecResult, HailerConfig, KernelConfig, MarimoServer, MarimoSession, WebConfig
+from hailer.models import CodeChecksConfig, ExecResult, HailerConfig, KernelConfig, MarimoServer, MarimoSession, WebConfig
 from hailer.tools import TOOL_NAMES, HailerTools, hailer_tools
 
 NOTEBOOK_SOURCE = 'import marimo\n\n__generated_with = "0.24.2"\napp = marimo.App()\n\n\n@app.cell\ndef _():\n    return\n\n\nif __name__ == "__main__":\n    app.run()\n'
@@ -263,6 +264,131 @@ def test_notebook_cells_filters(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# HailerTools: code checks (hailer.code_checks runs the real ruff and ty)
+# --------------------------------------------------------------------------- #
+
+STARTER_CELLS = {"imp": "import marimo as mo\nimport polars as pl", "load": "sales = pl.read_csv('sales.csv')"}
+WRITE_CELL = "import marimo._code_mode as cm\nasync with cm.get_context() as ctx:\n    ctx.create_cell('...')"
+
+
+class NotebookClient(FakeClient):
+    """A FakeClient with cells: it answers the cell snapshot from ``cells`` and applies ``writes``
+    (code -> cells to set) when the agent's code runs."""
+
+    def __init__(self, cells: dict[str, str], writes: dict[str, dict[str, str]] | None = None, **kw):
+        super().__init__(**kw)
+        self.cells = dict(cells)
+        self.writes = writes or {}
+
+    def execute(self, code, **kw):
+        if code_checks.SNAPSHOT_MARKER in code:
+            self.executed.append(code)
+            payload = {"cells": [{"id": cid, "name": cid, "code": text} for cid, text in self.cells.items()]}
+            return ExecResult(success=True, stdout=code_checks.SNAPSHOT_MARKER + json.dumps(payload) + "\n")
+        result = super().execute(code, **kw)
+        self.cells.update(self.writes.get(code, {}))
+        return result
+
+
+def test_marimo_execute_checks_the_cells_it_changed(tmp_path):
+    new_cell = "revenue = sales.group_by('region').agg(pl.col('revenue').sum())\nrevenue.sortt('revenue')"
+    client = NotebookClient(
+        {**STARTER_CELLS, "old": "print(missing_before)"},
+        {WRITE_CELL: {"revenue": new_cell}},
+        result=ExecResult(success=True, stdout="created cell\n"),
+    )
+    text = HailerTools(make_config(tmp_path), factory_for(client)).marimo_execute(WRITE_CELL)
+    assert text == (
+        "created cell\n\n"
+        "Checks (ruff, ty) on the 1 changed cell: 1 finding.\n"
+        "- cell revenue (revenue), line 2: ty unresolved-attribute: Object of type `DataFrame` has no attribute `sortt`\n"
+        "    revenue.sortt('revenue')"
+    ), "the pre-existing problem in cell 'old' is not the agent's change"
+    before, agent, after = client.executed
+    assert "format_on_save" in before and agent == WRITE_CELL and "format_on_save" not in after
+
+
+def test_marimo_execute_reports_a_clean_change_and_a_failed_run(tmp_path):
+    client = NotebookClient(STARTER_CELLS, {WRITE_CELL: {"n": "rows = sales.height"}}, result=ExecResult(success=False, stderr="boom"))
+    text = HailerTools(make_config(tmp_path), factory_for(client)).marimo_execute(WRITE_CELL)
+    assert text.startswith("Execution failed.\n[stderr]\nboom")
+    assert text.endswith("\n\nChecks (ruff, ty) on the 1 changed cell: no findings.")
+
+
+def test_marimo_execute_without_cell_writes_runs_only_the_code(tmp_path):
+    client = NotebookClient(STARTER_CELLS)
+    tools = HailerTools(make_config(tmp_path), factory_for(client))
+    assert tools.marimo_execute("print(sales.shape)") == "hello"
+    assert client.executed == ["print(sales.shape)"]
+    reading = "import marimo._code_mode as cm\nprint(cm.get_context().cells[0].code)"
+    assert tools.marimo_execute(reading) == "hello" and client.executed[-1] == reading and len(client.executed) == 2
+
+
+def test_marimo_execute_says_nothing_when_no_cell_changed(tmp_path):
+    client = NotebookClient(STARTER_CELLS)
+    assert HailerTools(make_config(tmp_path), factory_for(client)).marimo_execute(WRITE_CELL) == "hello"
+    assert len(client.executed) == 3
+
+
+def test_checks_config_switches_the_parts_off(tmp_path):
+    writes = {WRITE_CELL: {"n": "print(undefined_x)"}}
+    off = CodeChecksConfig(lint=False, typecheck=False, format=False)
+    client = NotebookClient(STARTER_CELLS, writes)
+    assert HailerTools(make_config(tmp_path, checks=off), factory_for(client)).marimo_execute(WRITE_CELL) == "hello"
+    assert client.executed == [WRITE_CELL]
+
+    format_only = CodeChecksConfig(lint=False, typecheck=False, format=True)
+    client = NotebookClient(STARTER_CELLS, writes)
+    assert HailerTools(make_config(tmp_path, checks=format_only), factory_for(client)).marimo_execute(WRITE_CELL) == "hello"
+    assert len(client.executed) == 2 and "format_on_save" in client.executed[0], "formatting is switched on, nothing checked"
+
+    lint_only = CodeChecksConfig(typecheck=False, format=False)
+    client = NotebookClient(STARTER_CELLS, writes)
+    text = HailerTools(make_config(tmp_path, checks=lint_only), factory_for(client)).marimo_execute(WRITE_CELL)
+    assert "Checks (ruff) on the 1 changed cell: 1 finding." in text and "ruff F821" in text
+    assert "format_on_save" not in client.executed[0]
+
+
+def test_marimo_execute_runs_the_code_when_the_cells_cannot_be_read(tmp_path):
+    class Unreadable(NotebookClient):
+        def execute(self, code, **kw):
+            if code_checks.SNAPSHOT_MARKER in code:
+                self.executed.append(code)
+                return ExecResult(success=False, stderr="AttributeError: no _document")
+            return super().execute(code, **kw)
+
+    client = Unreadable(STARTER_CELLS, {WRITE_CELL: {"n": "print(undefined_x)"}})
+    assert HailerTools(make_config(tmp_path), factory_for(client)).marimo_execute(WRITE_CELL) == "hello"
+    assert WRITE_CELL in client.executed
+
+
+def test_the_findings_survive_the_output_cap(tmp_path):
+    big = "".join(f"row {i}\n" for i in range(5000))
+    client = NotebookClient(STARTER_CELLS, {WRITE_CELL: {"n": "print(undefined_x)"}}, result=ExecResult(success=True, stdout=big))
+    text = HailerTools(make_config(tmp_path, max_tool_output_chars=1000), factory_for(client)).marimo_execute(WRITE_CELL)
+    assert len(text) <= 1000 and text.startswith("row 0\n") and "truncated" in text
+    assert text.endswith("- cell n (n), line 1: ty unresolved-reference: Name `undefined_x` used when not defined\n    print(undefined_x)")
+
+
+def test_notebook_check_covers_the_whole_notebook(tmp_path):
+    client = NotebookClient({**STARTER_CELLS, "empty": " ", "old": "print(missing_before)"})
+    tools = HailerTools(make_config(tmp_path), factory_for(client))
+    assert tools.notebook_check() == (
+        "Checks (ruff, ty) on the notebook's 3 cells: 1 finding.\n"
+        "- cell old (old), line 1: ty unresolved-reference: Name `missing_before` used when not defined\n"
+        "    print(missing_before)"
+    )
+    assert "format_on_save" not in client.executed[0]
+
+    assert HailerTools(make_config(tmp_path), factory_for(NotebookClient({"e": ""}))).notebook_check() == "The notebook has no code to check."
+    off = make_config(tmp_path, checks=CodeChecksConfig(lint=False, typecheck=False))
+    assert "switched off" in HailerTools(off, factory_for(client)).notebook_check()
+    unreadable = FakeClient(result=ExecResult(success=False, stderr="NameError: x"))
+    assert HailerTools(make_config(tmp_path), factory_for(unreadable)).notebook_check().startswith("Could not read the notebook's cells.")
+    assert HailerTools(make_config(tmp_path), failing_factory).notebook_check().startswith("ERROR: marimo is not running")
+
+
+# --------------------------------------------------------------------------- #
 # HailerTools: notebook lifecycle tools
 # --------------------------------------------------------------------------- #
 
@@ -506,10 +632,10 @@ def test_skill_and_page_tools(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
-def test_hailer_tools_registers_eleven_tools_with_descriptions_and_schemas(tmp_path):
+def test_hailer_tools_registers_twelve_tools_with_descriptions_and_schemas(tmp_path):
     tools = hailer_tools(make_config(tmp_path), client_factory=failing_factory)
     assert [t.name for t in tools] == list(TOOL_NAMES)
-    assert len(tools) == 11
+    assert len(tools) == 12
     assert all(t.description and len(t.description) > 40 for t in tools)
     by_name = {t.name: t for t in tools}
     schema = {name: t.tool_call_schema.model_json_schema() for name, t in by_name.items()}
@@ -519,6 +645,7 @@ def test_hailer_tools_registers_eleven_tools_with_descriptions_and_schemas(tmp_p
     assert schema["read_skill_file"]["required"] == ["name", "path"]
     assert not schema["notebook_close"].get("required")
     assert not schema["marimo_status"].get("required")
+    assert not schema["notebook_check"].get("required")
     # the description is the method's docstring, the text the model reads
     assert "scratchpad" in by_name["marimo_execute"].description
     assert "ACTIVE" in by_name["marimo_status"].description

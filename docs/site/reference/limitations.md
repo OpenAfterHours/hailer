@@ -16,6 +16,11 @@
   project context) plus the conversation; an endpoint with a strict request-size limit needs room for that.
 - The endpoint must support function calling in the standard OpenAI shape. An endpoint that streams tool
   calls in a non-standard way may lose their arguments; `stream = false` on the provider avoids that.
+- The [code checks](../using/notebooks.md#code-checks) are static: ty cannot see column names or the data,
+  and types from packages Hailer's own Python lacks (with the docker kernel: altair, plotly) are unknown to
+  it, so it finds less there. ty is pre-1.0; Hailer pins it, and its rules and messages may change when
+  the pin moves. Formatting needs ruff in the kernel's Python: Hailer's own Python and the kernel image have
+  it; a marimo server you started yourself in another environment skips it.
 - After Ctrl+C during a long `marimo_execute`, the turn ends at once but the code keeps running in the
   kernel until it finishes, or until you interrupt or restart the kernel from the notebook.
 - The docker kernel needs Docker, which is not always an option: Docker Desktop is free for personal use
@@ -26,7 +31,7 @@
   much slower for large Parquet files has not been measured yet.
 - The release workflow builds the `linux/arm64` kernel image (Apple Silicon, ARM Linux), but the CI
   integration test only covers amd64. Podman is not supported.
-- The docker kernel has only the packages in the image (marimo, Polars, fastexcel, DuckDB, altair, plotly); anything
+- The docker kernel has only the packages in the image (marimo, Polars, fastexcel, DuckDB, altair, plotly, ruff); anything
   else needs an image of your own, built `FROM` Hailer's (so it keeps the version label) and named in
   `[kernel].image`. There is one kernel per workspace, and
   changing `[kernel]` settings while one is kept running needs `uvx hailer kernel stop` first.
