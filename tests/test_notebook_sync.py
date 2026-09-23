@@ -29,7 +29,14 @@ def notebook(marker: str = "") -> str:
 
 def _write(path: Path, text: str = NB) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
+    before = path.stat().st_mtime_ns if path.exists() else None
     path.write_text(text, encoding="utf-8", newline="\n")
+    if before is not None and path.stat().st_mtime_ns <= before:
+        # An overwrite must look like one, as it does in the kernel's tmpfs: the sync tells a changed
+        # notebook by its listing's time and size, and on Windows two writes within one clock tick
+        # can share a time (a same-size "v2" right after "v1" was then never copied back).
+        later = before + 10_000_000
+        os.utime(path, ns=(later, later))
     return path
 
 
