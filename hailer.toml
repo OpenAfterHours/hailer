@@ -56,3 +56,12 @@ runtime = "docker"                   # "docker" or "unsafe-local"
 # memory  = "4g"                     # docker: container memory limit (no swap on top)
 # cpus    = 2                        # docker: container CPU limit
 # network = false                    # docker: true lets notebook code reach the internet and this machine
+
+# The cells the agent writes. After each notebook change Hailer checks the changed cells with ruff
+# (lint) and ty (types) and hands the findings back to the agent; code mode formats new and edited
+# cells with ruff before marimo applies them. All three are on by default.
+#
+# [checks]
+# lint      = true                   # ruff: undefined names, unused variables, likely bugs
+# typecheck = true                   # ty: wrong attributes, arguments and types across cells
+# format    = true                   # ruff format, with marimo's line length

@@ -155,6 +155,18 @@ class KernelConfig:
 
 
 @dataclass(frozen=True)
+class CodeChecksConfig:
+    """The ``[checks]`` table: what happens to the cells the agent writes through code mode."""
+
+    #: ruff lints the changed cells; its findings are appended to the ``marimo_execute`` result.
+    lint: bool = True
+    #: ty type-checks the changed cells, with the types of the notebook's other cells in view.
+    typecheck: bool = True
+    #: ruff formats new and edited cells before marimo applies them (needs ruff in the kernel's Python).
+    format: bool = True
+
+
+@dataclass(frozen=True)
 class HailerConfig:
     """Fully resolved configuration (file + environment overrides). Paths are absolute."""
 
@@ -168,6 +180,7 @@ class HailerConfig:
     providers: dict[str, ProviderConfig] = field(default_factory=dict)
     web: WebConfig = field(default_factory=WebConfig)
     kernel: KernelConfig = field(default_factory=KernelConfig)
+    checks: CodeChecksConfig = field(default_factory=CodeChecksConfig)
     log_level: str = "WARNING"
     config_path: Path | None = None
     max_tool_output_chars: int = 12_000

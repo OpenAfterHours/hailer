@@ -54,6 +54,8 @@ IMAGE_PACKAGES = {
     "polars": "1.44.2",
     "fastexcel": "0.21.0",
     "duckdb": "1.5.5",
+    # Code mode formats the cells the agent writes with the kernel's ruff (hailer.code_checks).
+    "ruff": "0.16.8",
     "altair": "6.3.0",
     "plotly": "7.1.0",
 }

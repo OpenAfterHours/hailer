@@ -19,7 +19,7 @@ from hailer.config import (
     write_default_config,
 )
 from hailer.errors import ConfigError
-from hailer.models import HailerConfig, KernelConfig
+from hailer.models import CodeChecksConfig, HailerConfig, KernelConfig
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -498,6 +498,28 @@ def test_validate_unknown_keys_are_warnings(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------- #
 # [kernel]
 # --------------------------------------------------------------------------- #
+
+
+def test_checks_default_to_on_and_can_be_switched_off(tmp_path: Path) -> None:
+    ws = _make_workspace(tmp_path)
+    assert load_config(workspace=ws, env={}).checks == CodeChecksConfig(lint=True, typecheck=True, format=True)
+    (tmp_path / "off").mkdir()
+    ws = _make_workspace(tmp_path / "off", "[checks]\nlint = false\ntypecheck = false\nformat = false\n")
+    assert load_config(workspace=ws, env={}).checks == CodeChecksConfig(lint=False, typecheck=False, format=False)
+    (tmp_path / "some").mkdir()
+    ws = _make_workspace(tmp_path / "some", "[checks]\ntypecheck = false\n")
+    assert load_config(workspace=ws, env={}).checks == CodeChecksConfig(lint=True, typecheck=False, format=True)
+
+
+def test_checks_values_must_be_booleans_and_keys_known(tmp_path: Path) -> None:
+    ws = _make_workspace(tmp_path, '[checks]\nlint = "no"\n')
+    with pytest.raises(ConfigError, match=r"\[checks\]\.lint .* must be true or false"):
+        load_config(workspace=ws, env={})
+    (tmp_path / "typo").mkdir()
+    ws = _make_workspace(tmp_path / "typo", "[checks]\nformatting = false\n")
+    problems = validate(load_config(workspace=ws, env={}))
+    assert any("unknown key [checks].formatting" in p for p in problems)
+    assert not any("unknown section [checks]" in p for p in problems)
 
 
 def test_kernel_defaults_to_docker(tmp_path: Path) -> None:

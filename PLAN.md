@@ -14,8 +14,9 @@ Terminal ── hailer.cli (Typer) ── hailer.chat / chat_ui (composer, slash
                │
 agent.py       LangChain create_agent + ChatOpenAI ──HTTPS──► model endpoint (OpenAI or a custom base_url,
                │  API key and conversation stay here            Responses API or Chat Completions)
-tools.py       11 tools: marimo_execute, marimo_status, notebook_cells, notebook_list, notebook_create,
-               │  notebook_open, notebook_close, list_periods, load_skill, read_skill_file, fetch_page
+tools.py       12 tools: marimo_execute, marimo_status, notebook_cells, notebook_check, notebook_list,
+               │  notebook_create, notebook_open, notebook_close, list_periods, load_skill, read_skill_file,
+               │  fetch_page
                ▼
 sandbox.py     MarimoSandbox: the kernel this process started (endpoint, stop, notebooks and data by name)
                │  HTTP + SSE with the kernel's token (marimo_client.py)
@@ -29,10 +30,13 @@ unsafe-local      marimo in Hailer's own Python, as the user; secret-looking var
 Browser UI     the notebook tab; a kernel session exists only while it is open
 ```
 
-One Python process holds the CLI, the agent and the tools. The model gets those eleven tools and nothing
+One Python process holds the CLI, the agent and the tools. The model gets those twelve tools and nothing
 else: no shell, no file tool, no approval step; `fetch_page` reaches only `[web].allowed_domains`. Code the
 model writes runs in marimo's scratchpad, and durable changes go through marimo's private code-mode API
-(`marimo._code_mode`), so marimo is pinned (`==0.24.2`) and so is the kernel image's marimo.
+(`marimo._code_mode`), so marimo is pinned (`==0.24.2`) and so is the kernel image's marimo. Code mode
+formats the cells the agent creates or edits with the kernel's ruff before they run, and `code_checks.py`
+checks the changed cells with ruff and ty on this machine, over a snapshot the kernel returns; the findings
+end the tool result (`[checks]` in `hailer.toml` turns each part off).
 
 ## The sandbox contract
 
@@ -119,7 +123,8 @@ src/hailer/
 │                      init, login, logout, doctor, status (setup), shared collaborators and checks (common)
 ├── chat.py, chat_ui.py   ChatController (slash commands, notebook switches), the persistent composer
 ├── agent.py           build_model, HailerAgent (threads, streamed turns, Ctrl+C), system prompt, error mapping
-├── tools.py           HailerTools (the 11 tools) and hailer_tools(config) -> LangChain tools
+├── tools.py           HailerTools (the 12 tools) and hailer_tools(config) -> LangChain tools
+├── code_checks.py     ruff and ty on the cells the agent writes (and code mode's ruff formatting)
 ├── sandbox.py         MarimoSandbox, the sandbox contract
 ├── notebook_sync.py   the allow-listed copy between the docker kernel and the host
 ├── kernel.py          runtime_for, the unsafe-local runtime, withheld variables

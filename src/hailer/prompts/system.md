@@ -20,6 +20,9 @@ the workspace can be listed the same way (`sorted(p.name for p in WORKSPACE.iter
   the URL to open when the active notebook has none.
 - `notebook_cells(pattern)` — list the active notebook's cells (id, name, first line, status, errors).
   Call this before adding or editing cells.
+- `notebook_check()` — check every cell of the active notebook with ruff (lint) and ty (types). Cells
+  you create or edit are checked automatically; use it for the whole notebook, for example when the
+  user asks for a review or before you build on a notebook written elsewhere.
 - `notebook_list()` — the notebooks in the notebooks folder, marking which are open and which is active.
 - `notebook_create(name, template="starter")` — create a notebook in the notebooks folder from the
   starter template (`template="empty"` for a blank one), open it in the user's browser, wait for its
@@ -102,6 +105,17 @@ Rules that keep the notebook valid and readable:
 - `marimo._code_mode` is scratchpad-only. Never import it inside a notebook cell.
 - Never edit the notebook `.py` file on disk while the session is live; the kernel is the source of truth.
 - Deleting cells is destructive: check `ctx.graph.descendants(cid)` first and only delete on clear intent.
+
+**Formatting and checks.** Cells you create or edit are formatted with ruff before they run, so their
+code can be laid out differently from what you sent: read `ctx.cells[...].code` before editing a cell by
+replacing text in it. When a `marimo_execute` call changed cells, its result ends with
+`Checks (ruff, ty) on the N changed cells: ...` and one line per finding (cell, line, tool, rule,
+message, then the code on that line). The whole notebook is checked, in dependency order, so ty knows
+what the other cells define. Fix findings that point at real mistakes (undefined names, misspelt
+attributes, wrong arguments, type errors) with `ctx.edit_cell` in your next call, before building on the
+cell. A type checker cannot see column names or data, so a finding that is plainly wrong about them can
+be left; do not rewrite working code only to silence a checker, and do not mention findings to the user
+unless they matter.
 
 ## Data conventions
 

@@ -1,6 +1,7 @@
-# The Hailer kernel image: marimo, Polars, fastexcel, DuckDB, altair and plotly, plus a few hailer
-# modules (the notebook helpers in hailer.periods, the errors they raise and the forwarder in
-# hailer._forward; nothing else of Hailer runs in here: no LangChain, no keyring, no API key).
+# The Hailer kernel image: marimo, Polars, fastexcel, DuckDB, altair, plotly and ruff (code mode formats
+# the cells the agent writes with it), plus a few hailer modules (the notebook helpers in
+# hailer.periods, the errors they raise and the forwarder in hailer._forward; nothing else of
+# Hailer runs in here: no LangChain, no keyring, no API key).
 #
 # Build it with `uvx hailer kernel build`: that writes this file and those modules into a temporary
 # context and passes the build args below: the exact versions of the kernel contract
@@ -18,6 +19,7 @@ ARG MARIMO_VERSION
 ARG POLARS_VERSION
 ARG FASTEXCEL_VERSION
 ARG DUCKDB_VERSION
+ARG RUFF_VERSION
 ARG ALTAIR_VERSION
 ARG PLOTLY_VERSION
 ARG KERNEL_CONTRACT
@@ -32,7 +34,7 @@ ENV PATH="/opt/hailer-venv/bin:${PATH}"
 
 RUN --mount=type=secret,id=pip_config --mount=type=secret,id=pip_cert \
     test -n "$MARIMO_VERSION" && test -n "$POLARS_VERSION" && test -n "$FASTEXCEL_VERSION" && test -n "$DUCKDB_VERSION" \
-    && test -n "$ALTAIR_VERSION" && test -n "$PLOTLY_VERSION" && test -n "$KERNEL_CONTRACT" \
+    && test -n "$RUFF_VERSION" && test -n "$ALTAIR_VERSION" && test -n "$PLOTLY_VERSION" && test -n "$KERNEL_CONTRACT" \
     || { echo "Missing build args: build with uvx hailer kernel build (see hailer.kernel_image)." >&2; exit 1; }; \
     if [ -f /run/secrets/pip_config ]; then \
         unset PIP_INDEX_URL PIP_EXTRA_INDEX_URL PIP_TRUSTED_HOST PIP_NO_INDEX PIP_FIND_LINKS PIP_PROXY PIP_CERT PIP_TIMEOUT PIP_RETRIES; \
@@ -44,6 +46,7 @@ RUN --mount=type=secret,id=pip_config --mount=type=secret,id=pip_cert \
         polars==${POLARS_VERSION} \
         fastexcel==${FASTEXCEL_VERSION} \
         duckdb==${DUCKDB_VERSION} \
+        ruff==${RUFF_VERSION} \
         altair==${ALTAIR_VERSION} \
         plotly==${PLOTLY_VERSION}
 

@@ -184,7 +184,7 @@ context; the command refers to their original paths.
   through the mount, never copied. The starter notebook finds `WORKSPACE = /work` and
   `DATA_DIR = /work/data`, the model is told those paths, and notebooks need no changes.
 - **No network.** No internet, no DNS, no route to this machine. Installing packages (`ctx.packages.add()`)
-  and DuckDB's `INSTALL` fail. The image has marimo, Polars, fastexcel, DuckDB, altair and plotly; anything else
+  and DuckDB's `INSTALL` fail. The image has marimo, Polars, fastexcel, DuckDB, altair, plotly and ruff (which formats the agent's cells); anything else
   needs an image of your own (see [Known limitations](../reference/limitations.md#known-limitations)).
 - **The browser is not the kernel.** "No network" covers the kernel only. Notebook outputs render in your
   browser, which is online: an HTML, Markdown or image output that notebook code produces can load from, or

@@ -29,6 +29,7 @@ from hailer.models import (
     VALID_KERNEL_RUNTIMES,
     VALID_WIRE_APIS,
     WIRE_API_RESPONSES,
+    CodeChecksConfig,
     HailerConfig,
     KernelConfig,
     ModelConfig,
@@ -49,7 +50,7 @@ VALID_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 
 # Known keys per section; anything else is reported by validate() as a warning.
-_KNOWN_TOP = {"hailer", "model", "model_providers", "web", "kernel"}
+_KNOWN_TOP = {"hailer", "model", "model_providers", "web", "kernel", "checks"}
 _KNOWN_HAILER = {
     "notebook",
     "notebooks_dir",
@@ -75,6 +76,7 @@ _KNOWN_PROVIDER = {
 }
 _KNOWN_WEB = {"allowed_domains", "max_page_bytes"}
 _KNOWN_KERNEL = {"runtime", "image", "memory", "cpus", "network"}
+_KNOWN_CHECKS = {"lint", "typecheck", "format"}
 
 # docker --memory: a number with an optional b/k/m/g unit ("4g", "512m", "1.5g").
 _MEMORY_RE = re.compile(r"^(\d+(?:\.\d+)?)[bkmg]?$", re.IGNORECASE)
@@ -147,6 +149,15 @@ runtime = "docker"                   # "docker" or "unsafe-local"
 # memory  = "4g"                     # docker: container memory limit (no swap on top)
 # cpus    = 2                        # docker: container CPU limit
 # network = false                    # docker: true lets notebook code reach the internet and this machine
+
+# The cells the agent writes. After each notebook change Hailer checks the changed cells with ruff
+# (lint) and ty (types) and hands the findings back to the agent; code mode formats new and edited
+# cells with ruff before marimo applies them. All three are on by default.
+#
+# [checks]
+# lint      = true                   # ruff: undefined names, unused variables, likely bugs
+# typecheck = true                   # ty: wrong attributes, arguments and types across cells
+# format    = true                   # ruff format, with marimo's line length
 """
 
 
@@ -357,6 +368,7 @@ def load_config(
     providers_tbl = _section(data, "model_providers", path)
     web_tbl = _section(data, "web", path)
     kernel_tbl = _section(data, "kernel", path)
+    checks_tbl = _section(data, "checks", path)
 
     notebook = _str(hailer_tbl, "notebook", "hailer", path, DEFAULT_NOTEBOOK)
     notebooks_dir = _str(hailer_tbl, "notebooks_dir", "hailer", path)
@@ -412,6 +424,13 @@ def load_config(
         network=_bool(kernel_tbl, "network", "kernel", path, kernel_defaults.network),
     )
 
+    checks_defaults = CodeChecksConfig()
+    checks = CodeChecksConfig(
+        lint=_bool(checks_tbl, "lint", "checks", path, checks_defaults.lint),
+        typecheck=_bool(checks_tbl, "typecheck", "checks", path, checks_defaults.typecheck),
+        format=_bool(checks_tbl, "format", "checks", path, checks_defaults.format),
+    )
+
     resolved_notebook = _resolve(ws, notebook or DEFAULT_NOTEBOOK)
     return HailerConfig(
         workspace=ws,
@@ -430,6 +449,7 @@ def load_config(
         providers=providers,
         web=web,
         kernel=kernel,
+        checks=checks,
         log_level=log_level,
         config_path=path,
         max_tool_output_chars=max_tool_output_chars,
@@ -501,6 +521,9 @@ def _unknown_key_warnings(path: Path) -> list[str]:
     kernel_tbl = data.get("kernel") or {}
     if isinstance(kernel_tbl, dict):
         check(kernel_tbl, _KNOWN_KERNEL, "kernel")
+    checks_tbl = data.get("checks") or {}
+    if isinstance(checks_tbl, dict):
+        check(checks_tbl, _KNOWN_CHECKS, "checks")
     return warnings
 
 
