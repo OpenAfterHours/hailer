@@ -46,6 +46,8 @@ PINNED_DISTRIBUTIONS = {
     "POLARS_VERSION": "polars",
     "FASTEXCEL_VERSION": "fastexcel",
     "DUCKDB_VERSION": "duckdb",
+    # Code mode formats the cells the agent writes with the kernel's ruff (hailer.code_checks).
+    "RUFF_VERSION": "ruff",
 }
 _SKIPPED = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo")
 _IMAGE_TIMEOUT_SEC = 30.0

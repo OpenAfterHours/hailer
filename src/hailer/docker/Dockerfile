@@ -1,4 +1,5 @@
-# The Hailer kernel image: marimo, Polars, fastexcel, DuckDB, altair and plotly, plus the hailer package
+# The Hailer kernel image: marimo, Polars, fastexcel, DuckDB, altair, plotly and ruff (code mode formats
+# the cells the agent writes with it), plus the hailer package
 # (the notebook helpers in hailer.periods and the forwarder in hailer._forward; nothing else of
 # Hailer runs in here: no LangChain, no keyring, no API key).
 #
@@ -18,6 +19,7 @@ ARG MARIMO_VERSION
 ARG POLARS_VERSION
 ARG FASTEXCEL_VERSION
 ARG DUCKDB_VERSION
+ARG RUFF_VERSION
 ARG HAILER_VERSION
 ARG ALTAIR_VERSION=6.3.0
 ARG PLOTLY_VERSION=7.1.0
@@ -31,7 +33,7 @@ RUN python3 -c 'import sys; assert sys.version_info >= (3, 12), "Hailer needs Py
 ENV PATH="/opt/hailer-venv/bin:${PATH}"
 
 RUN --mount=type=secret,id=pip_config --mount=type=secret,id=pip_cert \
-    test -n "$MARIMO_VERSION" && test -n "$POLARS_VERSION" && test -n "$FASTEXCEL_VERSION" && test -n "$DUCKDB_VERSION" && test -n "$HAILER_VERSION" \
+    test -n "$MARIMO_VERSION" && test -n "$POLARS_VERSION" && test -n "$FASTEXCEL_VERSION" && test -n "$DUCKDB_VERSION" && test -n "$RUFF_VERSION" && test -n "$HAILER_VERSION" \
     || { echo "Missing build args: build with uvx hailer kernel build (see hailer.kernel_image)." >&2; exit 1; }; \
     if [ -f /run/secrets/pip_config ]; then \
         unset PIP_INDEX_URL PIP_EXTRA_INDEX_URL PIP_TRUSTED_HOST PIP_NO_INDEX PIP_FIND_LINKS PIP_PROXY PIP_CERT PIP_TIMEOUT PIP_RETRIES; \
@@ -43,6 +45,7 @@ RUN --mount=type=secret,id=pip_config --mount=type=secret,id=pip_cert \
         polars==${POLARS_VERSION} \
         fastexcel==${FASTEXCEL_VERSION} \
         duckdb==${DUCKDB_VERSION} \
+        ruff==${RUFF_VERSION} \
         altair==${ALTAIR_VERSION} \
         plotly==${PLOTLY_VERSION}
 

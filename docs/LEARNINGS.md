@@ -174,3 +174,31 @@ session milestones. Keep event-controlled startup tests in `test_chat.py`, `test
 `test_cli.py` and `test_agent_warmup.py` alongside the agent lifecycle checks; do not turn a passing
 recorded-terminal test into a claim about physical Windows Ctrl+C. The measurements, live-check
 scope and reproduction commands are in [STARTUP_PERFORMANCE.md](STARTUP_PERFORMANCE.md).
+
+## 11. Format cells before code mode applies them; check them as one script
+
+The code checks ([code_checks.py](../src/hailer/code_checks.py)) were verified live on 2026-09-22 against
+marimo 0.24.2 (Linux, local kernel, headless Chromium), ruff 0.16.8 and ty 0.0.83. Three findings shaped
+them:
+
+- **Formatting after the fact costs a rerun.** Editing a cell through code mode re-registers it and drops
+  its variables until it runs again, so reformatting a cell once it has run would rerun it and everything
+  below it. Code mode already formats new and changed code with ruff before applying it when the kernel's
+  `save.format_on_save` is on; the pre-call snapshot sets that flag in the kernel's memory. The kernel then
+  needs ruff: keep it a Hailer dependency and in the kernel image.
+- **Reading `cell.code` through `ctx.cells` counts as the agent reading the cell.** Code mode refuses an
+  `edit_cell` of a cell changed since the agent last read it (`StaleCellError`). A snapshot through
+  `ctx.cells` would mark every cell read and quietly defeat that protection, so it reads the notebook
+  document. The live run confirmed that an edit of a never-read cell is still refused after the snapshots.
+- **The kernel's graph holds only the cells that have run.** Ordering the script by it put a notebook's
+  unrun import cell after its users and produced false "undefined name" findings. The dependency order is
+  computed on the host with marimo's compiler from every cell's code. A cell that does not parse is left
+  out of the script: an unclosed bracket swallows the cells after it, and ruff lints nothing in a file with
+  a syntax error.
+
+ruff 0.16 enables several hundred rules by default and reads any project configuration, so Hailer passes
+`--isolated` and its own selection; ruff's E711/E712 "fixes" would break Polars expressions such as
+`pl.col("flag") == True`. Regression checks: `tests/test_code_checks.py` (real ruff and ty) and the code-check
+tests in `tests/test_tools.py`. After upgrading marimo, ruff or ty, rerun them and repeat a live create/edit
+through `marimo_execute`: the snapshot and the formatting flag use private marimo attributes
+(`ctx._document`, `ctx._kernel.user_config`).

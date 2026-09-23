@@ -349,7 +349,7 @@ marimo edit notebooks   (live kernel on the folder; a token since 2026-09-19)
 Browser UI
 ```
 
-`hailer.tools`: `HailerTools` holds the 11 tools (`TOOL_NAMES`) as plain methods that return text, errors
+`hailer.tools`: `HailerTools` holds the 12 tools (`TOOL_NAMES`) as plain methods that return text, errors
 included; a method's docstring is the description the model sees. `hailer_tools(config)` wraps them as
 LangChain `StructuredTool`s. The model has these tools and nothing else: no shell, no file tool, no approval step.
 
@@ -454,7 +454,8 @@ hailer/
 │   ├── docker/Dockerfile  the kernel image (package data)
 │   ├── agent.py           build_model (provider → ChatOpenAI), HailerAgent (threads, streamed turns, Ctrl+C),
 │   │                      system prompt, error mapping
-│   ├── tools.py           HailerTools (the 11 tools in §2) and hailer_tools(config) → LangChain tools
+│   ├── tools.py           HailerTools (the 12 tools in §2) and hailer_tools(config) → LangChain tools
+│   ├── code_checks.py     ruff and ty on the cells the agent writes (and code mode's ruff formatting)
 │   ├── marimo_client.py   HTTP/SSE client, registry discovery, session resolution, launch commands
 │   ├── notebooks.py       active-notebook state (.hailer/notebook.json), listing, creation from templates
 │   ├── browser.py         opens a URL in the user's browser (os.startfile first on Windows)

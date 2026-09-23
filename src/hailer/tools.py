@@ -17,6 +17,11 @@ started or reused, kept in memory), else it is discovered anew on every call.
 Tool results go to the model endpoint, so they never carry the marimo server's token: URLs in
 them are token-free (the user gets a signed-in link from ``/notebook`` in the chat), while the
 browser Hailer opens itself gets the signed-in URL.
+
+A ``marimo_execute`` call that creates or edits cells is bracketed by two snapshots of the
+notebook's cells (:mod:`hailer.code_checks`): the first also switches on code mode's ruff
+formatting in the kernel, and the cells that differ afterwards are checked with ruff and ty, the
+findings appended to the result (``[checks]`` in ``hailer.toml`` turns each part off).
 """
 
 from __future__ import annotations
@@ -32,10 +37,10 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from . import notebooks
+from . import code_checks, notebooks
 from .errors import HailerError, MarimoUnavailableError, NoSessionError
 from .models import KERNEL_RUNTIME_DOCKER, ExecResult, HailerConfig, MarimoServer, MarimoSession
-from .web import truncate_text
+from .web import TRUNCATED_MARKER, truncate_text
 
 log = logging.getLogger("hailer.tools")
 
@@ -44,6 +49,7 @@ TOOL_NAMES = (
     "marimo_execute",
     "marimo_status",
     "notebook_cells",
+    "notebook_check",
     "notebook_list",
     "notebook_create",
     "notebook_open",
@@ -96,6 +102,11 @@ def _result_text(result: Any) -> str:
             mimetype="text/plain",
         ).as_text()
     return result.as_text()
+
+
+def _writes_cells(code: str) -> bool:
+    """Whether scratchpad ``code`` creates or edits notebook cells through code mode."""
+    return "create_cell" in code or "edit_cell" in code
 
 
 def _error_text(err: HailerError) -> str:
@@ -252,6 +263,37 @@ class HailerTools:
     def _truncate(self, text: str) -> str:
         return truncate_text(text, self.config.max_tool_output_chars)
 
+    def _with_footer(self, text: str, footer: str) -> str:
+        """``text`` then ``footer``, ``text`` shortened so the footer survives the output cap."""
+        if not footer:
+            return text
+        limit = self.config.max_tool_output_chars
+        if limit > 0:
+            room = limit - len(footer) - 2
+            text = truncate_text(text, max(room, len(TRUNCATED_MARKER) + 20))
+        return f"{text}\n\n{footer}"
+
+    # -- code checks -------------------------------------------------------- #
+
+    def _snapshot(self, client: Any, notebook: Path, *, enable_format: bool = False) -> code_checks.Snapshot | None:
+        """The notebook's cells, read from the kernel; ``None`` when they could not be read."""
+        try:
+            result = client.execute(code_checks.snapshot_code(enable_format=enable_format), notebook=notebook)
+        except HailerError as err:
+            log.debug("cell snapshot failed: %s", err)
+            return None
+        snapshot = code_checks.parse_snapshot(result.stdout) if result.success else None
+        if snapshot is None:  # the reason only: the output may hold the notebook's code
+            log.debug("cell snapshot unreadable: %s", ((result.stderr or "").strip().splitlines() or ["no snapshot line"])[-1])
+        return snapshot
+
+    def _check_report(self, config: HailerConfig, snapshot: code_checks.Snapshot, cell_ids: list[str], *, changed: bool) -> str:
+        checks = config.checks
+        result = code_checks.check(
+            snapshot, cell_ids, lint=checks.lint, typecheck=checks.typecheck, search_paths=[Path(config.notebook).parent],
+        )
+        return code_checks.report(result, snapshot, cell_ids, changed=changed)
+
     def _run(self, fn: Callable[[], str]) -> str:
         try:
             return self._truncate(fn())
@@ -401,16 +443,28 @@ class HailerTools:
         new top-level assignments are discarded afterwards. To add or change notebook cells,
         use `import marimo._code_mode as cm` and `async with cm.get_context() as ctx:` with
         ctx.create_cell(...)/ctx.edit_cell(...)/ctx.run_cell(...) (top-level `async with` is
-        allowed). Keep printed output small: schemas, head(), aggregates. Never print whole
-        datasets.
+        allowed). New and edited cells are formatted with ruff, and when the call changed cells
+        the result ends with ruff and ty findings for them. Keep printed output small: schemas,
+        head(), aggregates. Never print whole datasets.
         """
 
         def go() -> str:
             config = self._active_config()
             client, _ = self._client_factory()
+            checks = config.checks
+            before = None
+            if (checks.lint or checks.typecheck or checks.format) and _writes_cells(code):
+                before = self._snapshot(client, config.notebook, enable_format=checks.format)
             result = client.execute(code, notebook=config.notebook)
             text = _result_text(result)
-            return text if result.success else f"Execution failed.\n{text}"
+            text = text if result.success else f"Execution failed.\n{text}"
+            if before is None or not (checks.lint or checks.typecheck):
+                return text
+            after = self._snapshot(client, config.notebook)
+            changed = code_checks.changed_cells(before, after) if after is not None else []
+            if after is None or not changed:
+                return text
+            return self._with_footer(text, self._check_report(config, after, changed, changed=True))
 
         return self._run(go)
 
@@ -481,6 +535,28 @@ class HailerTools:
                 lines = [ln for ln in text.splitlines() if needle in ln.lower()]
                 return "\n".join(lines) if lines else f"No cells match '{pattern.strip()}'."
             return text or "(no cells)"
+
+        return self._run(go)
+
+    def notebook_check(self) -> str:
+        """Check every cell of the active notebook with ruff (lint) and ty (types) and list the
+        findings by cell and line. Cells you create or edit are checked automatically, so use
+        this for the notebook as a whole: when the user asks for a review, or before building
+        on a notebook written elsewhere."""
+
+        def go() -> str:
+            config = self._active_config()
+            if not (config.checks.lint or config.checks.typecheck):
+                return "Code checks are switched off ([checks] lint and typecheck are false in hailer.toml)."
+            client, _ = self._client_factory()
+            result = client.execute(code_checks.snapshot_code(), notebook=config.notebook)
+            snapshot = code_checks.parse_snapshot(result.stdout) if result.success else None
+            if snapshot is None:
+                return f"Could not read the notebook's cells.\n{_result_text(result)}"
+            cell_ids = [c.id for c in snapshot.cells if c.code.strip()]
+            if not cell_ids:
+                return "The notebook has no code to check."
+            return self._check_report(config, snapshot, cell_ids, changed=False)
 
         return self._run(go)
 

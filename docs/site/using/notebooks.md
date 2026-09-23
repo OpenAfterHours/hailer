@@ -101,3 +101,39 @@ Where things live:
 notebook      = "notebooks/analysis.py"   # the default (and first) notebook
 notebooks_dir = "notebooks"               # where /notebook new and the agent's notebook_create put files
 ```
+
+## Formatting and code checks {#code-checks}
+
+The code the agent writes into your notebook is formatted and checked as it goes in:
+
+- **Formatting.** New and edited cells are formatted with [ruff](https://docs.astral.sh/ruff/) before
+  marimo runs them, using marimo's line length (`formatting.line_length` in your marimo settings, 79 by
+  default). Hailer switches this on in the running kernel only; your marimo settings file is not changed,
+  and cells you edit yourself in the browser follow your own *format on save* setting as before.
+- **Checks.** After each call that creates or edits cells, Hailer checks the changed cells with ruff (lint)
+  and [ty](https://docs.astral.sh/ty/) (types) and hands the findings back to the agent, which fixes the ones
+  that are real mistakes before it carries on: an undefined or misspelt name, a method the dataframe does
+  not have, a wrong argument, a mutable default argument. ty sees the whole notebook in the order marimo
+  runs it, so it knows that `sales` from another cell is a Polars `DataFrame`.
+
+Ask the agent to check the whole notebook at any time (it has a `notebook_check` tool for that):
+
+```text
+You > check the notebook for mistakes
+```
+
+Findings about what cells do on purpose are left out: an import meant for a later cell, top-level `await`,
+a cell whose last line is just a value to display, a missing package (the cell fails when it runs anyway).
+ruff runs with Hailer's own small rule set, so a `ruff.toml` or `pyproject.toml` in the workspace does not
+change the checks. Both tools come with Hailer and run on this machine, whichever kernel runtime you use.
+The checks usually take a fraction of a second and do not change the notebook; the agent fixes findings through
+ordinary cell edits.
+
+To switch parts off, add a `[checks]` section to `hailer.toml`:
+
+```toml
+[checks]
+lint      = true    # ruff
+typecheck = true    # ty
+format    = false   # leave the agent's cells as it wrote them
+```

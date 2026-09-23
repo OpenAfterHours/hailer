@@ -216,6 +216,11 @@ start refused over a running kernel). Types added to `models.py`: `KernelConfig`
 `KERNEL_RUNTIME_LOCAL` / `KERNEL_RUNTIME_DOCKER` / `VALID_KERNEL_RUNTIMES`, `KERNEL_IMAGE_REPOSITORY`, the
 `MarimoServer` fields listed under `marimo_client.py`, and `HailerConfig.kernel`.
 
+`[checks]` maps to `CodeChecksConfig` (models.py, `HailerConfig.checks`): `lint`, `typecheck`, `format`, all
+booleans defaulting to `true` (a non-boolean is a `ConfigError`, an unknown key a warning). `lint` and
+`typecheck` choose ruff and ty for the checks `marimo_execute` and `notebook_check` run; `format` switches on
+code mode's ruff formatting in the kernel (see `code_checks.py`).
+
 ## `log.py`  (owner: wave 1 / A)
 
 ```python
@@ -495,10 +500,10 @@ def stop_workspace_kernels(config, runner=None, *, procs=None, probe=None) -> St
 
 ```python
 VERSION_LABEL = "org.opencontainers.image.version"     # must equal hailer.__version__
-PINNED_DISTRIBUTIONS = {"MARIMO_VERSION": "marimo", "POLARS_VERSION": "polars", "FASTEXCEL_VERSION": "fastexcel", "DUCKDB_VERSION": "duckdb"}
+PINNED_DISTRIBUTIONS = {"MARIMO_VERSION": "marimo", "POLARS_VERSION": "polars", "FASTEXCEL_VERSION": "fastexcel", "DUCKDB_VERSION": "duckdb", "RUFF_VERSION": "ruff"}
 def default_image() -> str                  # ghcr.io/openafterhours/hailer-kernel:<hailer version> (models.KERNEL_IMAGE_REPOSITORY)
 def package_dir() -> Path                   # the installed hailer package
-def build_args() -> dict[str, str]          # the installed marimo, Polars, fastexcel, DuckDB versions + HAILER_VERSION
+def build_args() -> dict[str, str]          # the installed marimo, Polars, fastexcel, DuckDB, ruff versions + HAILER_VERSION
 def prepare_context(dest: Path) -> dict[str, str]   # dest gets Dockerfile (LF endings) and hailer/ (no __pycache__); returns build_args(); dest must not hold hailer/
 def build_command(tag, context, args) -> list[str]  # ["build", "--tag", tag, "--build-arg", ..., context]
 def build(tag: str, runner: DockerRunner, *, base_image=None, pip_config=None, pip_cert=None, no_cache=False, no_host_config=False, say=None) -> int
@@ -631,7 +636,7 @@ The agent's tools, run inside the Hailer process (no server, no transport). They
 no shell, no file tool, all Python runs in the marimo kernel.
 
 ```python
-TOOL_NAMES: tuple[str, ...]      # the 11 names in the table, in the order they are offered to the model
+TOOL_NAMES: tuple[str, ...]      # the 12 names in the table, in the order they are offered to the model
 DEFAULT_SESSION_WAIT_SEC = 30.0
 NOTEBOOK_LINK_TIP = "The user can also run /notebook in the chat to get the link."
 class HailerTools:               # one plain method per tool, each -> str; the method's docstring is the description the model sees
@@ -662,7 +667,8 @@ text, truncated to `config.max_tool_output_chars` with head/tail and a `[... tru
 
 | tool | args | behaviour |
 |---|---|---|
-| `marimo_execute` | `code: str` | run in the scratchpad against the active notebook's session; returns stdout/output/stderr (rich mimetypes such as text/html or application/json are replaced by a short placeholder, so HTML never reaches the model); a failed run starts `Execution failed.`; `MarimoUnavailableError`/`NoSessionError` become `ERROR:` text with the hint, not exceptions |
+| `marimo_execute` | `code: str` | run in the scratchpad against the active notebook's session; returns stdout/output/stderr (rich mimetypes such as text/html or application/json are replaced by a short placeholder, so HTML never reaches the model); a failed run starts `Execution failed.`; `MarimoUnavailableError`/`NoSessionError` become `ERROR:` text with the hint, not exceptions. Code that mentions `create_cell` or `edit_cell` (with any `[checks]` part on) is bracketed by two `code_checks.snapshot_code` runs, the first with `enable_format=config.checks.format`; when cells changed and `lint` or `typecheck` is on, the `code_checks.report` for the changed cells follows the result after a blank line, the result shortened so the report survives the output cap. A snapshot that cannot be read skips the checks, never the code |
+| `notebook_check` | none | a snapshot of the active notebook, then `code_checks.check` over every non-empty cell and the `report` (`Checks (ruff, ty) on the notebook's N cells: ...`); `[checks]` lint and typecheck both off → says so; unreadable cells → `Could not read the notebook's cells.` + the output |
 | `marimo_status` | none | server url, version; `kernel: <describe_runtime of the server in use>` and `kernel paths: notebooks folder ..., data folder ...` (`/work/notebooks` (writable) and `/work/data` (read-only) for a docker kernel, "use these in code"; host paths for local); `active notebook: <workspace-relative> -> session <id> (ready)` or `... has NO session. Ask the user to open <url>`; every session with its notebook and a marker: `(active notebook)`, `(another notebook in the notebooks folder; notebook_open switches to it)`, `(outside the notebooks folder)`, `(unsaved)`; when marimo is down (factory raises, or a configured `marimo_url` answers with `MarimoUnavailableError` on the first request) the text is `marimo: not running` / `active notebook: <name>` / error / hint, so the active notebook is always named |
 | `notebook_cells` | `pattern: str = ""` | runs `marimo_client.LIST_CELLS_CODE`, a `cm` snippet listing the active notebook's cells (id, name, status, error count, first line); optional case-insensitive substring filter |
 | `notebook_list` | none | `notebooks.list_notebooks`: one line per notebook `  - <name>  modified YYYY-MM-DD HH:MM  <size>  [active] [open]` (`[open]` = has a session; when marimo is unreachable the files are still listed and a trailing line says sessions are unknown); empty folder → `No notebooks in <folder> yet. Create one with notebook_create(name).` |
@@ -686,6 +692,50 @@ health-checked up front, so a dead server first shows up there) is folded into t
 was already created / made active by then, so `notebook_create` / `notebook_open` still begin with `Created ...` /
 `... is now the active notebook.` and never read as a failed call. Both hooks are keywords of `HailerTools`
 and `hailer_tools` so tests never launch a browser.
+
+## `code_checks.py`  (owner: code checks, 2026-09-22)
+
+ruff and ty for the cells the agent writes. Both are Hailer dependencies and run as subprocesses in the
+Hailer process's environment, whatever the kernel runtime; nothing raises into the agent loop.
+
+```python
+SNAPSHOT_MARKER = "HAILER_CELLS:"
+RUFF_SELECT = ("F", "PLE", "B006", "B023", "E722")          # ruff runs --isolated: no project config applies
+RUFF_IGNORE = ("F401", "F541", "F704", "F811", "PLE1142")   # imports for later cells, private helpers, top-level await
+TY_IGNORE = ("unresolved-import",)                          # the kernel's packages are not the host's (docker)
+MAX_REPORTED = 20
+def snapshot_code(*, enable_format: bool = False) -> str    # scratchpad code printing SNAPSHOT_MARKER + {"cells": [{id, name, code}]}
+def parse_snapshot(stdout: str) -> Snapshot | None          # Snapshot(cells: tuple[Cell(id, name, code), ...]) in notebook order
+def changed_cells(before: Snapshot, after: Snapshot) -> list[str]   # new or edited, non-empty, notebook order
+def dependency_order(cells) -> list[Cell]                   # marimo's compile_cell + DirectedGraph + topological_sort; unplaceable cells last
+def syntax_error(cell: Cell) -> Finding | None              # compile with PyCF_ALLOW_TOP_LEVEL_AWAIT
+def build_script(snapshot, *, skip=()) -> tuple[str, list[tuple[str, int] | None]]   # "# cell <id>" + code per cell; line -> (cell id, line)
+def check(snapshot, cell_ids=None, *, lint=True, typecheck=True, search_paths=()) -> CheckResult   # findings, tools that ran, problems
+def report(result, snapshot, cell_ids, *, changed=True) -> str
+```
+
+- The snapshot reads `ctx._document.cells`, never `ctx.cells[...].code`: the latter records a read in code
+  mode's staleness tracker, and an `edit_cell` of a cell the user changed in the browser would then go
+  through without the agent having seen it. With `enable_format` it first sets
+  `ctx._kernel.user_config["save"]["format_on_save"] = True` in the kernel's memory: code mode then formats
+  new and changed code with ruff before applying it (marimo's `DefaultFormatter`, the user's
+  `formatting.line_length`), so the formatted cell is the one that runs. The kernel needs ruff: Hailer's
+  own Python has it (local runtime) and the kernel image installs it (`RUFF_VERSION`); a server whose
+  Python lacks ruff skips formatting silently (marimo logs it). The flag stays on in that kernel until it
+  restarts or the user saves marimo settings (which replaces the kernel's copy), so `format = false` takes
+  full effect with the next kernel.
+- The notebook is checked as one script in dependency order, computed on the host from every cell's code
+  (the kernel's graph only holds cells that have run), so ty carries types across cells. Cells Python
+  cannot parse are reported as `python syntax-error` and left out of the script. ty runs first with
+  `--python sys.executable`, `--extra-search-path` for the notebook's folder (when it exists) and
+  `--exit-zero`; ruff reads the script on stdin with `--target-version` of the running Python. ty's
+  top-level-async syntax errors are dropped, and a ruff finding ty also made (`F821` /
+  `unresolved-reference` at the same place, `invalid-syntax` on the same line) is dropped.
+- A tool that is missing, exits with an unexpected code, times out (`TIMEOUT_SEC = 30`) or prints
+  unreadable output becomes `CheckResult.problems`, shown as `(Check skipped: <why>.)`.
+- Report: `Checks (ruff, ty) on the N changed cells: M findings.` (or `on the notebook's N cells`, or
+  `: no findings.`), then per finding `- cell <name> (<id>), line L: <tool> <rule>: <message>` and the source
+  line indented, at most `MAX_REPORTED`, then `(and K more)`.
 
 ## `secrets.py`  (owner: wave 2 / D)
 
@@ -933,7 +983,7 @@ fails, the REPL carries on after a failed turn; traceback only with `--verbose`.
 The agent persona and rules: the tool list (every `TOOL_NAMES` entry appears as `` `name(` ``, checked by
 `test_agent.py`) with the statement that there is no shell and no file tool, the one-active-notebook rules, the
 `[Hailer]` notice rule (a CLI notice, "not the user's words"), the scratchpad semantics and the canonical `cm`
-patterns, the data conventions with the "compact outputs only" rule, safety, and how to reply. The web
+patterns, formatting and the check findings (fix real mistakes, leave findings a checker cannot judge), the data conventions with the "compact outputs only" rule, safety, and how to reply. The web
 allowlist, project context, skills index and workspace (with the kernel runtime's notes, which carry the
 package-install rule) are appended by `agent.system_prompt`. Loaded with
 `importlib.resources.files("hailer").joinpath("prompts/system.md")`.
@@ -943,6 +993,8 @@ package-install rule) are appended by `agent.system_prompt`. Loaded with
 - `test_config.py`, `test_log.py`: A
 - `test_marimo_client.py` (fake SSE server on 127.0.0.1), `test_periods.py` (tiny parquet files in tmp_path): B
 - `test_web.py`, `test_context.py`: C. `test_notebooks.py`, `test_browser.py`: notebook feature
+- `test_code_checks.py`: code checks. The real ruff and ty on small notebooks (types across cells, the
+  rules left out for notebooks, syntax errors, deduplication, missing tools), the snapshot code and the report
 - `test_tools.py`: LangChain migration. Tool methods called directly with a fake marimo client, plus the
   `hailer_tools` registration: names, schemas, docstring descriptions, in-process `invoke`, the daemon-thread
   `ainvoke` path, and a cancelled call that does not wait for a blocked tool
