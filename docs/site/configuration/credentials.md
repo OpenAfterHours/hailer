@@ -8,8 +8,9 @@ session file, command history or logs, and never passed on a command line or to 
 `uvx hailer logout <provider>` removes it.
 
 An environment variable named by `env_key` takes precedence over the credential store, which keeps scripted
-and CI use simple. Hailer leaves that variable (and other secret-looking ones) out of the environment of the
-marimo server it starts, so it is not in notebook code's environment (see [Security](../security/data-handling.md#security)). Note that any
+and CI use simple. It never reaches notebook code: a docker kernel gets none of your environment variables,
+and an unsafe-local kernel's environment leaves out that variable and other secret-looking ones (see
+[Security](../security/data-handling.md#security)). Note that any
 process running as the same user can read both credential-store entries and environment variables; the
 gain is keeping the key out of files and history, not isolation from your own account.
 

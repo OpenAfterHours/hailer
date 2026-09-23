@@ -3,7 +3,7 @@
 Any CSV, Parquet, JSON or Excel file in `data/` can be analysed, whatever it is called: the starter notebook lists
 them in `data_files`, and the agent loads them with Polars or queries them with DuckDB when you ask.
 
-Excel reading is included in both the local installation and the Docker kernel through
+Excel reading is included in both the Docker kernel and Hailer's own installation (the unsafe-local runtime) through
 [Polars' Calamine engine (`fastexcel`)](https://docs.pola.rs/api/python/stable/reference/api/polars.read_excel.html).
 Put an `.xlsx`, `.xls` or `.xlsb` workbook in `data/` and ask, for example, *Explore the Sales worksheet in
 sales.xlsx and chart revenue by region*. The agent can inspect worksheet names and load the relevant sheet:

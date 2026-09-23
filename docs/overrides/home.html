@@ -134,7 +134,7 @@ uvx hailer init</code></pre></li>
 
   <section class="hl-trust hl-width" aria-labelledby="hl-trust-title">
     <div><p class="hl-eyebrow">KNOW WHERE YOUR DATA GOES</p><h2 id="hl-trust-title">Local files.<br>A model you configure.</h2></div>
-    <div class="hl-trust-copy"><p>Your analysis runs on your machine. Your messages, code and notebook tool outputs — which can include data samples — go to your configured model endpoint.</p><p>The default local runtime runs code with your account's file and network access. Optional Docker isolation restricts the kernel's access; its outputs still go to the model.</p><a href="{{ 'security/data-handling/' | url }}">Read about data handling <span aria-hidden="true">↗</span></a><a href="{{ 'security/runtimes/' | url }}">Choose your runtime <span aria-hidden="true">↗</span></a></div>
+    <div class="hl-trust-copy"><p>Your analysis runs on your machine. Your messages, code and notebook tool outputs — which can include data samples — go to your configured model endpoint.</p><p>By default notebook code runs in a Docker container that sees only your data folder, read-only, with no network; its outputs still go to the model. Running code as you, with your files and network, is an explicit opt-in (<code>unsafe-local</code>).</p><a href="{{ 'security/data-handling/' | url }}">Read about data handling <span aria-hidden="true">↗</span></a><a href="{{ 'security/runtimes/' | url }}">Choose your runtime <span aria-hidden="true">↗</span></a></div>
   </section>
 
   <section class="hl-explore hl-width" aria-labelledby="hl-explore-title">

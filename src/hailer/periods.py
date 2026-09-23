@@ -10,14 +10,15 @@ helpers add one, and they cope with columns appearing in later months (schema ev
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import polars as pl
 
 from hailer.errors import MalformedParquetError
-from hailer.models import Period, PeriodFile
 
 PERIOD_RE = re.compile(r"^(?P<yy>\d{2})-(?P<mm>\d{2})\s+(?P<stem>.+)$")
 
@@ -27,6 +28,41 @@ _READ_ERRORS: tuple[type[BaseException], ...] = (pl.exceptions.PolarsError, OSEr
 DATA_SUFFIXES: tuple[str, ...] = (
     ".csv", ".tsv", ".parquet", ".json", ".jsonl", ".ndjson", ".xlsx", ".xls", ".xlsb", ".arrow", ".feather", ".ipc",
 )
+
+
+# --------------------------------------------------------------------------- #
+# Periods
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True, order=True)
+class Period:
+    """A reporting month encoded in a filename as ``YY-MM``."""
+
+    year: int
+    month: int
+
+    @property
+    def label(self) -> str:
+        """Long form, e.g. ``2025-03``."""
+        return f"{self.year:04d}-{self.month:02d}"
+
+    @property
+    def short(self) -> str:
+        """Filename form, e.g. ``25-03``."""
+        return f"{self.year % 100:02d}-{self.month:02d}"
+
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        return self.label
+
+
+@dataclass(frozen=True)
+class PeriodFile:
+    """A data file whose period is encoded in its name, e.g. ``25-03 sales.parquet``."""
+
+    path: Path
+    period: Period
+    stem: str  # the dataset name after the period, lower-cased, e.g. "sales"
 
 
 # --------------------------------------------------------------------------- #
@@ -182,12 +218,17 @@ def _schema(pf: PeriodFile) -> dict[str, pl.DataType]:
         raise _malformed(pf.path, err) from err
 
 
-def describe_periods(files: Sequence[PeriodFile]) -> str:
-    """Compact text summary: count, span, common columns, and columns that only appear in some periods."""
+def describe_periods(files: Sequence[PeriodFile], schema: Callable[[PeriodFile], Mapping[str, Any]] | None = None) -> str:
+    """Compact text summary: count, span, common columns, and columns that only appear in some periods.
+
+    ``schema`` reads a file's columns and types (default: the Parquet schema at ``pf.path``); Hailer's
+    ``list_periods`` tool passes one that asks the kernel's sandbox, so it never opens the data folder.
+    """
     if not files:
         return "No period files found (expected names like '25-01 sales.parquet')."
     ordered = sorted(files, key=lambda f: (f.period, f.stem))
-    schemas = [(pf, _schema(pf)) for pf in ordered]
+    read = schema or _schema
+    schemas = [(pf, read(pf)) for pf in ordered]
     stems = sorted({pf.stem for pf in ordered})
     first, last = ordered[0].period.label, ordered[-1].period.label
     lines = [f"{len(ordered)} period file(s) [{', '.join(stems)}]: {first} -> {last}"]

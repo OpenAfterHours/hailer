@@ -33,7 +33,7 @@ async def _sample(notebook_delay: float) -> dict[str, float]:
     # Install after asyncio has created its Windows self-pipe, but before any
     # dependency imports can run, including on the warmup worker.
     sys.addaudithook(no_connections)
-    from hailer import cli
+    from hailer.cli import common
     from hailer.agent import HailerAgent, start_dependency_warmup
     from hailer.startup import StartupTimings
 
@@ -75,13 +75,13 @@ async def _sample(notebook_delay: float) -> dict[str, float]:
                 id="probe", env_key="HAILER_STARTUP_PROBE_KEY", base_url="http://127.0.0.1:1/v1",
             )},
         )
-        services = SimpleNamespace(**vars(cli))
-        services._make_agent = lambda config, bundle, server: HailerAgent(
-            config, bundle, server=server, env={"HAILER_STARTUP_PROBE_KEY": "dummy-offline-probe"},
+        services = SimpleNamespace(**vars(common))
+        services._make_agent = lambda config, bundle, sandbox: HailerAgent(
+            config, bundle, sandbox=sandbox, env={"HAILER_STARTUP_PROBE_KEY": "dummy-offline-probe"},
         )
         transcript, screen = io.StringIO(), io.StringIO()
         console = Console(file=transcript, force_terminal=False, color_system=None)
-        controller = ChatController(console, config, cli.CliOptions(), services=services)
+        controller = ChatController(console, config, common.CliOptions(), services=services)
         with create_pipe_input() as keys:
             output = Vt100_Output(screen, lambda: Size(rows=24, columns=100), term="xterm-256color")
             made: list[ChatUI] = []

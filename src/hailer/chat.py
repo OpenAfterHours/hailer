@@ -7,21 +7,23 @@ and credential operations. Only the synchronous facade drives an asyncio.Runner.
 from __future__ import annotations
 
 import asyncio
+import textwrap
 import threading
 from collections.abc import Awaitable, Callable
-from dataclasses import replace
 from datetime import datetime
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
 from hailer import notebooks
-from hailer.errors import HailerError, NoSessionError
-from hailer.models import ContextBundle, HailerConfig, MarimoServer, MarimoSession, ProviderConfig, SessionState, SkillInfo, TurnSummary
+from hailer.errors import HailerError, MarimoUnavailableError, NoSessionError
+from hailer.models import ContextBundle, HailerConfig, MarimoSession, ProviderConfig, SessionState, SkillInfo, TurnSummary
 from hailer.session import EXIT_COMMANDS, help_text, load_session, parse_command, save_session
+
+if TYPE_CHECKING:  # pragma: no cover - annotations only
+    from hailer.sandbox import MarimoSandbox
 
 
 class _CommandStopped(Exception):
@@ -29,12 +31,18 @@ class _CommandStopped(Exception):
 
 
 class ChatController:
-    def __init__(self, console: Console, config: HailerConfig, opts: Any, *, services: Any, server: MarimoServer | None = None) -> None:
+    def __init__(self, console: Console, config: HailerConfig, opts: Any, *, services: Any, sandbox: MarimoSandbox | None = None) -> None:
         self._cli = services
         self.console = console
         self.config = config
         self.opts = opts
-        self.server = server
+        #: The kernel this chat started (:class:`~hailer.sandbox.MarimoSandbox`); ``None``: no kernel.
+        #: Its warnings (notebook copies, from any thread) go to this chat's current console.
+        self.sandbox = sandbox
+        if sandbox is not None:
+            sandbox.notice = lambda text: self.console.print(text, style="yellow", markup=False)
+        #: The active notebook's name (the state file is the truth; see _sync_active_notebook).
+        self.notebook: str = notebooks.load_active_notebook(config)
         self.state: SessionState = load_session(config.workspace)
         self.bundle: ContextBundle = ContextBundle()
         self.agent: Any = None
@@ -54,7 +62,7 @@ class ChatController:
     def start(self) -> None:
         self.bundle = self._cli._load_context(self.config)
         self._print_context_warnings()
-        self.agent = self._cli._make_agent(self.config, self.bundle, self.server)
+        self.agent = self._cli._make_agent(self.config, self.bundle, self.sandbox)
         resume = None if self.opts.new_thread else self.state.thread_id
         forget = self.state.thread_id if self.opts.new_thread else None  # --new: drop the stored conversation
         thread_id = self.agent.start(resume_thread_id=resume, forget_thread_id=forget)
@@ -123,16 +131,15 @@ class ChatController:
     async def astart(self) -> None:
         self.bundle = await self._blocking(self._cli._load_context, self.config)
         self._print_context_warnings()
-        self.agent = self._cli._make_agent(self.config, self.bundle, self.server)
+        self.agent = self._cli._make_agent(self.config, self.bundle, self.sandbox)
         resume = None if self.opts.new_thread else self.state.thread_id
         forget = self.state.thread_id if self.opts.new_thread else None
         thread_id = await self.agent.astart(resume_thread_id=resume, forget_thread_id=forget)
         self._started(thread_id, resume)
 
     def context_line(self) -> str:
-        notebook = self._display_name(self.config.notebook)
         model = self.state.model or self.config.model.name
-        return f"Notebook: {notebook} | Model: {model} | Context: {len(self.bundle.context_files)} files"
+        return f"Notebook: {self.notebook} | Model: {model} | Context: {len(self.bundle.context_files)} files"
 
     async def run_interactive(
         self,
@@ -259,6 +266,7 @@ class ChatController:
         finally:
             # A tool may have switched notebooks before cancellation or failure.
             await self._blocking(self._sync_active_notebook)
+            self._copy_notebooks_back()
 
     # -- REPL -------------------------------------------------------------- #
 
@@ -314,6 +322,13 @@ class ChatController:
             # Also after Ctrl+C or a failed turn: a notebook_create/notebook_open tool call may have
             # completed (and switched the state file) before the turn was cut short.
             self._sync_active_notebook()
+            self._copy_notebooks_back()
+
+    def _copy_notebooks_back(self) -> None:
+        """After a turn and on a notebook switch: the sandbox copies changed notebooks back to the
+        workspace in the background (a no-op when its notebooks are the workspace's)."""
+        if self.sandbox is not None:
+            self.sandbox.sync_soon()
 
     def _record_turn(self, summary: TurnSummary) -> None:
         self.state.turns += 1
@@ -333,15 +348,14 @@ class ChatController:
             active = notebooks.load_active_notebook(self.config)
         except Exception:  # noqa: BLE001 - a bad state file must never spoil a finished turn
             return False
-        if self._cli._same_file(active, self.config.notebook):
+        if active == self.notebook:
             return False
-        self.config = replace(self.config, notebook=active)
-        name = notebooks.notebook_display_name(self.config, active)
-        self.console.print(Text(f"Active notebook is now {name}.", style="dim"))
+        self.notebook = active
+        self.console.print(Text(f"Active notebook is now {active}.", style="dim"))
         if open_browser:
-            server, session, _err = self._cli._marimo_state(self.config, self.server)
-            if server is not None and session is None:
-                url = self._cli._notebook_link(self.console, server, self.config)
+            sandbox, session, _err = self._cli._marimo_state(self.sandbox, active)
+            if sandbox is not None and session is None:
+                url = sandbox.notebook_url(active, with_token=True)
                 self.console.print(f"Opening {url} in your browser...", markup=False)
                 self._cli._open_browser(url)
         return True
@@ -360,6 +374,8 @@ class ChatController:
             self._model(args)
         elif name == "notebook":
             self._notebook(args)
+        elif name == "exec":
+            self._exec(args)
         elif name == "clear":
             self.console.clear()
         elif name == "context":
@@ -390,13 +406,13 @@ class ChatController:
 
     def _status(self) -> None:
         self._sync_active_notebook(open_browser=False)  # a late tool call may have switched notebooks
-        server, session, _err = self._cli._marimo_state(self.config, self.server)
-        if server is None:
+        sandbox, session, _err = self._cli._marimo_state(self.sandbox, self.notebook)
+        if sandbox is None:
             marimo = "not running"
         elif session is None:
-            marimo = f"{server.url} (notebook not open in a browser)"
+            marimo = f"{sandbox.server.url} (notebook not open in a browser)"
         else:
-            marimo = f"{server.url} (session {session.session_id})"
+            marimo = f"{sandbox.server.url} (session {session.session_id})"
         table = Table.grid(padding=(0, 2))
         rows = [
             ("Model", f"{self.state.model or self.config.model.name}"),
@@ -407,12 +423,13 @@ class ChatController:
             ("Tokens", f"{self.state.input_tokens} in / {self.state.output_tokens} out"),
             ("Marimo", marimo),
             ("Kernel", self._cli._kernel_line(self.config)),
-            ("Notebook", self._cli._relative(self.config.notebook, self.config.workspace)),
+            ("Notebook", self.notebook),
             ("Notebooks", self._cli._relative(self.config.notebooks_root, self.config.workspace)),
             ("Web access", self._cli._web_line(self.config)),
         ]
         for label, value in rows:
-            table.add_row(Text(label), Text(value))
+            style = self._cli._kernel_style(self.config) if label == "Kernel" else ""  # unsafe-local: a warning
+            table.add_row(Text(label), Text(value, style=style))
         self.console.print(table)
 
     def _active_provider(self) -> ProviderConfig | None:
@@ -475,6 +492,35 @@ class ChatController:
             self.state.provider = provider
         return f"Model set to {name}" + (f" ({provider})" if provider else "") + "; started a new thread."
 
+    # -- /exec ------------------------------------------------------------- #
+
+    def _exec(self, code: str) -> None:
+        """Run ``code`` in the scratchpad of the active notebook's kernel session (this chat's own
+        kernel) and print what it printed and returned. Nothing goes to the model."""
+        if not code.strip():
+            self.console.print("Usage: /exec <python code>  (runs in the active notebook's kernel; the model does not see it)", markup=False)
+            return
+        sandbox, session, err = self._cli._marimo_state(self.sandbox, self.notebook)
+        if sandbox is None:
+            self.console.print("Marimo is not running.", markup=False)
+            return
+        if session is None:
+            self._cli._print_error(self.console, err or NoSessionError("The notebook is not open in a browser."), verbose=False)
+            return
+        self._check_stopped()
+        client = sandbox.client(notebook=self.notebook, token_in_links=True)
+        result = client.execute(textwrap.dedent(code), session_id=session.session_id)
+        if result.stdout.strip():
+            self.console.print(result.stdout.rstrip(), markup=False)
+        if result.output.strip() and result.output.strip() != result.stdout.strip():
+            self.console.print(result.output.rstrip(), markup=False)
+        if result.stderr.strip():
+            self.console.print(result.stderr.rstrip(), style="red", markup=False)
+        if not result.success:
+            self.console.print("(the code failed)", style="red", markup=False)
+        elif not (result.stdout.strip() or result.output.strip() or result.stderr.strip()):
+            self.console.print("(no output)", style="dim", markup=False)
+
     # -- /notebook --------------------------------------------------------- #
 
     def _notebook(self, args: str) -> None:
@@ -494,62 +540,70 @@ class ChatController:
         else:
             self.console.print(f"Unknown /notebook subcommand {sub!r}. {self._cli.NOTEBOOK_USAGE}", markup=False)
 
-    def _display_name(self, path: Path) -> str:
-        return notebooks.notebook_display_name(self.config, path)
+    def _names(self) -> list[str]:
+        """The notebooks in the sandbox; empty without a kernel."""
+        return [info.name for info in self.sandbox.list_notebooks()] if self.sandbox is not None else []
+
+    def _resolve(self, ref: str) -> str:
+        """``ref`` as the name of an existing notebook (a name, a file name or a path in the folder)."""
+        if self.sandbox is None:
+            raise MarimoUnavailableError("Marimo is not running, so the notebooks cannot be listed.")
+        folders = notebooks.reference_folders(self.config, self.sandbox.notebooks_path)
+        return notebooks.resolve_notebook(ref, self._names(), folders=folders)
 
     def _notebook_show(self) -> None:
         cfg, out = self.config, self.console
-        out.print(f"Notebook:  {self._display_name(cfg.notebook)} (active)", markup=False)
-        count = len(notebooks.list_notebooks(cfg))
-        out.print(f"Notebooks: {self._display_name(cfg.notebooks_root)} ({self._cli._plural(count, 'notebook')}; /notebook list)", markup=False)
-        recent = [p for p in notebooks.load_recent(cfg) if not self._cli._same_file(p, cfg.notebook)]
+        out.print(f"Notebook:  {self.notebook} (active)", markup=False)
+        folder = self._cli._relative(cfg.notebooks_root, cfg.workspace)
+        names = self._names()
+        if self.sandbox is not None:
+            out.print(f"Notebooks: {folder} ({self._cli._plural(len(names), 'notebook')}; /notebook list)", markup=False)
+        recent = [name for name in notebooks.load_recent(cfg) if name != self.notebook and name in names]
         if recent:
-            out.print("Recent:    " + ", ".join(self._display_name(p) for p in recent[:5]), markup=False)
-        server, session, _err = self._cli._marimo_state(cfg, self.server)
-        if server is None:
+            out.print("Recent:    " + ", ".join(recent[:5]), markup=False)
+        sandbox, session, _err = self._cli._marimo_state(self.sandbox, self.notebook)
+        if sandbox is None:
             out.print("Marimo:    not running", markup=False)
         else:
             state = f"session {session.session_id}" if session is not None else "not open in a browser"
-            out.print(f"Marimo:    {server.url} ({state})", markup=False)
-            out.print(f"URL:       {self._cli._notebook_link(out, server, cfg)}", markup=False)
+            out.print(f"Marimo:    {sandbox.server.url} ({state})", markup=False)
+            out.print(f"URL:       {sandbox.notebook_url(self.notebook, with_token=True)}", markup=False)
             out.print("View:      app view (results only); Ctrl+. in the notebook toggles the code editor", markup=False)
-        out.print("Start everything in one go:  uvx hailer notebook", markup=False)
-        out.print(f"Launch:    {' '.join(self._cli._launch_command())}", markup=False)
         out.print(self._cli.NOTEBOOK_USAGE, markup=False)
 
-    def _server_sessions(self) -> tuple[MarimoServer | None, Any, list[MarimoSession]]:
-        """(server, client, open sessions); server is None when marimo is not running."""
-        try:
-            server = self.server or self._cli._find_server(self.config)
-        except HailerError:
+    def _server_sessions(self) -> tuple[Any, Any, list[MarimoSession]]:
+        """(sandbox, client, open sessions) for this chat's kernel; sandbox is None when it does not answer."""
+        sandbox = self.sandbox
+        if sandbox is None:
             return None, None, []
-        if server is None:
-            return None, None, []
-        client = self._cli._make_client(server, self.config)
+        client = sandbox.client(notebook=self.notebook, token_in_links=True)
         try:
             if not client.health():
                 return None, None, []
-            return server, client, client.sessions()
+            return sandbox, client, client.sessions()
         except HailerError:
-            return server, client, []
+            return sandbox, client, []
 
     def _notebook_list(self) -> None:
-        infos = notebooks.list_notebooks(self.config)
-        folder = self._display_name(self.config.notebooks_root)
+        folder = self._cli._relative(self.config.notebooks_root, self.config.workspace)
+        if self.sandbox is None:
+            self.console.print("Marimo is not running, so the notebooks cannot be listed.", markup=False)
+            return
+        infos = self.sandbox.list_notebooks()
         if not infos:
             self.console.print(f"No notebooks in {folder} yet. Create one with /notebook new <name>.", markup=False)
             return
-        _server, _client, sessions = self._server_sessions()
+        _sandbox, _client, sessions = self._server_sessions()
         table = Table.grid(padding=(0, 2))
         for info in infos:
             markers = []
-            if self._cli._same_file(info.path, self.config.notebook):
+            if info.name == self.notebook:
                 markers.append("active")
-            if self._cli._session_for(sessions, info.path, self.config.workspace) is not None:
+            if self._cli._session_for(sessions, info.name) is not None:
                 markers.append("open")
             modified = datetime.fromtimestamp(info.modified).strftime("%Y-%m-%d %H:%M")
             table.add_row(
-                Text(self._display_name(info.path)),
+                Text(info.name),
                 Text(modified),
                 Text(f"{info.size / 1024:.1f} KB"),
                 Text(", ".join(markers)),
@@ -564,43 +618,46 @@ class ChatController:
         if not name:
             self.console.print("Usage: /notebook new <name> [--empty]", markup=False)
             return
-        path = notebooks.create_notebook(self.config, name, kind=kind)
-        self.console.print(f"Created {self._display_name(path)} from the {kind} template.", markup=False)
-        self._switch_notebook(path, how=f"created from the {kind} template")
+        if self.sandbox is None:
+            self.console.print("Marimo is not running, so no notebook can be created.", markup=False)
+            return
+        filename, source = notebooks.new_notebook(name, kind=kind)
+        created = self.sandbox.write_notebook(filename, source, replace=False).name
+        self.console.print(f"Created {created} from the {kind} template.", markup=False)
+        self._switch_notebook(created, how=f"created from the {kind} template")
 
     def _notebook_open(self, rest: str) -> None:
         if not rest:
             self.console.print("Usage: /notebook open <name>", markup=False)
             return
-        path = notebooks.resolve_notebook(self.config, rest)
-        if self._cli._same_file(path, self.config.notebook):
-            self.console.print(f"{self._display_name(path)} is already the active notebook.", markup=False)
+        name = self._resolve(rest)
+        if notebooks.same_name(name, self.notebook):
+            self.console.print(f"{name} is already the active notebook.", markup=False)
             self._ensure_session()
             return
-        self._switch_notebook(path, how="reopened")
+        self._switch_notebook(name, how="reopened")
 
     def _notebook_close(self, rest: str) -> None:
-        path = notebooks.resolve_notebook(self.config, rest) if rest else self.config.notebook
-        name = self._display_name(path)
-        server, client, _sessions = self._server_sessions()
-        if server is None:
+        name = self._resolve(rest) if rest else self.notebook
+        sandbox, client, _sessions = self._server_sessions()
+        if sandbox is None:
             self.console.print("Marimo is not running.", markup=False)
             return
         try:
-            session = client.resolve_session(path)
+            session = client.resolve_session(name)
         except NoSessionError:
             self.console.print(f"{name} is not open (no kernel session).", markup=False)
             return
         client.shutdown_session(session.session_id)
         self.console.print(f"Closed {name} (session {session.session_id}); its browser tab is disconnected.", markup=False)
-        if self._cli._same_file(path, self.config.notebook):
-            self.console.print(f"It stays the active notebook; /notebook open {Path(path).stem} reopens it.", markup=False)
+        if notebooks.same_name(name, self.notebook):
+            self.console.print(f"It stays the active notebook; /notebook open {name.removesuffix('.py')} reopens it.", markup=False)
 
-    def _switch_notebook(self, path: Path, *, how: str) -> None:
-        """Make ``path`` the active notebook for this chat, the tool server and the next session."""
-        notebooks.save_active_notebook(self.config, path)
-        self.config = replace(self.config, notebook=path)
-        name = self._display_name(path)
+    def _switch_notebook(self, name: str, *, how: str) -> None:
+        """Make ``name`` the active notebook for this chat, the agent's tools and the next session."""
+        notebooks.save_active_notebook(self.config, name)
+        self.notebook = name
+        self._copy_notebooks_back()
         # Queue the notice first: if the wait for the browser tab is interrupted (Ctrl+C) or marimo
         # fails, the switch has still happened and the model must hear about it.
         self._pending_preamble = self._switch_notice(name, f"{how}, not open in a browser yet")
@@ -624,26 +681,26 @@ class ChatController:
 
     def _ensure_session(self) -> tuple[MarimoSession | None, Any]:
         """Open the active notebook in the browser when it has no kernel session; (session, client)."""
-        cfg = self.config
+        name = self.notebook
         self._check_stopped()
-        server, session, _err = self._cli._marimo_state(cfg, self.server)
+        sandbox, session, _err = self._cli._marimo_state(self.sandbox, name)
         self._check_stopped()
-        if server is None:
+        if sandbox is None:
             self.console.print("Marimo is not running; the notebook opens once it is (uvx hailer notebook).", markup=False)
             return None, None
-        client = self._cli._make_client(server, cfg)
+        client = sandbox.client(notebook=name, token_in_links=True)
         if session is not None:
             self.console.print(f"Notebook is open (session {session.session_id}).", markup=False)
             return session, client
-        url = self._cli._notebook_link(self.console, server, cfg)
+        url = sandbox.notebook_url(name, with_token=True)
         self.console.print(f"Opening {url} in your browser...", markup=False)
         self._cli._open_browser(url)
         with self.console.status("Waiting for the notebook to open..."):
             if self._stop_event is None:
-                session = self._cli._wait_for_session(client, cfg.notebook, self._cli.SWITCH_SESSION_TIMEOUT_SEC)
+                session = self._cli._wait_for_session(client, name, self._cli.SWITCH_SESSION_TIMEOUT_SEC)
             else:
                 session = self._cli._wait_for_session(
-                    client, cfg.notebook, self._cli.SWITCH_SESSION_TIMEOUT_SEC,
+                    client, name, self._cli.SWITCH_SESSION_TIMEOUT_SEC,
                     should_stop=self._stop_event.is_set,
                 )
         self._check_stopped()
@@ -659,7 +716,7 @@ class ChatController:
             return None
         self._check_stopped()
         try:
-            result = client.execute(self._cli._list_cells_code(), notebook=self.config.notebook, timeout=5.0)
+            result = client.execute(self._cli._list_cells_code(), notebook=self.notebook, timeout=5.0)
         except Exception:  # noqa: BLE001 - informational only; never fail a switch over it
             return None
         if not result.success:

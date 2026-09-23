@@ -23,9 +23,12 @@ What happens:
    Nothing is committed.
 4. Publish. Commit ``Release vX.Y.Z``, create the annotated tag ``vX.Y.Z`` and
    ``git push --atomic origin main vX.Y.Z``. The tag push triggers
-   ``.github/workflows/release.yml``, which builds the sdist and wheel, publishes
-   them to PyPI through the ``pypi`` environment (trusted publishing) and creates
-   the GitHub release.
+   ``.github/workflows/release.yml``, which builds the sdist and wheel, builds and
+   pushes the kernel image only when its contract tag
+   (``hailer-kernel:marimo<version>-<fingerprint>``, computed from the image's inputs
+   by ``hailer.kernel_image``) is not published yet, publishes the distributions
+   to PyPI through the ``pypi`` environment (trusted publishing) and creates the
+   GitHub release.
 
 The script only uses the standard library so it runs before the project is synced.
 """

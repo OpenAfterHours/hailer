@@ -1,5 +1,8 @@
 # Docker kernel: final adversarial review
 
+> Historical record: this describes the design at the time it was written (2026-09-18/19). The current
+> architecture is in [PLAN.md](../../PLAN.md).
+
 Reviewed on 2026-09-19 on `worktree-docker-kernel`, including the interrupted second review fixes and
 integration with main's automatic kernel startup and persistent chat composer.
 

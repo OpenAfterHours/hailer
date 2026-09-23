@@ -37,7 +37,7 @@ def save_session(config: HailerConfig, monkeypatch) -> Path:
 
 
 def save_active_notebook(config: HailerConfig, monkeypatch) -> Path:
-    notebooks.save_active_notebook(config, config.notebook)
+    notebooks.save_active_notebook(config, "analysis.py")
     return notebooks.state_path(config.workspace)
 
 
@@ -52,7 +52,7 @@ def start_marimo(config: HailerConfig, monkeypatch) -> Path:
 
     procs = Procs().local_processes()
     procs.spawn = spawn
-    running = kernel.LocalRuntime(config, procs=procs, probe=lambda *args: False).start(2718)
+    running = kernel.LocalRuntime(config, procs=procs).start(2718)
     return running.log_path
 
 

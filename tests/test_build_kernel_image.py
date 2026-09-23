@@ -8,6 +8,7 @@ the ``image`` job in release.yml.
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -26,7 +27,7 @@ script = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = script
 _spec.loader.exec_module(script)
 
-ARGS = {"MARIMO_VERSION": "0.24.2", "HAILER_VERSION": "9.9.9"}
+ARGS = {"MARIMO_VERSION": "0.24.2", "KERNEL_CONTRACT": "marimo0.24.2-0123456789ab"}
 
 
 def _build_arg_parts(args) -> list[str]:
@@ -43,7 +44,7 @@ def test_buildx_command_has_platforms_tags_build_args_output_then_the_context():
         "--tag", "reg/img:1",
         "--tag", "reg/img:latest",
         "--build-arg", "MARIMO_VERSION=0.24.2",
-        "--build-arg", "HAILER_VERSION=9.9.9",
+        "--build-arg", "KERNEL_CONTRACT=marimo0.24.2-0123456789ab",
         "--push",
         "ctx",
     ]  # fmt: skip
@@ -124,6 +125,74 @@ def test_a_build_runs_buildx_on_a_prepared_temporary_context(monkeypatch):
     assert cmd[:3] == ["/opt/docker", "buildx", "build"] and seen["ready"]
     assert cmd[3:-1] == ["--platform", "linux/amd64", "--tag", "t:1", *_build_arg_parts(kernel_image.build_args()), "--load"]
     assert not Path(cmd[-1]).exists(), "the temporary context is removed afterwards"
+
+
+BOTH = ("linux/amd64", "linux/arm64")
+NOT_FOUND = (1, "ERROR: ghcr.io/openafterhours/hailer-kernel:x: not found")
+
+
+def _index(*platforms: str) -> tuple[int, str]:
+    """``imagetools inspect --format {{json .Manifest}}`` for an image index (plus an attestation)."""
+    entries = [{"platform": {"os": p.split("/")[0], "architecture": p.split("/")[1]}} for p in platforms]
+    entries.append({"platform": {"os": "unknown", "architecture": "unknown"}})
+    return 0, json.dumps({"mediaType": "application/vnd.oci.image.index.v1+json", "manifests": entries})
+
+
+def _registry(monkeypatch, answers: dict[str, tuple[int, str]]) -> list[list[str]]:
+    """``subprocess.run`` as a registry answering ``imagetools inspect`` per tag, and a build that works."""
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if cmd[1:4] == ["buildx", "imagetools", "inspect"]:
+            code, text = answers.get(cmd[-1], NOT_FOUND)
+            return subprocess.CompletedProcess(cmd, code, text if code == 0 else "", "" if code == 0 else text)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(script.shutil, "which", lambda name: "/opt/docker" if name == "docker" else None)
+    monkeypatch.setattr(script.subprocess, "run", fake_run)
+    return calls
+
+
+def test_if_missing_builds_nothing_when_every_tag_is_published_for_both_platforms(monkeypatch, capsys):
+    """A release that changed nothing in the image reuses the published one."""
+    calls = _registry(monkeypatch, {"reg/img:t": _index(*BOTH)})
+    assert script.main(["--push", "--if-missing", "--tag", "reg/img:t"]) == 0
+    assert calls == [["/opt/docker", "buildx", "imagetools", "inspect", "--format", "{{json .Manifest}}", "reg/img:t"]]
+    assert "already published: nothing to build" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("missing", [NOT_FOUND, (1, "ERROR: reg/img:t: manifest unknown")])
+def test_if_missing_builds_and_pushes_when_the_registry_says_the_tag_does_not_exist(monkeypatch, missing):
+    calls = _registry(monkeypatch, {"reg/img:t": missing})
+    assert script.main(["--push", "--if-missing", "--tag", "reg/img:t"]) == 0
+    build = calls[-1]
+    assert build[:3] == ["/opt/docker", "buildx", "build"] and "--push" in build
+    assert script.parse_args(["--push"]).if_missing is False, "without --if-missing: always build"
+
+
+@pytest.mark.parametrize(
+    ("answers", "said"),
+    [
+        ({"reg/img:t": (1, "ERROR: failed to authorize: 401 Unauthorized")}, "could not ask the registry about reg/img:t"),
+        ({"reg/img:t": (1, "ERROR: dial tcp: lookup ghcr.io: no such host")}, "could not ask the registry"),
+        ({"reg/img:t": _index("linux/amd64")}, "reg/img:t is published without linux/arm64; refusing to overwrite it"),
+        ({"reg/img:t": (0, json.dumps({"mediaType": "application/vnd.oci.image.manifest.v1+json"}))}, "published without linux/amd64, linux/arm64"),
+        ({"reg/img:t": (0, "not json")}, "unexpected manifest for reg/img:t"),
+        ({"reg/img:t": _index(*BOTH), "reg/img:u": NOT_FOUND}, "only some tags are published (missing: reg/img:u)"),
+    ],
+)
+def test_if_missing_fails_closed_and_never_overwrites(monkeypatch, capsys, answers, said):
+    calls = _registry(monkeypatch, answers)
+    assert script.main(["--push", "--if-missing", *[part for tag in answers for part in ("--tag", tag)]]) == 1
+    assert said in capsys.readouterr().err
+    assert not any(call[1:3] == ["buildx", "build"] for call in calls), "nothing built or pushed"
+
+
+def test_if_missing_needs_push(capsys):
+    with pytest.raises(SystemExit) as info:
+        script.parse_args(["--load", "--if-missing"])
+    assert info.value.code == 2 and "--if-missing needs --push" in capsys.readouterr().err
 
 
 def test_no_docker_is_a_clear_error(monkeypatch, capsys):

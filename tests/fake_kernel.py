@@ -1,5 +1,5 @@
-"""Shared pieces for the kernel runtime tests (test helper): a workspace configuration, a liveness
-probe stub (no connects to closed ports) and a fake process layer for the local runtime."""
+"""Shared pieces for the kernel runtime tests (test helper): a workspace configuration and a fake
+process layer for the local runtime (nothing is spawned; no connects to closed ports)."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ from hailer import kernel as k
 from hailer.models import HailerConfig
 
 TOKEN = "unit-test-token-0123456789"
-LIVE = "http://127.0.0.1:2718"
 
 
 def make_config(tmp_path: Path, **overrides) -> HailerConfig:
@@ -24,12 +23,6 @@ def make_config(tmp_path: Path, **overrides) -> HailerConfig:
     )
     base.update(overrides)
     return HailerConfig(**base)
-
-
-def answers(*live: tuple[str, str]):
-    """A liveness probe that says yes only for the (url, token) pairs given."""
-    alive = set(live)
-    return lambda url, token: (url, token) in alive
 
 
 class FakeProc:
@@ -59,8 +52,6 @@ class Procs:
         self.healthy = healthy
         self.proc = proc or FakeProc()
         self.calls: list[tuple] = []
-        self.killed: list[int] = []
-        self.removed: list[str] = []
 
     def spawn(self, cmd, cwd, log_path, *, env=None, stdin_text=None):
         self.calls.append(("spawn", cmd, cwd, log_path, env, stdin_text))
@@ -70,8 +61,8 @@ class Procs:
         self.calls.append(("attach", cmd, cwd, None, env, stdin_text))
         return self.proc
 
-    def wait_for_health(self, url, timeout, should_stop=None):
-        self.calls.append(("health", url, timeout))
+    def wait_for_health(self, url, timeout, *, token=None, should_stop=None):
+        self.calls.append(("health", url, timeout, token))
         if callable(self.healthy):
             return self.healthy()
         return self.healthy
@@ -81,7 +72,5 @@ class Procs:
             spawn=self.spawn,
             attach=self.attach,
             kill_tree=lambda pid: None,
-            kill_pid=self.killed.append,
             wait_for_health=self.wait_for_health,
-            remove_registry_entry=lambda url: (self.removed.append(url) or True),
         )

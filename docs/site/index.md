@@ -14,4 +14,4 @@ through a terminal conversation and builds the results in a live marimo notebook
 
 [Start your first analysis](getting-started/quickstart.md) or explore the
 [everyday workflow](using/workflow.md). Learn [where your data goes](security/data-handling.md)
-and choose a [local or Docker runtime](security/runtimes.md).
+and [where notebook code runs](security/runtimes.md): a Docker container by default.

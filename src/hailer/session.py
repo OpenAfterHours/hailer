@@ -21,6 +21,7 @@ COMMANDS: dict[str, str] = {
     "new": "Start a new conversation thread (context files are re-read).",
     "model": "Switch model and start a new thread. Usage: /model <name>  or  /model <provider>:<name>",
     "notebook": "Show or switch the active notebook. Usage: /notebook [list | new <name> [--empty] | open <name> | close [name]]",
+    "exec": "Run Python in the active notebook's kernel and print the result (not sent to the model). Usage: /exec <code>",
     "context": "List loaded context files, skills, prompts and the web allowlist.",
     "skill": "Run a turn with a project skill attached. Usage: /skill <name> [message]",
     "prompt": "Send a saved prompt from .config/hailer/prompts. Usage: /prompt <name> [args]",
@@ -37,6 +38,7 @@ def parse_command(line: str) -> Command | None:
     """Parse a slash command. Returns ``None`` for ordinary conversation text.
 
     ``"/model gpt-5.5"`` -> ``Command("model", "gpt-5.5")``; ``"/"`` -> ``Command("", "")``.
+    The name ends at the first whitespace, so a pasted ``/exec`` block keeps its line breaks.
     Unknown commands are still returned so the CLI can report them.
     """
     text = line.strip()
@@ -45,8 +47,11 @@ def parse_command(line: str) -> Command | None:
     body = text[1:].strip()
     if not body:
         return Command("", "")
-    name, _, rest = body.partition(" ")
-    return Command(name.strip().lower(), rest.strip())
+    name = body.split(None, 1)[0]
+    rest = body[len(name):].lstrip(" \t").rstrip()
+    # Arguments that start on the next line keep that line's indentation (a pasted /exec block).
+    rest = rest.lstrip("\r\n") if rest[:1] in ("\r", "\n") else rest
+    return Command(name.lower(), rest)
 
 
 def help_text() -> str:

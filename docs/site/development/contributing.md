@@ -37,8 +37,9 @@ The marimo protocol is exercised against a local fake server (`tests/fake_marimo
 server Hailer starts), the agent against a scripted chat model and against a strict Chat-Completions-only
 fake gateway on loopback (`tests/fake_gateway.py`, which rejects unknown request fields and model names the
 way internal gateways do), and the credential store against an in-memory backend. The kernel runtimes are
-tested without starting anything: `tests/test_kernel.py` (path map, `kernel.json`, the kernel's
-environment, the local runtime with its processes faked), `tests/test_kernel_docker.py` (the docker runtime
+tested without starting anything: `tests/test_kernel.py` (the kernel's environment, the unsafe-local runtime
+with its processes faked), `tests/test_sandbox.py` (notebook files through marimo's file API, served by
+`tests/fake_marimo.py`; notebook names that could leave the folder are refused before any request), `tests/test_kernel_docker.py` (the docker runtime
 against `tests/fake_docker.py`, a scripted `docker` CLI that keeps containers and networks with ids,
 labels and `--filter`, like Docker 29), `tests/test_kernel_image.py`, `tests/test_forward.py` (the forwarder
 on real loopback sockets) and `tests/test_build_kernel_image.py`. `tests/fake_kernel.py` holds the shared

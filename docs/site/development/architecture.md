@@ -21,25 +21,34 @@ Terminal ─────► │  conversation   │   (create_agent + ChatOpenAI
                 │ Marimo runtime  │   scratchpad over the kernel globals +
                 │ Polars · DuckDB │   marimo._code_mode for durable cells
                 │ Python          │
-                └────────┬────────┘   local (default): Hailer's own Python, as you
-                         │            docker: a Linux container that sees only the
-                    Browser UI        notebooks folder and, read-only, the data folder
+                └────────┬────────┘   docker (default): a Linux container with copies of
+                         │            the notebooks and, read-only, the data folder
+                    Browser UI        unsafe-local: Hailer's own Python, as you
 ```
 
 The CLI runs the agent in its own process, with the model and provider taken from `hailer.toml`. The agent
 has exactly the twelve tools above and nothing else: no shell, no file editing. The tools talk to the
 running marimo server over plain HTTP. Code from the agent runs in marimo's *scratchpad*, a temporary
 namespace that can read every notebook variable, and durable changes (new cells, edits, runs) go through
-marimo's code-mode API so they appear immediately in the browser. The notebook file on disk is written by
-marimo itself, never edited behind the kernel's back. Cells the agent creates or edits are formatted with
-ruff by code mode before they run, and checked afterwards with ruff and ty on the Hailer side; the findings
-go back to the model with the tool result (see [Formatting and code checks](../using/notebooks.md#code-checks)).
+marimo's code-mode API so they appear immediately in the browser. marimo writes the notebook file itself,
+never edited behind the kernel's back; with Docker that is the kernel's copy, which Hailer copies back.
+Cells the agent creates or edits are formatted with ruff by code mode before they run, and checked
+afterwards with ruff and ty on the Hailer side; the findings go back to the model with the tool result (see
+[Formatting and code checks](../using/notebooks.md#code-checks)).
 
-Where marimo and its kernel run is the *kernel runtime*, set by `[kernel] runtime`: `local` (the default)
-starts marimo in Hailer's own Python, `docker` starts it in a container (see
-[Isolated kernel (Docker)](../security/docker.md#isolated-kernel-docker)). The agent, the conversation and the API key stay in
-the Hailer process either way.
+Where marimo and its kernel run is the *kernel runtime*, set by `[kernel] runtime`: `docker` (the default)
+starts it in a container (see [Isolated kernel (Docker)](../security/docker.md#isolated-kernel-docker)), and
+`unsafe-local` starts marimo in Hailer's own Python, as the user. The agent, the conversation and the API key stay in
+the Hailer process either way. Every session starts its own marimo server, keeps it in memory for the
+agent's tools as a *sandbox* (its URL and token, and its files), and stops it when the chat ends; nothing attaches to a server
+another session started. A docker kernel keeps its notebooks in a folder of its own: the session copies
+the workspace's notebooks in when it starts and copies changed marimo notebooks, and nothing else, back
+after every turn, every 15 seconds and when it stops (`hailer.notebook_sync`).
 
 ## Design records
 
-The current module contracts are in [INTERFACES.md](https://github.com/OpenAfterHours/hailer/blob/main/docs/INTERFACES.md). Read [LEARNINGS.md](https://github.com/OpenAfterHours/hailer/blob/main/docs/LEARNINGS.md) before changing the agent, providers, tools or conversation lifecycle, and [PLAN.md](https://github.com/OpenAfterHours/hailer/blob/main/PLAN.md) for the architecture and implementation history.
+[PLAN.md](https://github.com/OpenAfterHours/hailer/blob/main/PLAN.md) describes the current architecture and
+the module contracts are in [INTERFACES.md](https://github.com/OpenAfterHours/hailer/blob/main/docs/INTERFACES.md).
+Read [LEARNINGS.md](https://github.com/OpenAfterHours/hailer/blob/main/docs/LEARNINGS.md) before changing the
+agent, providers, tools, kernel runtimes or conversation lifecycle. Earlier plans, reviews and dated findings
+are kept in [docs/history](https://github.com/OpenAfterHours/hailer/tree/main/docs/history).

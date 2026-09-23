@@ -4,18 +4,25 @@ Usage (from the repository root)::
 
     uv run python -m scripts.build_kernel_image --load                 # into this machine's Docker
     uv run python -m scripts.build_kernel_image --push                 # both platforms, to the registry
+    uv run python -m scripts.build_kernel_image --push --if-missing    # only when the tag is not published yet
     uv run python -m scripts.build_kernel_image --dry-run --push       # print the command only
     uv run python -m scripts.build_kernel_image --load --tag hailer-kernel:dev
     uv run python -m scripts.build_kernel_image --push -- --progress plain  # arguments after -- go to buildx
 
 The build context is the one ``uvx hailer kernel build`` uses (``hailer.kernel_image.prepare_context``):
-the packaged Dockerfile and the installed ``hailer`` package (this checkout, under ``uv run``) in a
-temporary folder, with one ``--build-arg`` per pinned version (marimo, Polars, fastexcel, DuckDB and Hailer's own,
-which becomes the image's version label). Users build their own image with ``uvx hailer kernel build``;
-this script adds what a release needs: several platforms and ``--push``.
+the packaged Dockerfile and the image's hailer modules (from this checkout, under ``uv run``) in a
+temporary folder, with one ``--build-arg`` per pinned package version and ``KERNEL_CONTRACT``, which
+becomes the image's contract label. Users build their own image with ``uvx hailer kernel build``;
+this script adds what a release needs: several platforms, ``--push`` and ``--if-missing``.
 
 - ``--tag`` (repeatable) defaults to the image this Hailer runs,
-  ``ghcr.io/openafterhours/hailer-kernel:<version>``.
+  ``ghcr.io/openafterhours/hailer-kernel:marimo<version>-<fingerprint>``.
+- ``--if-missing`` (with ``--push``) asks the registry first (``docker buildx imagetools inspect``):
+  every tag published with every ``--platform``: nothing to build (a release that changed nothing in
+  the image reuses it); the registry says none of them exists (not found, manifest unknown): build and
+  push. Anything else stops the script without building: an error asking the registry (no access,
+  no network), a tag published without one of the platforms, or only some tags published (a
+  published tag is never overwritten).
 - ``--platform`` defaults to ``linux/amd64,linux/arm64``; with ``--load`` it defaults to this machine's
   platform (Docker's classic image store cannot load a multi-platform image).
 - ``--push`` uploads (``docker login`` first); ``--load`` puts the image into the local engine; with
@@ -36,6 +43,7 @@ Needs Docker with the buildx plugin (Docker Desktop and GitHub's Ubuntu runners 
 from __future__ import annotations
 
 import argparse
+import json
 import shlex
 import shutil
 import subprocess
@@ -128,12 +136,15 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     where.add_argument("--load", dest="output", action="store_const", const="load", help="load the image into the local Docker engine")
     parser.add_argument("--context", type=Path, metavar="DIR", help="prepare the build context here and keep it")
     parser.add_argument("--dry-run", action="store_true", help="print the command and run nothing")
+    parser.add_argument("--if-missing", action="store_true", help="with --push: build nothing when every tag is already published")
     parser.add_argument("--base-image", metavar="IMAGE", help="Python 3.12+ base image with venv and ensurepip")
     parser.add_argument("--pip-config", type=Path, metavar="FILE", help="pip build secret; overrides host pip/uv discovery")
     parser.add_argument("--pip-cert", type=Path, metavar="FILE", help="pip PEM CA bundle mounted as a build secret")
     parser.add_argument("--no-cache", action="store_true", help="reinstall packages without cached build layers")
     parser.add_argument("--no-host-config", action="store_true", help="disable host pip/uv package configuration discovery")
     args = parser.parse_args(argv)
+    if args.if_missing and args.output != "push":
+        parser.error("--if-missing needs --push")
     args.extra = extra
     if not args.tags:
         args.tags = [kernel_image.default_image()]
@@ -144,6 +155,49 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 def _format(cmd: Sequence[str]) -> str:
     return shlex.join(cmd)
+
+
+class RegistryError(Exception):
+    """The registry's answer does not allow a safe decision; the message says why."""
+
+
+_MISSING_SIGNS = ("not found", "manifest unknown")
+
+
+def published_platforms(tag: str, docker: str) -> set[str] | None:
+    """The platforms ``tag`` is published for (``"linux/amd64"``, ...); ``None`` when the registry
+    says the tag does not exist. Raises :class:`RegistryError` for any other failure."""
+    result = subprocess.run(
+        [docker, "buildx", "imagetools", "inspect", "--format", "{{json .Manifest}}", tag],
+        check=False, stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    if result.returncode != 0:
+        said = (result.stderr or result.stdout or "").strip()
+        if any(sign in said.lower() for sign in _MISSING_SIGNS):
+            return None
+        raise RegistryError(f"could not ask the registry about {tag}: {said or f'exit code {result.returncode}'}")
+    try:
+        manifest = json.loads(result.stdout)
+        entries = manifest.get("manifests") or []
+        return {f"{m['platform']['os']}/{m['platform']['architecture']}" for m in entries if m.get("platform")}
+    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise RegistryError(f"unexpected manifest for {tag}: {exc}") from None
+
+
+def all_published(tags: Sequence[str], platforms: Sequence[str], docker: str) -> bool:
+    """True when every tag is published with every platform, False when none is published.
+    Raises :class:`RegistryError` otherwise (never build over a published tag)."""
+    found = {tag: published_platforms(tag, docker) for tag in tags}
+    missing = [tag for tag, have in found.items() if have is None]
+    if len(missing) == len(tags):
+        return False
+    if missing:
+        raise RegistryError(f"only some tags are published (missing: {', '.join(missing)}); refusing to overwrite the others")
+    for tag, have in found.items():
+        lacking = sorted(set(platforms) - (have or set()))
+        if lacking:
+            raise RegistryError(f"{tag} is published without {', '.join(lacking)}; refusing to overwrite it")
+    return True
 
 
 def _prepare(context: Path) -> dict[str, str]:
@@ -164,6 +218,18 @@ def _build(args: argparse.Namespace, context: Path, build_args: Mapping[str, str
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.if_missing and not args.dry_run:
+        docker = shutil.which("docker")
+        if docker is None:
+            warn("aborted: docker is not on PATH (install Docker Desktop or Docker Engine with the buildx plugin)")
+            return 1
+        try:
+            if all_published(args.tags, args.platforms or DEFAULT_PLATFORMS, docker):
+                say(f"{', '.join(args.tags)} already published: nothing to build (--if-missing)")
+                return 0
+        except RegistryError as exc:
+            warn(f"aborted: {exc}")
+            return 1
     try:
         with kernel_image.configured_build_options(
             base_image=args.base_image, pip_config=args.pip_config, pip_cert=args.pip_cert, no_cache=args.no_cache,

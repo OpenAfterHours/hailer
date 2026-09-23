@@ -97,7 +97,23 @@ translated faithfully. Evidence: `tests/test_kernel_packages.py`, `tests/test_ke
 `tests/test_build_kernel_image.py` and the kernel-build tests in `tests/test_cli.py`.
 
 Keep credentials out of prompts, logs and errors. Use Hailer's credential resolution and redaction
-helpers; do not move keys into subprocess arguments or new plaintext config files.
+helpers; do not move keys into subprocess arguments or new plaintext config files. The same holds for
+the marimo token: the unsafe-local kernel reads it from stdin, the Docker kernel from a read-only single-file
+mount (`--token-password-file`), because `docker inspect` shows a container's arguments and environment.
+The file is deleted once marimo answers (it reads it as its CLI starts). On Docker Desktop for Windows
+(29.4.3, 2026-09-22) the file then also disappears inside the container; on Linux the mount keeps the
+deleted inode readable there, which gives notebook code nothing it lacks. The start deletes the
+`.hailer/kernel-token-<random>` folder in a `finally`; nothing sweeps token folders, because several sessions
+start in one workspace and a sweep could delete another session's token before its marimo read it. Evidence:
+`test_the_token_reaches_marimo_in_a_file_that_is_gone_once_it_started`,
+`test_the_token_file_is_removed_when_a_start_fails` and the Docker integration test
+`test_the_token_is_not_in_docker_inspect_or_the_kernels_command_lines`.
+
+The kernel image is versioned by its kernel contract (`hailer.kernel_image`), not by Hailer's version, so
+a CLI-only release publishes no image. The tag is computed from the image's inputs (a sha256 prefix): a
+hand-maintained contract number was rejected in review because updating a stored fingerprint without
+bumping the number would let a changed image reuse a published tag. `--if-missing` fails closed on any
+registry answer other than "not found" and never overwrites a published tag.
 
 ## 7. Report structured errors and test visible warnings
 
@@ -156,7 +172,7 @@ the agent's original event loop. A cancelled wait must neither cancel shared imp
 shutdown wait for them; failed imports must produce an actionable error without re-importing them
 on the UI thread.
 
-Start warmup before kernel discovery/start. Once the server is healthy, render the interactive
+Start warmup before the kernel start. Once the server is healthy, render the interactive
 composer before preparing the agent and waiting for the notebook in parallel. A user can type and
 paste while either is pending; one first submission may wait for preparation and must run at most
 once. Preserve both that message and any next draft on failure. Ordinary busy-turn submissions
@@ -175,7 +191,176 @@ session milestones. Keep event-controlled startup tests in `test_chat.py`, `test
 recorded-terminal test into a claim about physical Windows Ctrl+C. The measurements, live-check
 scope and reproduction commands are in [STARTUP_PERFORMANCE.md](STARTUP_PERFORMANCE.md).
 
-## 11. Format cells before code mode applies them; check them as one script
+## 11. One session, one kernel: own it, never find one
+
+Until 2026-09-22 a session could reuse a kernel another terminal had started (`.hailer/kernel.json`,
+marimo's registry of `--no-token` servers, `[hailer].marimo_url`, `--keep-marimo`, `hailer exec`). Proving
+that a recorded kernel was still the one it described, and never orphaning or destroying a busy one, took
+liveness probes, a start guard, settings-mismatch checks and id bookkeeping, and was the most intricate code
+in Hailer. Now each `uvx hailer` / `uvx hailer notebook` process starts its own kernel, keeps it in memory
+(the `Sandbox` its runtime's start returns, handed to the chat, the agent and the tools) and stops it in the `finally` of
+`hailer.cli.chat._run_session` (`_start_kernel` runs inside the guarded block, so Ctrl+C right after the start cannot
+leak the kernel); `/exec` replaced `hailer exec`. Do not add a way to find or attach to another process's
+kernel: a restart costs a few seconds, which is cheaper than the lifecycle bugs.
+
+Two sessions can pick the same free port. The start's wait therefore checks its own process (local) or
+containers (docker) first and then requires `answers_with_token(url, its own token)`: a bare `/health`
+check once let a second session adopt the first one's server, and every call then got 401. Evidence:
+`test_a_start_never_takes_another_sessions_server_on_the_same_port_for_its_own` and
+`test_wait_for_health_with_a_token_accepts_only_the_server_that_holds_it`.
+
+Docker ownership is a lock, not a pid: each start creates `.hailer/owner-<random>.lock`, holds an OS lock on
+it (`msvcrt.locking` / `fcntl.flock`) and labels its containers and network with that id. An owner is alive
+while its lock file exists and cannot be locked; the OS drops the lock however the process ends, so a reused
+pid (or a WSL/Windows pid namespace) can never make a dead owner look alive. A start removes only objects
+whose owner is not alive; `uvx hailer kernel stop` removes every labelled object and nothing in `.hailer`.
+An earlier design kept a per-session record for the local (now unsafe-local) runtime and killed orphans by pid; it was dropped:
+the `finally` stops the unsafe-local kernel on every normal exit, and a killed session's token-protected marimo is
+ended by the user (Task Manager or `kill`). Evidence: `test_owner_locks_say_whether_their_hailer_still_runs`,
+`test_a_start_never_removes_a_live_sessions_objects`, `test_start_removes_what_owners_that_are_gone_left_by_id`,
+`test_two_sessions_run_side_by_side_and_each_removes_only_its_own`,
+`test_ctrl_c_right_after_the_kernel_started_still_stops_it` and the owner-label check in
+`tests/test_docker_integration.py`.
+
+## 12. Files belong to the sandbox: names above the runtime, paths only inside it
+
+Until 2026-09-22 the tools listed, created and resolved notebooks by walking the host's notebooks folder,
+read the data folder for `list_periods`, stored host paths in `.hailer/notebook.json`, and translated host
+paths to container paths (and back) through a `PathMap` that every layer carried. That only worked because the
+docker kernel's notebooks folder was a bind mount of the host's; it could not hold for notebooks that live in a
+container's own filesystem or in a cloud kernel. Now the started kernel is a `hailer.sandbox.MarimoSandbox`: notebooks
+are names relative to its notebooks folder (`"q3/review.py"`), notebook files go through marimo's own file API
+(`/api/files/list_files`, `/file_details`, `/create`, `/update`, `/delete`; marimo 0.24.2, bearer token plus the
+`Marimo-Server-Token` header, no browser session needed), and data files are names from `list_data()`. The only
+place a name becomes a path is the runtime layer (`MarimoClient.file_key` / `name_of`, from the sandbox's
+`notebooks_path`), for `?file=` keys and session matching.
+
+Keep it that way: `hailer.tools` must not name the notebooks or data folders or call a file-system API
+(`test_the_tools_never_touch_the_notebooks_or_data_folders` checks the source). Every name is checked by
+`notebooks.check_notebook_name` before a request (no `..`, drive, leading `/`, dot- or dunder-folder, `:`
+stream, trailing dot/space or Windows device name): `test_names_are_checked_before_any_request`. marimo's
+`create` never overwrites; it writes `<stem>_1.py` instead, so a create that loses a race deletes that copy and
+reports the existing file (`test_a_file_that_appears_during_a_create_is_never_overwritten`).
+
+marimo's file endpoints confine nothing and follow links: a live probe against marimo 0.24.2 wrote
+`jn/escape.py` through a junction to outside the notebooks folder, and `Q3/Review.py` replaced `q3/review.py`
+on Windows and came back with the variant's spelling. So Hailer checks every path before sending it: a local
+kernel's names are compared with links resolved (a link out of the folder is outside; reads, writes and
+listings stop there), a Windows kernel's names ignore case and keep the listing's spelling, and
+`fake_marimo.py` records every path it was asked about instead of confining them
+(`test_a_link_out_of_the_notebooks_folder_is_never_followed`, `test_a_case_variant_is_the_same_notebook_on_windows`,
+`test_hailer_never_sends_a_path_outside_the_notebooks_folder`). marimo's `update` writes `\r\n` on Windows
+while `create` stores the bytes as given: compare contents with `sandbox.notebook_digest`. A `notebook.json`
+without the current `version` (an older Hailer's host paths) is ignored, not converted: the session starts on
+`[hailer].notebook` (`test_an_old_state_file_falls_back_to_the_configured_notebook`). Workspace setup (`uvx hailer init`, the
+doctor's notebook row) may stay host-side.
+
+## 13. A sandbox writes to the host only through the notebook allow-list
+
+Until 2026-09-22 the docker kernel's `/work/notebooks` was a writable bind mount of the host's notebooks
+folder. Notebook code could then plant files that other programs on the host run: git hooks and
+`core.fsmonitor`, `.vscode`/`.idea`/`.devcontainer` settings, a `hailer.toml`, and for Python tools
+`conftest.py`, `test_*.py` (pytest collects them), `sitecustomize.py`. Defending that took mount-layout
+refusals (no `.git` or `hailer.toml` anywhere in the notebooks tree, not the workspace, not inside
+`.hailer`), a scan for planted control files at every stop and in `doctor`, and warnings that could not stop
+an editor acting while the kernel ran. Now the kernel's notebooks folder is a size-capped tmpfs of its own
+(`--tmpfs /work/notebooks:uid=U,gid=G,mode=0700,size=512m`, not a volume: nothing to clean up) and
+`hailer.notebook_sync.NotebookSync` copies notebooks through marimo's file API: in at start (after health,
+before `_active_notebook` and the browser), back after every turn, on a notebook switch, every 15 s from a
+daemon thread, and in `DockerKernel.stop` before the containers are removed, which the `finally` of every
+session path reaches (`/exit`, EOF, Ctrl+C, errors, `--foreground`).
+
+Keep these properties; each has a test in `tests/test_notebook_sync.py` unless named:
+
+- **One allow-list for both directions**, `sync_refusal(name, text)`: a name `check_notebook_name` accepts
+  (so no dot or dunder part), `.py` exactly, no 8.3 short-name part (`~` and a digit), at most four folders,
+  no `TOOLING_NAMES` match (test, task and packaging runners, Sphinx/Django/gunicorn/IPython/Jupyter
+  configuration, start-up hooks; one casefolded pattern list), no part named like a module Python would import
+  instead (`module_names()`: stdlib, the image's packages, common ones such as pandas;
+  a `json.py` next to a script shadows `json`), UTF-8 without NUL, at most 5 MiB, containing `import marimo`
+  and `marimo.App(`; at most 500 files. `module_names()` is a fixed list (stdlib, the image's packages,
+  `COMMON_MODULES`), not what happens to be installed with Hailer, so the rule is the same on every machine.
+  Per session at most 200 new notebooks / 100 MiB are written here; names in warnings are made printable. Widen it only with a reason a host tool will not run the new kind of file
+  (`test_the_allow_list_refuses_everything_else`). Case-insensitive duplicates are copied once.
+  `DockerKernel.write_notebook` refuses a name the allow-list refuses, so the agent cannot create a notebook
+  that would silently stay in the container (`test_a_docker_kernel_refuses_to_create_a_notebook_that_would_never_come_back`).
+- **Host writes** are atomic (`write_atomically`: temp file in the same folder + `os.replace`), stay inside
+  the notebooks folder and never pass through a symlink or junction, and never delete anything
+  (`test_a_write_never_goes_through_a_link_or_junction`, `test_writes_here_are_atomic_and_leave_nothing_behind`).
+- **Conflicts**: the digest (`notebook_digest`, newline-normalised) last copied in or out is remembered per
+  name, in memory. A host file that differs from it is saved to `.hailer/notebook-backups/<name>.<time>.py`
+  before it is replaced; if the backup fails, nothing is written.
+- **Kernel code can replace the marimo server**, so every `/api/files` reply may be forged. Replies are
+  capped (`marimo_client.MAX_REPLY_BYTES`, sized from the notebook cap; `Content-Length` checked, then a
+  bounded chunked read) and every copy runs under one thread-local monotonic deadline
+  (`marimo_client.request_deadline`), checked before each request and between reads, so a trickling server
+  cannot hold the exit: 30 s for the copy in and the last copy back, 10 s and 50 MiB read per background
+  pass. On the deadline Hailer warns, keeps the host copies and goes on (at stop: to container removal).
+  Evidence: `test_a_trickling_reply_ends_at_the_deadline`, `test_a_reply_larger_than_the_cap_is_refused_without_reading_it`,
+  `test_the_last_copy_has_one_deadline_whatever_the_server_does`, `test_a_pass_stops_at_its_deadline_or_byte_budget_and_leaves_the_rest`.
+- **Every read counts, and the stop always ends.** A review reproduced a stop hanging over 150 s: the page
+  read for marimo's server token ignored the deadline, a trickling server held the background pass and its
+  lock, and `close()` waited on the lock forever. Now that page goes through the same bounded read, the token
+  is cached per sandbox, copies take the lock with a timeout, `execute()` collects at most
+  `MAX_EXEC_BYTES`, and `DockerKernel.stop` runs the last copy on a daemon thread for at most
+  `SYNC_STOP_SEC`, then removes the containers whatever happened
+  (`test_a_server_that_trickles_its_page_cannot_hold_the_last_copy`,
+  `test_a_last_copy_that_never_ends_cannot_keep_the_containers`).
+- **Failures warn, never raise**, and repeat once per message (a dead kernel does not print every 15 s). The
+  chat routes `sandbox.notice` to its own console, which the composer queues from any thread.
+- **Ordering**: sync-in runs inside `DockerRuntime.start`, so the chat and the browser never see an empty
+  folder, and a Ctrl+C there stops the kernel. This costs one list + create per notebook on loopback before
+  the composer renders (LEARNINGS §10); keep it bounded rather than moving it after `_active_notebook`. Stop
+  joins the thread (a pass ends within 10 s) before the final copy; Ctrl+C during that copy skips it with a warning and the
+  containers are still removed (`test_ctrl_c_during_the_last_copy_still_removes_the_containers`).
+
+Linux UID mapping (`--user <uid>:<gid>`) stays: nothing is written through a mount any more, but the kernel
+still reads the data folder as the user, and files only the owner may read (`0600` exports) would otherwise be
+unreadable. The notebooks-folder mount rules and the planted-file scan are gone; the data-folder rules
+(`config.docker_mount_problems`) remain. A notebook is code wherever it came from: once a sandbox copied
+notebooks back, `.hailer/sandbox-wrote-notebooks` stays until the user agrees, at an interactive unsafe-local
+start (default No), to run them unisolated; a non-interactive unsafe-local start refuses
+(`test_an_unsafe_local_start_asks_before_running_notebooks_a_sandbox_wrote`). A one-time warning was not
+enough: the first start would open and auto-run them before anyone read it. Evidence at
+the Docker level: `test_the_notebooks_folder_is_the_containers_own_and_only_notebooks_come_back` and
+`test_stop_copies_the_last_edit_back_and_leaves_no_containers_network_or_token` in
+`tests/test_docker_integration.py` (Windows 11, Docker Desktop 29.4.3, 2026-09-22, `HAILER_DOCKER_TESTS=strict`).
+
+## 14. Isolation is the default; running unisolated is a decision the user writes down
+
+Until 2026-09-22 the kernel ran in Hailer's own Python, as the user, unless `[kernel] runtime = "docker"`
+was set, and `[kernel].pass_env` could hand secret-looking variables to notebook code. Code the model writes
+therefore had the user's files and network by default. Now `docker` is the default (`KernelConfig`,
+`MarimoServer`, the `init` template, a file without `[kernel]`), and the unisolated runtime is called
+`unsafe-local`. Keep these properties:
+
+- **The old name is refused, not mapped.** `runtime = "local"`, `HAILER_KERNEL=local` and `--kernel local`
+  are a fatal config problem (`config.runtime_problem`; `--kernel` exits 2; `runtime_for` raises the same
+  text) telling the user to write `unsafe-local` only if they accept that notebook code runs as them, with
+  their files and network. Silently mapping `local` would keep people unisolated without a decision, and
+  silently mapping it to docker would break their start without saying why. Evidence:
+  `test_the_retired_local_runtime_is_fatal_and_says_how_to_opt_in` (test_config) and
+  `test_the_retired_local_runtime_is_refused_with_the_way_to_opt_in` (test_cli).
+- **No fallback, two ways on.** Without a usable Docker (no CLI, engine down, Windows containers) a start
+  fails closed; every such hint ends with `kernel_docker.UNSAFE_LOCAL_OPTION` after the install/start advice
+  (`test_docker_that_cannot_run_the_kernel_fails_closed`), except in `uvx hailer kernel ...`, which manages
+  Docker itself (`test_kernel_pull`). A bad runtime is one `config` row, and its fix names `HAILER_KERNEL`
+  when that set it (`test_a_retired_runtime_from_the_environment_is_one_config_row_with_an_environment_fix`). `init` still writes `docker` on a machine without
+  Docker and says how to install it or opt in
+  (`test_init_writes_docker_and_says_how_to_get_docker_only_when_it_is_missing`).
+- **Visible every time.** The `Kernel:` line is `unsafe-local (runs as you; not isolated)` in yellow in the
+  startup panel, `status`, `/status` and `--foreground`, and a WARN row in `doctor`; a start drops that row
+  so the panel says it once (`test_kernel_line_of_the_unsafe_local_runtime_is_a_warning`,
+  `test_doctor_has_a_kernel_row`).
+- **No pass-through.** `[kernel].pass_env` is gone; an old file gets the ordinary unknown-key warning, which
+  never quotes the value (`test_pass_env_is_gone_and_reported_as_an_unknown_key_without_its_value`). The
+  secret-looking names stay withheld from an unsafe-local kernel.
+- **The offline suite never needs Docker.** Because the default now reaches Docker, test configs that start
+  or describe a kernel name their runtime (`KernelConfig(runtime="unsafe-local")` in the CLI and agent
+  fixtures, `runtime="docker"` against `fake_docker.py`); only `tests/test_docker_integration.py` uses a real
+  engine.
+
+## 15. Format cells before code mode applies them; check them as one script
 
 The code checks ([code_checks.py](../src/hailer/code_checks.py)) were verified live on 2026-09-22 against
 marimo 0.24.2 (Linux, local kernel, headless Chromium), ruff 0.16.8 and ty 0.0.83. Three findings shaped
@@ -185,7 +370,7 @@ them:
   its variables until it runs again, so reformatting a cell once it has run would rerun it and everything
   below it. Code mode already formats new and changed code with ruff before applying it when the kernel's
   `save.format_on_save` is on; the pre-call snapshot sets that flag in the kernel's memory. The kernel then
-  needs ruff: keep it a Hailer dependency and in the kernel image.
+  needs ruff: keep it a Hailer dependency and in the kernel image (`kernel_image.IMAGE_PACKAGES`).
 - **Reading `cell.code` through `ctx.cells` counts as the agent reading the cell.** Code mode refuses an
   `edit_cell` of a cell changed since the agent last read it (`StaleCellError`). A snapshot through
   `ctx.cells` would mark every cell read and quietly defeat that protection, so it reads the notebook
@@ -195,6 +380,10 @@ them:
   computed on the host with marimo's compiler from every cell's code. A cell that does not parse is left
   out of the script: an unclosed bracket swallows the cells after it, and ruff lints nothing in a file with
   a syntax error.
+- **The cells come from the sandbox; the checks run here.** ruff and ty run on this machine over the
+  snapshot the kernel returns, so they work the same for every runtime. The tools give ty no search path:
+  the folder a kernel imports local modules from is the sandbox's, not one on this machine (§12), and
+  `unresolved-import` is ignored anyway.
 
 ruff 0.16 enables several hundred rules by default and reads any project configuration, so Hailer passes
 `--isolated` and its own selection; ruff's E711/E712 "fixes" would break Polars expressions such as

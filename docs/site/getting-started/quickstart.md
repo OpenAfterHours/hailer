@@ -6,12 +6,14 @@ You'll need:
 
 - [uv](https://docs.astral.sh/uv/getting-started/installation/), which provides the `uvx` command.
   Install it, then reopen your terminal.
+- **Docker**, installed and running: [Docker Desktop](https://docs.docker.com/desktop/) on Windows or
+  macOS, [Docker Engine](https://docs.docker.com/engine/install/) on Linux. Your notebook code runs in a
+  Docker container that sees only your data folder, read-only, with no network.
 - An [OpenAI API key](https://platform.openai.com/api-keys) for the default setup.
 - A web browser.
 
 These steps work in PowerShell on Windows and in a terminal on macOS or Linux. `uvx` downloads Hailer,
-its dependencies and a suitable Python version when needed. You do not need to clone this repository
-or install Docker.
+its dependencies and a suitable Python version when needed. You do not need to clone this repository.
 
 ### 1. Create a workspace and sign in
 
@@ -26,7 +28,8 @@ uvx hailer login openai
 
 `init` creates your settings (`hailer.toml`), a starter notebook and a `data/` folder. At the login prompt,
 paste your API key; input is hidden and the key is saved in your operating system's credential store.
-The starter settings use OpenAI with `gpt-5.5`.
+The starter settings use OpenAI with `gpt-5.5` and the Docker kernel (`[kernel] runtime = "docker"`).
+If Docker is not on your machine, `init` says so and how to get it.
 
 For a company or another model endpoint, follow [custom endpoint setup](../configuration/models.md#a-custom-or-internal-endpoint)
 after `init`, using that provider's login command, then continue below.
@@ -54,8 +57,9 @@ From the same terminal, run:
 uvx hailer
 ```
 
-Hailer opens the notebook in your browser and starts the chat in your terminal. **Keep the notebook tab
-open while you work**; it provides the live session that runs the analysis.
+The first start downloads Hailer's kernel image, which takes a minute or two. Then Hailer opens the notebook
+in your browser and starts the chat in your terminal. **Keep the notebook tab open while you work**; it
+provides the live session that runs the analysis.
 
 You can type or paste your first question while chat preparation continues. Pressing Enter keeps one
 message waiting and sends it when preparation finishes; you can keep editing your next draft meanwhile.
@@ -77,10 +81,11 @@ in `my-analysis` and run `uvx hailer` again; it resumes your conversation and ac
 Use `/new` for a fresh conversation, or `/help` to see the chat commands.
 
 If startup fails, run `uvx hailer doctor` for checks and suggested fixes, or see
-[Troubleshooting](../reference/troubleshooting.md#troubleshooting). A missing marimo server before your first session is expected:
-`uvx hailer` starts it for you.
+[Troubleshooting](../reference/troubleshooting.md#troubleshooting). `Docker is not installed.` or
+`Docker is not running.` means exactly that: install or start Docker and run `uvx hailer` again. `doctor`
+starts no kernel: every `uvx hailer` session starts its own and stops it when the chat ends.
 
 **Data and code:** files are read locally, but your messages, code and notebook tool outputs (which can
-include data samples) go to the configured model endpoint. By default, notebook code runs with your
-account's file and network access. See [Security](../security/data-handling.md#security) and the optional
-[Docker runtime](../security/docker.md#isolated-kernel-docker) for details.
+include data samples) go to the configured model endpoint. Notebook code runs in the Docker container,
+which sees your data folder read-only and has no network. See [Security](../security/data-handling.md#security)
+and [Isolated kernel (Docker)](../security/docker.md#isolated-kernel-docker) for details.

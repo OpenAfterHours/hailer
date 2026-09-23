@@ -2,9 +2,13 @@
 #
 # Triggered by the vX.Y.Z tag that `uv run python -m scripts.release` pushes after the
 # tests pass locally. Runs the test suite again (test.yml: every supported platform,
-# plus the Docker kernel job) and builds the sdist and wheel. Then it builds the docker
-# runtime's kernel image for linux/amd64 and linux/arm64 with scripts/build_kernel_image.py
-# and pushes it as ghcr.io/openafterhours/hailer-kernel:X.Y.Z. Only if all of that
+# plus the Docker kernel job) and builds the sdist and wheel. Then it makes sure the docker
+# runtime's kernel image for this Hailer's kernel contract is published:
+# ghcr.io/openafterhours/hailer-kernel:marimo<version>-<fingerprint> (hailer.kernel_image, a tag
+# computed from the image's inputs). scripts/build_kernel_image.py --push --if-missing is the one
+# gate: when the registry has that tag for both platforms nothing is built; when it says the tag does
+# not exist the image is built for linux/amd64 and linux/arm64 and pushed; any other answer fails
+# the job. Only if all of that
 # succeeds does it publish through the "pypi" environment using PyPI trusted publishing
 # (OIDC, no API token to store) and then create the GitHub release with the
 # distributions attached, so no released Hailer points at a missing image.
@@ -87,16 +91,12 @@ jobs:
       - name: Install the project
         run: uv sync --locked
 
-      - name: Check that the image's version label will match the tag
-        env:
-          VERSION: ${{ needs.build.outputs.version }}
+      - name: Find the kernel image this release needs
+        id: image
         run: |
-          # build checked pyproject.toml against the tag; the image's label comes from hailer.__version__.
-          installed="$(uv run --locked python -c 'import hailer; print(hailer.__version__)')"
-          if [ "v${VERSION}" != "${GITHUB_REF_NAME}" ] || [ "${installed}" != "${VERSION}" ]; then
-            echo "::error::tag ${GITHUB_REF_NAME}, pyproject.toml ${VERSION} and hailer.__version__ ${installed} must agree"
-            exit 1
-          fi
+          image="$(uv run --locked python -c 'from hailer import kernel_image; print(kernel_image.default_image())')"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "Kernel image: ${image}"
 
       - uses: docker/setup-qemu-action@v4.4.0 # emulation for the linux/arm64 build on an amd64 runner
         with:
@@ -110,13 +110,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push ghcr.io/openafterhours/hailer-kernel for linux/amd64 and linux/arm64
+      - name: Build and push the kernel image for linux/amd64 and linux/arm64 unless it is published
         env:
-          VERSION: ${{ needs.build.outputs.version }}
+          IMAGE: ${{ steps.image.outputs.image }}
         run: >-
-          uv run --locked python -m scripts.build_kernel_image --push
+          uv run --locked python -m scripts.build_kernel_image --push --if-missing
           --platform linux/amd64,linux/arm64
-          --tag "ghcr.io/openafterhours/hailer-kernel:${VERSION}"
+          --tag "${IMAGE}"
 
   publish:
     name: Publish to PyPI

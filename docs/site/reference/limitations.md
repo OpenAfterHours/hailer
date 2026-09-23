@@ -10,8 +10,9 @@
   may still finish and switch the active notebook a moment later. Hailer re-reads the state after every
   turn and before `/notebook` and `/status`, so the next command shows the right notebook; a `/notebook
   new` typed in that instant can still be overtaken by the late switch.
-- Both `uvx hailer` and `uvx hailer notebook` start or reuse this workspace's marimo server and stop only
-  a server they started. An explicitly pinned server must already be running.
+- Every `uvx hailer` and `uvx hailer notebook` session starts its own marimo server and stops it when the
+  chat ends, so restarting the chat re-runs the notebook in a fresh kernel. A server you start yourself
+  (for example with `marimo edit --no-token`) cannot be used, and two sessions never share a kernel.
 - Every request carries about 10 KB of instructions and 5 KB of tool definitions (measured with an empty
   project context) plus the conversation; an endpoint with a strict request-size limit needs room for that.
 - The endpoint must support function calling in the standard OpenAI shape. An endpoint that streams tool
@@ -19,19 +20,24 @@
 - The [code checks](../using/notebooks.md#code-checks) are static: ty cannot see column names or the data,
   and types from packages Hailer's own Python lacks (with the docker kernel: altair, plotly) are unknown to
   it, so it finds less there. ty is pre-1.0; Hailer pins it, and its rules and messages may change when
-  the pin moves. Formatting needs ruff in the kernel's Python: Hailer's own Python and the kernel image have
-  it; a marimo server you started yourself in another environment skips it.
+  the pin moves. Formatting needs ruff in the kernel's Python: Hailer's own Python (unsafe-local) and the
+  kernel image have it, and so does an image of your own built `FROM` Hailer's.
 - After Ctrl+C during a long `marimo_execute`, the turn ends at once but the code keeps running in the
   kernel until it finishes, or until you interrupt or restart the kernel from the notebook.
-- The docker kernel needs Docker, which is not always an option: Docker Desktop is free for personal use
-  and small businesses, but larger organisations need a paid subscription (check Docker's current terms),
-  and managed machines often block Docker Desktop, WSL2 or Hyper-V. That is why `local` stays the default
-  and fully supported.
-- Reading large files through a Windows bind mount is slower than reading them from a local folder; how
-  much slower for large Parquet files has not been measured yet.
+- The default docker kernel needs Docker, which is not always an option: Docker Desktop is free for
+  personal use and small businesses, but larger organisations need a paid subscription (check Docker's
+  current terms), and managed machines often block Docker Desktop, WSL2 or Hyper-V. Where it is not,
+  `runtime = "unsafe-local"` runs notebook code on the machine as you, without isolation, for those who
+  accept that (see [Kernel runtimes](../security/runtimes.md#kernel-runtimes)).
+- Reading large data files through a Windows bind mount is slower than reading them from a local folder;
+  how much slower for large Parquet files has not been measured yet.
+- A docker kernel works on copies of the notebooks (see [Notebook copies](../security/docker.md#notebook-copies)):
+  only marimo notebooks with plain names travel, at most 500 of up to 5 MB each; other files notebook code
+  writes next to them are gone when the kernel stops; edits made on your machine during a session reach the
+  kernel only at the next start; and if Hailer is killed, the kernel's changes since the last copy (at most
+  about 15 seconds of browser edits, or the current turn) are lost.
 - The release workflow builds the `linux/arm64` kernel image (Apple Silicon, ARM Linux), but the CI
   integration test only covers amd64. Podman is not supported.
-- The docker kernel has only the packages in the image (marimo, Polars, fastexcel, DuckDB, altair, plotly, ruff); anything
-  else needs an image of your own, built `FROM` Hailer's (so it keeps the version label) and named in
-  `[kernel].image`. There is one kernel per workspace, and
-  changing `[kernel]` settings while one is kept running needs `uvx hailer kernel stop` first.
+- The docker kernel has only the packages in the image (marimo, Polars, fastexcel, DuckDB, ruff, altair, plotly); anything
+  else needs an image of your own, built `FROM` Hailer's (so it keeps the kernel contract label) and named in
+  `[kernel].image`. Changed `[kernel]` settings apply from the next session.
