@@ -253,6 +253,9 @@ SERVER_TOKEN_HEADER = "Marimo-Server-Token"
 MAX_NOTEBOOK_BYTES = 5 * 1024 * 1024       # the notebook cap (sandbox re-exports it); replies are sized from it
 MAX_REPLY_BYTES = 3 * MAX_NOTEBOOK_BYTES + 1 MiB   # every GET /api/sessions and POST reply: a larger Content-Length, or more data,
                                            # is MarimoUnavailableError ("... more than 16 MiB; Hailer stopped reading.") without reading on
+MAX_PAGE_BYTES = 2_000_000                 # GET / (the server token's page), read like every reply: bounded, against the deadline
+MAX_EXEC_BYTES = 3 * MAX_NOTEBOOK_BYTES + 1 MiB   # execute(): the most its event stream may add up to (lines read at most that long);
+                                           # past it MarimoExecutionError; a non-stream error body is read at most 64 KiB
 def request_deadline(seconds) -> ContextManager   # thread-local: every request inside must finish (connect, headers, whole body read
                                            # in 64 KiB read1 chunks) by one monotonic deadline; past it MarimoUnavailableError "(out of time)"
                                            # and nothing more is sent. Kernel code can replace the server, so a reply may be forged or trickled
@@ -263,7 +266,8 @@ def answers_with_token(url: str, token: str | None, timeout: float = 1.0) -> boo
 class MarimoClient:
     def __init__(self, base_url: str, token: str | None = None, *, timeout: float = 10.0,
                  notebooks_path: str | None = None, native_paths: bool = False,
-                 notebook: str | None = None, token_in_links: bool = False) -> None
+                 notebook: str | None = None, token_in_links: bool = False,
+                 token_cache: dict[str, str] | None = None) -> None   # token_cache: shares the server token (a sandbox passes its own)
                  # notebooks_path: the kernel's path of the notebooks folder; notebooks are names relative to it.
                  # native_paths: the kernel's paths are this machine's (unsafe-local runtime), else POSIX paths in a container.
                  # notebook: the name resolve_session()/execute() default to; token: sent as Authorization: Bearer;
@@ -370,6 +374,8 @@ def notebook_digest(source: str) -> str   # sha256 with \r\n normalised to \n (u
                                                               # never looked into; MAX_NOTEBOOK_DEPTH / MAX_NOTEBOOK_FOLDERS / MAX_TREE_ENTRIES
     def has_notebook(self, name: str) -> bool                 # one listing of the parent folder (startup's active-notebook check)
     def read_notebook(self, name: str) -> str                 # for copying out; NotebookNotFoundError; NotebookPathError (not UTF-8, larger than MAX_NOTEBOOK_BYTES, behind a link out of the folder)
+    def writable_name(self, name: str) -> str                 # check_notebook_name + at most MAX_NOTEBOOK_DEPTH deep; NotebookPathError;
+                                                              # runtimes add rules (DockerKernel: sync_refusal); write_notebook calls it first
     def write_notebook(self, name: str, source: str, *, replace: bool = True) -> NotebookFile
         # create (folders too, at most MAX_NOTEBOOK_DEPTH deep) or replace the text; replace=False → NotebookExistsError
         # for an existing file, which is never touched (a create that loses a race: marimo writes <stem>_1.py, which is
@@ -399,10 +405,12 @@ BACKUP_FOLDER = "notebook-backups"; TEMP_PREFIX = ".hailer-sync-"
 TOOLING_NAMES = ("conftest.py", "test_*.py", "*_test.py", "setup.py", "noxfile.py", "tasks.py", "fabfile.py", "dodo.py", "conf.py",
                  "manage.py", "gunicorn.conf.py", "ipython_config.py", "jupyter_*_config.py", "sitecustomize.py", "usercustomize.py",
                  "__init__.py", "__main__.py")   # fnmatch patterns on the casefolded file name
-COMMON_MODULES = ("hailer", "pandas", "numpy", "scipy", "matplotlib", "seaborn", "sklearn", "pyarrow", "requests", "openpyxl")
-def module_names() -> frozenset[str]       # cached, casefolded: sys.stdlib_module_names, the kernel image's packages, COMMON_MODULES,
-                                           # imported top-level modules, and a scan of Hailer's site-packages (namespace packages too;
-                                           # importlib.metadata.packages_distributions() names the same but reads every RECORD, ~3 s)
+COMMON_MODULES = ("hailer", "pandas", "numpy", "scipy", "matplotlib", ...)   # modules scripts commonly import
+def module_names() -> frozenset[str]       # cached, casefolded: sys.stdlib_module_names, the kernel image's packages and COMMON_MODULES;
+                                           # never what is installed with Hailer, so the rule is the same on every machine
+SYNC_LOCK_SEC = SYNC_CYCLE_SEC + 5         # the most a copy waits for another under way (then a warning, no copy)
+SYNC_STOP_SEC = 2 * SYNC_LOCK_SEC + SYNC_DEADLINE_SEC   # the most DockerKernel.stop waits for the last copy
+SESSION_NEW_FILES = 200; SESSION_BYTES = 100 MiB   # per session: then new names are no longer copied back (one warning)
 def sync_refusal(name: str, text: str | None = None) -> str | None
     # THE allow-list, both directions (None: may be copied): no backslash; notebooks.check_notebook_name accepts it (relative,
     # no drive/../empty part, no part starting with "." or "__", Windows-safe); ends in ".py" (that spelling); no part with "~"
@@ -430,6 +438,7 @@ class NotebookSync:                        # NotebookSync(sandbox, folder, works
     def soon(self) -> None
     def close(self, *, final: bool = True) -> list[str]   # stop the thread (a pass ends within SYNC_CYCLE_SEC), then (final)
                                            # sync_out(seconds=SYNC_DEADLINE_SEC) once more: one deadline for the whole last copy
+    # Every write here also calls statedir.mark_sandbox_wrote; names in warnings have non-printable characters replaced by "?"
 ```
 
 
@@ -441,7 +450,6 @@ Every `uvx hailer` / `uvx hailer notebook` process starts its own kernel and sto
 or attaches to a kernel another process started.
 
 ```python
-LAST_KERNEL_FILENAME = "last-kernel.json"
 LOCAL_LOG_PREFIX = "marimo-"              # .hailer/marimo-<pid>.log: the unsafe-local runtime's log, one per process, deleted on stop
 START_TIMEOUT_SEC = 60.0                  # the start's wait, counted after any image pull
 KERNEL_WORKDIR, KERNEL_NOTEBOOKS_DIR, KERNEL_DATA_DIR   # PurePosixPath: /work, /work/notebooks (docker: the kernel's own tmpfs), /work/data (read-only mount)
@@ -452,8 +460,6 @@ UNSAFE_LOCAL_HINT                         # the unsafe-local doctor row's hint: 
 
 def new_token() -> str                                     # secrets.token_urlsafe(32)
 def local_log_path(workspace, pid=None) -> Path            # .hailer/marimo-<pid>.log (this process by default)
-def note_kernel_start(workspace, runtime, notebooks_root) -> None       # .hailer/last-kernel.json; never raises
-def docker_wrote_notebooks(workspace, notebooks_root) -> bool            # the last server on this folder was a docker kernel
 def withheld_variables(config: HailerConfig, environ: Mapping[str, str]) -> list[str]
     # sorted names the unsafe-local server does not get: every provider env_key and OPENAI_API_KEY, every
     # env_http_headers variable, KERNEL_SECRET_NAMES, and names ending in KERNEL_SECRET_SUFFIXES (any case);
@@ -483,14 +489,17 @@ class KernelRuntime(Protocol):
     def prepare(self, say: Callable[[str], None] | None = None) -> None   # slow steps and warnings before any spinner (docker: pull a missing image); start() runs it when not done
     def start(self, port: int, *, foreground: bool = False) -> MarimoSandbox   # starts a new server on 127.0.0.1:port and waits until it answers with this start's token (its own process/containers checked first); KernelRuntimeError (log tail in the hint) and nothing left running on failure
     def describe(self) -> str                                             # the text after "Kernel:"
-class LocalRuntime:                        # runtime = "unsafe-local"; LocalRuntime(config, *, procs=None, environ=None, token_factory=new_token, start_timeout=60.0)
+class LocalRuntime:                        # runtime = "unsafe-local"; LocalRuntime(config, *, procs=None, environ=None, token_factory=new_token, start_timeout=60.0,
+                                           #   confirm=ask_yes_no)
     # (the class keeps its name: it is the runtime on this machine; "unsafe-" is the setting's warning)
     # check: one warning "kernel" row (ok=False, fatal=False): describe() + how many variables are withheld,
     #   hint UNSAFE_LOCAL_HINT. kernel_checks(starting=True) drops it: the startup panel shows the line instead
-    # prepare: warns when docker_wrote_notebooks ("Warning: the notebooks in <folder> were last run by the
-    #   isolated docker kernel; with the unsafe-local kernel their code runs on this machine as you. ...")
+    # prepare: when statedir.sandbox_wrote_notebooks, a warning line, then confirm("Run them on this machine anyway? [y/N] "):
+    #   True clears the mark; False → KernelRuntimeError("Not started: ... were not approved ..."); None (no terminal) →
+    #   KernelRuntimeError("Not started: ... no terminal to ask ...", hint: run uvx hailer notebook --kernel unsafe-local in a
+    #   terminal and answer yes, or keep --kernel docker)
     # start: marimo_server_command + kernel_environment + the token on stdin; log .hailer/marimo-<pid>.log (None in
-    #   foreground); wait_for_health(token=its token, should_stop=its process ended); note_kernel_start on success; "Marimo
+    #   foreground); wait_for_health(token=its token, should_stop=its process ended); "Marimo
     #   exited early (code N)." / "Marimo did not answer on <url> within 60 s." with "Last lines of its log:" and the masked
     #   tail otherwise (the log is deleted). No state file: a Hailer that is killed leaves its token-protected marimo
     #   running, to be ended with Task Manager or kill
@@ -554,10 +563,11 @@ def data_path_problems(data_dir, *, windows=None, drive_type=None) -> list[str]
     runner; containers; container_ids; network; network_id; owner (OwnerLock)   # what this session started; removed and inspected by id
     sync: NotebookSync | None              # set by start after the copy in; None again once stop made the last copy
     def sync_soon(self) -> None            # sync.soon() (nothing without one)
-    def write_notebook(self, name, source, *, replace=True) -> NotebookFile   # NotebookPathError ("... would stay in the docker kernel and be
+    def writable_name(self, name) -> str   # MarimoSandbox's rules, then NotebookPathError ("... would stay in the docker kernel and be
                                            # lost when it stops (<reason>).") for a name notebook_sync.sync_refusal refuses (json.py, conftest.py, ...); else MarimoSandbox's
     def remove(self) -> Removal            # containers, then the network
-    def stop(self) -> None                 # sync.close(final=True) first (Ctrl+C there: a warning, removal goes on), then remove, then
+    def stop(self) -> None                 # sync.close(final=True) on a daemon thread, joined at most SYNC_STOP_SEC (then a warning; Ctrl+C
+                                           # there: a warning), then remove (always), then
                                            # release the owner lock; stop_error explains a failure ("... Run uvx hailer kernel stop to retry.")
     def log_tail(self, lines=15, *, container=None) -> list[str]   # docker logs --tail, token masked
     def wait(self) -> int                  # docker logs -f; then sets ended from docker inspect: removed from outside, out of memory, exit 137, "exited (code N)"
@@ -600,7 +610,7 @@ class DockerRuntime:
         # network (unless network=true), kernel, forwarder (create, network connect, start); wait_for_health through the
         # forwarder with this start's token (should_stop: one of its containers stopped); the token folder is deleted once that
         # wait ends (success, failure or Ctrl+C); then NotebookSync.sync_in and .start(), before
-        # anything can open a notebook (Ctrl+C there stops the kernel); note_kernel_start. No state file: the returned DockerKernel is the only
+        # anything can open a notebook (Ctrl+C there stops the kernel). No state file: the returned DockerKernel is the only
         # handle. Any failure or Ctrl+C removes what was created. foreground changes nothing (DockerKernel.wait follows the log)
 def workspace_kernels(config, runner=None) -> list[str]
     # hailer status, whatever [kernel] runtime says, when the docker CLI is there: one line per running kernel container of
@@ -699,11 +709,11 @@ def default_notebook(config: HailerConfig) -> str                        # confi
 def state_path(workspace: Path) -> Path
 def load_active_notebook(config: HailerConfig) -> str
     # ONLY the state file (never the environment or the notebooks folder; see the ground rule): its valid "active"
-    # name, else default_notebook. A file without "version" is the old format (host paths): entries inside
-    # notebooks_root become names, anything else is dropped. Whether the notebook still exists is the sandbox's to say
-def load_recent(config: HailerConfig) -> list[str]                 # names, most recent first (converted like "active")
+    # name, else default_notebook. A file that cannot be read or has another "version" (an older Hailer's host
+    # paths) is ignored. Whether the notebook still exists is the sandbox's to say
+def load_recent(config: HailerConfig) -> list[str]                 # names, most recent first
 def save_active_notebook(config: HailerConfig, name: str) -> None
-    # checks the name; atomic (tmp + replace); writes the current format (so the first save converts an old file);
+    # checks the name; atomic (tmp + replace); writes the current format;
     # "recent" most-recent-first, unique, max 10; creates .hailer/ via statedir.ensure_state_dir
 def notebook_display_name(config: HailerConfig, path: Path) -> str   # a host path, workspace-relative posix ("notebooks/q2_churn.py"), absolute posix when outside
 def slugify(name: str) -> str                              # "Q2 Churn (draft).py" → "q2_churn_draft"; must start with a letter (else "nb_" prefix); ValueError when empty
@@ -956,6 +966,8 @@ class HailerAgent:
 STATE_DIRNAME = ".hailer"; GITIGNORE_NAME = ".gitignore"; GITIGNORE_TEXT   # a comment line, then "*"
 def state_dir(workspace: Path) -> Path          # <workspace>/.hailer (path only)
 def ensure_state_dir(workspace: Path) -> Path   # mkdir -p, then write .hailer/.gitignore unless one exists (never overwritten; a failed write is ignored)
+SANDBOX_MARK_NAME = "sandbox-wrote-notebooks"   # a sandbox copied notebooks here since the user last agreed to run them unsafe-local
+def mark_sandbox_wrote(workspace) -> None; def sandbox_wrote_notebooks(workspace) -> bool; def clear_sandbox_mark(workspace) -> None
 ```
 The only place `.hailer/` is created: `session.save_session`, `notebooks.save_active_notebook`,
 `HailerAgent` (the default `threads.sqlite`) and the kernel runtimes' record, log and token folders all go through `ensure_state_dir`, so the
@@ -1008,9 +1020,9 @@ Both plain and interactive chat receive the sandbox the runtime started through 
 `HailerAgent` and the tools; nothing reads it back from a file, so `/new`, `/model` and notebook switches keep
 it. `ChatController` points `sandbox.notice` at its current console (yellow, thread-safe through the composer's
 queue), and asks for a copy back (`sandbox.sync_soon()`, `_copy_notebooks_back`) after every turn (finished,
-failed or interrupted) and whenever the active notebook changes (`_switch_notebook`, `_sync_active_notebook`). The prompt gets a token-free URL. Once the kernel answers, `_active_notebook(config, sandbox)` picks the
+failed or interrupted) and on a `/notebook` switch (`_switch_notebook`). The prompt gets a token-free URL. Once the kernel answers, `_active_notebook(config, sandbox)` picks the
 active notebook (the state file's, else `default_notebook` when `sandbox.has_notebook` says it is gone: one
-request, not a listing) and saves it, which converts an old `notebook.json`; the startup panel shows that
+request, not a listing) and saves it; the startup panel shows that
 name. The CLI and the chat take clients from `sandbox.client(notebook=..., token_in_links=True)` and links
 from `sandbox.notebook_url(name, with_token=True)` / `sandbox.home_url(with_token=True)`: they are printed or
 opened for the user, never sent to the model. `_marimo_state(sandbox, notebook)` is the seam the chat uses.

@@ -32,7 +32,7 @@ from hailer.models import HailerConfig
 from hailer.statedir import ensure_state_dir, state_dir
 
 STATE_FILENAME = "notebook.json"
-#: ``notebook.json`` holds names from this version on; a file without it holds host paths.
+#: ``notebook.json``'s format (names); a file of any other version is ignored.
 STATE_VERSION = 2
 RECENT_LIMIT = 10
 FALLBACK_MARIMO_VERSION = "0.24.2"
@@ -290,33 +290,23 @@ def state_path(workspace: Path) -> Path:
 
 
 def _read_state(config: HailerConfig) -> tuple[str | None, list[str]]:
-    """(active, recent) from the state file, as names. A file without ``version`` is the old
-    format (host paths, absolute or relative to the workspace): entries inside the notebooks
-    folder become names, anything else is dropped. Invalid entries, entries of the wrong type and a
-    file of an unknown (newer) version are ignored, and names that differ only in case on Windows
-    are one."""
+    """(active, recent) from the state file, as names. A file that cannot be read, of another
+    version (an older Hailer's host paths, a newer format), invalid entries and entries of the wrong
+    type are ignored, so the session falls back to ``[hailer].notebook``; names that differ only
+    in case on Windows are one."""
     try:
         raw = json.loads(state_path(config.workspace).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None, []
-    if not isinstance(raw, dict):
+    if not isinstance(raw, dict) or raw.get("version") != STATE_VERSION:
         return None, []
-    version = raw.get("version")
-    if version == STATE_VERSION:
-        convert = _valid_name
-    elif version is None:
-        def convert(value: object) -> str | None:
-            return notebook_name(config, value) if isinstance(value, str) and value.strip() else None
-    else:
-        return None, []
-
     stored = raw.get("recent")
     recent: list[str] = []
     for value in stored if isinstance(stored, list) else []:
-        name = convert(value)
+        name = _valid_name(value)
         if name is not None and not any(same_name(name, seen) for seen in recent):
             recent.append(name)
-    return convert(raw.get("active")), recent
+    return _valid_name(raw.get("active")), recent
 
 
 def load_active_notebook(config: HailerConfig) -> str:
@@ -337,8 +327,7 @@ def load_recent(config: HailerConfig) -> list[str]:
 
 
 def save_active_notebook(config: HailerConfig, name: str) -> None:
-    """Persist ``name`` as the active notebook (atomic write) and push it onto the recent list.
-    Writes the current format, so an old file is converted by the first save."""
+    """Persist ``name`` as the active notebook (atomic write) and push it onto the recent list."""
     name = check_notebook_name(name)
     path = ensure_state_dir(config.workspace) / STATE_FILENAME
     previous = [r for r in load_recent(config) if not same_name(r, name)]

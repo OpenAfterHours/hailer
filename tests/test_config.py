@@ -856,3 +856,14 @@ def test_kernel_runtime_errors_quote_like_the_rest(tmp_path: Path) -> None:
     with pytest.raises(ConfigError) as excinfo:
         config_template("podman")
     assert str(excinfo.value).startswith('Invalid kernel runtime "podman"; use "docker"')
+
+
+def test_temp_directory_does_not_exempt_ssh_credentials(tmp_path: Path, monkeypatch) -> None:
+    import hailer.config as cfg
+    from fake_kernel import make_config
+
+    secret = tmp_path / "home" / ".ssh"
+    monkeypatch.setattr(cfg, "_credential_folders", lambda windows: [secret])
+    monkeypatch.setattr(cfg, "_in_temp", lambda folder: True)
+    config = make_config(tmp_path / "workspace", data_dir=secret / "nested", kernel=KernelConfig(runtime="docker"))
+    assert "credentials" in " ".join(cfg.docker_mount_problems(config))

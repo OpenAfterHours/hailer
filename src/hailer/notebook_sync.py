@@ -34,7 +34,6 @@ import os
 import re
 import shutil
 import sys
-import sysconfig
 import tempfile
 import threading
 import time
@@ -46,7 +45,7 @@ from hailer.errors import MarimoUnavailableError, NotebookExistsError, NotebookN
 from hailer.marimo_client import request_deadline
 from hailer.notebooks import check_notebook_name
 from hailer.sandbox import MAX_NOTEBOOK_BYTES, MAX_NOTEBOOK_DEPTH, MAX_NOTEBOOKS, SKIPPED_FOLDERS, notebook_digest
-from hailer.statedir import ensure_state_dir
+from hailer.statedir import ensure_state_dir, mark_sandbox_wrote
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
     from hailer.sandbox import MarimoSandbox
@@ -59,6 +58,16 @@ SYNC_DEADLINE_SEC = 30.0
 #: (the rest waits for the next pass).
 SYNC_CYCLE_SEC = 10.0
 SYNC_CYCLE_BYTES = 10 * MAX_NOTEBOOK_BYTES
+#: How long a copy waits for another one under way (they share one lock) before it gives up.
+SYNC_LOCK_SEC = SYNC_CYCLE_SEC + 5
+#: The most a docker kernel's stop waits for the last copy (the background pass to end, the lock,
+#: the copy itself) before it removes the containers anyway.
+SYNC_STOP_SEC = 2 * SYNC_LOCK_SEC + SYNC_DEADLINE_SEC
+#: Per session: at most this many notebooks new to this machine, and this many bytes written here;
+#: past either, new names are no longer copied back (changes to known notebooks within the byte
+#: budget still are), with one warning.
+SESSION_NEW_FILES = 200
+SESSION_BYTES = 100 * 1024 * 1024
 #: ``.hailer/notebook-backups``: the copies of files here that a sandbox's version replaced.
 BACKUP_FOLDER = "notebook-backups"
 #: File names other tools run or import as code however they look (test runners, task runners,
@@ -77,34 +86,21 @@ SHOWN_NAMES = 5
 TEMP_PREFIX = ".hailer-sync-"
 
 
-#: Modules scripts next to notebooks commonly import, installed in Hailer's environment or not.
-COMMON_MODULES = ("hailer", "pandas", "numpy", "scipy", "matplotlib", "seaborn", "sklearn", "pyarrow", "requests", "openpyxl")
+#: Modules scripts next to notebooks commonly import (besides the standard library and the image's).
+COMMON_MODULES = (
+    "hailer", "pandas", "numpy", "scipy", "matplotlib", "seaborn", "sklearn", "statsmodels", "pyarrow", "requests",
+    "httpx", "openpyxl", "xlsxwriter", "sqlalchemy", "pytest", "ipython", "jupyter", "yaml", "toml", "attr", "pydantic",
+)  # fmt: skip
 
 
 @functools.cache
 def module_names() -> frozenset[str]:
     """Top-level module names (casefolded) Python may import instead of a notebook of that name:
-    the standard library, what is installed in Hailer's environment (its site-packages, namespace
-    packages included, and every module already imported), the kernel image's packages and
-    :data:`COMMON_MODULES`. A scan of the site-packages folders, not
-    ``importlib.metadata.packages_distributions()``, which reads every distribution's RECORD (about
-    3 s on Windows) and names the same modules."""
+    the standard library, the kernel image's packages and :data:`COMMON_MODULES`. A fixed list, so
+    the rule is the same on every machine whatever Hailer's environment holds."""
     from hailer.kernel_image import IMAGE_PACKAGES  # lazy: only the name list is needed
 
-    names = {name.casefold() for name in (*sys.stdlib_module_names, *IMAGE_PACKAGES, *COMMON_MODULES)}
-    names |= {name.split(".", 1)[0].casefold() for name in list(sys.modules)}  # hailer itself, editable installs
-    for folder in {sysconfig.get_paths()[key] for key in ("purelib", "platlib")}:
-        try:
-            entries = list(os.scandir(folder))
-        except OSError:
-            continue
-        for entry in entries:
-            stem = entry.name.split(".", 1)[0]
-            if entry.name.endswith((".dist-info", ".egg-info", ".pth")) or not stem.isidentifier():
-                continue
-            if entry.is_dir() or entry.name.endswith((".py", ".pyd", ".so")):
-                names.add(stem.casefold())
-    return frozenset(names)
+    return frozenset(name.casefold() for name in (*sys.stdlib_module_names, *IMAGE_PACKAGES, *COMMON_MODULES))
 
 
 def sync_refusal(name: str, text: str | None = None) -> str | None:
@@ -195,9 +191,17 @@ def _write_atomically(target: Path, data: bytes) -> None:
         raise
 
 
+def _printable(text: str) -> str:
+    """``text`` without control or formatting characters (a name from the sandbox may carry escape
+    sequences or a right-to-left override meant for the terminal)."""
+    return "".join(char if char.isprintable() else "?" for char in text)
+
+
 def _names(refused: Iterable[tuple[str, str]]) -> str:
     """``name`` for each refused file, with the reason for a module's name (the user would not guess it)."""
-    shown = [f"{name} ({reason})" if reason.startswith("the name of the Python module") else name for name, reason in sorted(refused)]
+    shown = [
+        _printable(f"{name} ({reason})" if reason.startswith("the name of the Python module") else name) for name, reason in sorted(refused)
+    ]
     text = ", ".join(shown[:SHOWN_NAMES])
     return text + (f" and {len(shown) - SHOWN_NAMES} more" if len(shown) > SHOWN_NAMES else "")
 
@@ -226,6 +230,8 @@ class NotebookSync:
         self._known: dict[str, str] = {}
         self._seen: dict[str, tuple[float, int]] = {}
         self._named: set[str] = set()  # refused names already in a "not copied" line
+        self._new_files = 0  # notebooks this session created here
+        self._written = 0  # bytes this session wrote here
         self._said: set[str] = set()  # warnings already shown (a dead kernel would repeat them every pass)
         self._lock = threading.Lock()
         self._wake = threading.Event()
@@ -311,12 +317,18 @@ class NotebookSync:
 
     # -- out ------------------------------------------------------------------ #
 
-    def sync_out(self, *, seconds: float = SYNC_CYCLE_SEC, budget: int = SYNC_CYCLE_BYTES) -> list[str]:
+    def sync_out(self, *, seconds: float | None = None, budget: int | None = None) -> list[str]:
         """Copy the notebooks the sandbox changed since they were last copied back here, within
-        ``seconds`` (every request and reply counts) and ``budget`` bytes read; the names written.
+        ``seconds`` (default :data:`SYNC_CYCLE_SEC`; every request and reply counts) and ``budget``
+        bytes read (default :data:`SYNC_CYCLE_BYTES`); the names written.
         Never raises; failures, and a copy cut short, are warning lines and leave the files here as
-        they were."""
-        with self._lock:
+        they were. Waits at most :data:`SYNC_LOCK_SEC` for a copy under way."""
+        if not self._lock.acquire(timeout=SYNC_LOCK_SEC):
+            self._say_once("Warning: an earlier copy of the notebooks back from the kernel did not finish; this one was skipped.")
+            return []
+        seconds = SYNC_CYCLE_SEC if seconds is None else seconds
+        budget = SYNC_CYCLE_BYTES if budget is None else budget
+        try:
             copied: list[str] = []
             try:
                 with request_deadline(seconds):
@@ -332,6 +344,8 @@ class NotebookSync:
             except Exception as err:  # noqa: BLE001 - a copy must never break the chat
                 self._say_once(f"Warning: could not copy the notebooks back from the kernel ({err}). The files in {self.folder} are unchanged.")
             return copied
+        finally:
+            self._lock.release()
 
     def _sync_out(self, copied: list[str], end: float, budget: int) -> None:
         refused: list[tuple[str, str]] = []
@@ -421,6 +435,13 @@ class NotebookSync:
         if self._known.get(name) == digest:
             return False
         target = self._target(name)
+        data = text.encode("utf-8")
+        if not target.exists() and (self._new_files >= SESSION_NEW_FILES or self._written + len(data) > SESSION_BYTES):
+            self._say_once(
+                f"Warning: this session already copied back {self._new_files} new notebooks "
+                f"({self._written // (1024 * 1024)} MiB); new notebooks from the kernel are no longer copied back."
+            )
+            return False
         backup = None
         if target.is_file():
             current = target.read_bytes()
@@ -430,8 +451,12 @@ class NotebookSync:
                 return False
             if here != self._known.get(name):
                 backup = self._backup(name, current)
-        _write_atomically(target, text.encode("utf-8"))
+        if not target.exists():
+            self._new_files += 1
+        _write_atomically(target, data)
+        self._written += len(data)
         self._known[name] = digest
+        mark_sandbox_wrote(self.workspace)  # the unsafe-local runtime asks before it runs them
         if backup is not None:
             self.sandbox.notify(
                 f"Warning: {name} changed both here and in the kernel. The kernel's version replaced it; "

@@ -323,7 +323,6 @@ def test_a_unc_data_folder_is_fatal_in_the_config_row_and_nothing_else_says_othe
     rows = docker_runtime(tmp_path, FakeDocker(), config=config).check()
     assert "data" not in [r.name for r in rows], "no OK row for a folder that cannot be mounted"
     assert scanned == [], "a share is not walked for links"
-    assert docker_mount_problems(config, windows=False) == [] or "UNC" not in " ".join(docker_mount_problems(config, windows=False))
 
 
 def test_mapped_network_drives_are_flagged_and_local_drives_are_not(monkeypatch):
@@ -438,7 +437,7 @@ def test_start_runs_the_hardened_kernel_offline_behind_a_forwarder(tmp_path):
     assert running.log_hint == f"docker logs {names.kernel}"
     assert running.containers == (names.kernel, names.forwarder) and running.container_ids == (kernel_c.id, forwarder_c.id)
     assert running.network == names.network and running.network_id == network.id
-    assert [p.name for p in (tmp_path / ".hailer").glob("*.json")] == ["last-kernel.json"], "no kernel record: the chat holds it in memory"
+    assert list((tmp_path / ".hailer").glob("*.json")) == [], "no kernel record: the chat holds it in memory"
 
     sync = running.sync
     running.stop()
@@ -960,3 +959,18 @@ def test_subprocess_runner_stream_keeps_dockers_errors_and_still_shows_them(monk
     result = kd.SubprocessDockerRunner("docker").stream(["pull", IMAGE], keep_errors=True)
     assert result.returncode == 1 and result.stderr == "Error response from daemon: error from registry: denied\ndenied"
     assert "error from registry: denied" in capsys.readouterr().err, "shown as it comes"
+
+
+def test_failed_automatic_cleanup_says_so_and_can_retry(tmp_path):
+    fake = FakeDocker()
+    _rt, running = started(tmp_path, fake)
+    fake.fail[("rm",)] = (1, "engine unavailable")
+    fake.fail[("network", "rm")] = (1, "engine unavailable")
+    running.stop()
+    assert "Could not finish stopping" in running.stop_error and "uvx hailer kernel stop" in running.stop_error
+    assert len(fake.containers) == 2, "still labelled: kernel stop or the next start removes them"
+    assert not running.owner.path.exists(), "ownerless now: the next start may remove them"
+    fake.fail.clear()
+    running.stop()
+    assert running.stop_error == ""
+    assert not fake.containers and not fake.networks

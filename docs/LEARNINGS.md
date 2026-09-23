@@ -228,7 +228,7 @@ Until 2026-09-22 the tools listed, created and resolved notebooks by walking the
 read the data folder for `list_periods`, stored host paths in `.hailer/notebook.json`, and translated host
 paths to container paths (and back) through a `PathMap` that every layer carried. That only worked because the
 docker kernel's notebooks folder was a bind mount of the host's; it could not hold for notebooks that live in a
-container's own filesystem or in a cloud kernel. Now the started kernel is a `hailer.sandbox.Sandbox`: notebooks
+container's own filesystem or in a cloud kernel. Now the started kernel is a `hailer.sandbox.MarimoSandbox`: notebooks
 are names relative to its notebooks folder (`"q3/review.py"`), notebook files go through marimo's own file API
 (`/api/files/list_files`, `/file_details`, `/create`, `/update`, `/delete`; marimo 0.24.2, bearer token plus the
 `Marimo-Server-Token` header, no browser session needed), and data files are names from `list_data()`. The only
@@ -250,9 +250,9 @@ listings stop there), a Windows kernel's names ignore case and keep the listing'
 `fake_marimo.py` records every path it was asked about instead of confining them
 (`test_a_link_out_of_the_notebooks_folder_is_never_followed`, `test_a_case_variant_is_the_same_notebook_on_windows`,
 `test_hailer_never_sends_a_path_outside_the_notebooks_folder`). marimo's `update` writes `\r\n` on Windows
-while `create` stores the bytes as given: compare contents with `sandbox.notebook_digest`. `notebook.json`
-without a `version` is the old host-path format: entries inside the notebooks folder are converted, everything
-else is dropped (`test_an_old_state_file_is_converted_to_names`). Workspace setup (`uvx hailer init`, the
+while `create` stores the bytes as given: compare contents with `sandbox.notebook_digest`. A `notebook.json`
+without the current `version` (an older Hailer's host paths) is ignored, not converted: the session starts on
+`[hailer].notebook` (`test_an_old_state_file_falls_back_to_the_configured_notebook`). Workspace setup (`uvx hailer init`, the
 doctor's notebook row) may stay host-side.
 
 ## 13. A sandbox writes to the host only through the notebook allow-list
@@ -276,10 +276,11 @@ Keep these properties; each has a test in `tests/test_notebook_sync.py` unless n
   (so no dot or dunder part), `.py` exactly, no 8.3 short-name part (`~` and a digit), at most four folders,
   no `TOOLING_NAMES` match (test, task and packaging runners, Sphinx/Django/gunicorn/IPython/Jupyter
   configuration, start-up hooks; one casefolded pattern list), no part named like a module Python would import
-  instead (`module_names()`: stdlib, Hailer's site-packages, the image's packages, common ones such as pandas;
+  instead (`module_names()`: stdlib, the image's packages, common ones such as pandas;
   a `json.py` next to a script shadows `json`), UTF-8 without NUL, at most 5 MiB, containing `import marimo`
-  and `marimo.App(`; at most 500 files. `module_names()` scans site-packages instead of calling
-  `importlib.metadata.packages_distributions()`, which took about 3 s on Windows (it reads every RECORD). Widen it only with a reason a host tool will not run the new kind of file
+  and `marimo.App(`; at most 500 files. `module_names()` is a fixed list (stdlib, the image's packages,
+  `COMMON_MODULES`), not what happens to be installed with Hailer, so the rule is the same on every machine.
+  Per session at most 200 new notebooks / 100 MiB are written here; names in warnings are made printable. Widen it only with a reason a host tool will not run the new kind of file
   (`test_the_allow_list_refuses_everything_else`). Case-insensitive duplicates are copied once.
   `DockerKernel.write_notebook` refuses a name the allow-list refuses, so the agent cannot create a notebook
   that would silently stay in the container (`test_a_docker_kernel_refuses_to_create_a_notebook_that_would_never_come_back`).
@@ -297,6 +298,14 @@ Keep these properties; each has a test in `tests/test_notebook_sync.py` unless n
   pass. On the deadline Hailer warns, keeps the host copies and goes on (at stop: to container removal).
   Evidence: `test_a_trickling_reply_ends_at_the_deadline`, `test_a_reply_larger_than_the_cap_is_refused_without_reading_it`,
   `test_the_last_copy_has_one_deadline_whatever_the_server_does`, `test_a_pass_stops_at_its_deadline_or_byte_budget_and_leaves_the_rest`.
+- **Every read counts, and the stop always ends.** A review reproduced a stop hanging over 150 s: the page
+  read for marimo's server token ignored the deadline, a trickling server held the background pass and its
+  lock, and `close()` waited on the lock forever. Now that page goes through the same bounded read, the token
+  is cached per sandbox, copies take the lock with a timeout, `execute()` collects at most
+  `MAX_EXEC_BYTES`, and `DockerKernel.stop` runs the last copy on a daemon thread for at most
+  `SYNC_STOP_SEC`, then removes the containers whatever happened
+  (`test_a_server_that_trickles_its_page_cannot_hold_the_last_copy`,
+  `test_a_last_copy_that_never_ends_cannot_keep_the_containers`).
 - **Failures warn, never raise**, and repeat once per message (a dead kernel does not print every 15 s). The
   chat routes `sandbox.notice` to its own console, which the composer queues from any thread.
 - **Ordering**: sync-in runs inside `DockerRuntime.start`, so the chat and the browser never see an empty
@@ -308,8 +317,11 @@ Keep these properties; each has a test in `tests/test_notebook_sync.py` unless n
 Linux UID mapping (`--user <uid>:<gid>`) stays: nothing is written through a mount any more, but the kernel
 still reads the data folder as the user, and files only the owner may read (`0600` exports) would otherwise be
 unreadable. The notebooks-folder mount rules and the planted-file scan are gone; the data-folder rules
-(`config.docker_mount_problems`) remain. The unsafe-local runtime keeps the simple "last run by the isolated
-docker kernel" warning (`kernel.docker_wrote_notebooks`): a notebook is code wherever it came from. Evidence at
+(`config.docker_mount_problems`) remain. A notebook is code wherever it came from: once a sandbox copied
+notebooks back, `.hailer/sandbox-wrote-notebooks` stays until the user agrees, at an interactive unsafe-local
+start (default No), to run them unisolated; a non-interactive unsafe-local start refuses
+(`test_an_unsafe_local_start_asks_before_running_notebooks_a_sandbox_wrote`). A one-time warning was not
+enough: the first start would open and auto-run them before anyone read it. Evidence at
 the Docker level: `test_the_notebooks_folder_is_the_containers_own_and_only_notebooks_come_back` and
 `test_stop_copies_the_last_edit_back_and_leaves_no_containers_network_or_token` in
 `tests/test_docker_integration.py` (Windows 11, Docker Desktop 29.4.3, 2026-09-22, `HAILER_DOCKER_TESTS=strict`).

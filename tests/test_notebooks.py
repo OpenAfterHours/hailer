@@ -146,30 +146,15 @@ def test_active_falls_back_when_state_is_corrupt_or_invalid(tmp_path):
         assert nbs.load_recent(cfg) == ["ok.py"]
 
 
-def test_an_old_state_file_is_converted_to_names(tmp_path):
-    """Before names, notebook.json held host paths (workspace-relative, or absolute outside the
-    workspace). Entries inside the notebooks folder become names; anything else is dropped; the
-    next save writes the new format."""
+def test_an_old_state_file_falls_back_to_the_configured_notebook(tmp_path):
+    """notebook.json from before names (host paths, no version) is ignored, not converted."""
     cfg = make_config(tmp_path)
     state = nbs.state_path(cfg.workspace)
     state.parent.mkdir(parents=True)
-    old = {
-        "active": "notebooks/q3/review.py",
-        "recent": [
-            "notebooks/q3/review.py",
-            str(cfg.notebooks_root / "sales.py"),  # absolute, inside
-            "elsewhere/x.py",  # the workspace, outside the folder
-            str(tmp_path / "other" / "y.py"),  # absolute, outside
-            "notebooks/../secrets.py",
-            "notebooks/.git/hooks.py",
-            42,
-        ],
-    }
-    state.write_text(json.dumps(old), encoding="utf-8")
-    assert nbs.load_active_notebook(cfg) == "q3/review.py"
-    assert nbs.load_recent(cfg) == ["q3/review.py", "sales.py"]
+    state.write_text(json.dumps({"active": "notebooks/q3/review.py", "recent": ["notebooks/q3/review.py"]}), encoding="utf-8")
+    assert nbs.load_active_notebook(cfg) == "analysis.py" and nbs.load_recent(cfg) == []
     nbs.save_active_notebook(cfg, "sales.py")
-    assert _state(cfg) == {"version": 2, "active": "sales.py", "recent": ["sales.py", "q3/review.py"]}
+    assert _state(cfg) == {"version": 2, "active": "sales.py", "recent": ["sales.py"]}
 
 
 @pytest.mark.parametrize(

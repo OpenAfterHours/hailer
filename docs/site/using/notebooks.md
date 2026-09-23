@@ -1,12 +1,12 @@
 # Notebooks and sessions {#notebooks-and-sessions}
 
-`hailer init` creates the starter notebook (`[hailer].notebook`) and the data folder (`[hailer].data_dir`)
+`uvx hailer init` creates the starter notebook (`[hailer].notebook`) and the data folder (`[hailer].data_dir`)
 that `hailer.toml` names. It never overwrites anything except `hailer.toml` itself, and only with
 `--force`, so running it again just fills in what is missing (a deleted notebook, say). Put the files you
 want to analyse in `data/`: CSV, Parquet, JSON or Excel, with any names (see [Data conventions](data.md#data-conventions)).
 The notebook lists them when it opens, and you can start asking straight away.
 
-`hailer notebook` runs the startup checks, starts a marimo server on the **notebooks folder** in the
+`uvx hailer notebook` runs the startup checks, starts a marimo server on the **notebooks folder** in the
 background, opens the active notebook's URL so the kernel gets a session, then runs the chat in the same
 terminal. One server hosts every notebook in the folder, and marimo's own home page (the server URL
 without `?file=`) lists them all. When you leave the chat (`/exit`, Ctrl+Z Enter, or Ctrl+C at the
@@ -105,9 +105,8 @@ Where things live:
   notebook's title and the data files it found), so the agent can start analysing straight away. `--empty` gives marimo's plain empty notebook.
 - The active notebook is remembered by name in `.hailer/notebook.json` (git-ignored, next to
   `session.json`), so the next `uvx hailer` or `uvx hailer notebook` resumes where you left off; if that
-  notebook is gone, the session starts on `[hailer].notebook`. A file written by an older Hailer (host
-  paths) is converted on the first run; entries outside the notebooks folder are dropped. Delete the file
-  to go back to `[hailer].notebook`.
+  notebook is gone, the session starts on `[hailer].notebook`. Delete the file to go back to
+  `[hailer].notebook`.
 - `/notebook` also lists the notebooks you worked in recently (`Recent:`), most recent first.
 
 ```toml

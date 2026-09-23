@@ -167,7 +167,7 @@ def test_start_passes_the_token_on_stdin_and_scrubs_the_environment(tmp_path):
     assert procs.calls[1] == ("health", "http://127.0.0.1:2718", k.START_TIMEOUT_SEC, TOKEN), "waits for its own token"
     assert running.server == MarimoServer(url="http://127.0.0.1:2718", pid=4242, token=TOKEN, runtime="unsafe-local")
     assert running.log_hint == str(log_path)
-    assert [p.name for p in (tmp_path / ".hailer").glob("*.json")] == ["last-kernel.json"], "no kernel record"
+    assert list((tmp_path / ".hailer").glob("*.json")) == [], "no kernel record"
     # the sandbox: the kernel knows the host's own folders
     from hailer.marimo_client import notebook_file_key
 
@@ -177,6 +177,7 @@ def test_start_passes_the_token_on_stdin_and_scrubs_the_environment(tmp_path):
     assert running.notebook_url("q3/r.py") == f"http://127.0.0.1:2718/?file={notebook_file_key(tmp_path / 'notebooks')}/q3/r.py&view-as=present"
     assert running.home_url(with_token=True) == f"http://127.0.0.1:2718/?access_token={TOKEN}" and TOKEN not in repr(running)
 
+    log_path.parent.mkdir(exist_ok=True)  # the real spawn creates it with the log
     log_path.write_text(f"URL: http://localhost:2718?access_token={TOKEN}\n", encoding="utf-8")
     running.stop()
     assert procs.proc.terminated
@@ -266,22 +267,39 @@ def test_a_start_never_takes_another_sessions_server_on_the_same_port_for_its_ow
 # --------------------------------------------------------------------------- #
 
 
-def test_a_local_start_warns_when_a_docker_kernel_last_ran_the_notebooks(tmp_path):
+def test_an_unsafe_local_start_asks_before_running_notebooks_a_sandbox_wrote(tmp_path):
+    """The docker kernel's notebooks would open and run as the user: ask (default No), and without a
+    terminal refuse with how to go on; only a yes clears the mark."""
+    from hailer.errors import KernelRuntimeError
+    from hailer.statedir import mark_sandbox_wrote, sandbox_wrote_notebooks
+
     config = make_config(tmp_path)
     said: list[str] = []
-    k.note_kernel_start(tmp_path, "docker", config.notebooks_root)
     rt = runtime(tmp_path, Procs())
     rt.prepare(say=said.append)
-    assert len(said) == 2 and said[0].startswith(f"Warning: the notebooks in {config.notebooks_root} were last run by the isolated docker kernel")
-    assert "runs on this machine as you" in said[0] and "uvx hailer notebook --kernel docker" in said[1]
+    assert said == [], "nothing written by a sandbox: no question"
+    mark_sandbox_wrote(tmp_path)
+    asked: list[str] = []
+    for answer, fragment in ((None, "no terminal to ask"), (False, "were not approved")):
+        rt._confirm = lambda question, answer=answer: (asked.append(question), answer)[1]
+        with pytest.raises(KernelRuntimeError) as exc:
+            rt.prepare(say=said.append)
+        assert fragment in str(exc.value) and "uvx hailer notebook --kernel docker" in exc.value.hint
+        assert sandbox_wrote_notebooks(tmp_path), "kept until acknowledged"
+    assert said[0].startswith(f"Warning: the docker kernel wrote notebooks into {config.notebooks_root}.")
+    assert asked == ["Run them on this machine anyway? [y/N] "] * 2
+    rt._confirm = lambda question: True
+    rt.prepare(say=said.append)
+    assert not sandbox_wrote_notebooks(tmp_path), "a yes clears it"
     rt.start(2718).stop()
-    said.clear()
-    rt.prepare(say=said.append)
-    assert said == [], "once per switch: the local start is recorded now"
-    k.note_kernel_start(tmp_path, "docker", tmp_path / "elsewhere")
-    rt.prepare(say=said.append)
-    assert said == [], "another notebooks folder"
-    assert not (tmp_path / "notebooks" / ".hailer").exists(), "kept in .hailer/, which is never mounted"
+    assert not sandbox_wrote_notebooks(tmp_path)
+
+
+def test_ask_yes_no_needs_a_terminal(monkeypatch):
+    import io
+
+    monkeypatch.setattr("sys.stdin", io.StringIO("y\n"))
+    assert k.ask_yes_no("? ") is None, "piped input never answers for the user"
 
 
 # --------------------------------------------------------------------------- #

@@ -23,6 +23,16 @@ The current design is described in [PLAN.md](../PLAN.md); the text below is the 
   sandbox variant.
 - R7 also removed `HAILER_NOTEBOOK`, `HAILER_NOTEBOOKS_DIR` and `HAILER_DATA_DIR` (§4.6), and moved
   `CHAT_UI_PLAN.md` to `docs/history/` with the Docker plan and review.
+- **§5 overstates what was deleted.** The data-folder mount rules, Linux UID mapping (the kernel still reads
+  the data folder as the user), the "notebooks written by a sandbox" check (now a confirmation before an
+  unsafe-local start runs them) and the unsafe-local runtime's secret withholding were kept: data is still a
+  bind mount, and unsafe-local still exists. Net source size is roughly flat (about +160 lines), because the
+  sandbox contract, the notebook sync and its hardening against a forged marimo server (reply caps,
+  deadlines, the allow-list) were added.
+
+Follow-ups, not done here: trim `docs/INTERFACES.md` to public contracts; decouple `ChatController` from
+`hailer.cli.common`; a proxy in front of the kernel that sets a Content-Security-Policy on notebook pages,
+so outputs rendered in the (online) browser cannot contact the internet.
 
 The original purpose: it reviews `main` at v0.2.8 (4dc96df) against two goals: the agent's Python must run
 in a sandbox it cannot escape, and the project must stay small enough for one maintainer. It also prepares

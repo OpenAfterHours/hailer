@@ -701,3 +701,22 @@ def test_a_trickling_reply_ends_at_the_deadline():
             client.list_files("/work/notebooks")  # nothing is sent past the deadline
     finally:
         done.set()
+
+
+def test_execute_collects_at_most_its_cap_from_a_forged_stream(monkeypatch):
+    monkeypatch.setattr(mc, "MAX_EXEC_BYTES", 10_000)
+    head = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+    line = b'event: stdout\ndata: {"data": "' + b"x" * 900 + b'"}\n\n'
+    url, done = _forged_server(head, [line] * 1000)
+    try:
+        with pytest.raises(MarimoExecutionError, match="larger than 0 MiB"):
+            mc.MarimoClient(url, "t").execute("print('x' * 10**9)", session_id="s1")
+        endless = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: "
+        url2, done2 = _forged_server(endless, [b"y" * 4096] * 100)  # one line that never ends
+        try:
+            with pytest.raises(MarimoExecutionError, match="stopped reading"):
+                mc.MarimoClient(url2, "t").execute("1", session_id="s1")
+        finally:
+            done2.set()
+    finally:
+        done.set()

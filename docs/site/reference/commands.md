@@ -25,14 +25,14 @@ in memory for this session). You can draft your next message while Hailer works;
 draft until the current operation finishes or is cancelled. Requests are not queued.
 
 The interface uses normal terminal scrollback and text selection. It does not capture the mouse or
-switch to an alternate screen. Use `hailer --plain` or `hailer notebook --plain` for the line-oriented
+switch to an alternate screen. Use `uvx hailer --plain` or `uvx hailer notebook --plain` for the line-oriented
 `You >` interface. Pipes and terminals reporting `TERM=dumb` or `TERM=unknown` use plain input automatically.
 
 Ctrl+C during a turn cancels the model request and keeps the composer open. A notebook command already
 performing a blocking operation finishes its cleanup before another command can start. Cancellation does
 not undo tool actions that have already happened. Ctrl+C while idle exits; Ctrl+D on empty input or
 Ctrl+Z then Enter also exits. The conversation is stored in `.hailer/threads.sqlite`, which is how
-`hailer` resumes it after a restart; `/new` (or `hailer --new`) discards it and starts another.
+`uvx hailer` resumes it after a restart; `/new` (or `uvx hailer --new`) discards it and starts another.
 Completed replies are displayed once, with Markdown formatting; live activity does not print interim
 model commentary. `/clear` clears the display without resetting the conversation.
 
@@ -40,15 +40,15 @@ Other subcommands:
 
 | Command | What it does |
 |---|---|
-| `hailer` | Start this session's own notebook server, open the notebook and chat in the terminal; the server stops when the chat ends. |
-| `hailer notebook [--port N] [--no-browser] [--foreground] [--new] [--plain] [--kernel RUNTIME]` | The same session with extra startup options; marimo runs on the notebooks folder. `RUNTIME` is `docker` or `unsafe-local` (notebook code runs as you). |
-| `hailer status` | Configuration, credentials and this workspace's running Docker kernels (whenever Docker is installed). |
-| `hailer doctor` | The startup checks with fixes: configuration, credentials, Docker, the kernel image and folders. It starts no kernel. |
-| `hailer login <provider>`, `hailer logout <provider>` | Store or remove a provider's API key. |
-| `hailer init [--force] [--kernel RUNTIME]` | Set up a workspace (see Quick start). `hailer.toml` gets `[kernel] runtime = "docker"`, or the `--kernel` runtime. |
-| `hailer kernel pull` | Download the kernel image for this Hailer (or `[kernel].image`). |
-| `hailer kernel build [--tag <name>]` | Build the kernel image, discovering host pip/uv mirror settings. `--pip-config FILE` overrides discovery; `--no-host-config` disables it. See [corporate mirrors](../security/docker.md#building-with-corporate-mirrors). |
-| `hailer kernel stop` | Remove every Docker container and network of this workspace, whichever session started it, and say what was removed. |
+| `uvx hailer` | Start this session's own notebook server, open the notebook and chat in the terminal; the server stops when the chat ends. |
+| `uvx hailer notebook [--port N] [--no-browser] [--foreground] [--new] [--plain] [--kernel RUNTIME]` | The same session with extra startup options; marimo runs on the notebooks folder. `RUNTIME` is `docker` or `unsafe-local` (notebook code runs as you). |
+| `uvx hailer status` | Configuration, credentials and this workspace's running Docker kernels (whenever Docker is installed). |
+| `uvx hailer doctor` | The startup checks with fixes: configuration, credentials, Docker, the kernel image and folders. It starts no kernel. |
+| `uvx hailer login <provider>`, `uvx hailer logout <provider>` | Store or remove a provider's API key. |
+| `uvx hailer init [--force] [--kernel RUNTIME]` | Set up a workspace (see Quick start). `hailer.toml` gets `[kernel] runtime = "docker"`, or the `--kernel` runtime. |
+| `uvx hailer kernel pull` | Download the kernel image for this Hailer (or `[kernel].image`). |
+| `uvx hailer kernel build [--tag <name>]` | Build the kernel image, discovering host pip/uv mirror settings. `--pip-config FILE` overrides discovery; `--no-host-config` disables it. See [corporate mirrors](../security/docker.md#building-with-corporate-mirrors). |
+| `uvx hailer kernel stop` | Remove every Docker container and network of this workspace, whichever session started it, and say what was removed. |
 
 Global options go before the subcommand: `--verbose`, `--config <path>`, `--workspace <path>`, `--new`,
 `--plain`, `--version` (for example `uvx hailer --workspace C:\projects\sales kernel stop`).

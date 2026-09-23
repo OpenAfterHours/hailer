@@ -25,7 +25,7 @@ import hashlib
 import re
 import urllib.error
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from hailer.errors import (
@@ -135,6 +135,8 @@ class MarimoSandbox:
     log_hint: str = ""
     ended: str = ""
     notice: Callable[[str], None] | None = None
+    #: marimo's server token (its page's skew token), read once and shared by this sandbox's clients.
+    _tokens: dict[str, str] = field(default_factory=dict, repr=False, compare=False)
 
     # -- the kernel ---------------------------------------------------------- #
 
@@ -165,6 +167,7 @@ class MarimoSandbox:
             native_paths=self.native_paths,
             notebook=notebook,
             token_in_links=token_in_links,
+            token_cache=self._tokens,
         )
 
     def notebook_url(self, name: str, *, with_token: bool = False) -> str:
@@ -291,6 +294,18 @@ class MarimoSandbox:
             raise NotebookPathError(f"{name} is not a UTF-8 text file.")
         return contents
 
+    def writable_name(self, name: str) -> str:
+        """``name`` as a notebook this sandbox may create (``/`` separators), or ``NotebookPathError``:
+        :func:`~hailer.notebooks.check_notebook_name`, at most :data:`MAX_NOTEBOOK_DEPTH` folders
+        deep; a runtime may add rules (the docker kernel: names it would copy back)."""
+        name = check_notebook_name(name)
+        if name.count("/") > MAX_NOTEBOOK_DEPTH:
+            raise NotebookPathError(
+                f"{name} is more than {MAX_NOTEBOOK_DEPTH} folders deep.",
+                hint="Keep notebooks at most four folders below the notebooks folder.",
+            )
+        return name
+
     def write_notebook(self, name: str, source: str, *, replace: bool = True) -> NotebookFile:
         """Create the notebook ``name`` with ``source``, or replace its text when it exists (marimo
         reloads an open session of it). ``replace=False`` refuses an existing file with
@@ -298,13 +313,9 @@ class MarimoSandbox:
         deep. On a Windows kernel a name that differs only in case is the existing file, and the
         result has the listing's spelling. A local kernel never writes through a link or junction
         that leaves the notebooks folder. A new file holds ``source``'s bytes; a replaced one is
-        written by marimo with the kernel's line endings (compare with :func:`notebook_digest`)."""
-        name = check_notebook_name(name)
-        if name.count("/") > MAX_NOTEBOOK_DEPTH:
-            raise NotebookPathError(
-                f"{name} is more than {MAX_NOTEBOOK_DEPTH} folders deep.",
-                hint="Keep notebooks at most four folders below the notebooks folder.",
-            )
+        written by marimo with the kernel's line endings (compare with :func:`notebook_digest`).
+        The name goes through :meth:`writable_name` first."""
+        name = self.writable_name(name)
         client = self.client()
         key = self._inside(client, name)
         existing = self._entry(client, key)

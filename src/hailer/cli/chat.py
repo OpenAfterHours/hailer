@@ -58,8 +58,7 @@ def _chat_console(opts: CliOptions) -> Console:
 def _active_notebook(config: HailerConfig, sandbox: MarimoSandbox) -> str:
     """The active notebook for a session that just started ``sandbox``: the state file's, else the
     configured one when the sandbox does not have it (it was deleted or renamed; one existence
-    check, not a listing). Saved, so an old state file is converted and the agent's tools read the
-    same name."""
+    check, not a listing). Saved, so the agent's tools read the same name."""
     active = notebooks.load_active_notebook(config)
     try:
         exists = sandbox.has_notebook(active)

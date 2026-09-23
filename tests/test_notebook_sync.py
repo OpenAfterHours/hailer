@@ -190,7 +190,9 @@ def test_sync_in_never_follows_a_link_out_of_the_folder(sync, host, tmp_path, sa
     assert not (container(tmp_path) / "shared").exists()
 
 
-def test_a_kernel_that_does_not_answer_is_a_warning_on_the_way_in(host, tmp_path, said):
+def test_a_kernel_that_does_not_answer_is_a_warning_on_the_way_in(host, tmp_path, said, monkeypatch):
+    monkeypatch.setattr(ns, "SYNC_DEADLINE_SEC", 0.3)  # a refused connection takes about 2 s on Windows
+    monkeypatch.setattr(ns, "SYNC_CYCLE_SEC", 0.3)
     _write(host / "sales.py")
     dead = MarimoSandbox(MarimoServer(url="http://127.0.0.1:9", token=TOKEN, runtime="docker"), notebooks_path="/work/notebooks", notice=said.append)
     assert ns.NotebookSync(dead, host, host.parent).sync_in() == []
@@ -348,6 +350,7 @@ def test_names_that_differ_only_in_case_are_copied_once(sync, host, tmp_path, sa
 
 
 def test_at_most_500_notebooks_are_copied(sync, monkeypatch, said):
+    monkeypatch.setattr(ns, "SESSION_NEW_FILES", 10_000)
     entries = [SandboxEntry(f"n{i:03}.py", False, 1.0, 10) for i in range(ns.MAX_NOTEBOOKS + 2)]
     monkeypatch.setattr(sync.sandbox, "list_tree", lambda: entries)
     monkeypatch.setattr(sync.sandbox, "read_notebook", lambda name: NB)
@@ -355,7 +358,9 @@ def test_at_most_500_notebooks_are_copied(sync, monkeypatch, said):
     assert said[-1].endswith("n500.py, n501.py.")
 
 
-def test_a_kernel_that_stopped_answering_is_one_warning_and_changes_nothing(host, tmp_path, said):
+def test_a_kernel_that_stopped_answering_is_one_warning_and_changes_nothing(host, tmp_path, said, monkeypatch):
+    monkeypatch.setattr(ns, "SYNC_DEADLINE_SEC", 0.3)  # a refused connection takes about 2 s on Windows
+    monkeypatch.setattr(ns, "SYNC_CYCLE_SEC", 0.3)
     _write(host / "sales.py")
     dead = MarimoSandbox(MarimoServer(url="http://127.0.0.1:9", token=TOKEN, runtime="docker"), notebooks_path="/work/notebooks", notice=said.append)
     sync = ns.NotebookSync(dead, host, host.parent)
@@ -503,6 +508,8 @@ def test_a_docker_start_copies_in_before_it_returns_and_its_stop_copies_back_bef
 
 
 def test_ctrl_c_during_the_last_copy_still_removes_the_containers(fake, tmp_path, monkeypatch):
+    import threading as real_threading
+
     monkeypatch.setattr(kd, "_sleep", lambda seconds: None)
     docker = FakeDocker()
     monkeypatch.setattr(ns, "SYNC_INTERVAL_SEC", 3600.0)
@@ -510,13 +517,101 @@ def test_ctrl_c_during_the_last_copy_still_removes_the_containers(fake, tmp_path
     said: list[str] = []
     kernel.notice = said.append
 
-    def interrupted(*args, **kwargs):
-        raise KeyboardInterrupt
+    class Interrupted(real_threading.Thread):
+        def join(self, timeout=None):
+            raise KeyboardInterrupt
 
-    monkeypatch.setattr(kernel.sync, "sync_out", interrupted)
+    monkeypatch.setattr(kd.threading, "Thread", Interrupted)
     kernel.stop()
     assert docker.containers == {} and docker.networks == {}
     assert said == ["Warning: stopped before the notebooks were copied back; the kernel's changes since the last copy are lost."]
+
+
+def test_a_last_copy_that_never_ends_cannot_keep_the_containers(fake, tmp_path, monkeypatch):
+    """Whatever the kernel's server does (a forged one can stall a request the deadline does not
+    cover, or hold the lock), the stop removes the containers after a bounded wait."""
+    monkeypatch.setattr(kd, "_sleep", lambda seconds: None)
+    monkeypatch.setattr(ns, "SYNC_INTERVAL_SEC", 3600.0)
+    monkeypatch.setattr(ns, "SYNC_STOP_SEC", 0.3)
+    docker = FakeDocker()
+    _config, kernel = _docker_start(tmp_path, fake, docker)
+    said: list[str] = []
+    kernel.notice = said.append
+    stuck = threading.Event()
+    monkeypatch.setattr(kernel.sync, "close", lambda final=True: stuck.wait(30))
+    started = time.monotonic()
+    kernel.stop()
+    stuck.set()
+    assert time.monotonic() - started < 5
+    assert docker.containers == {} and docker.networks == {}
+    assert said == ["Warning: the last copy of the notebooks back from the kernel did not finish within 0.3 s; the kernel's latest changes may be missing here."]
+
+
+def test_a_server_that_trickles_its_page_cannot_hold_the_last_copy(host, tmp_path, monkeypatch, said):
+    """The server token's page used to be read without the deadline: a trickling page held the
+    background pass, its lock, and so the stop, for minutes."""
+    import socket
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+    done = threading.Event()
+
+    def serve():
+        listener.settimeout(0.2)
+        while not done.is_set():
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                continue
+            with conn:
+                try:
+                    conn.recv(65536)
+                    conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 100000\r\n\r\n")
+                    while not done.is_set():
+                        conn.sendall(b" ")
+                        time.sleep(0.05)
+                except OSError:
+                    pass
+        listener.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    try:
+        forged = MarimoSandbox(
+            MarimoServer(url=f"http://127.0.0.1:{listener.getsockname()[1]}", token=TOKEN, runtime="docker"),
+            notebooks_path="/work/notebooks", notice=said.append,
+        )  # fmt: skip
+        sync = ns.NotebookSync(forged, host, host.parent)
+        monkeypatch.setattr(ns, "SYNC_DEADLINE_SEC", 0.5)
+        monkeypatch.setattr(ns, "SYNC_CYCLE_SEC", 0.5)
+        sync.start(interval=0.01)
+        time.sleep(0.2)  # a background pass is now reading the page
+        started = time.monotonic()
+        sync.close()
+        assert time.monotonic() - started < 5, "the page read ends at the deadline"
+        assert any("out of time" in line or "stopped after" in line for line in said), said
+    finally:
+        done.set()
+
+
+def test_a_session_stops_copying_new_notebooks_back_after_its_cap(sync, host, monkeypatch, said):
+    monkeypatch.setattr(ns, "SESSION_NEW_FILES", 2)
+    entries = [SandboxEntry(f"n{i}.py", False, 1.0, 10) for i in range(4)]
+    monkeypatch.setattr(sync.sandbox, "list_tree", lambda: entries)
+    monkeypatch.setattr(sync.sandbox, "read_notebook", lambda name: notebook(name))
+    assert sync.sync_out() == ["n0.py", "n1.py"]
+    assert sorted(p.name for p in host.iterdir()) == ["n0.py", "n1.py"]
+    assert said == ["Warning: this session already copied back 2 new notebooks (0 MiB); new notebooks from the kernel are no longer copied back."]
+    entries[0] = SandboxEntry("n0.py", False, 2.0, 11)
+    monkeypatch.setattr(sync.sandbox, "read_notebook", lambda name: notebook(name + " edited"))
+    assert sync.sync_out() == ["n0.py"], "a notebook it already has still comes back"
+
+
+def test_names_in_warnings_are_printable(sync, monkeypatch, said):
+    entries = [SandboxEntry("evil\x1b[2Jname.txt", False, 1.0, 10)]
+    monkeypatch.setattr(sync.sandbox, "list_tree", lambda: entries)
+    sync.sync_out()
+    assert "\x1b" not in said[-1] and "evil?[2Jname.txt" in said[-1]
 
 
 def test_ctrl_c_while_copying_in_stops_the_kernel(fake, tmp_path, monkeypatch):
@@ -538,7 +633,7 @@ def test_a_docker_kernel_refuses_to_create_a_notebook_that_would_never_come_back
     from hailer.errors import NotebookPathError
 
     kernel = kd.DockerKernel(server=MarimoServer(url=fake.url, token=TOKEN, runtime="docker"), notebooks_path="/work/notebooks")
-    for name in ("test_sales.py", "q3/conftest.py", "sales_test.py", "a/b/c/d/e/deep.py"):
+    for name in ("test_sales.py", "q3/conftest.py", "sales_test.py", "json.py"):
         with pytest.raises(NotebookPathError) as info:
             kernel.write_notebook(name, NB, replace=False)
         assert "would stay in the docker kernel and be lost when it stops" in str(info.value)

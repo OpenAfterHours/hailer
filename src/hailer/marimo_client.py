@@ -57,6 +57,11 @@ MAX_NOTEBOOK_BYTES = 5 * 1024 * 1024
 MAX_REPLY_BYTES = 3 * MAX_NOTEBOOK_BYTES + 1024 * 1024
 #: How much of a reply is read at once (the deadline is checked between reads).
 _READ_CHUNK = 64 * 1024
+#: The largest page ``GET /`` Hailer reads for the server token.
+MAX_PAGE_BYTES = 2_000_000
+#: The most an execute call collects from its event stream (stdout, stderr, the result), and the
+#: longest line it reads: a forged server cannot make Hailer hold more.
+MAX_EXEC_BYTES = 3 * MAX_NOTEBOOK_BYTES + 1024 * 1024
 _deadlines = threading.local()
 
 
@@ -401,6 +406,7 @@ class MarimoClient:
         native_paths: bool = False,
         notebook: str | None = None,
         token_in_links: bool = False,
+        token_cache: dict[str, str] | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.token = token
@@ -409,7 +415,20 @@ class MarimoClient:
         self.native_paths = native_paths
         self.notebook = notebook
         self.token_in_links = token_in_links
-        self._server_token: str | None = None
+        #: Holds the server token once read; a sandbox shares one dict between its clients, so the
+        #: page is fetched once per kernel, not once per request.
+        self._tokens: dict[str, str] = token_cache if token_cache is not None else {}
+
+    @property
+    def _server_token(self) -> str | None:
+        return self._tokens.get("server")
+
+    @_server_token.setter
+    def _server_token(self, value: str | None) -> None:
+        if value:
+            self._tokens["server"] = value
+        else:
+            self._tokens.pop("server", None)
 
     # -- names <-> kernel paths ---------------------------------------------- #
 
@@ -553,7 +572,7 @@ class MarimoClient:
             return self._server_token
         try:
             with self._open("GET", "/") as resp:
-                html = resp.read(2_000_000).decode("utf-8", "replace")
+                html = self._read(resp, "/", limit=MAX_PAGE_BYTES).decode("utf-8", "replace")
         except urllib.error.HTTPError as err:
             raise MarimoUnavailableError(
                 f"Marimo at {self.base_url} answered HTTP {err.code} to GET /.",
@@ -749,14 +768,14 @@ class MarimoClient:
         content_type = (resp.headers.get("Content-Type") or "").lower()
         with resp:
             if "text/event-stream" not in content_type:
-                raw = resp.read()
+                raw = resp.read(65536)
                 detail = _error_detail(raw)
                 raise MarimoExecutionError(
                     f"Marimo returned a non-stream response to the execute request: {detail}",
                     hint="Check that the notebook is still open in the browser and retry.",
                 )
             try:
-                for event, data in _iter_sse(_read_lines(resp, unparsed)):
+                for event, data in _iter_sse(_read_lines(resp, unparsed, MAX_EXEC_BYTES)):
                     try:
                         payload = json.loads(data)
                     except ValueError:
@@ -799,12 +818,21 @@ class MarimoClient:
         )
 
 
-def _read_lines(resp, unparsed: list[bytes]) -> Iterator[bytes]:
-    """Yield raw lines from the response; remember lines that are not SSE fields for error reporting."""
+def _read_lines(resp, unparsed: list[bytes], limit: int = MAX_EXEC_BYTES) -> Iterator[bytes]:
+    """Yield raw lines from the response; remember lines that are not SSE fields for error reporting.
+    ``MarimoExecutionError`` once the lines add up to more than ``limit`` bytes (a line is read at
+    most ``limit + 1`` bytes long, so one endless line cannot exhaust memory either)."""
+    total = 0
     while True:
-        line = resp.readline()
+        line = resp.readline(limit + 1)
         if not line:
             return
+        total += len(line)
+        if total > limit:
+            raise MarimoExecutionError(
+                f"Marimo's answer to the execute request is larger than {limit // (1024 * 1024)} MiB; Hailer stopped reading it.",
+                hint="Print less (a summary, .head()), or show large results in the notebook instead.",
+            )
         stripped = line.strip()
         if stripped and not (stripped.startswith(b"event:") or stripped.startswith(b"data:") or stripped.startswith(b":") or stripped.startswith(b"id:") or stripped.startswith(b"retry:")):
             unparsed.append(line)

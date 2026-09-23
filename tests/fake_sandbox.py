@@ -1,4 +1,4 @@
-"""A sandbox over a host folder (test helper): the :class:`~hailer.sandbox.Sandbox` contract for
+"""A sandbox over a host folder (test helper): the :class:`~hailer.sandbox.MarimoSandbox` contract for
 the tests of what holds one (the tools, the chat, the CLI), without a marimo server.
 
 Notebook files are the folder's (listed with marimo's rules: ``.py`` files holding
@@ -87,7 +87,7 @@ class FolderSandbox(MarimoSandbox):
         return path.read_text(encoding="utf-8")
 
     def write_notebook(self, name: str, source: str, *, replace: bool = True) -> NotebookFile:
-        name = check_notebook_name(name)
+        name = self.writable_name(name)
         path = Path(self.folder) / name
         if path.exists() and not replace:
             raise NotebookExistsError(f"{name} already exists in the notebooks folder.", hint="Pick another name, or open the existing notebook instead.")
@@ -106,7 +106,8 @@ def with_folder_files(box: MarimoSandbox, folder: Path, client_factory: Callable
     box.list_tree = view.list_tree  # type: ignore[method-assign]
     box.read_notebook = view.read_notebook  # type: ignore[method-assign]
     box.has_notebook = view.has_notebook  # type: ignore[method-assign]
-    box.write_notebook = view.write_notebook  # type: ignore[method-assign]
+    # the box's own name rules (a docker kernel refuses names it would never copy back), then the folder
+    box.write_notebook = lambda name, source, *, replace=True: view.write_notebook(box.writable_name(name), source, replace=replace)  # type: ignore[method-assign]
     if client_factory is not None:
         box.client = view.client  # type: ignore[method-assign]
     return box

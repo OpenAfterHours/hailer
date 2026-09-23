@@ -49,13 +49,12 @@ from hailer.kernel import (
     describe_runtime,
     mask_token,
     new_token,
-    note_kernel_start,
 )
 from hailer.marimo_client import wait_for_health
 from hailer.models import KERNEL_RUNTIME_DOCKER, Check, HailerConfig, KernelConfig, MarimoServer
+from hailer import notebook_sync
 from hailer.notebook_sync import NotebookSync, sync_refusal
-from hailer.notebooks import check_notebook_name
-from hailer.sandbox import MarimoSandbox, NotebookFile
+from hailer.sandbox import MarimoSandbox
 from hailer.statedir import ensure_state_dir, state_dir
 
 #: marimo's port inside the kernel container; the forwarder listens on the same port in its own.
@@ -653,19 +652,19 @@ class DockerKernel(MarimoSandbox):
                 return name
         return ident[:12]
 
-    def write_notebook(self, name: str, source: str, *, replace: bool = True) -> NotebookFile:
-        """:meth:`MarimoSandbox.write_notebook` for a name that is copied back to the workspace: one
-        :func:`~hailer.notebook_sync.sync_refusal` refuses (``conftest.py``, ``test_*.py``, deeper
-        than four folders) would stay in the container and be lost when it stops, so it is a
-        ``NotebookPathError`` before anything is written."""
-        clean = check_notebook_name(name)
+    def writable_name(self, name: str) -> str:
+        """:meth:`MarimoSandbox.writable_name`, and not a name
+        :func:`~hailer.notebook_sync.sync_refusal` refuses (``conftest.py``, ``json.py``, deeper than
+        four folders): such a notebook would stay in the container and be lost when it stops, so
+        :meth:`write_notebook` refuses it with ``NotebookPathError`` before anything is written."""
+        clean = super().writable_name(name)
         reason = sync_refusal(clean)
         if reason is not None:
             raise NotebookPathError(
                 f"{clean} would stay in the docker kernel and be lost when it stops ({reason}).",
-                hint="Pick a plain notebook name such as sales.py or q3/review.py (not conftest.py, test_*.py or *_test.py).",
+                hint="Pick a plain notebook name such as sales.py or q3/review.py (not conftest.py, test_*.py or a module's name such as json.py).",
             )
-        return super().write_notebook(clean, source, replace=replace)
+        return clean
 
     def sync_soon(self) -> None:
         if self.sync is not None:
@@ -685,12 +684,21 @@ class DockerKernel(MarimoSandbox):
         """Copy the notebooks back a last time (after the periodic copy stopped), remove the
         containers and the network, then release the owner lock; ``stop_error`` says what could not
         be removed (ownerless now, the next start or ``uvx hailer kernel stop`` removes it). Ctrl+C
-        during the last copy skips it, with a warning, and the containers are still removed."""
+        during the last copy skips it, with a warning, and the containers are still removed. The copy
+        runs on a daemon thread that gets at most :data:`~hailer.notebook_sync.SYNC_STOP_SEC`: the
+        containers are always removed after that, whatever the kernel's server does."""
         self.stop_error = ""
         sync, self.sync = self.sync, None
         if sync is not None:
+            last = threading.Thread(target=sync.close, name="hailer-notebook-last-copy", daemon=True)
             try:
-                sync.close(final=True)
+                last.start()
+                last.join(notebook_sync.SYNC_STOP_SEC)
+                if last.is_alive():
+                    self.notify(
+                        f"Warning: the last copy of the notebooks back from the kernel did not finish within "
+                        f"{notebook_sync.SYNC_STOP_SEC:g} s; the kernel's latest changes may be missing here."
+                    )
             except KeyboardInterrupt:
                 self.notify("Warning: stopped before the notebooks were copied back; the kernel's changes since the last copy are lost.")
         try:
@@ -1292,7 +1300,6 @@ class DockerRuntime:
             kernel.stop()
             raise
         kernel.sync = sync
-        note_kernel_start(workspace, self.name, config.notebooks_root)
         return kernel
 
 

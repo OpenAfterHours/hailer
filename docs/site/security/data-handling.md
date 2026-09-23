@@ -45,12 +45,16 @@ and press Ctrl+C if a turn goes somewhere you did not intend.
 
 **What the docker runtime does not protect against:**
 
+- *Outputs render in your browser, which is online.* The kernel's "no network" does not cover the browser:
+  an HTML or image output notebook code produces can contact the internet when it is displayed, so a
+  notebook could send data out that way. Treat outputs of untrusted code accordingly.
 - *Output goes to the model.* Anything notebook code prints or returns is a tool result and is sent to the
   model endpoint, in either runtime.
 - *Notebooks are code.* A notebook the container wrote is copied back to your notebooks folder, and it
   runs on your machine, as you, if it is later opened with the unsafe-local runtime (or with marimo directly,
-  or imported by a script: marimo runs a notebook's setup cell on import). Hailer warns on the first
-  unsafe-local start after a docker kernel used the notebooks folder. Keep the notebooks folder inside your project's git
+  or imported by a script: marimo runs a notebook's setup cell on import). After a docker kernel wrote
+  notebooks here, an unsafe-local start asks before it runs them (default No; without a terminal to ask in,
+  it refuses and says how to go on). Keep the notebooks folder inside your project's git
   repository, so every change is a diff you can review. Only notebooks come back: git and editor settings,
   test-runner hooks (`conftest.py`, `test_*.py`), Python start-up hooks and other files notebook code writes
   stay in the container (see [Notebook copies](docker.md#notebook-copies)). A notebook named like a module
@@ -82,7 +86,7 @@ is stored unencrypted in `.hailer/threads.sqlite` inside the workspace until `/n
 replaces it. While an unsafe-local kernel runs, `.hailer/marimo-<pid>.log` holds its output, including its
 signed-in URL; it is deleted when the kernel stops, also after a failed start. The kernel's token is kept
 in memory only. A docker kernel's token file exists only while the kernel starts, and
-`.hailer/owner-<id>.lock` marks a running docker session (it holds no secret). `.hailer/last-kernel.json` notes which runtime last used the
-notebooks folder, and `.hailer/notebook-backups/` keeps your versions of notebooks a docker kernel's copy
+`.hailer/owner-<id>.lock` marks a running docker session (it holds no secret). `.hailer/sandbox-wrote-notebooks` marks notebooks a docker kernel
+copied back that you have not yet agreed to run unsafe-local, and `.hailer/notebook-backups/` keeps your versions of notebooks a docker kernel's copy
 replaced (see [Notebook copies](docker.md#notebook-copies)). On macOS and Linux these files are readable by you only. `.hailer/` is never mounted into a docker kernel and is
 kept out of git by its own `.gitignore` containing `*`; Hailer never edits your repository's `.gitignore`.

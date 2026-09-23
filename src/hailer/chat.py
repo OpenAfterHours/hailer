@@ -36,7 +36,7 @@ class ChatController:
         self.console = console
         self.config = config
         self.opts = opts
-        #: The kernel this chat started (:class:`~hailer.sandbox.Sandbox`); ``None``: no kernel.
+        #: The kernel this chat started (:class:`~hailer.sandbox.MarimoSandbox`); ``None``: no kernel.
         #: Its warnings (notebook copies, from any thread) go to this chat's current console.
         self.sandbox = sandbox
         if sandbox is not None:

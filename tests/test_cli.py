@@ -1381,13 +1381,11 @@ def test_load_config_keeps_the_configured_notebook_and_the_active_one_in_the_sta
     assert notebooks.load_active_notebook(base) == "other.py"
 
 
-def test_a_session_converts_an_old_state_file_and_falls_back_from_a_deleted_notebook(harness):
-    """notebook.json from before names held host paths: the first session converts it. An active
-    notebook the sandbox no longer has falls back to the configured one."""
+def test_a_session_falls_back_from_a_deleted_notebook(harness):
+    """An active notebook the sandbox no longer has falls back to the configured one."""
     write_notebook(harness.config, "q3/review")
+    notebooks.save_active_notebook(harness.config, "q3/review.py")
     state = notebooks.state_path(harness.config.workspace)
-    state.parent.mkdir(parents=True, exist_ok=True)
-    state.write_text(json.dumps({"active": "notebooks/q3/review.py", "recent": ["notebooks/q3/review.py", "../x.py"]}), encoding="utf-8")
     result = chat()
     assert result.exit_code == 0, result.output
     assert "Notebook:   q3/review.py" in result.output

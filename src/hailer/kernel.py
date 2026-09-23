@@ -1,7 +1,7 @@
 """Where the notebook kernel runs: the kernel runtimes and the pieces they share.
 
 Every ``uvx hailer`` (and ``uvx hailer notebook``) process starts its own marimo server through a
-*runtime*, keeps the :class:`~hailer.sandbox.Sandbox` its start returns in memory for as long as
+*runtime*, keeps the :class:`~hailer.sandbox.MarimoSandbox` its start returns in memory for as long as
 the chat runs, and stops it on exit. Nothing ever finds or attaches to a server another process
 started.
 
@@ -26,13 +26,11 @@ Import order: this module imports :mod:`hailer.marimo_client` and :mod:`hailer.s
 
 from __future__ import annotations
 
-import json
 import os
 import secrets
 import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
@@ -48,10 +46,8 @@ from hailer.models import (
     MarimoServer,
 )
 from hailer.sandbox import MarimoSandbox
-from hailer.statedir import ensure_state_dir, state_dir
+from hailer.statedir import clear_sandbox_mark, ensure_state_dir, sandbox_wrote_notebooks, state_dir
 
-#: Which runtime last started a server on which notebooks folder (``.hailer/last-kernel.json``).
-LAST_KERNEL_FILENAME = "last-kernel.json"
 #: ``.hailer/marimo-<pid>.log``: the unsafe-local runtime's log, one per Hailer process, deleted on stop.
 LOCAL_LOG_PREFIX = "marimo-"
 #: How long a start waits for ``/health`` (counted after any image pull in docker mode).
@@ -110,25 +106,6 @@ DOCKER_NETWORK_PROMPT_NOTES = (
 
 
 # --------------------------------------------------------------------------- #
-# Host paths
-# --------------------------------------------------------------------------- #
-
-
-def _host_parts(path: Path | str) -> tuple[str, ...]:
-    """``path`` split into parts after the ``notebook_file_key`` normalisation (absolute, no ``..``,
-    symlinks and junctions not resolved)."""
-    absolute = os.path.normpath(str(Path(path).expanduser().absolute()))
-    return Path(absolute).parts
-
-
-def _same_parts(prefix: tuple[str, ...], parts: tuple[str, ...]) -> bool:
-    """True when ``parts`` starts with ``prefix`` (each part compared with ``os.path.normcase``)."""
-    if len(prefix) > len(parts):
-        return False
-    return all(os.path.normcase(a) == os.path.normcase(b) for a, b in zip(prefix, parts))
-
-
-# --------------------------------------------------------------------------- #
 # Small state helpers
 # --------------------------------------------------------------------------- #
 
@@ -138,26 +115,9 @@ def new_token() -> str:
     return secrets.token_urlsafe(32)
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
 def local_log_path(workspace: Path, pid: int | None = None) -> Path:
     """``<workspace>/.hailer/marimo-<pid>.log``: this process's unsafe-local marimo log."""
     return state_dir(workspace) / f"{LOCAL_LOG_PREFIX}{os.getpid() if pid is None else pid}.log"
-
-
-def _write_private(path: Path, data: object) -> Path:
-    """Write ``data`` as JSON to ``path`` (atomic; owner-only permissions on POSIX)."""
-    ensure_state_dir(path.parent.parent)
-    tmp = path.with_suffix(".json.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        json.dump(data, handle, indent=2)
-    if os.name != "nt":
-        os.chmod(tmp, 0o600)  # O_CREAT keeps the mode of a leftover file
-    os.replace(tmp, path)
-    return path
 
 
 def _unlink(path: Path) -> None:
@@ -165,37 +125,6 @@ def _unlink(path: Path) -> None:
         path.unlink()
     except OSError:
         pass
-
-
-# --------------------------------------------------------------------------- #
-# Which runtime last used the notebooks folder (a docker kernel's notebooks, later run unsafe-local)
-# --------------------------------------------------------------------------- #
-
-
-def _last_kernel_path(workspace: Path) -> Path:
-    return state_dir(workspace) / LAST_KERNEL_FILENAME
-
-
-def note_kernel_start(workspace: Path, runtime: str, notebooks_root: Path) -> None:
-    """Remember that ``runtime`` started a server on ``notebooks_root`` (never raises)."""
-    try:
-        _write_private(_last_kernel_path(workspace), {"runtime": runtime, "notebooks": str(notebooks_root), "started": _now()})
-    except OSError:
-        pass
-
-
-def docker_wrote_notebooks(workspace: Path, notebooks_root: Path) -> bool:
-    """True when the last server Hailer started on ``notebooks_root`` was a docker kernel: code the
-    container wrote into those notebooks (copied back when it stopped) would now run on this
-    machine."""
-    try:
-        raw = json.loads(_last_kernel_path(workspace).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False
-    if not isinstance(raw, dict) or raw.get("runtime") != KERNEL_RUNTIME_DOCKER or not isinstance(raw.get("notebooks"), str):
-        return False
-    recorded, current = _host_parts(raw["notebooks"]), _host_parts(notebooks_root)
-    return len(recorded) == len(current) and _same_parts(recorded, current)
 
 
 # --------------------------------------------------------------------------- #
@@ -486,12 +415,14 @@ class LocalRuntime:
         environ: Mapping[str, str] | None = None,
         token_factory: Callable[[], str] = new_token,
         start_timeout: float = START_TIMEOUT_SEC,
+        confirm: Callable[[str], bool | None] | None = None,
     ) -> None:
         self.config = config
         self.procs = procs if procs is not None else LocalProcesses()
         self._environ = environ
         self._token_factory = token_factory
         self.start_timeout = start_timeout
+        self._confirm = confirm if confirm is not None else ask_yes_no
 
     @property
     def log_path(self) -> Path:
@@ -511,15 +442,28 @@ class LocalRuntime:
         return [Check("kernel", False, summary, hint=UNSAFE_LOCAL_HINT, fatal=False)]
 
     def prepare(self, say: Callable[[str], None] | None = None) -> None:
-        """Nothing to download: marimo runs in Hailer's own Python. Warns when a docker kernel was
-        the last to run these notebooks: from here on their code runs on this machine."""
-        if docker_wrote_notebooks(self.config.workspace, self.config.notebooks_root):
-            out = say or _print
-            out(
-                f"Warning: the notebooks in {self.config.notebooks_root} were last run by the isolated docker kernel; "
-                "with the unsafe-local kernel their code runs on this machine as you. Open only notebooks you trust."
+        """Nothing to download: marimo runs in Hailer's own Python. When a sandbox (the docker
+        kernel) wrote notebooks into this workspace since the user last agreed
+        (:func:`~hailer.statedir.sandbox_wrote_notebooks`), their code would now open and run on
+        this machine: ask (default No; yes clears the mark). Refused, or no terminal to ask in:
+        ``KernelRuntimeError`` saying how to go on."""
+        workspace = Path(self.config.workspace)
+        if not sandbox_wrote_notebooks(workspace):
+            return
+        (say or _print)(
+            f"Warning: the docker kernel wrote notebooks into {self.config.notebooks_root}. With the unsafe-local "
+            "kernel they open and run on this machine as you, with your files and network."
+        )
+        answer = self._confirm("Run them on this machine anyway? [y/N] ")
+        keep_isolated = 'To keep them isolated, run uvx hailer notebook --kernel docker (or set [kernel] runtime = "docker").'
+        if answer is None:
+            raise KernelRuntimeError(
+                "Not started: the docker kernel wrote notebooks here, and there is no terminal to ask whether to run them unisolated.",
+                hint=f"Run uvx hailer notebook --kernel unsafe-local once in a terminal and answer yes after reviewing them. {keep_isolated}",
             )
-            out('    To keep them isolated: uvx hailer notebook --kernel docker (or [kernel] runtime = "docker").')
+        if not answer:
+            raise KernelRuntimeError("Not started: the notebooks the docker kernel wrote were not approved to run on this machine.", hint=keep_isolated)
+        clear_sandbox_mark(workspace)
 
     def describe(self) -> str:
         return describe_runtime(KernelConfig(runtime=KERNEL_RUNTIME_UNSAFE_LOCAL))
@@ -574,12 +518,24 @@ class LocalRuntime:
             if tail:
                 hint += "\n" + "\n".join(f"    {line}" for line in tail)
             raise KernelRuntimeError(message, hint=hint)
-        note_kernel_start(workspace, self.name, config.notebooks_root)
         return kernel
 
 
 def _print(text: str) -> None:
     print(text, flush=True)
+
+
+def ask_yes_no(question: str) -> bool | None:
+    """``question`` answered in this terminal: True for y/yes, False otherwise (Enter: No); ``None``
+    when stdin or stdout is not a terminal, or input ends."""
+    import sys
+
+    if not (sys.stdin and sys.stdin.isatty() and sys.stdout and sys.stdout.isatty()):
+        return None
+    try:
+        return input(question).strip().lower() in ("y", "yes")
+    except (EOFError, OSError):
+        return None
 
 
 def runtime_for(config: HailerConfig, runner: Any = None) -> KernelRuntime:

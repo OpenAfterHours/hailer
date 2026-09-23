@@ -186,6 +186,11 @@ context; the command refers to their original paths.
 - **No network.** No internet, no DNS, no route to this machine. Installing packages (`ctx.packages.add()`)
   and DuckDB's `INSTALL` fail. The image has marimo, Polars, fastexcel, DuckDB, altair and plotly; anything else
   needs an image of your own (see [Known limitations](../reference/limitations.md#known-limitations)).
+- **The browser is not the kernel.** "No network" covers the kernel only. Notebook outputs render in your
+  browser, which is online: an HTML, Markdown or image output that notebook code produces can load from, or
+  send data to, the internet when the browser shows it. Treat the outputs of code you did not review like
+  a web page from an unknown site, and do not open notebooks of untrusted origin while signed in to
+  anything sensitive in that browser profile.
 - **No secrets.** None of your environment variables reach the container, and nothing of Hailer's own
   runs in it but the notebook helpers (`hailer.periods`) and the forwarder: no LangChain, no keyring, no
   API key.
@@ -237,7 +242,9 @@ answers: a reply is read in pieces up to about 16 MB (three times the notebook l
 the start and the last copy at the end each finish within 30 seconds, and a background copy stops after
 10 seconds or 50 MB read (the rest follows on the next pass). When a copy is cut short, Hailer says so,
 keeps the files on your machine as they were and, at the end of a session, goes on to remove the
-container.
+container. The end of a session waits at most about a minute for the last copy, then removes the container
+anyway. One session copies back at most 200 new notebooks and 100 MB; after that, new names stay in the kernel
+(with a warning).
 
 So notebook code cannot plant git hooks or settings, editor or dev-container settings, a `hailer.toml`,
 test-runner hooks or Python modules in your notebooks folder: those stay in the container and are gone when
