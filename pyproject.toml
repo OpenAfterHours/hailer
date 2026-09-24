@@ -1,6 +1,6 @@
 [project]
 name = "hailer"
-version = "0.2.8"
+version = "0.3.0"
 description = "Hailer: chat with your data. A conversational CLI that explores, analyses and charts local data files in a live marimo notebook."
 readme = "README.md"
 requires-python = ">=3.12"
