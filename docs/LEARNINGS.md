@@ -236,7 +236,9 @@ place a name becomes a path is the runtime layer (`MarimoClient.file_key` / `nam
 `notebooks_path`), for `?file=` keys and session matching.
 
 Keep it that way: `hailer.tools` must not name the notebooks or data folders or call a file-system API
-(`test_the_tools_never_touch_the_notebooks_or_data_folders` checks the source). Every name is checked by
+(`test_the_tools_never_touch_the_notebooks_or_data_folders` checks the source). The project files (§16) are
+the one exception to "files come from the sandbox", and they are not the sandbox's: they are the user's
+project on this machine, read in `hailer.project` (as skills are in `hailer.context`), never in `hailer.tools`. Every name is checked by
 `notebooks.check_notebook_name` before a request (no `..`, drive, leading `/`, dot- or dunder-folder, `:`
 stream, trailing dot/space or Windows device name): `test_names_are_checked_before_any_request`. marimo's
 `create` never overwrites; it writes `<stem>_1.py` instead, so a create that loses a race deletes that copy and
@@ -391,3 +393,69 @@ ruff 0.16 enables several hundred rules by default and reads any project configu
 tests in `tests/test_tools.py`. After upgrading marimo, ruff or ty, rerun them and repeat a live create/edit
 through `marimo_execute`: the snapshot and the formatting flag use private marimo attributes
 (`ctx._document`, `ctx._kernel.user_config`).
+
+## 16. The agent reads the project's files on this machine, read-only, and never what Hailer keeps out
+
+Added on 2026-10-28 so that a chat inside another project can answer an analyst's questions about the product
+the data comes from. It is the agent's first file capability since §1, so it is deliberately narrow: three
+read-only tools (`project_files`, `project_search`, `project_read`), off without `[project]`, reading only on this
+machine through `hailer.project.ProjectFiles`; no kernel ever sees these files and nothing there writes. Keep
+these properties:
+
+- **What is listed is what git would commit, minus what Hailer keeps out.** In a git work tree the names come
+  from `git ls-files --cached --others --exclude-standard` (run with `core.fsmonitor=false`, so a repository's
+  configuration cannot make the listing run a program); elsewhere from a walk that skips virtual environments.
+  Never: `SKIPPED_DIRS`, the state folder, `local.toml`, the notebooks folder (the kernel holds the live
+  notebooks), the data folder and every data folder (raw data reaches the model only through code that prints
+  it), credential-named files, links out of the root, files over 1 MiB. Without `include` only code, docs and
+  config files by type. Evidence: `test_in_a_git_repository_ignored_files_hailers_files_and_credentials_are_left_out`,
+  `test_without_git_the_folder_is_walked_with_the_same_exclusions`, `test_a_link_out_of_the_root_is_never_followed`,
+  `test_read_refuses_anything_that_is_not_a_project_file`.
+- **Credential lines are withheld, and the heuristic knows code.** Every result passes `withheld`: a line
+  `looks_like_secret` flags, and a PEM key block from its BEGIN line for as long as the lines look like key
+  material (a bare BEGIN string in a test once withheld the next 200 lines of it). Hailer's own repository
+  showed why `code=True` exists: in source code `token = request.headers.get(...)` is an expression, so there a
+  `key = value` match counts only with a quoted value; outside code (YAML, `.env`, INI) an unquoted value counts.
+  The name may end a longer one (`db_password`, `client_secret`, `SECRET_KEY` were missed before). Evidence:
+  `test_lines_that_look_like_credentials_are_withheld_in_reads_and_searches`,
+  `test_in_code_only_a_quoted_value_is_a_credential`, `test_looks_like_secret_positive`.
+- **Bounded like every tool result.** At most 200 paths (then a summary by folder), 100 matching lines, a 15 s
+  search, 400 lines per read and the output budget; `validate` refuses a root that is a drive, holds the home
+  folder or holds or sits in a credential folder. Evidence: `test_search_stops_at_the_match_cap_and_at_its_time_budget`,
+  `test_read_numbers_lines_and_says_how_to_continue`, `test_the_project_folder_may_not_be_home_a_drive_or_hold_credentials`.
+- **What it reads is sent to the model**, like every tool result: the startup panel's `Project:` line says
+  which folder, and the data-handling page says so. The prompt tells the agent notebook code cannot import
+  these files (it re-creates the logic) and never to claim it changed them.
+
+## 17. Data folders are mounts with names, and their paths belong to each machine
+
+Before 2026-10-28 the only folder of the machine a docker kernel saw was `[hailer].data_dir`; a symlink to data
+elsewhere did not resolve in the container (`data_path_problems` warns about such links). `[data_folders]` adds
+named folders, each mounted read-only at `/work/folders/<name>`. Keep these properties:
+
+- **Same rules, every folder.** `docker_mount_problems` checks each available data folder with the data
+  folder's rules (`_mount_problems`), on every start path; a UNC path is refused before anything touches the
+  share. `hailer data add` applies the same rules whatever the runtime. Evidence:
+  `test_docker_refuses_a_data_folder_that_would_expose_more_than_data`, `test_a_network_share_is_refused_without_looking_at_it`.
+- **The hardened `docker run` still passes no environment.** The starter notebook finds the folders by listing
+  `/work/folders` (Docker creates the mount points in the read-only root; verified with Docker Engine 29.9 on
+  2026-10-28, writes there fail with EROFS); only the unsafe-local kernel, whose paths are the host's, gets
+  `HAILER_DATA_DIR` and `HAILER_DATA_FOLDERS`. Evidence: `test_the_docker_kernel_mounts_each_folder_read_only_and_says_nothing_in_its_environment`,
+  `test_the_token_reaches_marimo_in_a_file_that_is_gone_once_it_started` (no `-e`),
+  `test_a_data_folder_from_elsewhere_is_mounted_read_only_and_named_in_data_folders` (Docker integration).
+- **Paths per machine, names per project.** Notebooks use `DATA_FOLDERS["<name>"]`, never a host path, so they
+  run on every machine and in the container. The project's config may declare a folder without a path; each
+  machine's `.hailer/local.toml` says where it is, merged into the declaration (a string path becomes
+  `{ path = ... }` first, so the description survives). `hailer data add` edits `local.toml` line by line and
+  re-parses before writing; a form it does not handle is refused, not rewritten (users keep comments there).
+  A declared folder missing on this machine is a warning and is not mounted. Evidence:
+  `test_this_machines_path_merges_into_the_folder_the_project_declares`,
+  `test_add_writes_local_toml_and_keeps_what_else_is_there`, `test_a_form_the_editor_does_not_handle_is_refused_not_mangled`.
+- **A running kernel's mounts are fixed.** `/data add` and `hailer data add` say the change applies at the next
+  start; one session still owns one kernel (§11), so there is no restart-in-place.
+
+Inside a project the workspace is found up to the git root (a uv workspace member belongs to the whole
+repository: the first `pyproject.toml` used to win) and the project layout keeps Hailer's files in `.hailer/`
+with state in `.hailer/state/` (`statedir.state_dir` decides, so every state writer follows). Evidence:
+`test_a_command_in_a_uv_workspace_member_belongs_to_the_whole_repository`, `test_the_search_stops_at_the_repository_root`,
+`test_init_inside_a_project_puts_everything_in_dot_hailer`.

@@ -244,8 +244,13 @@ def docker_kernel(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Kernel]:
 
     workspace = tmp_path_factory.mktemp("docker-workspace")
     scratch = tmp_path_factory.mktemp("docker-browser")
+    exports = tmp_path_factory.mktemp("docker-exports") / "exports"  # a data folder outside the workspace
+    exports.mkdir()  # not mktemp's owner-only mode: the kernel user may be another uid (root runs Hailer)
+    (exports / "targets.csv").write_text("region,target\nNorth,100\nSouth,80\n", encoding="utf-8")
     (workspace / "hailer.toml").write_text(
-        '[hailer]\nnotebook = "notebooks/analysis.py"\ndata_dir = "data"\n\n[kernel]\nruntime = "docker"\n', encoding="utf-8"
+        '[hailer]\nnotebook = "notebooks/analysis.py"\ndata_dir = "data"\n\n[kernel]\nruntime = "docker"\n\n'
+        f"[data_folders]\nexports = '{exports}'\n",
+        encoding="utf-8",
     )
     write_sales_data(workspace / "data")
     write_workbook(workspace / "data" / "Regional sales.xlsx")
@@ -318,6 +323,29 @@ def test_notebook_code_runs_in_the_container_on_the_mounted_data(docker_kernel: 
 
     assert _poll(started, 60), docker_kernel.run("print(DATA_DIR)").stderr + docker_kernel.diagnostics()
     assert docker_kernel.chrome.poll() is None, "Chrome must remain connected after notebook initialization"
+
+
+def test_a_data_folder_from_elsewhere_is_mounted_read_only_and_named_in_data_folders(docker_kernel: Kernel):
+    """[data_folders] entries are bind-mounted read-only at /work/folders/<name> (Docker creates the mount
+    point in the read-only root), and the starter notebook finds them by listing /work/folders."""
+
+    def found() -> bool:
+        return docker_kernel.run("print(DATA_FOLDERS)").stdout.strip() == "{'exports': PosixPath('/work/folders/exports')}"
+
+    assert _poll(found, 60), docker_kernel.run("print(DATA_FOLDERS)").stderr + docker_kernel.diagnostics()
+    result = docker_kernel.run(
+        "import polars as pl\n"
+        "print(pl.read_csv(DATA_FOLDERS['exports'] / 'targets.csv')['target'].sum())\n"
+        "for target in (DATA_FOLDERS['exports'] / 'x.csv', DATA_FOLDERS['exports'].parent / 'y'):\n"
+        "    try:\n"
+        "        target.write_text('no')\n"
+        "        print('written')\n"
+        "    except OSError as err:\n"
+        "        print(type(err).__name__, err.errno)\n"
+    )
+    assert result.success, result.stderr
+    assert result.stdout.split() == ["180", "OSError", "30", "OSError", "30"], "30 = EROFS: read-only, also /work/folders itself"
+    assert docker_kernel.kernel.data_folders["exports"].path == "/work/folders/exports"
 
 
 def test_excel_can_be_read_in_the_container_without_installing_packages(docker_kernel: Kernel):
@@ -468,8 +496,8 @@ def test_the_notebooks_folder_is_the_containers_own_and_only_notebooks_come_back
     code writes there only marimo notebooks with plain names reach this machine."""
     kernel = docker_kernel.kernel
     mounts = json.loads(docker_kernel.docker("inspect", "--format", "{{json .Mounts}}", kernel.container_ids[0])[0])
-    assert sorted(m["Destination"] for m in mounts) == ["/run/secrets/hailer-token", "/work/data"], mounts
-    assert all(m.get("RW") is False for m in mounts), "both read-only"
+    assert sorted(m["Destination"] for m in mounts) == ["/run/secrets/hailer-token", "/work/data", "/work/folders/exports"], mounts
+    assert all(m.get("RW") is False for m in mounts), "all read-only"
     result = docker_kernel.run(
         "print([line.split()[2] for line in open('/proc/mounts') if line.split()[1] == '/work/notebooks'])"
     )

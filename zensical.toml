@@ -28,6 +28,7 @@ nav = [
   { "Configuration" = [
     { "Models and endpoints" = "configuration/models.md" },
     { "Context, skills and prompts" = "configuration/context.md" },
+    { "Inside another project" = "configuration/project.md" },
     { "Allowed web domains" = "configuration/web.md" },
     { "Credentials" = "configuration/credentials.md" },
     { "Running inside abeam" = "configuration/abeam.md" },
