@@ -7,11 +7,14 @@
 ``uvx hailer doctor``     check the configuration, credentials, Docker, the kernel image and folders
 ``uvx hailer login``      store an API key in the OS credential store
 ``uvx hailer logout``     remove it
-``uvx hailer init``       set up a workspace: hailer.toml, .config/hailer, the starter notebook, data/
+``uvx hailer init``       set up a workspace: the config, context/skills/prompts, the starter notebook, data/
+                          (inside another project, all of it in .hailer/)
+``uvx hailer data``       the data folders notebooks see: ``list``, ``add`` a folder from anywhere, ``remove``
 ``uvx hailer kernel``     the Docker kernel: ``pull`` or ``build`` its image, ``stop`` this workspace's kernels
 
-The commands live in :mod:`hailer.cli.chat` (the chat and ``notebook``), :mod:`hailer.cli.kernel`
-and :mod:`hailer.cli.setup` (``init``, ``login``, ``logout``, ``doctor``, ``status``); what they
+The commands live in :mod:`hailer.cli.chat` (the chat and ``notebook``), :mod:`hailer.cli.data`,
+:mod:`hailer.cli.kernel` and :mod:`hailer.cli.setup` (``init``, ``login``, ``logout``, ``doctor``,
+``status``); what they
 share, including the collaborators tests replace, is in :mod:`hailer.cli.common`.
 """
 
@@ -22,7 +25,7 @@ from pathlib import Path
 import typer
 
 from hailer import __version__
-from hailer.cli import chat, common, kernel, setup
+from hailer.cli import chat, common, data, kernel, setup
 from hailer.cli.common import CliOptions
 
 app = typer.Typer(
@@ -58,6 +61,7 @@ def _main(
 app.command()(chat.notebook)
 app.command()(setup.status)
 app.command()(setup.doctor)
+app.add_typer(data.data_app, name="data")
 app.add_typer(kernel.kernel_app, name="kernel")
 app.command()(setup.login)
 app.command()(setup.logout)

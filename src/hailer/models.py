@@ -167,6 +167,18 @@ class CodeChecksConfig:
 
 
 @dataclass(frozen=True)
+class DataFolder:
+    """A ``[data_folders]`` entry: a folder of this machine, outside or inside the workspace, whose
+    files notebooks may read (a docker kernel mounts it read-only at ``/work/folders/<name>``)."""
+
+    name: str  # lower-case letters, digits, "-" and "_": the folder's name in the kernel
+    #: Absolute; ``None`` when the folder is declared without a path (the project's config names it,
+    #: each machine's ``.hailer/local.toml`` says where it is).
+    path: Path | None = None
+    description: str = ""
+
+
+@dataclass(frozen=True)
 class ProjectConfig:
     """The ``[project]`` table: the project's own files (code, docs, configuration) the agent may
     list, search and read, read-only, on this machine (:mod:`hailer.project`). Kernels never see them."""
@@ -199,6 +211,8 @@ class HailerConfig:
     kernel: KernelConfig = field(default_factory=KernelConfig)
     checks: CodeChecksConfig = field(default_factory=CodeChecksConfig)
     project: ProjectConfig = field(default_factory=ProjectConfig)
+    #: More data folders besides ``data_dir`` (``[data_folders]``), in the order they were declared.
+    data_folders: tuple[DataFolder, ...] = ()
     log_level: str = "WARNING"
     config_path: Path | None = None
     #: This machine's ``.hailer/local.toml`` when it exists (merged over ``config_path``).

@@ -39,10 +39,11 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
 from hailer import kernel_image
-from hailer.config import is_unc_path
+from hailer.config import available_data_folders, is_unc_path
 from hailer.errors import HailerError, KernelRuntimeError, NotebookPathError
 from hailer.kernel import (
     KERNEL_DATA_DIR,
+    KERNEL_FOLDERS_DIR,
     KERNEL_NOTEBOOKS_DIR,
     KERNEL_WORKDIR,
     START_TIMEOUT_SEC,
@@ -54,7 +55,7 @@ from hailer.marimo_client import wait_for_health
 from hailer.models import KERNEL_RUNTIME_DOCKER, Check, HailerConfig, KernelConfig, MarimoServer
 from hailer import notebook_sync
 from hailer.notebook_sync import NotebookSync, sync_refusal
-from hailer.sandbox import MarimoSandbox
+from hailer.sandbox import MarimoSandbox, SandboxFolder
 from hailer.statedir import ensure_state_dir, state_dir
 
 #: marimo's port inside the kernel container; the forwarder listens on the same port in its own.
@@ -873,6 +874,7 @@ class DockerRuntime:
         data = self._data_check()
         if data is not None:
             rows.append(data)
+        rows += self._folder_checks()
         return rows
 
     def _image_check(self) -> Check:
@@ -900,6 +902,20 @@ class DockerRuntime:
         if problems:
             return Check("data", False, "the container may not see all of the data folder", hint="\n".join(problems), fatal=False)
         return Check("data", True, f"{self.config.data_dir} (read-only in the kernel, as {KERNEL_DATA_DIR})", fatal=False)
+
+    def _folder_checks(self) -> list[Check]:
+        """A row per data folder the kernel gets: where it appears, or why the container may not see all of it."""
+        rows: list[Check] = []
+        for folder in available_data_folders(self.config):
+            name = f"data:{folder.name}"
+            if _on_windows() and is_unc_path(folder.path):  # type: ignore[arg-type]
+                continue  # fatal, and said once: the config row (docker_mount_problems) refuses it
+            problems = data_path_problems(folder.path)  # type: ignore[arg-type]
+            if problems:
+                rows.append(Check(name, False, f"the container may not see all of {folder.path}", hint="\n".join(problems), fatal=False))
+            else:
+                rows.append(Check(name, True, f"{folder.path} (read-only in the kernel, as {KERNEL_FOLDERS_DIR / folder.name})", fatal=False))
+        return rows
 
     def engine_version(self) -> str:
         """The Docker engine's version. ``KernelRuntimeError`` when Docker is not installed, not
@@ -1062,8 +1078,10 @@ class DockerRuntime:
         return ["network", "create", "--internal", *self._labels("network"), self.names.network]
 
     def kernel_command(self, port: int, token_file: Path) -> list[str]:
-        """``docker run`` for the kernel. Nothing of this machine is mounted but the data folder
-        (read-only) and ``token_file`` (read-only, at :data:`KERNEL_TOKEN_FILE`, where marimo
+        """``docker run`` for the kernel. Nothing of this machine is mounted but the data folder and
+        the ``[data_folders]`` (read-only, at ``/work/data`` and ``/work/folders/<name>``: the starter
+        notebook lists that folder, so no environment variable is needed) and ``token_file``
+        (read-only, at :data:`KERNEL_TOKEN_FILE`, where marimo
         reads its token): not the notebooks folder (the kernel's own is a tmpfs owned by its user,
         at most :data:`NOTEBOOKS_TMPFS_SIZE`), the workspace root, ``.hailer/``,
         ``.config/hailer/``, the home folder or the Docker socket. The token itself is never an
@@ -1094,6 +1112,7 @@ class DockerRuntime:
             "-w", str(KERNEL_WORKDIR),
             *self._labels("kernel"),
             "--mount", mount_arg(self.config.data_dir, KERNEL_DATA_DIR, readonly=True),
+            *self._folder_mounts(),
             "--mount", mount_arg(token_file, KERNEL_TOKEN_FILE, readonly=True),
             self.image,
             "marimo", "edit", KERNEL_NOTEBOOKS_DIR.name,
@@ -1104,6 +1123,14 @@ class DockerRuntime:
             "--token-password-file", str(KERNEL_TOKEN_FILE),
         ]  # fmt: skip
         return cmd
+
+    def _folder_mounts(self) -> list[str]:
+        """``--mount`` arguments binding each data folder read-only at ``/work/folders/<name>``."""
+        return [
+            arg
+            for folder in available_data_folders(self.config)
+            for arg in ("--mount", mount_arg(folder.path, KERNEL_FOLDERS_DIR / folder.name, readonly=True))  # type: ignore[arg-type]
+        ]
 
     def forwarder_command(self, port: int) -> list[str]:
         """``docker create`` for the forwarder: published on 127.0.0.1 only, and it only ever
@@ -1227,6 +1254,10 @@ class DockerRuntime:
             notebooks_path=str(KERNEL_NOTEBOOKS_DIR),
             data_path=str(KERNEL_DATA_DIR),
             data_dir=config.data_dir,
+            data_folders={
+                folder.name: SandboxFolder(str(KERNEL_FOLDERS_DIR / folder.name), folder.path)  # type: ignore[arg-type]
+                for folder in available_data_folders(config)
+            },
             log_hint=f"docker logs {names.kernel}",
             runner=self.runner,
             owner=owner,

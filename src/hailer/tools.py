@@ -602,18 +602,21 @@ class HailerTools:
 
     # -- data, skills, web ------------------------------------------------- #
 
-    def list_periods(self, name: str = "") -> str:
+    def list_periods(self, name: str = "", folder: str = "") -> str:
         """Describe the data directory: monthly files named like '25-01 sales.parquet'
         (YY-MM then the dataset name) with the periods available, common columns and columns
         that only appear in some months, plus the names of any other data files (CSV, JSON,
-        ...). Optional dataset name filter for the monthly files, e.g. 'sales'."""
+        ...). Optional dataset name filter for the monthly files, e.g. 'sales'. The data folders
+        besides it (DATA_FOLDERS in notebooks) are listed by name at the end; pass folder='<name>'
+        to describe one of them the same way."""
 
         def go() -> str:
             from . import periods  # lazy
 
             sandbox = self._kernel()
-            shown = sandbox.data_path
-            files = sandbox.list_data()
+            chosen = folder.strip() or None
+            shown = sandbox.data_path_of(chosen)
+            files = sandbox.list_data(chosen)
             wanted = name.strip().lower() or None
             found = []
             for info in files:
@@ -621,18 +624,30 @@ class HailerTools:
                 if pf is not None and (wanted is None or pf.stem == wanted):
                     found.append(pf)
             if found:
-                text = periods.describe_periods(found, schema=lambda pf: sandbox.data_schema(pf.path.name))
+                text = periods.describe_periods(found, schema=lambda pf: sandbox.data_schema(pf.path.name, chosen))
             else:
                 text = (
                     f"No period files found in {shown}"
                     + (f" for '{name.strip()}'" if name.strip() else "")
                     + ". Monthly files are named like '25-01 sales.parquet' (YY-MM then the dataset name)."
                 )
+            if chosen:
+                text = f"Data folder {chosen!r} ({shown}, DATA_FOLDERS[{chosen!r}] in notebooks):\n" + text
             listed = {pf.path.name for pf in found}
             others = [f.name for f in files if f.name.lower().endswith(periods.DATA_SUFFIXES) and f.name not in listed]
             if others:
-                shown = ", ".join(others[:20]) + (f" (and {len(others) - 20} more)" if len(others) > 20 else "")
-                text += f"\nOther data files (load them directly with Polars or DuckDB): {shown}"
+                more = ", ".join(others[:20]) + (f" (and {len(others) - 20} more)" if len(others) > 20 else "")
+                text += f"\nOther data files (load them directly with Polars or DuckDB): {more}"
+            if not chosen and sandbox.data_folders:
+                lines = []
+                for folder_name, extra in sandbox.data_folders.items():
+                    try:
+                        count = sum(1 for f in sandbox.list_data(folder_name) if f.name.lower().endswith(periods.DATA_SUFFIXES))
+                        state = f"{count} data file(s)"
+                    except HailerError as err:
+                        state = str(err)
+                    lines.append(f"- {folder_name}: {extra.path} ({state})")
+                text += "\nMore data folders (describe one with list_periods(folder='<name>')):\n" + "\n".join(lines)
             return text
 
         return self._run(go)

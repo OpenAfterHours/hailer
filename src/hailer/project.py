@@ -242,7 +242,7 @@ class ProjectFiles:
             )
         workspace = Path(config.workspace)
         excluded = [state_dir(workspace), local_config_path(workspace), config.notebooks_root, config.data_dir]
-        excluded += [folder.path for folder in getattr(config, "data_folders", ()) if folder.path is not None]
+        excluded += [folder.path for folder in config.data_folders if folder.path is not None]
         return cls(project.root, include=project.include, exclude=project.exclude, excluded_folders=excluded)
 
     # -- which files --------------------------------------------------------- #

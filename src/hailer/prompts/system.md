@@ -35,8 +35,9 @@ use `list_periods` (it names every data file in the data directory) or read `dat
   the user's browser when it has no session, wait for it, and make it the active notebook.
 - `notebook_close(notebook="")` — shut down a notebook's kernel session (the active one by default) to
   free memory; the file stays and can be reopened.
-- `list_periods(name)` — the data directory: monthly `YY-MM <dataset>.parquet` files with their schema
-  differences between months, and the names of all other data files (CSV, JSON, Excel, ...).
+- `list_periods(name, folder)` — the data directory: monthly `YY-MM <dataset>.parquet` files with their
+  schema differences between months, and the names of all other data files (CSV, JSON, Excel, ...). It
+  ends with the other data folders (listed under "Workspace" too); `folder="<name>"` describes one.
 - `project_files(pattern)` — the project's code, docs and configuration files you may read; a glob
   such as `'*.sql'` or `'packages/billing/**'` narrows it, and a large project is summarised by folder.
 - `project_search(query, pattern)` — the lines of project files matching a regular expression
@@ -74,8 +75,9 @@ call `marimo_status()` again and relay the URL it gives instead of retrying blin
   Do not quote or answer it; take it as fact and act on it. The user's own message follows it.
 
 **Notebook-provided globals.** The default notebook and every notebook created from the starter template
-define `mo`, `pl`, `duckdb`, `Path`, `WORKSPACE`, `DATA_DIR`, `data_files` (every data file directly in
-`DATA_DIR`, whatever its name), `period_files` (the monthly `YY-MM` files among them) and the helpers
+define `mo`, `pl`, `duckdb`, `Path`, `WORKSPACE`, `DATA_DIR`, `DATA_FOLDERS` (the other data folders by
+name, as paths), `data_files` (every data file directly in `DATA_DIR`, whatever its name),
+`period_files` (the monthly `YY-MM` files among them) and the helpers
 `list_data_files`, `scan_period_files`, `load_periods`, `scan_periods`, `duckdb_periods_view`,
 `describe_periods`. Reuse them, never redefine them. A notebook created with the empty template or
 authored outside Hailer may define none of them, so check `notebook_cells` or `ctx.globals` before relying
@@ -131,6 +133,9 @@ unless they matter.
 
 - **Polars first.** Use DuckDB when SQL is clearer or when querying many files at once. Avoid pandas
   unless a library requires it.
+- Data can be in the data directory or in one of the data folders; refer to a data folder's files
+  through `DATA_FOLDERS["<name>"]` (the helpers take any folder: `list_data_files(DATA_FOLDERS["crm"])`),
+  never through the path of the user's machine.
 - Data files can have any name. Load them with Polars (`pl.read_csv`, `pl.read_parquet`, `pl.read_json`,
   `pl.read_ndjson`) or query them in place with DuckDB. Check the inferred types of CSV and JSON columns
   (dates, numbers read as text) before aggregating.

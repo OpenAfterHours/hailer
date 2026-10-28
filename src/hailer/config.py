@@ -32,6 +32,7 @@ from hailer.models import (
     VALID_WIRE_APIS,
     WIRE_API_RESPONSES,
     CodeChecksConfig,
+    DataFolder,
     HailerConfig,
     KernelConfig,
     ModelConfig,
@@ -64,7 +65,7 @@ VALID_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 
 # Known keys per section; anything else is reported by validate() as a warning.
-_KNOWN_TOP = {"hailer", "model", "model_providers", "web", "kernel", "checks", "project"}
+_KNOWN_TOP = {"hailer", "model", "model_providers", "web", "kernel", "checks", "project", "data_folders"}
 _KNOWN_HAILER = {
     "notebook",
     "notebooks_dir",
@@ -92,6 +93,9 @@ _KNOWN_WEB = {"allowed_domains", "max_page_bytes"}
 _KNOWN_KERNEL = {"runtime", "image", "memory", "cpus", "network"}
 _KNOWN_CHECKS = {"lint", "typecheck", "format"}
 _KNOWN_PROJECT = {"root", "include", "exclude", "enabled"}
+_KNOWN_DATA_FOLDER = {"path", "description"}
+#: A data folder's name: its folder in the kernel (``/work/folders/<name>``) and its key in ``DATA_FOLDERS``.
+DATA_FOLDER_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 
 # docker --memory: a number with an optional b/k/m/g unit ("4g", "512m", "1.5g").
 _MEMORY_RE = re.compile(r"^(\d+(?:\.\d+)?)[bkmg]?$", re.IGNORECASE)
@@ -164,6 +168,15 @@ runtime = "docker"                   # "docker" or "unsafe-local"
 # memory  = "4g"                     # docker: container memory limit (no swap on top)
 # cpus    = 2                        # docker: container CPU limit
 # network = false                    # docker: true lets notebook code reach the internet and this machine
+
+# More data folders, anywhere on this machine: each is mounted read-only in the kernel at
+# /work/folders/<name> (notebooks get them as DATA_FOLDERS["<name>"]). `uvx hailer data add <name>
+# <folder>` adds one to .hailer/local.toml, this machine's settings, which are never committed; a
+# folder declared here without a path is one each machine sets that way.
+#
+# [data_folders]
+# finance = "~/Shared/Finance exports"
+# warehouse = { path = "/mnt/warehouse/parquet", description = "Nightly Parquet exports" }
 
 # The project's own files (code, docs, configuration) that the agent may list, search and read,
 # read-only, on this machine; the kernel never sees them. Files git ignores, Hailer's own state,
@@ -405,6 +418,40 @@ def _clean_url(value: str | None) -> str | None:
     return value.rstrip("/") or None
 
 
+def _folder_tables(data: Mapping[str, Any]) -> dict[str, Any]:
+    """``data`` with each ``[data_folders]`` path written as a string turned into ``{path = ...}``,
+    so a machine's path merges into a folder the project declared (keeping its description)."""
+    folders = data.get("data_folders")
+    if not isinstance(folders, dict):
+        return dict(data)
+    return {**data, "data_folders": {name: {"path": value} if isinstance(value, str) else value for name, value in folders.items()}}
+
+
+def _data_folders(table: Mapping[str, Any], ws: Path, where: Path | str | None) -> tuple[DataFolder, ...]:
+    found: list[DataFolder] = []
+    for name, raw in table.items():
+        if not DATA_FOLDER_NAME_RE.match(name):
+            raise ConfigError(
+                f"[data_folders] in {where}: {name!r} is not a data folder name.",
+                hint="Use lower-case letters, digits, - and _ (up to 40, starting with a letter or digit), e.g. finance or crm-exports.",
+            )
+        section = f"data_folders.{name}"
+        if not isinstance(raw, dict):
+            raise ConfigError(
+                f"[data_folders].{name} in {where} must be a folder path or a table, not {_written(raw)}.",
+                hint=f'Write {name} = "/path/to/folder" or {name} = {{ path = "/path/to/folder", description = "..." }}.',
+            )
+        path = _str(raw, "path", section, where)
+        found.append(
+            DataFolder(
+                name=name,
+                path=_resolve(ws, path) if path and path.strip() else None,
+                description=(_str(raw, "description", section, where, "") or "").strip(),
+            )
+        )
+    return tuple(found)
+
+
 def _merge_tables(base: Mapping[str, Any], top: Mapping[str, Any]) -> dict[str, Any]:
     """``base`` with ``top`` on top: tables merge key by key, any other value replaces."""
     merged = dict(base)
@@ -440,7 +487,7 @@ def load_config(
     local_path = local.resolve() if local.is_file() and local.resolve() != path else None
     where: Path | str | None = path
     if local_path is not None:
-        data = _merge_tables(data, _read_toml(local_path))
+        data = _merge_tables(_folder_tables(data), _folder_tables(_read_toml(local_path)))
         where = f"{path} or {local_path}" if path is not None else local_path
     defaults = PROJECT_DEFAULTS if is_project_layout(ws) else {}
 
@@ -451,6 +498,7 @@ def load_config(
     kernel_tbl = _section(data, "kernel", where)
     checks_tbl = _section(data, "checks", where)
     project_tbl = _section(data, "project", where) if "project" in data else None
+    folders_tbl = _section(_folder_tables(data), "data_folders", where)
 
     notebook = _str(hailer_tbl, "notebook", "hailer", where, defaults.get("notebook", DEFAULT_NOTEBOOK))
     notebooks_dir = _str(hailer_tbl, "notebooks_dir", "hailer", where)
@@ -541,6 +589,7 @@ def load_config(
         kernel=kernel,
         checks=checks,
         project=project,
+        data_folders=_data_folders(folders_tbl, ws, where),
         log_level=log_level,
         config_path=path,
         local_config_path=local_path,
@@ -619,6 +668,11 @@ def _unknown_key_warnings(path: Path) -> list[str]:
     project_tbl = data.get("project") or {}
     if isinstance(project_tbl, dict):
         check(project_tbl, _KNOWN_PROJECT, "project")
+    folders_tbl = data.get("data_folders") or {}
+    if isinstance(folders_tbl, dict):
+        for name, raw in folders_tbl.items():
+            if isinstance(raw, dict):
+                check(raw, _KNOWN_DATA_FOLDER, f"data_folders.{name}")
     return warnings
 
 
@@ -697,8 +751,8 @@ def _in_temp(folder: Path) -> bool:
 
 
 def docker_mount_problems(config: HailerConfig, *, windows: bool | None = None) -> list[str]:
-    """Every reason, in docker mode, not to mount the data folder (at most one; empty when it is
-    fine). The one place for these rules: ``validate()`` reports them and
+    """Every reason, in docker mode, not to mount the data folder or one of the data folders
+    (:func:`available_data_folders`; at most one each; empty when they are fine). The one place for these rules: ``validate()`` reports them and
     :class:`~hailer.kernel_docker.DockerRuntime` refuses to start on them, on every start path
     (``--foreground`` never runs ``validate()``). The data folder is the only folder of this machine a docker kernel
     sees (read-only); its notebooks folder is the container's own, copied to and from the
@@ -713,7 +767,21 @@ def docker_mount_problems(config: HailerConfig, *, windows: bool | None = None) 
       temporary folder).
     """
     windows = _on_windows() if windows is None else windows
-    folder = config.data_dir
+    problems = _mount_problems(config, config.data_dir, "The data folder", windows)
+    for extra in config.data_folders:
+        if extra.path is not None and ((windows and is_unc_path(extra.path)) or extra.path.is_dir()):  # a share: never probed
+            problems += _mount_problems(config, extra.path, f"The data folder {extra.name!r}", windows, fix=data_folder_fix(extra.name))
+    return problems
+
+
+def data_folder_fix(name: str) -> str:
+    """The advice for a ``[data_folders]`` entry that may not be mounted."""
+    return f"Point it at a folder that holds only the data to analyse (uvx hailer data add {name} <folder>), or remove it (uvx hailer data remove {name})."
+
+
+def _mount_problems(config: HailerConfig, folder: Path, label: str, windows: bool, *, fix: str | None = None) -> list[str]:
+    """Why ``folder`` may not be mounted (:func:`docker_mount_problems`); ``label`` names it and
+    ``fix`` says what to do (default: the advice for ``[hailer].data_dir``)."""
     workspace = Path(config.workspace)
     guarded: list[tuple[Path, str]] = [
         (workspace, "the workspace folder"),
@@ -729,20 +797,19 @@ def docker_mount_problems(config: HailerConfig, *, windows: bool | None = None) 
             guarded.append((path, f"the config file {path.name}"))
     guarded += [(config.context_dir, "the context folder"), (config.skills_dir, "the skills folder"), (config.prompts_dir, "the prompts folder")]
     docker = '[kernel] runtime = "docker"'
-    fix = "Keep the data folder a folder of its own, such as data/, and point [hailer].data_dir at it."
     if windows and is_unc_path(folder):  # first: resolving a share's path can wait on the network
-        return [
-            f"The data folder {folder} is on a network share (UNC path), which Docker cannot mount. "
-            "Copy it to a folder on a local disk and point [hailer].data_dir at it."
-        ]
+        local = "Copy it to a folder on a local disk and point [hailer].data_dir at it." if fix is None else f"Copy it to a folder on a local disk. {fix}"
+        return [f"{label} {folder} is on a network share (UNC path), which Docker cannot mount. {local}".rstrip()]
+    if fix is None:
+        fix = "Keep the data folder a folder of its own, such as data/, and point [hailer].data_dir at it."
     if _is_drive_root(folder):
-        return [f"The data folder ({folder}) is a whole drive. With {docker} it is mounted into the container. {fix}"]
+        return [f"{label} ({folder}) is a whole drive. With {docker} it is mounted into the container. {fix}"]
     found = next(((target, name) for target, name in guarded if _inside_or_equal(target, folder)), None)
     if found is not None:
         target, name = found
         relation = "is" if _same_folder(target, folder) else "contains"
         return [
-            f"The data folder ({folder}) {relation} {name}. With {docker} it is mounted into the container, "
+            f"{label} ({folder}) {relation} {name}. With {docker} it is mounted into the container, "
             f"so notebook code could read Hailer's own files. {fix}"
         ]
     credentials = _credential_folders(windows)
@@ -754,10 +821,32 @@ def docker_mount_problems(config: HailerConfig, *, windows: bool | None = None) 
     if secret is not None:
         relation = "is" if _same_folder(secret, folder) else ("contains" if _inside_or_equal(secret, folder) else "is inside")
         return [
-            f"The data folder ({folder}) {relation} {secret}, a folder that holds credentials. With {docker} it is "
+            f"{label} ({folder}) {relation} {secret}, a folder that holds credentials. With {docker} it is "
             f"mounted into the container, so notebook code could read them. {fix}"
         ]
     return []
+
+
+def available_data_folders(config: HailerConfig) -> list[DataFolder]:
+    """The ``[data_folders]`` with a path on this machine that is a folder: the ones a kernel gets."""
+    return [folder for folder in config.data_folders if folder.path is not None and folder.path.is_dir()]
+
+
+def data_folder_problems(config: HailerConfig) -> list[str]:
+    """Warnings about ``[data_folders]`` a kernel will not get: no path on this machine, or no folder there."""
+    problems: list[str] = []
+    for folder in config.data_folders:
+        if folder.path is None:
+            problems.append(
+                f"Warning: the data folder {folder.name!r} has no path on this machine, so notebooks will not see it. "
+                f"Set it with `uvx hailer data add {folder.name} <folder>`."
+            )
+        elif not folder.path.is_dir():
+            problems.append(
+                f"Warning: the data folder {folder.name!r} ({folder.path}) does not exist, so notebooks will not see it. "
+                f"Fix it with `uvx hailer data add {folder.name} <folder>` or remove it with `uvx hailer data remove {folder.name}`."
+            )
+    return problems
 
 
 def project_problems(config: HailerConfig, *, windows: bool | None = None) -> list[str]:
@@ -863,6 +952,7 @@ def validate(config: HailerConfig) -> list[str]:
             f"Warning: data directory not found: {config.data_dir}. "
             "Create it (or set [hailer].data_dir) and put the files to analyse there."
         )
+    problems.extend(data_folder_problems(config))
 
     if config.log_level not in VALID_LOG_LEVELS:
         problems.append(f"Invalid log level {config.log_level!r}; use one of {', '.join(VALID_LOG_LEVELS)}.")
