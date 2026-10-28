@@ -27,7 +27,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from hailer import secrets as _secrets
 from hailer.errors import AgentError, ConfigError, CredentialsError, HailerError, ProviderError
@@ -520,6 +520,90 @@ def _update_messages(change: Any) -> list[Any]:
     return []
 
 
+class _Step(NamedTuple):
+    """A tool call waiting for its result."""
+
+    event_id: str  # the id its events carry: unique in the turn
+    name: str
+    args: dict[str, Any]
+    started: float
+
+
+class _TurnEvents:
+    """One turn's events and totals, from the graph's ``updates`` stream.
+
+    A ``model`` update's tool calls become ``tool_call`` events; a ``tools`` update's ``ToolMessage``
+    becomes the ``tool_result`` of the call it answers. The events carry an id unique in the turn: the
+    call's own id, or ``<id>#<n>`` (``call#<n>`` without one) when a gateway sends none or repeats one
+    (some number calls per reply). A result is matched to its call by the tool call id and, among calls
+    sharing one, by tool name, then oldest first. A result for no call of this turn says nothing.
+    """
+
+    def __init__(self, emit: Callable[[AgentEvent], None]) -> None:
+        self.emit = emit
+        self.tool_calls: list[str] = []
+        self.final = ""
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.usage_seen = False
+        self.steps = 0
+        self._waiting: dict[str, list[_Step]] = {}  # by the tool call id the ToolMessage will carry
+        self._event_ids: set[str] = set()
+
+    def on_update(self, update: Mapping[str, Any]) -> None:
+        from langchain_core.messages import AIMessage, ToolMessage
+
+        for node, change in update.items():
+            if node == "tools":
+                for message in _update_messages(change):
+                    if isinstance(message, ToolMessage):
+                        self._finished(message)
+            elif node == "model" and isinstance(change, Mapping):
+                for message in change.get("messages", []):
+                    if isinstance(message, AIMessage):
+                        self._model_message(message)
+
+    def _model_message(self, message: Any) -> None:
+        for call in message.tool_calls or []:
+            self._started(call)
+        counts = message.usage_metadata
+        if counts:
+            self.usage_seen = True
+            self.input_tokens += counts.get("input_tokens", 0) or 0
+            self.output_tokens += counts.get("output_tokens", 0) or 0
+        if not message.tool_calls:
+            self.final = _message_text(message)
+
+    def _started(self, call: Mapping[str, Any]) -> None:
+        self.tool_calls.append(call["name"])
+        call_id = str(call.get("id") or "")
+        event_id, n = call_id, len(self.tool_calls)
+        while not event_id or event_id in self._event_ids:
+            event_id = f"{call_id or 'call'}#{n}"
+            n += 1
+        self._event_ids.add(event_id)
+        args = _call_args(call.get("args"))
+        self._waiting.setdefault(call_id, []).append(_Step(event_id, call["name"], args, time.monotonic()))
+        detail = {"arguments": _preview(call.get("args")), "args": dict(args), "id": event_id}
+        self.emit(AgentEvent("tool_call", call["name"], detail))
+
+    def _finished(self, message: Any) -> None:
+        call_id = str(message.tool_call_id or "")
+        waiting = self._waiting.get(call_id)
+        if not waiting:
+            return  # no call of this turn (the results _settle_history writes never stream)
+        step = next((s for s in waiting if s.name == message.name), waiting[0])
+        waiting.remove(step)
+        if not waiting:
+            del self._waiting[call_id]
+        ok, summary = tool_outcome(
+            step.name, step.args, _message_text(message), getattr(message, "artifact", None), error=message.status == "error"
+        )
+        self.steps += 1
+        seconds = round(time.monotonic() - step.started, 3)
+        self.emit(AgentEvent("tool_result", step.name, {"id": step.event_id, "ok": ok, "summary": summary, "seconds": seconds}))
+
+
 class HailerAgent:
     """Owns the chat model, the tool loop and one conversation thread at a time."""
 
@@ -879,9 +963,9 @@ class HailerAgent:
         The next turn repairs any unfinished history, including tool calls whose effect is unknown.
         Event callbacks are synchronous and execute on the owning loop. Each tool call is a
         ``tool_call`` event when the model asks for it and a ``tool_result`` event with the same
-        ``id`` when the tools node answers it (calls in one model message may finish in any order);
-        a call the turn was cancelled in, and the results ``_settle_history`` writes for such calls
-        later, get no ``tool_result``.
+        ``id`` when the tools node answers it (calls in one model message may finish in any order;
+        see :class:`_TurnEvents`); a call the turn was cancelled in, and the results
+        ``_settle_history`` writes for such calls later, get no ``tool_result``.
         """
         self._bind_loop()
         if self.thread_id is None:
@@ -889,58 +973,7 @@ class HailerAgent:
         emit = on_event or (lambda _event: None)
         content = self._turn_text(text, skill, preamble)
         started = time.monotonic()
-        tool_calls: list[str] = []
-        usage = {"input": 0, "output": 0, "seen": False}
-        final: list[str] = [""]
-        #: Calls waiting for their result, by tool_call_id: (started, tool name, arguments), oldest first.
-        running: dict[str, list[tuple[float, str, dict[str, Any]]]] = {}
-        steps = [0]
-
-        def on_result(message: Any) -> None:
-            call_id = str(message.tool_call_id or "")
-            waiting = running.get(call_id)
-            reply = _message_text(message)
-            if waiting:
-                since, name, args = waiting.pop(0)
-                if not waiting:
-                    del running[call_id]
-            elif reply == INTERRUPTED_TOOL_RESULT:
-                return  # a repaired call from an earlier turn, never one of this turn's
-            else:
-                since, name, args = None, str(message.name or ""), {}
-            ok, summary = tool_outcome(name, args, reply, error=getattr(message, "status", None) == "error")
-            steps[0] += 1
-            seconds = round(time.monotonic() - since, 3) if since is not None else 0.0
-            emit(AgentEvent("tool_result", name, {"id": call_id, "ok": ok, "summary": summary, "seconds": seconds}))
-
-        def on_update(update: Mapping[str, Any]) -> None:
-            from langchain_core.messages import AIMessage, ToolMessage
-
-            for node, change in update.items():
-                if node == "tools":
-                    for message in _update_messages(change):
-                        if isinstance(message, ToolMessage):
-                            on_result(message)
-                    continue
-                if node != "model" or not isinstance(change, Mapping):
-                    continue
-                for message in change.get("messages", []):
-                    if not isinstance(message, AIMessage):
-                        continue
-                    for call in message.tool_calls or []:
-                        tool_calls.append(call["name"])
-                        call_id = str(call.get("id") or "")
-                        args = _call_args(call.get("args"))
-                        running.setdefault(call_id, []).append((time.monotonic(), call["name"], args))
-                        detail = {"arguments": _preview(call.get("args")), "args": dict(args), "id": call_id}
-                        emit(AgentEvent("tool_call", call["name"], detail))
-                    counts = message.usage_metadata
-                    if counts:
-                        usage["seen"] = True
-                        usage["input"] += counts.get("input_tokens", 0) or 0
-                        usage["output"] += counts.get("output_tokens", 0) or 0
-                    if not message.tool_calls:
-                        final[0] = _message_text(message)
+        turn = _TurnEvents(emit)
 
         async def go() -> None:
             graph = await self._ensure_graph()
@@ -948,7 +981,7 @@ class HailerAgent:
             stream = graph.astream({"messages": [message]}, self._thread_config(), stream_mode=["updates", "messages"])
             async for mode, data in stream:
                 if mode == "updates":
-                    on_update(data)
+                    turn.on_update(data)
                     continue
                 chunk, meta = data
                 if meta.get("langgraph_node") == "model":  # not the summariser's own model call
@@ -959,11 +992,11 @@ class HailerAgent:
         await self._aguarded(go)
 
         return TurnSummary(
-            final_response=final[0],
+            final_response=turn.final,
             thread_id=self.thread_id or "",
             duration_ms=int((time.monotonic() - started) * 1000),
-            tool_calls=tool_calls,
-            input_tokens=usage["input"] if usage["seen"] else None,
-            output_tokens=usage["output"] if usage["seen"] else None,
-            steps=steps[0],
+            tool_calls=turn.tool_calls,
+            input_tokens=turn.input_tokens if turn.usage_seen else None,
+            output_tokens=turn.output_tokens if turn.usage_seen else None,
+            steps=turn.steps,
         )

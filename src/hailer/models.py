@@ -240,10 +240,10 @@ class AgentEvent:
 
     ``message_delta``: ``text`` is a piece of the model's reply. ``tool_call``: ``text`` is the tool's
     name; ``detail`` has ``arguments`` (an 80-character preview), ``args`` (a JSON-safe copy of the
-    arguments) and ``id`` (the tool call's id). ``tool_result``: the answer to the ``tool_call`` with
-    the same ``id``; ``detail`` has ``id``, ``ok``, ``summary`` (one line, may be empty; see
-    :mod:`hailer.tool_outcomes`) and ``seconds`` since the ``tool_call``. ``status``: ``text`` is a
-    short activity line.
+    arguments) and ``id`` (the tool call's id, made unique in the turn). ``tool_result``: the answer to
+    the ``tool_call`` with the same ``id``; ``detail`` has ``id``, ``ok``, ``summary`` (one line, may be
+    empty; see :mod:`hailer.tool_outcomes`) and ``seconds`` since the ``tool_call``. ``status``:
+    ``text`` is a short activity line.
     """
 
     kind: AgentEventKind

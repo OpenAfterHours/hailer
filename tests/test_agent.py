@@ -1067,13 +1067,59 @@ def test_parallel_tool_calls_are_matched_by_id_as_they_finish(harness):
     assert summary.steps == 2 and summary.tool_calls == ["slow", "echo"]
 
 
-def test_a_repeated_call_id_is_answered_in_order(harness):
+def test_a_repeated_call_id_gets_its_own_event_id(harness):
     """Some gateways number calls per reply (call_1 every time): sequential calls reuse the id."""
     h = harness([call("echo", {"text": "a"}, "call_1"), call("echo", {"text": "b"}, "call_1"), say("ok")])
     events: list[AgentEvent] = []
     summary = h.agent.run_turn("twice", on_event=events.append)
-    assert [kind for kind, _name, _id in steps_of(events)] == ["tool_call", "tool_result", "tool_call", "tool_result"]
+    assert steps_of(events) == [
+        ("tool_call", "echo", "call_1"),
+        ("tool_result", "echo", "call_1"),
+        ("tool_call", "echo", "call_1#2"),
+        ("tool_result", "echo", "call_1#2"),
+    ]
     assert summary.steps == 2
+
+
+@pytest.mark.parametrize("ids", [("", ""), ("dup", "dup")])
+def test_parallel_calls_without_distinct_ids_keep_their_own_name_args_and_time(harness, ids):
+    both = AIMessage(
+        content="",
+        tool_calls=[{"name": "slow", "args": {"seconds": 0.3}, "id": ids[0]}, {"name": "echo", "args": {"text": "hi"}, "id": ids[1]}],
+    )
+    h = harness([both, say("both done")])
+    events: list[AgentEvent] = []
+    summary = h.agent.run_turn("do both", on_event=events.append)
+    calls = {e.detail["id"]: (e.text, e.detail["args"]) for e in events if e.kind == "tool_call"}
+    results = {e.detail["id"]: (e.text, e.detail["seconds"]) for e in events if e.kind == "tool_result"}
+    first, second = (f"{ids[0] or 'call'}#1", f"{ids[0] or 'call'}#2") if not ids[0] else ("dup", "dup#2")
+    assert calls == {first: ("slow", {"seconds": 0.3}), second: ("echo", {"text": "hi"})}, "ids unique in the turn"
+    assert [e.detail["id"] for e in events if e.kind == "tool_result"] == [second, first]  # echo finishes first
+    assert results[first][0] == "slow" and results[first][1] >= 0.29
+    assert results[second][0] == "echo" and results[second][1] < results[first][1]
+    assert summary.steps == 2
+
+
+def test_turn_events_ignore_a_result_for_no_call_of_the_turn():
+    """The tools node only answers this turn's calls, and _settle_history's results never stream; a
+    result for any other id says nothing rather than guess."""
+    seen: list[AgentEvent] = []
+    turn = agent_mod._TurnEvents(seen.append)
+    turn.on_update({"tools": {"messages": [ToolMessage(INTERRUPTED_TOOL_RESULT, tool_call_id="old", name="slow")]}})
+    turn.on_update({"tools": {"messages": [ToolMessage("echo: hi", tool_call_id="nope", name="echo")]}})
+    assert seen == [] and turn.steps == 0
+    calls = [{"name": "echo", "args": {"text": "a"}, "id": "x"}, {"name": "slow", "args": {"seconds": 1}, "id": "x"}]
+    turn.on_update({"model": {"messages": [AIMessage(content="", tool_calls=calls)]}})
+    turn.on_update({"tools": [{"messages": [ToolMessage("slow done", tool_call_id="x", name="slow")]}]})
+    turn.on_update({"tools": {"messages": [ToolMessage("echo: a", tool_call_id="x", name="echo")]}})
+    turn.on_update({"tools": {"messages": [ToolMessage("again", tool_call_id="x", name="echo")]}})
+    assert [(e.kind, e.text, e.detail["id"]) for e in seen] == [
+        ("tool_call", "echo", "x"),
+        ("tool_call", "slow", "x#2"),
+        ("tool_result", "slow", "x#2"),  # matched by name, not by order
+        ("tool_result", "echo", "x"),
+    ]
+    assert turn.steps == 2 and turn.tool_calls == ["echo", "slow"]
 
 
 def test_failed_tool_results_are_not_ok(tmp_path):
@@ -1096,7 +1142,7 @@ def test_failed_tool_results_are_not_ok(tmp_path):
         agent.close()
     results = {e.detail["id"]: (e.text, e.detail["ok"], e.detail["summary"]) for e in events if e.kind == "tool_result"}
     assert results == {
-        "x1": ("marimo_execute", False, "marimo is not running: this session has no kernel"),
+        "x1": ("marimo_execute", False, "marimo not running"),
         "x2": ("notebook_create", False, "invalid arguments"),
         "x3": ("no_such_tool", False, "unknown tool"),
         "x4": ("marimo_status", True, "not running"),
@@ -1277,6 +1323,45 @@ def test_wire_tool_steps_carry_the_gateways_call_ids(wire, stream):
     assert [b["stream"] for b in bodies] == [stream, stream]
     answered = [m["tool_call_id"] for m in bodies[1]["messages"] if m["role"] == "tool"]
     assert sorted(answered) == ["call_1", "call_2"]
+
+
+@pytest.mark.parametrize("stream", [True, False])
+def test_wire_tool_status_never_reaches_the_endpoint(tmp_path, monkeypatch, stream):
+    """Hailer's own tools (no kernel): what the model is sent is the reply text exactly, and the status
+    LangChain keeps beside it (the artifact the tool_result events are made from) is not sent."""
+    from hailer.tools import HailerTools
+
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
+    with FakeGateway(allow_stream=stream) as gateway:
+        config = gateway_config(tmp_path, gateway, stream=stream)
+        agent = HailerAgent(config, ContextBundle(), env=GATEWAY_ENV)
+        events: list[AgentEvent] = []
+        try:
+            summary = agent.run_turn("please check both", on_event=events.append)
+        finally:
+            agent.close()
+
+    direct = HailerTools(config)
+    expected = {"call_1": str(direct.marimo_status()), "call_2": str(direct.marimo_execute("print(1 + 1)"))}
+    bodies = [r["body"] for r in gateway.requests]
+    assert len(bodies) == 2 and all(sorted(b) == ["messages", "model", "stream", "tools"] for b in bodies)
+    sent = [m for m in bodies[1]["messages"] if m["role"] == "tool"]
+    assert {m["tool_call_id"]: m["content"] for m in sent} == expected, "the model reads the reply text, byte for byte"
+    assert all(sorted(m) == ["content", "role", "tool_call_id"] for m in sent)
+    assert "artifact" not in json.dumps(bodies) and '"ok"' not in json.dumps(bodies)
+    results = {e.detail["id"]: (e.detail["ok"], e.detail["summary"]) for e in events if e.kind == "tool_result"}
+    assert results == {"call_1": (True, "not running"), "call_2": (False, "marimo not running")}
+    assert summary.steps == 2
+
+
+def test_the_status_is_left_out_of_both_wire_formats():
+    """langchain-openai's own conversions of a tool message: Chat Completions and Responses."""
+    from langchain_openai.chat_models import base
+
+    message = ToolMessage("reply text", tool_call_id="c1", artifact={"ok": False, "error": "NoSessionError"})
+    assert base._convert_message_to_dict(message) == {"content": "reply text", "role": "tool", "tool_call_id": "c1"}
+    assert base._construct_responses_api_input([message]) == [{"type": "function_call_output", "output": "reply text", "call_id": "c1"}]
 
 
 def test_async_wire_lifecycle_owns_http_and_sqlite_on_one_loop(wire, monkeypatch):

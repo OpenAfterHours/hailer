@@ -805,12 +805,28 @@ no shell, no file tool, all Python runs in the marimo kernel.
 TOOL_NAMES: tuple[str, ...]      # the 12 names in the table, in the order they are offered to the model
 DEFAULT_SESSION_WAIT_SEC = 30.0
 NOTEBOOK_LINK_TIP = "The user can also run /notebook in the chat to get the link."
-class HailerTools:               # one plain method per tool, each -> str; the method's docstring is the description the model sees
+class HailerTools:               # one plain method per tool, each -> str (a ToolReply); the method's docstring is the description the model sees
     def __init__(self, config: HailerConfig, sandbox: MarimoSandbox | None = None, *, open_url: UrlOpener | None = None, session_wait_sec: float = DEFAULT_SESSION_WAIT_SEC) -> None
+class ToolReply(str):            # the reply text, equal to it, with how the call went beside it
+    status: dict[str, Any]       # {"ok": bool, ...}, see below
 def hailer_tools(config: HailerConfig, *, sandbox: MarimoSandbox | None = None, open_url: UrlOpener | None = None, session_wait_sec: float = DEFAULT_SESSION_WAIT_SEC) -> list[Any]
-    # LangChain StructuredTool.from_function(func=method, coroutine=_in_daemon_thread(method), name=name, description=inspect.getdoc(method)), in TOOL_NAMES order
+    # LangChain StructuredTool.from_function(func=call, coroutine=_in_daemon_thread(call), name=name, description=inspect.getdoc(method),
+    #   response_format="content_and_artifact"), in TOOL_NAMES order; call = _content_and_artifact(method) (functools.wraps keeps the
+    #   signature the schema is read from) returns (str(reply), reply.status)
     # UrlOpener = Callable[[str], bool]
 ```
+
+**Status beside the text.** Every reply is a `ToolReply`, which equals its text (callers comparing text are
+unaffected), and LangChain gets the text as the tool message's content (byte for byte, a plain `str`) and
+`status` as its artifact, which langchain-openai leaves out of both wire formats (`test_agent.py` checks the
+requests). `status` is decided where the tool knows, never from the text (which holds whatever the user's code
+printed or a file contained): `_run` sets `{"ok": False, "error": <HailerError subclass name>}` for a
+`HailerError`, `{"ok": False, "error": <exception type name>, "unexpected": True}` for any other exception,
+and `truncated: True` when the text was cut to `max_tool_output_chars`; `marimo_execute` sets
+`{"ok": False, "error": "execution_failed"}` from the kernel's `success` flag; a failed cell listing or check
+snapshot is `error: "cells_unreadable"` and an unknown template `error: "unknown_template"`. A reply with code
+checks adds `findings` (count), `checked` and `skipped` (`ruff` / `ty`), and `marimo_execute` adds `cells`
+(the changed cells' names from the after snapshot, `""` for an unnamed one). `hailer.tool_outcomes` reads it.
 
 The kernel is `sandbox`, the one this session started (kept in memory; nothing is discovered). Without one
 every kernel tool answers `ERROR: marimo is not running: this session has no kernel` with `launch_hint()`.
@@ -865,27 +881,42 @@ and `hailer_tools` so tests never launch a browser.
 ```python
 SUMMARY_LIMIT = 80
 class Outcome(NamedTuple): ok: bool; summary: str = ""
-def tool_outcome(name: str, args: Mapping[str, Any] | None, result: Any, *, error: bool = False) -> Outcome  # never raises
+def tool_outcome(name: str, args: Mapping[str, Any] | None, content: Any, status: Any = None, *, error: bool = False) -> Outcome  # never raises
 ```
-The `ok` and `summary` of the agent's `tool_result` events, read from the reply a tool gave the model (standard
-library and `hailer.log.redact` only). `ok` is False for `error=True` (a `status="error"` `ToolMessage`:
-`invalid arguments`, `unknown tool`, else the exception name or `failed`; the arguments LangGraph quotes never
-show), for an `ERROR: ` reply (summary: its first line, with `unexpected <ExceptionType>` for `tools._run`'s
-unexpected errors), for `marimo_execute` code that failed (`Execution failed.`) or ran a cell that raised (the
-exception name from the traceback, else `failed` / `cell error`), for `Could not list cells.` /
-`Could not read the notebook's cells.` and for a `fetch_page` response that is not text. Summaries by tool:
-`marimo_execute` the cells code mode reports it changed (`growth_by_region`, `a and b`, `4 cells`, `deleted
-scratch`, `installed altair`; read from marimo's own lines such as `created and ran cell 'Hbol' (name)`), a
-frame's `4 rows` (Polars `shape: (4, 3)`, pandas `[4 rows x 3 columns]`) and the checks (`checks clean`,
-`2 findings`, `ty skipped`); `notebook_check` `clean` / `N findings`; `notebook_cells` `6 cells, 1 with errors` /
-`N matching cells` / `no cells`; `notebook_list` `3 notebooks, 1 open`; `notebook_create` / `notebook_open` the
-notebook's name and session outcome (`already open`, `opened in your browser`, `no session yet`, `browser did
-not open`, `marimo not running`; open adds the cell count); `notebook_close` `<name>, closed` / `<name>, was not
-open`; `marimo_status` `<name> ready` / `<name> not open` / `not running`; `list_periods` `[dataset, ]6 months,
-25-01 to 25-06[; discount from 25-04]` or `no period files, N other files`; `load_skill` `<name>, N files`;
-`read_skill_file` `<path>, N lines`; `fetch_page` `<host[:port]>, 12.3 KB`. A summary is one line of at most
-`SUMMARY_LIMIT` characters (`...` when cut), with control characters removed, URLs reduced to their host and
-secrets masked; it names counts and names only, never data values. An unknown tool or reply format gives `""`.
+The `ok` and `summary` of the agent's `tool_result` events (standard library only). **`ok` never comes from the
+text**: `error=True` (a `status="error"` `ToolMessage`, LangChain could not run the tool) is a failure worded by
+LangGraph's template (`invalid arguments`, `unknown tool`, else the exception name or `failed`; the arguments it
+quotes never show); otherwise `ok` is `status["ok"]` (the `ToolReply` status, the message's artifact), and
+without a status (not a Hailer tool) the call is ok with an empty summary. A failure is worded by its error
+class, never its message (which may quote a URL with a token, a path or data): `NoSessionError` → `notebook not
+open`, `MarimoUnavailableError` → `marimo not running`, `MarimoExecutionError` → `kernel request failed`,
+`NotebookNotFoundError` → `notebook not found`, `NotebookExistsError` → `notebook already exists`,
+`NotebookPathError` → `not in the notebooks folder` (`not a usable notebook name` for `notebook_create`),
+`WebAccessDenied` → `host not allowed`, `cells_unreadable` → `could not read the cells`, `unknown_template` →
+`unknown template`, an unexpected exception → `unexpected <Type>`, a plain `HailerError` by tool (`could not
+fetch the page`, `skill not found`, `could not read the file`, `could not read the data folder`, else
+`failed`); `marimo_execute` code that failed names the exception from its traceback (else `failed`).
+
+Summaries of calls that worked are read from the parts of the text Hailer writes itself, and never repeat what
+the arguments say (the UI shows those as the step's target): `marimo_execute` the changed cells (`cells` from
+the status: `growth_by_region`, `a and b`, `4 cells`; without checks, and for `deleted scratch` / `installed
+altair` / a cell that raised, marimo's own lines such as `created and ran cell 'Hbol' (name)`, read only when
+the code used `marimo._code_mode`), a frame's `4 rows` (Polars `shape: (4, 3)` at the start of a line, pandas
+`[4 rows x 3 columns]`, read from the text before the check report) and the checks from the status (`checks
+clean`, `2 findings`, `ty skipped`, `checks skipped`); `notebook_check` `clean` / `N findings` / `checks off` /
+`no code`; `notebook_cells` `6 cells, 1 with errors` / `N matching cells` / `no cells` (`N+ cells` when the
+reply was truncated); `notebook_list` `3 notebooks, 1 open`; `notebook_create` / `notebook_open` the session
+outcome (`already open`, `opened in your browser`, `no session yet`, `browser did not open`, `marimo not
+running`; open adds the cell count), led by the notebook's name only when the argument did not already name it
+(`q2_churn.py` for "Q2 Churn"); `notebook_close` `closed` / `was not open` (`<name>, closed` without an
+argument); `marimo_status` `<name> ready` / `<name> not open` / `not running`; `list_periods` `[dataset, ]6
+months, 25-01 to 25-06[; discount from 25-04]` (the dataset only without a name argument) or `no period files,
+N other files`; `load_skill` `N files` / `no files` (from the last `Files (read with read_skill_file(...)):`
+block, so a SKILL.md quoting it changes nothing); `read_skill_file` `N lines` / `truncated`; `fetch_page`
+`12.3 KB` (`, truncated`; `, redirected to <host[:port]>` when the page came from another host) or `not text
+(<type>)` when the whole reply is fetch_page's not-text notice. A summary is one line of at most
+`SUMMARY_LIMIT` printable characters (`...` when cut; `str.isprintable`, as `chat_ui._single_line`), counts and
+names only. An unknown tool or reply format gives `""`.
 
 ## `code_checks.py`  (owner: code checks, 2026-09-22)
 
@@ -1019,17 +1050,21 @@ class HailerAgent:
   The turn runs as `graph.astream(..., stream_mode=["updates", "messages"])`. Events (`AgentEventKind =
   "message_delta" | "tool_call" | "tool_result" | "status"`), all emitted synchronously on the owning loop:
   - `AgentEvent("message_delta", <text>)`: a piece of the reply (the `model` node only, never the summariser).
-  - `AgentEvent("tool_call", <name>, {"arguments": <80-char preview>, "args": <dict>, "id": <tool_call_id>})`
-    for each call in a `model` update. `args` is a shallow copy of the call's arguments that `json.dumps`
-    accepts (other values as `str`; `{}` when they are not a mapping); `id` is `""` when the model sent none.
-  - `AgentEvent("tool_result", <name>, {"id": <tool_call_id>, "ok": <bool>, "summary": <str>, "seconds":
-    <float>})` for each `ToolMessage` in a `tools` update, after that call's `tool_call`. Results are matched
-    to calls by id (an id the turn already answered may be reused by a later call; oldest first), so calls of
-    one model message may finish in any order (LangChain runs each as its own task). `seconds` is the wall time
-    since the `tool_call` event, rounded to ms; `0.0` for a result without a call in this turn. `ok` and
-    `summary` come from `tool_outcomes.tool_outcome(name, args, content, error=(status == "error"))`.
+  - `AgentEvent("tool_call", <name>, {"arguments": <80-char preview>, "args": <dict>, "id": <str>})` for each
+    call in a `model` update. `args` is a shallow copy of the call's arguments that `json.dumps` accepts (other
+    values as `str`; `{}` when they are not a mapping). `id` is unique in the turn, so the UI matches on it
+    alone: the call's tool_call_id, or `<id>#<n>` when the turn already used that id (some gateways number
+    calls per reply) and `call#<n>` when the model sent none (`n`: the call's position in the turn).
+  - `AgentEvent("tool_result", <name>, {"id": <str>, "ok": <bool>, "summary": <str>, "seconds": <float>})` for
+    each `ToolMessage` in a `tools` update that answers a call of this turn, after that call's `tool_call` and
+    with its `id`. A result is matched by its tool_call_id and, among the turn's waiting calls sharing one, by
+    tool name, then oldest first; calls of one model message may finish in any order (LangChain runs each as
+    its own task). A `ToolMessage` for no waiting call emits nothing and is not a step. `seconds` is the wall
+    time since the `tool_call` event, rounded to ms. `ok` and `summary` come from
+    `tool_outcomes.tool_outcome(name, args, content, message.artifact, error=(message.status == "error"))`.
     A call the turn is cancelled in gets no `tool_result` (the UI marks it cancelled), nor does the
-    `INTERRUPTED_TOOL_RESULT` that `_settle_history` writes for it before the next turn.
+    `INTERRUPTED_TOOL_RESULT` that `_settle_history` writes for it before the next turn (state updates are
+    not streamed). The bookkeeping is `_TurnEvents(emit).on_update(update)`, testable without a graph.
   - `"status"`: the agent does not emit it today.
   `TurnSummary(final_response, thread_id, duration_ms, tool_calls, input_tokens, output_tokens,
   status="completed", steps)`: `final_response` is the last model message without tool calls; tokens are summed
@@ -1250,14 +1285,18 @@ package-install rule) are appended by `agent.system_prompt`. Loaded with
   check that `hailer.tools` touches neither folder. The `tool_outcomes` tests read replies the tools wrote:
   `CodeModeClient` runs `LIST_CELLS_CODE` and the check snapshot for real against a stand-in code-mode
   context, and `code_mode_says` produces marimo's own change lines (its `_print_summary`), so a format change
-  in marimo or in a tool fails there
+  in marimo or in a tool fails there. They also check that each reply's status reaches LangChain as the
+  artifact with the content unchanged, and that what the user's code prints (`ERROR: ...`, `Execution
+  failed.`, a fake code-mode or check line) or a skill file holds never decides `ok` or shows up
 - `test_secrets.py`: D. `test_agent.py`: LangChain migration. Unit tests drive `HailerAgent` through
   `model_factory=` with `ScriptedModel` (a `BaseChatModel` replaying messages, exceptions or callables) and
   two toy tools: `build_model` kwargs, tracing, system prompt, error mapping, lifecycle (resume after a
   restart, `new_thread`, `set_model`, `close`), turns (events, usage, one user message, `/reload`, failed-turn
   merge, summarisation), tool steps (each `tool_call` followed by the `tool_result` with its id, parallel calls
-  matched by id as they finish, error results, no result for a cancelled call or for the history repair,
-  `TurnSummary.steps`) and Ctrl+C during a model call and during a tool (a real SIGINT to the main thread
+  matched by id as they finish, empty and repeated ids made unique and matched by name, `_TurnEvents` ignoring a
+  result for no call of the turn, error results, no result for a cancelled call or for the history repair,
+  `TurnSummary.steps`; on the wire, with Hailer's own tools streamed and not, the tool messages sent are the
+  reply text exactly and carry no status) and Ctrl+C during a model call and during a tool (a real SIGINT to the main thread
   on POSIX, `_thread.interrupt_main()` on Windows; see "Runtime facts").
   Wire-level tests run the real `ChatOpenAI` against `tests/fake_gateway.py` (`FakeGateway`, a stdlib
   `ThreadingHTTPServer` on 127.0.0.1: only `POST /v1/chat/completions`, 404 elsewhere, 422 for unknown fields
