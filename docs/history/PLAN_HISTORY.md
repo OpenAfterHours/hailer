@@ -1,8 +1,32 @@
 # Hailer: implementation plan (history)
 
-> Historical record: `PLAN.md` before its 2026-09-23 rewrite, kept as written. Each section describes the
-> design at the time (for example the `local` default runtime, kernels shared between terminals and the
-> writable notebooks mount), not the current one, which is in [PLAN.md](../../PLAN.md).
+> Historical record: the dated entries `PLAN.md` carried, newest first, and `PLAN.md` before its 2026-09-23
+> rewrite, kept as written. Each section describes the design at the time (for example the `local` default
+> runtime, kernels shared between terminals and the writable notebooks mount), not the current one, which is
+> in [PLAN.md](../../PLAN.md).
+
+## 2026-09-23: the sandbox simplification
+
+Phases 0–4 of [docs/ARCHITECTURE_PROPOSAL.md](../ARCHITECTURE_PROPOSAL.md) are implemented on branch
+`worktree-sandbox-simplification`: the image is versioned by its content and its token is off the command
+line (R5, F7); each process owns one kernel and cross-terminal reuse, `kernel.json`, `marimo_url`,
+`--keep-marimo` and `hailer exec` are gone (R2); notebook and data access goes through `MarimoSandbox` and
+`PathMap` is gone (R1); the docker kernel's notebooks live in a tmpfs and come back through the allow-listed
+sync, which replaced the notebooks mount rules and the planted-file scan (R3); Docker is the default and the
+unisolated runtime is `unsafe-local` (R4); `cli.py` became the `hailer.cli` package, the unused environment
+overrides went and the history moved to `docs/history/` (R7). The GCP runtime (R6) is not started.
+
+Verified:
+
+- Offline suite on Windows 11, Python 3.13: 1024 passed, 14 skipped (no key, no Docker, loopback only).
+- `tests/test_docker_integration.py` with `HAILER_DOCKER_TESTS=strict`: 11 passed on Windows 11 with Docker
+  Desktop 29.4.3, including the token absent from `docker inspect`, planted files
+  (`.git/`, `conftest.py`, `.vscode/`, a non-notebook `.py`) never reaching the host while notebook edits do,
+  and nothing left behind after stop.
+
+Still owed: the Docker integration run on Linux, macOS and `linux/arm64`; a live turn against a paid model on
+this branch; a physical Ctrl+C in a Windows console.
+
 
 ## 2026-09-19: final Docker kernel review and integration
 

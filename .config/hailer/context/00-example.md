@@ -29,6 +29,8 @@
 ## Conventions
 
 - "Latest month" means the most recent period present in `data/`, not the calendar month.
+- Reports are refreshed every month when the new file lands in `data/`: the reporting month is a
+  setting that defaults to the latest month, never a month typed into the analysis or the text.
 - Month-on-month movement is `latest - previous`; percentages are relative to the previous month.
 - Report revenue in £k with one decimal (e.g. £41.1k). Keep tables to the top 10 rows unless asked.
 - Prefer Polars; use DuckDB SQL when joining across many files.
