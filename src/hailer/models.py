@@ -231,12 +231,20 @@ class ContextBundle:
 # --------------------------------------------------------------------------- #
 
 
-AgentEventKind = Literal["message_delta", "tool_call", "status"]
+AgentEventKind = Literal["message_delta", "tool_call", "tool_result", "status"]
 
 
 @dataclass(frozen=True)
 class AgentEvent:
-    """A progress event surfaced to the terminal while a turn is running."""
+    """A progress event surfaced to the terminal while a turn is running.
+
+    ``message_delta``: ``text`` is a piece of the model's reply. ``tool_call``: ``text`` is the tool's
+    name; ``detail`` has ``arguments`` (an 80-character preview), ``args`` (a JSON-safe copy of the
+    arguments) and ``id`` (the tool call's id). ``tool_result``: the answer to the ``tool_call`` with
+    the same ``id``; ``detail`` has ``id``, ``ok``, ``summary`` (one line, may be empty; see
+    :mod:`hailer.tool_outcomes`) and ``seconds`` since the ``tool_call``. ``status``: ``text`` is a
+    short activity line.
+    """
 
     kind: AgentEventKind
     text: str
@@ -252,6 +260,8 @@ class TurnSummary:
     input_tokens: int | None = None
     output_tokens: int | None = None
     status: str = "completed"
+    #: Tool calls that ran: the turn's ``tool_result`` events.
+    steps: int = 0
 
 
 # --------------------------------------------------------------------------- #

@@ -22,6 +22,15 @@ MODEL_PATTERN = re.compile(r"^(corp-gpt|corp-mini)$")
 ALLOWED_FIELDS = {"model", "messages", "tools", "tool_choice", "stream", "temperature", "max_tokens", "reasoning_effort"}
 
 
+def _calls(reply: dict) -> list[tuple[str, str, dict]]:
+    """``(id, name, args)`` of a scripted reply's tool calls: ``tool``/``args`` for one, ``tools`` for several."""
+    if reply.get("tools"):
+        return [(f"call_{i}", name, args) for i, (name, args) in enumerate(reply["tools"], start=1)]
+    if reply.get("tool"):
+        return [("call_1", reply["tool"], reply.get("args", {}))]
+    return []
+
+
 class FakeGateway:
     def __init__(
         self,
@@ -81,11 +90,12 @@ class FakeGateway:
                 if body.get("stream"):
                     return self._stream(body, reply)
                 message = {"role": "assistant", "content": reply.get("text")}
-                if reply.get("tool"):
-                    message["tool_calls"] = [{"id": "call_1", "type": "function", "function": {"name": reply["tool"], "arguments": json.dumps(reply.get("args", {}))}}]
+                calls = _calls(reply)
+                if calls:
+                    message["tool_calls"] = [{"id": call_id, "type": "function", "function": {"name": name, "arguments": json.dumps(args)}} for call_id, name, args in calls]
                 self._json(200, {
                     "id": "chatcmpl-spike", "object": "chat.completion", "created": 0, "model": body["model"],
-                    "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if reply.get("tool") else "stop"}],
+                    "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if calls else "stop"}],
                     "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
                 })
 
@@ -102,11 +112,13 @@ class FakeGateway:
 
                 base = {"id": "chatcmpl-spike", "object": "chat.completion.chunk", "created": 0, "model": body["model"]}
                 try:
-                    if reply.get("tool"):
-                        args = json.dumps(reply.get("args", {}))
-                        send({**base, "choices": [{"index": 0, "delta": {"role": "assistant", "content": None, "tool_calls": [{"index": 0, "id": "call_1", "type": "function", "function": {"name": reply["tool"], "arguments": ""}}]}, "finish_reason": None}]})
-                        for piece in (args[: len(args) // 2], args[len(args) // 2:]):
-                            send({**base, "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": piece}}]}, "finish_reason": None}]})
+                    calls = _calls(reply)
+                    if calls:
+                        for index, (call_id, name, call_args) in enumerate(calls):
+                            args = json.dumps(call_args)
+                            send({**base, "choices": [{"index": 0, "delta": {"role": "assistant", "content": None, "tool_calls": [{"index": index, "id": call_id, "type": "function", "function": {"name": name, "arguments": ""}}]}, "finish_reason": None}]})
+                            for piece in (args[: len(args) // 2], args[len(args) // 2:]):
+                                send({**base, "choices": [{"index": 0, "delta": {"tool_calls": [{"index": index, "function": {"arguments": piece}}]}, "finish_reason": None}]})
                         finish = "tool_calls"
                     else:
                         send({**base, "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]})
@@ -137,6 +149,8 @@ class FakeGateway:
         if last["role"] == "tool":
             return {"text": f"Tool said: {str(last['content'])[:60]}"}
         text = last["content"] if isinstance(last["content"], str) else json.dumps(last["content"])
+        if "check both" in text:  # two tool calls in one reply, as a model calling tools in parallel sends
+            return {"tools": [("marimo_status", {}), ("marimo_execute", {"code": "print(1 + 1)"})]}
         if "status" in text:
             return {"tool": "marimo_status", "args": {}}
         if "run" in text:

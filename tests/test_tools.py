@@ -6,9 +6,15 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
+import io
 import json
 import threading
+import traceback
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -16,8 +22,9 @@ import pytest
 from fake_sandbox import folder_sandbox
 from hailer import code_checks, notebooks
 from hailer.errors import MarimoUnavailableError, NoSessionError
-from hailer.marimo_client import name_in_folder
+from hailer.marimo_client import LIST_CELLS_CODE, name_in_folder
 from hailer.models import CodeChecksConfig, ExecResult, HailerConfig, MarimoServer, MarimoSession, WebConfig
+from hailer.tool_outcomes import SUMMARY_LIMIT, tool_outcome
 from hailer.tools import TOOL_NAMES, HailerTools, hailer_tools
 
 NOTEBOOK_SOURCE = 'import marimo\n\n__generated_with = "0.24.2"\napp = marimo.App()\n\n\n@app.cell\ndef _():\n    return\n\n\nif __name__ == "__main__":\n    app.run()\n'
@@ -935,3 +942,371 @@ def test_the_tools_work_through_marimos_file_api(tmp_path):
     assert all(url.startswith(f"{srv.url}/?file=/work/notebooks/") for url in opened)
     files = [r for r in srv.requests if r["path"].startswith("/api/files/")]
     assert files and all(r["headers"]["Authorization"] == f"Bearer {SECRET}" for r in files)
+
+
+# --------------------------------------------------------------------------- #
+# One-line outcomes (hailer.tool_outcomes) of the replies the tools above write
+# --------------------------------------------------------------------------- #
+
+
+def outcome(name: str, args: dict, text: str) -> tuple[bool, str]:
+    """tool_outcome, checked for what every summary must be: one short line without control characters."""
+    ok, summary = tool_outcome(name, args, text)
+    assert isinstance(ok, bool) and isinstance(summary, str)
+    assert len(summary) <= SUMMARY_LIMIT and summary == " ".join(summary.split()), repr(summary)
+    assert not any(ord(ch) < 32 or 0x7F <= ord(ch) < 0xA0 for ch in summary), repr(summary)
+    return ok, summary
+
+
+class CodeModeClient(FakeClient):
+    """A FakeClient whose kernel runs Hailer's own read-only scratchpad code (the cell listing and the
+    check snapshot) for real, in this process, with marimo's code-mode context replaced by one that
+    holds ``cells`` (``id``, ``code`` and optionally ``name``, ``status``, ``errors``). Any other code
+    gets ``result`` and applies ``writes`` (code -> cells it adds or replaces)."""
+
+    def __init__(self, cells: list[dict], writes: dict[str, list[dict]] | None = None, **kw):
+        super().__init__(**kw)
+        self.cells = [dict(c) for c in cells]
+        self.writes = writes or {}
+
+    def execute(self, code, **kw):
+        if code == LIST_CELLS_CODE or code_checks.SNAPSHOT_MARKER in code:
+            self.executed.append(code)
+            return self._run_here(code)
+        result = super().execute(code, **kw)
+        for cell in self.writes.get(code, []):
+            self.cells = [c for c in self.cells if c["id"] != cell["id"]] + [cell]
+        return result
+
+    def _run_here(self, code: str) -> ExecResult:
+        import marimo._code_mode as cm
+        from marimo._code_mode._context import CellStatusType
+
+        views = [
+            SimpleNamespace(
+                id=c["id"], name=c.get("name", "_"), code=c["code"], status=CellStatusType(c.get("status", "idle")), errors=[object()] * c.get("errors", 0)
+            )
+            for c in self.cells
+        ]
+        context = SimpleNamespace(cells=views, _document=SimpleNamespace(cells=views), _kernel=SimpleNamespace(user_config={"save": {}}))
+        out = io.StringIO()
+        with mock.patch.object(cm, "get_context", lambda: context), contextlib.redirect_stdout(out):
+            exec(compile(code, "<scratchpad>", "exec"), {})
+        return ExecResult(success=True, stdout=out.getvalue())
+
+
+def code_mode_says(ops: list, *, names: dict[str, str], ran: set[str] = frozenset(), errored: set[str] = frozenset(), packages: tuple[str, ...] = ()) -> str:
+    """What marimo's code mode prints once it has applied ``ops`` (its own ``_print_summary``, on a
+    stand-in context: ``names`` are the cells' names, ``errored`` the ones whose run raised)."""
+    from marimo._code_mode._context import AsyncCodeModeContext
+    from marimo._code_mode._packages import _AddPackage
+
+    documents = {cid: SimpleNamespace(name=name) for cid, name in names.items()}
+    graph = SimpleNamespace(cells={cid: SimpleNamespace(exception=ZeroDivisionError() if cid in errored else None) for cid in names})
+    context = SimpleNamespace(_document=SimpleNamespace(get=documents.get), graph=graph)
+    context._cell_label = lambda cid: AsyncCodeModeContext._cell_label(context, cid)
+    context._cell_errored = lambda cid: AsyncCodeModeContext._cell_errored(context, cid)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        AsyncCodeModeContext._print_summary(context, ops, [_AddPackage(p) for p in packages], [], set(ran))
+    return out.getvalue()
+
+
+def traceback_of(fn) -> str:
+    try:
+        fn()
+    except Exception:  # noqa: BLE001 - the point is the traceback text
+        return traceback.format_exc()
+    raise AssertionError("expected an exception")
+
+
+STARTER = [{"id": "imp", "code": "import marimo as mo\nimport polars as pl"}, {"id": "load", "name": "load", "code": "sales = pl.read_csv('sales.csv')"}]
+
+
+def test_outcome_of_code_that_adds_a_cell(tmp_path):
+    from marimo._ast.cell import CellConfig
+    from marimo._code_mode._plan import _AddOp
+
+    cell = {"id": "Hbol", "name": "growth_by_region", "code": "growth = sales.height"}
+    says = code_mode_says([_AddOp("Hbol", cell["code"], CellConfig(), name="growth_by_region")], names={"Hbol": "growth_by_region"}, ran={"Hbol"})
+    assert says == "created and ran cell 'Hbol' (growth_by_region)\n", "marimo's words, which the summary is read from"
+    client = CodeModeClient(STARTER, {WRITE_CELL: [cell]}, result=ExecResult(success=True, stdout=says))
+    text = checked(make_config(tmp_path), client).marimo_execute(WRITE_CELL)
+    assert text.endswith("Checks (ruff, ty) on the 1 changed cell: no findings.")
+    assert outcome("marimo_execute", {"code": WRITE_CELL}, text) == (True, "growth_by_region, checks clean")
+
+
+def test_outcome_of_an_edit_with_a_finding_and_a_run_that_raised(tmp_path):
+    from marimo._code_mode._plan import _UpdateOp
+
+    pl = pytest.importorskip("polars")
+    edited = {"id": "load", "name": "load", "code": "sales = pl.read_csv('sales.csv')\nsales.sortt('region')"}
+    says = code_mode_says([_UpdateOp("load", code=edited["code"])], names={"load": "load"}, ran={"load"}, errored={"load"})
+    assert says == "\nedited code of cell 'load' (load) and ran (error)\n"
+    raised = traceback_of(lambda: pl.DataFrame().sortt)
+    client = CodeModeClient(STARTER, {WRITE_CELL: [edited]}, result=ExecResult(success=True, stdout=says, stderr=raised))
+    text = checked(make_config(tmp_path), client).marimo_execute(WRITE_CELL)
+    assert "1 finding." in text
+    assert outcome("marimo_execute", {"code": WRITE_CELL}, text) == (False, "load, AttributeError, 1 finding")
+
+
+def test_outcome_of_several_cells_a_delete_and_a_package():
+    from marimo._ast.cell import CellConfig
+    from marimo._code_mode._plan import _AddOp, _DeleteOp
+
+    ops = [_AddOp("a1", "t = 1", CellConfig(), name="totals"), _AddOp("b2", "2", CellConfig()), _DeleteOp("c3")]
+    says = code_mode_says(ops, names={"a1": "totals", "b2": "_", "c3": "scratch"}, packages=("altair",))
+    assert says.splitlines() == ["installed altair", "created cell 'a1' (totals)", "created cell 'b2' (_)", "deleted cell 'c3' (scratch)"]
+    assert outcome("marimo_execute", {}, says.rstrip()) == (True, "2 cells, deleted scratch, installed altair")
+    named = code_mode_says([_AddOp(f"c{i}", "1", CellConfig(), name=f"n{i}") for i in range(2)], names={"c0": "n0", "c1": "n1"}, ran={"c0", "c1"})
+    assert outcome("marimo_execute", {}, named.rstrip()) == (True, "n0 and n1")
+    many = code_mode_says([_AddOp(f"c{i}", "1", CellConfig(), name=f"n{i}") for i in range(4)], names={f"c{i}": f"n{i}" for i in range(4)})
+    assert outcome("marimo_execute", {}, many.rstrip()) == (True, "4 cells")
+    unnamed_error = code_mode_says([_AddOp("u1", "1/0", CellConfig())], names={"u1": ""}, ran={"u1"}, errored={"u1"})
+    assert unnamed_error.strip() == "created and ran cell 'u1' (error)"
+    assert outcome("marimo_execute", {}, unnamed_error.strip()) == (False, "1 cell, cell error")
+
+
+def test_outcome_when_a_checker_is_missing(tmp_path, monkeypatch):
+    find = code_checks._binary
+
+    def no_ty(name: str) -> str:
+        if name == "ty":
+            raise code_checks._Unavailable("ty is not installed")
+        return find(name)
+
+    monkeypatch.setattr(code_checks, "_binary", no_ty)
+    cell = {"id": "Hbol", "name": "growth_by_region", "code": "growth = sales.height"}
+    client = CodeModeClient(STARTER, {WRITE_CELL: [cell]}, result=ExecResult(success=True, stdout="created cell 'Hbol' (growth_by_region)\n"))
+    text = checked(make_config(tmp_path), client).marimo_execute(WRITE_CELL)
+    assert "(Check skipped: ty is not installed.)" in text
+    assert outcome("marimo_execute", {"code": WRITE_CELL}, text) == (True, "growth_by_region, checks clean, ty skipped")
+
+
+def test_outcome_of_code_that_failed_or_printed_frames(ws):
+    pl = pytest.importorskip("polars")
+
+    def run(result: ExecResult, code: str = "x") -> tuple[bool, str]:
+        return outcome("marimo_execute", {"code": code}, HailerTools(ws, sandbox(ws, FakeClient(result=result))).marimo_execute(code))
+
+    assert run(ExecResult(success=False, stderr=traceback_of(lambda: 1 / 0))) == (False, "ZeroDivisionError")
+    assert run(ExecResult(success=False, stderr="boom")) == (False, "failed")
+    frame = pl.DataFrame({"region": ["N", "S", "E", "W"], "q1": [1, 2, 3, 4], "q2": [5, 6, 7, 8]})
+    assert run(ExecResult(success=True, stdout=f"{frame}\n")) == (True, "4 rows")
+    assert run(ExecResult(success=True, stdout=f"{pl.DataFrame({'a': range(1500)})}\n")) == (True, "1,500 rows")
+    assert run(ExecResult(success=True, stdout=f"{pl.Series('s', [1, 2])}\n")) == (True, "2 values")
+    pandas_footer = "     a\n0    0\n..  ..\n99  99\n\n[100 rows x 1 columns]\n"  # how pandas ends a long frame (not installed here)
+    assert run(ExecResult(success=True, stdout=pandas_footer)) == (True, "100 rows")
+    assert run(ExecResult(success=True, output="<table></table>", mimetype="text/html")) == (True, "")
+    assert run(ExecResult(success=True)) == (True, "")  # "(no output)"
+    assert run(ExecResult(success=True, stdout="42\n")) == (True, "")
+
+
+def test_outcome_of_error_replies_names_no_url_secret_or_data(ws):
+    assert outcome("marimo_execute", {}, HailerTools(ws).marimo_execute("1")) == (False, "marimo is not running: this session has no kernel")
+    client = FakeClient(raise_on_execute=RuntimeError("customer 4711 owes 12,000"))
+    text = HailerTools(ws, sandbox(ws, client)).marimo_execute("1")
+    assert outcome("marimo_execute", {}, text) == (False, "unexpected RuntimeError")
+    lost = NoSessionError(f"Not open: http://127.0.0.1:2718/?file=x.py&access_token={SECRET}", f"Open http://127.0.0.1:2718/?access_token={SECRET}")
+    text = HailerTools(ws, sandbox(ws, FakeClient(raise_on_execute=lost))).marimo_execute("1")
+    assert outcome("marimo_execute", {}, text) == (False, "Not open: 127.0.0.1:2718")
+    text = HailerTools(ws, sandbox(ws, client)).fetch_page(f"ftp://docs.pola.rs/x?access_token={SECRET}")
+    assert outcome("fetch_page", {}, text) == (False, "Only http and https URLs can be fetched (got 'docs.pola.rs')")
+
+
+def test_outcome_of_calls_langchain_could_not_run():
+    """status="error" tool messages, in LangGraph's own words: the arguments they quote never show."""
+    from langgraph.prebuilt.tool_node import INVALID_TOOL_NAME_ERROR_TEMPLATE, TOOL_INVOCATION_ERROR_TEMPLATE
+
+    invalid = TOOL_INVOCATION_ERROR_TEMPLATE.format(tool_name="notebook_create", tool_kwargs={"secret": SECRET}, error="name: Field required")
+    assert tool_outcome("notebook_create", {}, invalid, error=True) == (False, "invalid arguments")
+    unknown = INVALID_TOOL_NAME_ERROR_TEMPLATE.format(requested_tool="shell", available_tools="marimo_execute")
+    assert tool_outcome("shell", {}, unknown, error=True) == (False, "unknown tool")
+    assert tool_outcome("marimo_execute", {}, "Error: ValueError('x')\n Please fix your mistakes.", error=True) == (False, "ValueError")
+    assert tool_outcome("marimo_execute", {}, "anything", error=True) == (False, "failed")
+
+
+def test_outcome_of_marimo_status(ws):
+    assert outcome("marimo_status", {}, HailerTools(ws).marimo_status()) == (True, "not running")
+    assert outcome("marimo_status", {}, HailerTools(ws, sandbox(ws)).marimo_status()) == (True, "not running")
+    assert outcome("marimo_status", {}, HailerTools(ws, sandbox(ws, FakeClient())).marimo_status()) == (True, "analysis.py ready")
+    text = HailerTools(ws, sandbox(ws, FakeClient(has_session=False))).marimo_status()
+    assert outcome("marimo_status", {}, text) == (True, "analysis.py not open")
+
+
+def test_outcome_of_notebook_cells(ws):
+    cells = [
+        {"id": "Hbol", "name": "imports", "code": "import marimo as mo"},
+        {"id": "Abcd", "name": "load", "code": "df = load()", "status": "exception", "errors": 2},
+        {"id": "Efgh", "code": ""},  # the listing's last field is empty, and the reply is stripped
+    ]
+    tools = HailerTools(ws, sandbox(ws, CodeModeClient(cells)))
+    listing = tools.notebook_cells()
+    assert listing.splitlines()[1] == "Abcd\tload\texception\terrors=2\tdf = load()", "the real listing code ran"
+    assert outcome("notebook_cells", {}, listing) == (True, "3 cells, 1 with errors")
+    assert outcome("notebook_cells", {"pattern": "load"}, tools.notebook_cells("load")) == (True, "1 matching cell, 1 with errors")
+    assert outcome("notebook_cells", {"pattern": "zzz"}, tools.notebook_cells("zzz")) == (True, "no matching cells")
+    empty = HailerTools(ws, sandbox(ws, CodeModeClient([]))).notebook_cells()
+    assert outcome("notebook_cells", {}, empty) == (True, "no cells")
+    broken = HailerTools(ws, sandbox(ws, FakeClient(result=ExecResult(success=False, stderr="AttributeError: no cells")))).notebook_cells()
+    assert outcome("notebook_cells", {}, broken) == (False, "could not list cells")
+    big = [{"id": f"c{i:03}", "name": f"cell_{i}", "code": "x" * 80} for i in range(200)]
+    truncated = HailerTools(make_config(ws.workspace, max_tool_output_chars=2000), sandbox(ws, CodeModeClient(big))).notebook_cells()
+    assert "truncated" in truncated
+    ok, summary = outcome("notebook_cells", {}, truncated)
+    assert ok and summary.endswith("+ cells")
+
+
+def test_outcome_of_notebook_check(tmp_path):
+    cells = [*STARTER, {"id": "old", "name": "old", "code": "print(missing_before)"}]
+    assert outcome("notebook_check", {}, checked(make_config(tmp_path), CodeModeClient(cells)).notebook_check()) == (True, "1 finding")
+    assert outcome("notebook_check", {}, checked(make_config(tmp_path), CodeModeClient(STARTER)).notebook_check()) == (True, "clean")
+    assert outcome("notebook_check", {}, checked(make_config(tmp_path), CodeModeClient([{"id": "e", "code": " "}])).notebook_check()) == (True, "no code")
+    off = make_config(tmp_path, checks=CodeChecksConfig(lint=False, typecheck=False))
+    assert outcome("notebook_check", {}, checked(off, CodeModeClient(STARTER)).notebook_check()) == (True, "checks off")
+    unreadable = FakeClient(result=ExecResult(success=False, stderr="NameError: x"))
+    assert outcome("notebook_check", {}, checked(make_config(tmp_path), unreadable).notebook_check()) == (False, "could not read the cells")
+
+
+def test_outcome_of_notebook_list(ws, tmp_path):
+    assert outcome("notebook_list", {}, HailerTools(ws, sandbox(ws, FakeClient(open_names={"analysis.py"}))).notebook_list()) == (True, "2 notebooks, 1 open")
+    assert outcome("notebook_list", {}, HailerTools(ws, sandbox(ws)).notebook_list()) == (True, "2 notebooks"), "marimo down: none known open"
+    empty = make_config(tmp_path / "other")
+    empty.notebooks_root.mkdir(parents=True)
+    assert outcome("notebook_list", {}, HailerTools(empty, sandbox(empty)).notebook_list()) == (True, "no notebooks")
+
+
+def test_outcome_of_notebook_create(ws):
+    client = FakeClient(open_names={"analysis.py"})
+
+    def create(name: str, opener: Opener, box=None, **kw) -> tuple[bool, str]:
+        tools = HailerTools(ws, box or sandbox(ws, client), open_url=opener, session_wait_sec=0)
+        return outcome("notebook_create", {"name": name}, tools.notebook_create(name, **kw))
+
+    assert create("Q2 Churn", Opener(client)) == (True, "q2_churn.py, opened in your browser")
+    assert create("draft", Opener(client, grant_session=False), template="empty") == (True, "draft.py, no session yet")
+    assert create("second", Opener(client, succeed=False)) == (True, "second.py, browser did not open")
+    assert create("offline one", Opener(), box=sandbox(ws)) == (True, "offline_one.py, marimo not running")
+    assert create("other", Opener()) == (False, "other.py already exists in the notebooks folder")
+    assert create("x", Opener(), template="fancy") == (False, "unknown template 'fancy'")
+
+
+def test_outcome_of_notebook_open_and_close(ws):
+    client = CodeModeClient([{"id": "Hbol", "name": "imports", "code": "import marimo as mo"}], open_names={"analysis.py", "other.py"})
+    tools = HailerTools(ws, sandbox(ws, client), open_url=Opener(client), session_wait_sec=0)
+    assert outcome("notebook_open", {"notebook": "other"}, tools.notebook_open("other")) == (True, "other.py, already open, 1 cell")
+    assert outcome("notebook_close", {"notebook": "other"}, tools.notebook_close("other")) == (True, "other.py, closed")
+    assert outcome("notebook_close", {"notebook": "other"}, tools.notebook_close("other")) == (True, "other.py, was not open")
+    reopened = tools.notebook_open("other")  # no session: the browser is opened and grants one
+    assert outcome("notebook_open", {"notebook": "other"}, reopened) == (True, "other.py, opened in your browser, 1 cell")
+    empty = CodeModeClient([], open_names={"analysis.py", "other.py"})
+    text = HailerTools(ws, sandbox(ws, empty), session_wait_sec=0).notebook_open("other")
+    assert outcome("notebook_open", {}, text) == (True, "other.py, already open, no cells")
+    text = HailerTools(ws, sandbox(ws), open_url=Opener(), session_wait_sec=0).notebook_open("other")
+    assert outcome("notebook_open", {}, text) == (True, "other.py, marimo not running")
+    ok, summary = outcome("notebook_open", {}, tools.notebook_open("missing"))
+    assert not ok and summary.startswith("No notebook named 'missing'")
+    assert outcome("notebook_close", {}, HailerTools(ws, sandbox(ws)).notebook_close()) == (True, "marimo not running")
+
+
+def test_outcome_of_list_periods(ws):
+    pl = pytest.importorskip("polars")
+    tools = HailerTools(ws, sandbox(ws, docker=True))
+    ok, summary = outcome("list_periods", {}, tools.list_periods())
+    assert not ok and summary == "Data directory does not exist: /work/data"
+    ws.data_dir.mkdir()
+    assert outcome("list_periods", {}, tools.list_periods()) == (True, "no period files")
+    (ws.data_dir / "customers.csv").write_text("id\n1\n", encoding="utf-8")
+    (ws.data_dir / "Survey, 2024.json").write_text("[]", encoding="utf-8")
+    for month in range(1, 7):
+        columns = {"region": ["North"], "revenue": [float(month)]} | ({"discount": [0.1]} if month >= 4 else {})
+        pl.DataFrame(columns).write_parquet(ws.data_dir / f"25-{month:02} sales.parquet")
+    assert outcome("list_periods", {}, tools.list_periods()) == (True, "sales, 6 months, 25-01 to 25-06; discount from 25-04")
+    assert outcome("list_periods", {"name": "sales"}, tools.list_periods("sales")) == (True, "6 months, 25-01 to 25-06; discount from 25-04")
+    assert outcome("list_periods", {"name": "costs"}, tools.list_periods("costs")) == (True, "no period files, 8 other files")
+    pl.DataFrame({"n": [1]}).write_parquet(ws.data_dir / "25-01 costs.parquet")
+    assert outcome("list_periods", {}, tools.list_periods()) == (True, "2 datasets, 6 months, 25-01 to 25-06; 4 columns in some months")
+    pl.DataFrame({"region": ["North"], "revenue": [1.0]}).write_parquet(ws.data_dir / "25-01 refunds.parquet")
+    assert outcome("list_periods", {"name": "refunds"}, tools.list_periods("refunds")) == (True, "1 month, 25-01")
+
+
+def test_outcome_of_list_periods_without_period_files_counts_the_others(ws):
+    from hailer import periods, tool_outcomes
+
+    assert tool_outcomes.DATA_SUFFIXES == periods.DATA_SUFFIXES
+    ws.data_dir.mkdir()
+    for name in ("customers.csv", "Survey 2024.JSON", "Sales.xlsx", "notes.txt"):
+        (ws.data_dir / name).touch()
+    assert outcome("list_periods", {}, HailerTools(ws, sandbox(ws)).list_periods()) == (True, "no period files, 3 other files")
+    for i in range(25):
+        (ws.data_dir / f"extra {i}.csv").touch()
+    text = HailerTools(ws, sandbox(ws)).list_periods()
+    assert text.endswith("(and 8 more)")
+    assert outcome("list_periods", {}, text) == (True, "no period files, 28 other files")
+
+
+def test_outcome_of_the_skill_tools(tmp_path):
+    config = make_config(tmp_path)
+    skill_dir = config.skills_dir / "alpha"
+    (skill_dir / "reference").mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\nname: alpha\ndescription: d\n---\nBody\n- not a file line", encoding="utf-8")
+    (skill_dir / "reference" / "r.md").write_text("one\ntwo\n", encoding="utf-8")
+    (config.skills_dir / "bare").mkdir()
+    (config.skills_dir / "bare" / "SKILL.md").write_text("---\nname: bare\ndescription: d\n---\nBody", encoding="utf-8")
+    tools = HailerTools(config)
+    assert outcome("load_skill", {"name": "alpha"}, tools.load_skill("alpha")) == (True, "alpha, 1 file")
+    assert outcome("load_skill", {"name": "bare"}, tools.load_skill("bare")) == (True, "bare")
+    ok, summary = outcome("load_skill", {"name": "nope"}, tools.load_skill("nope"))
+    assert not ok and summary.startswith("No skill named 'nope'")
+    args = {"name": "alpha", "path": "reference\\r.md"}
+    assert outcome("read_skill_file", args, tools.read_skill_file("alpha", "reference\\r.md")) == (True, "reference/r.md, 2 lines")
+    assert outcome("read_skill_file", {"path": "../../x"}, tools.read_skill_file("alpha", "../../x")) == (False, "'../../x' is outside the skill folder")
+
+
+class _PageHandler(BaseHTTPRequestHandler):
+    def log_message(self, *args):  # noqa: D401 - silence
+        pass
+
+    def do_GET(self):  # noqa: N802
+        body, ctype = (b"\x00\x01", "application/octet-stream") if self.path.startswith("/binary") else (b"<h1>Hello</h1><p>" + b"x" * 2000 + b"</p>", "text/html")
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def test_outcome_of_fetch_page_names_the_host_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+    monkeypatch.setenv("no_proxy", "127.0.0.1")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _PageHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        host = f"127.0.0.1:{server.server_address[1]}"
+        tools = HailerTools(make_config(tmp_path, web=WebConfig(allowed_domains=("127.0.0.1",))))
+        text = tools.fetch_page(f"http://{host}/page?access_token={SECRET}")
+        assert text.startswith(f"Source: http://{host}/page?access_token={SECRET}")
+        assert outcome("fetch_page", {}, text) == (True, f"{host}, 2.0 KB")
+        text = tools.fetch_page(f"http://{host}/binary")
+        assert outcome("fetch_page", {}, text) == (False, f"{host}, not text (application/octet-stream)")
+        text = tools.fetch_page(f"http://user:pw@{host}/page")  # urllib cannot: an error that quotes the URL
+        ok, summary = outcome("fetch_page", {}, text)
+        assert text.startswith("ERROR: Could not fetch http://user:pw@") and not ok
+        assert summary.startswith(f"Could not fetch {host}: ") and "pw" not in summary
+    finally:
+        server.shutdown()
+        server.server_close()
+    denied = HailerTools(make_config(tmp_path, web=WebConfig(allowed_domains=("docs.pola.rs",)))).fetch_page("https://example.com/")
+    assert outcome("fetch_page", {}, denied) == (False, "Web access to 'example.com' is not allowed")
+
+
+def test_outcome_is_empty_for_unknown_formats_and_never_raises():
+    assert tool_outcome("echo", {"text": "hi"}, "echo: hi") == (True, "")
+    for name in TOOL_NAMES:
+        for odd in (None, "", "\x1b[2J\x1b[31mred\x00", ["block", {"text": "x"}, 3], "Created \n from the starter template; it is now the active notebook.", "x" * 100_000):
+            ok, summary = outcome(name, {"pattern": object(), "path": None, "name": 3}, odd)  # type: ignore[arg-type]
+            assert ok is True, (name, odd)
+    long = "a" * 200 + ".py is not open (no kernel session), so there is nothing to close."
+    ok, summary = outcome("notebook_close", {}, long)
+    assert ok and summary.endswith("...")
+    assert "\x1b" not in outcome("notebook_close", {}, "x\x1b[31m.py is not open (no kernel session), so there is nothing to close.")[1]

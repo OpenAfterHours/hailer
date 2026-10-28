@@ -860,6 +860,33 @@ was already created / made active by then, so `notebook_create` / `notebook_open
 `... is now the active notebook.` and never read as a failed call. Both hooks are keywords of `HailerTools`
 and `hailer_tools` so tests never launch a browser.
 
+## `tool_outcomes.py`  (chat terminal, 2026-10-28)
+
+```python
+SUMMARY_LIMIT = 80
+class Outcome(NamedTuple): ok: bool; summary: str = ""
+def tool_outcome(name: str, args: Mapping[str, Any] | None, result: Any, *, error: bool = False) -> Outcome  # never raises
+```
+The `ok` and `summary` of the agent's `tool_result` events, read from the reply a tool gave the model (standard
+library and `hailer.log.redact` only). `ok` is False for `error=True` (a `status="error"` `ToolMessage`:
+`invalid arguments`, `unknown tool`, else the exception name or `failed`; the arguments LangGraph quotes never
+show), for an `ERROR: ` reply (summary: its first line, with `unexpected <ExceptionType>` for `tools._run`'s
+unexpected errors), for `marimo_execute` code that failed (`Execution failed.`) or ran a cell that raised (the
+exception name from the traceback, else `failed` / `cell error`), for `Could not list cells.` /
+`Could not read the notebook's cells.` and for a `fetch_page` response that is not text. Summaries by tool:
+`marimo_execute` the cells code mode reports it changed (`growth_by_region`, `a and b`, `4 cells`, `deleted
+scratch`, `installed altair`; read from marimo's own lines such as `created and ran cell 'Hbol' (name)`), a
+frame's `4 rows` (Polars `shape: (4, 3)`, pandas `[4 rows x 3 columns]`) and the checks (`checks clean`,
+`2 findings`, `ty skipped`); `notebook_check` `clean` / `N findings`; `notebook_cells` `6 cells, 1 with errors` /
+`N matching cells` / `no cells`; `notebook_list` `3 notebooks, 1 open`; `notebook_create` / `notebook_open` the
+notebook's name and session outcome (`already open`, `opened in your browser`, `no session yet`, `browser did
+not open`, `marimo not running`; open adds the cell count); `notebook_close` `<name>, closed` / `<name>, was not
+open`; `marimo_status` `<name> ready` / `<name> not open` / `not running`; `list_periods` `[dataset, ]6 months,
+25-01 to 25-06[; discount from 25-04]` or `no period files, N other files`; `load_skill` `<name>, N files`;
+`read_skill_file` `<path>, N lines`; `fetch_page` `<host[:port]>, 12.3 KB`. A summary is one line of at most
+`SUMMARY_LIMIT` characters (`...` when cut), with control characters removed, URLs reduced to their host and
+secrets masked; it names counts and names only, never data values. An unknown tool or reply format gives `""`.
+
 ## `code_checks.py`  (owner: code checks, 2026-09-22)
 
 ruff and ty for the cells the agent writes. Both are Hailer dependencies and run as subprocesses in the
@@ -989,12 +1016,26 @@ class HailerAgent:
   stored conversation valid: every tool call without a result gets a `ToolMessage(INTERRUPTED_TOOL_RESULT)`,
   and when the last stored message is the user's (the turn died before the model answered) the new text is
   appended to it under the same message id, because strict chat templates refuse two user messages in a row.
-  The turn runs as `graph.astream(..., stream_mode=["updates", "messages"])` and emits `AgentEvent("tool_call",
-  <name>, {"arguments": <80-char preview>})` and `AgentEvent("message_delta", <text>)` (the `model` node only,
-  never the summariser). `AgentEventKind` also has `"status"`; the agent does not emit it today.
+  The turn runs as `graph.astream(..., stream_mode=["updates", "messages"])`. Events (`AgentEventKind =
+  "message_delta" | "tool_call" | "tool_result" | "status"`), all emitted synchronously on the owning loop:
+  - `AgentEvent("message_delta", <text>)`: a piece of the reply (the `model` node only, never the summariser).
+  - `AgentEvent("tool_call", <name>, {"arguments": <80-char preview>, "args": <dict>, "id": <tool_call_id>})`
+    for each call in a `model` update. `args` is a shallow copy of the call's arguments that `json.dumps`
+    accepts (other values as `str`; `{}` when they are not a mapping); `id` is `""` when the model sent none.
+  - `AgentEvent("tool_result", <name>, {"id": <tool_call_id>, "ok": <bool>, "summary": <str>, "seconds":
+    <float>})` for each `ToolMessage` in a `tools` update, after that call's `tool_call`. Results are matched
+    to calls by id (an id the turn already answered may be reused by a later call; oldest first), so calls of
+    one model message may finish in any order (LangChain runs each as its own task). `seconds` is the wall time
+    since the `tool_call` event, rounded to ms; `0.0` for a result without a call in this turn. `ok` and
+    `summary` come from `tool_outcomes.tool_outcome(name, args, content, error=(status == "error"))`.
+    A call the turn is cancelled in gets no `tool_result` (the UI marks it cancelled), nor does the
+    `INTERRUPTED_TOOL_RESULT` that `_settle_history` writes for it before the next turn.
+  - `"status"`: the agent does not emit it today.
   `TurnSummary(final_response, thread_id, duration_ms, tool_calls, input_tokens, output_tokens,
-  status="completed")`: `final_response` is the last model message without tool calls; tokens are summed over
-  the turn's model calls, `None` when the endpoint reported none.
+  status="completed", steps)`: `final_response` is the last model message without tool calls; tokens are summed
+  over the turn's model calls, `None` when the endpoint reported none; `tool_calls` names every call the model
+  asked for and `steps` counts the turn's `tool_result` events (the calls that ran). None of this changes the
+  requests sent.
 - `map_exception`: a `HailerError` passes through. `openai.APIStatusError` is mapped on `status_code`, in this
   order: 401 → `CredentialsError` (login hint); 400/404/422 whose body names the model (`model_not_found`,
   `param == "model"`, a pydantic `loc` with `'model'`, or "model" with "not found" / "does not exist" ...) →
@@ -1206,18 +1247,24 @@ package-install rule) are appended by `agent.system_prompt`. Loaded with
   (the contract over a tmp folder, clients faked), plus the `hailer_tools` registration: names, schemas,
   docstring descriptions, in-process `invoke`, the daemon-thread `ainvoke` path, a cancelled call that does not
   wait for a blocked tool, an end-to-end pass over a real `MarimoSandbox` and `fake_marimo.py`, and a source
-  check that `hailer.tools` touches neither folder
+  check that `hailer.tools` touches neither folder. The `tool_outcomes` tests read replies the tools wrote:
+  `CodeModeClient` runs `LIST_CELLS_CODE` and the check snapshot for real against a stand-in code-mode
+  context, and `code_mode_says` produces marimo's own change lines (its `_print_summary`), so a format change
+  in marimo or in a tool fails there
 - `test_secrets.py`: D. `test_agent.py`: LangChain migration. Unit tests drive `HailerAgent` through
   `model_factory=` with `ScriptedModel` (a `BaseChatModel` replaying messages, exceptions or callables) and
   two toy tools: `build_model` kwargs, tracing, system prompt, error mapping, lifecycle (resume after a
   restart, `new_thread`, `set_model`, `close`), turns (events, usage, one user message, `/reload`, failed-turn
-  merge, summarisation) and Ctrl+C during a model call and during a tool (a real SIGINT to the main thread
+  merge, summarisation), tool steps (each `tool_call` followed by the `tool_result` with its id, parallel calls
+  matched by id as they finish, error results, no result for a cancelled call or for the history repair,
+  `TurnSummary.steps`) and Ctrl+C during a model call and during a tool (a real SIGINT to the main thread
   on POSIX, `_thread.interrupt_main()` on Windows; see "Runtime facts").
   Wire-level tests run the real `ChatOpenAI` against `tests/fake_gateway.py` (`FakeGateway`, a stdlib
   `ThreadingHTTPServer` on 127.0.0.1: only `POST /v1/chat/completions`, 404 elsewhere, 422 for unknown fields
   and model names, required key, `X-Client-Id` header and `api-version` query, optional refusal of `stream:
-  true`, every request recorded; `port=0` picks a free port, a fixed one serves manual end-to-end runs) and
-  assert the exact request fields, headers and query, and one request per 4xx
+  true`, every request recorded; `port=0` picks a free port, a fixed one serves manual end-to-end runs; "check
+  both" in the message gets two tool calls in one reply) and assert the exact request fields, headers and query,
+  one request per 4xx, and the gateway's call ids in the tool events
 - `test_session.py`, `test_cli.py` (Typer `CliRunner`; slash commands; preflight messages with fakes; a
   `FakeAgent` with the `HailerAgent` surface the CLI uses): E
 - Kernel runtimes (docker kernel, 2026-09-19), none of which start anything: `test_kernel.py` (the withheld
