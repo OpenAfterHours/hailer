@@ -391,3 +391,42 @@ ruff 0.16 enables several hundred rules by default and reads any project configu
 tests in `tests/test_tools.py`. After upgrading marimo, ruff or ty, rerun them and repeat a live create/edit
 through `marimo_execute`: the snapshot and the formatting flag use private marimo attributes
 (`ctx._document`, `ctx._kernel.user_config`).
+
+## 16. Notebooks are re-run: settings in one cell, text from variables
+
+Users reported (2026-10-28) that the agent's commentary was hard-coded markdown: it works out a result in
+the scratchpad, sees `5.6%`, then types it into `mo.md`. The notebook could not be re-run for next month's
+data, which is how people use it (a monthly report, a dashboard), and nothing in the instructions asked
+for simple code. Three parts now answer that; keep them in step:
+
+- **The instructions** ([prompts/system.md](../src/hailer/prompts/system.md), *Notebooks people re-run* and
+  *Simple code*): one `settings` cell holds every choice, with defaults from the data (the latest
+  period) in a `mo.ui.dropdown` that `mo.cli_args()` can preset; summaries are f-strings over computed
+  values, direction words included; interpretation goes in a note labelled with its period; the same
+  analysis for another period means switching the dropdown, not copying cells.
+- **The check** (`code_checks.hardcoded_values`, `[checks] hardcoded`): numbers, dates and month names
+  typed into `mo.md(...)` text or a `title=` come back to the agent as `hailer hardcoded-value`
+  findings through the same loop as ruff and ty (§15). It reads only text a reader sees, so a typed
+  period in code (`pl.col("period") == "2025-03"`) is left to the instructions.
+- **The examples** (the example skill and context in `.config/hailer`) follow the same pattern.
+
+Verified live on 2026-10-28 (marimo 0.24.2, unsafe-local kernel, headless Chromium, `HailerTools`
+driven without a model): the settings pattern from the instructions runs, defaults to the latest period
+and comes back with no findings; a typed-in summary is reported on the line that shows it. Two findings
+shaped the details:
+
+- **A dropdown takes a list.** `ctx.set_ui_value(dropdown, "2025-03")`, as marimo's own docstring shows,
+  fails in `_convert_value` ("Dropdowns only support a single value"); `["2025-03"]` switches it and every
+  dependent cell re-runs, the summary text with it. The instructions give the list form.
+- **marimo lays a markdown cell out again.** A cell created as `mo.md("""\n## March ...""")` (escaped
+  newlines on one line) was later stored with real newlines around the string, so "text line k is source
+  line k" pointed at the closing `""")`. A value's line is now the first line of its string's span that
+  shows it.
+
+ty reports `unsupported-operator` for arithmetic on two `Series.sum()` results (`float | Decimal` in
+Polars' annotations). It predates this change, but headline values make it more common; the instructions'
+"plainly wrong about the data" rule covers it. Regression checks: the *Values typed into text* tests in
+`tests/test_code_checks.py` (including the starter template and the instructions' own examples passing
+the check), the `[checks]` tests in `tests/test_tools.py` and `tests/test_config.py`, and
+`test_system_prompt_asks_for_notebooks_that_re_run_and_simple_code` in `tests/test_agent.py`. After
+upgrading marimo, repeat a live `set_ui_value` on a dropdown.

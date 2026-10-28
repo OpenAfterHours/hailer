@@ -162,6 +162,9 @@ class CodeChecksConfig:
     lint: bool = True
     #: ty type-checks the changed cells, with the types of the notebook's other cells in view.
     typecheck: bool = True
+    #: Hailer reports numbers, dates and months typed into ``mo.md`` text or a chart title, so a
+    #: notebook re-run on other data does not go on describing the old data.
+    hardcoded: bool = True
     #: ruff formats new and edited cells before marimo applies them (needs ruff in the kernel's Python).
     format: bool = True
 

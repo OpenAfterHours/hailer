@@ -35,8 +35,9 @@ else: no shell, no file tool, no approval step; `fetch_page` reaches only `[web]
 model writes runs in marimo's scratchpad, and durable changes go through marimo's private code-mode API
 (`marimo._code_mode`), so marimo is pinned (`==0.24.2`) and so is the kernel image's marimo. Code mode
 formats the cells the agent creates or edits with the kernel's ruff before they run, and `code_checks.py`
-checks the changed cells with ruff and ty on this machine, over a snapshot the kernel returns; the findings
-end the tool result (`[checks]` in `hailer.toml` turns each part off).
+checks the changed cells with ruff, ty and its own check for values typed into text on this machine, over a
+snapshot the kernel returns; the findings end the tool result (`[checks]` in `hailer.toml` turns each part
+off).
 
 ## The sandbox contract
 
@@ -124,7 +125,7 @@ src/hailer/
 ├── chat.py, chat_ui.py   ChatController (slash commands, notebook switches), the persistent composer
 ├── agent.py           build_model, HailerAgent (threads, streamed turns, Ctrl+C), system prompt, error mapping
 ├── tools.py           HailerTools (the 12 tools) and hailer_tools(config) -> LangChain tools
-├── code_checks.py     ruff and ty on the cells the agent writes (and code mode's ruff formatting)
+├── code_checks.py     ruff, ty and typed-in values on the cells the agent writes (and code mode's ruff formatting)
 ├── sandbox.py         MarimoSandbox, the sandbox contract
 ├── notebook_sync.py   the allow-listed copy between the docker kernel and the host
 ├── kernel.py          runtime_for, the unsafe-local runtime, withheld variables
@@ -136,24 +137,22 @@ src/hailer/
 └── periods.py         YY-MM period files and multi-period loaders, also used inside the image
 ```
 
-## 2026-09-23: the sandbox simplification
+## 2026-10-28: notebooks that re-run
 
-Phases 0–4 of [docs/ARCHITECTURE_PROPOSAL.md](docs/ARCHITECTURE_PROPOSAL.md) are implemented on branch
-`worktree-sandbox-simplification`: the image is versioned by its content and its token is off the command
-line (R5, F7); each process owns one kernel and cross-terminal reuse, `kernel.json`, `marimo_url`,
-`--keep-marimo` and `hailer exec` are gone (R2); notebook and data access goes through `MarimoSandbox` and
-`PathMap` is gone (R1); the docker kernel's notebooks live in a tmpfs and come back through the allow-listed
-sync, which replaced the notebooks mount rules and the planted-file scan (R3); Docker is the default and the
-unisolated runtime is `unsafe-local` (R4); `cli.py` became the `hailer.cli` package, the unused environment
-overrides went and the history moved to `docs/history/` (R7). The GCP runtime (R6) is not started.
+The agent wrote its commentary as typed-in markdown (it saw `5.6%` in the scratchpad and typed it), so a
+notebook could not be re-run for next month's data. Now:
 
-Verified:
+- The system prompt asks for one `settings` cell (defaults from the data; the period in a
+  `mo.ui.dropdown` that `mo.cli_args()` can preset), summaries as f-strings over computed values,
+  interpretation in a note labelled with its period, switching the dropdown for another period, and
+  simple code (one step per cell, plain Polars, no helpers or defensive code the data does not need).
+- `code_checks.hardcoded_values` reports numbers, dates and month names typed into `mo.md` text or a
+  chart `title=` as `hailer hardcoded-value` findings, next to ruff and ty; `[checks] hardcoded` turns it
+  off.
+- The example skill and context in `.config/hailer`, the notebooks page of the docs, INTERFACES and
+  LEARNINGS §16 follow.
 
-- Offline suite on Windows 11, Python 3.13: 1024 passed, 14 skipped (no key, no Docker, loopback only).
-- `tests/test_docker_integration.py` with `HAILER_DOCKER_TESTS=strict`: 11 passed on Windows 11 with Docker
-  Desktop 29.4.3, including the token absent from `docker inspect`, planted files
-  (`.git/`, `conftest.py`, `.vscode/`, a non-notebook `.py`) never reaching the host while notebook edits do,
-  and nothing left behind after stop.
-
-Still owed: the Docker integration run on Linux, macOS and `linux/arm64`; a live turn against a paid model on
-this branch; a physical Ctrl+C in a Windows console.
+Verified: the offline suite, and a live run through `HailerTools` on an unsafe-local kernel with headless
+Chromium (no model): the settings pattern runs and is clean, `set_ui_value` on the dropdown (it takes a
+list) re-runs the summary for the other period, and typed-in text is reported on the right line. Still
+owed: a live turn against a paid model, to see the agent follow the instructions.
