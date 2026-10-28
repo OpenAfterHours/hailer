@@ -28,6 +28,9 @@ GITIGNORE_TEXT = "# Created by Hailer: this folder is local state, not something
 PROJECT_GITIGNORE_TEXT = (
     "# Created by Hailer: these stay on this machine; everything else in .hailer/ is the project's.\n"
     f"{PROJECT_STATE_DIRNAME}/\n{LOCAL_CONFIG_NAME}\ndata/\n"
+    "# State a standalone workspace kept here before it moved to the project layout:\n"
+    "/threads.sqlite*\n/session.json\n/notebook.json\n/notebook-backups/\n/owner-*.lock\n/kernel-token-*/\n"
+    "/marimo-*.log\n/sandbox-wrote-notebooks\n"
 )
 
 
@@ -55,11 +58,19 @@ def local_config_path(workspace: Path) -> Path:
 
 def ensure_project_gitignore(workspace: Path) -> None:
     """In the project layout, create ``.hailer/.gitignore`` (state, ``local.toml``, ``data/``) when
-    missing; an existing one is never changed. Never raises."""
+    missing. An existing one is never changed, except the ``*`` one Hailer wrote while ``.hailer/`` was a
+    standalone workspace's state folder (unedited): it would hide the project's files from git. Never raises."""
     if not is_project_layout(workspace):
         return
+    path = project_dir(workspace) / GITIGNORE_NAME
     try:
-        with open(project_dir(workspace) / GITIGNORE_NAME, "x", encoding="utf-8") as handle:
+        if path.read_text(encoding="utf-8") == GITIGNORE_TEXT:
+            path.write_text(PROJECT_GITIGNORE_TEXT, encoding="utf-8")
+        return
+    except OSError:  # FileNotFoundError included: create it
+        pass
+    try:
+        with open(path, "x", encoding="utf-8") as handle:
             handle.write(PROJECT_GITIGNORE_TEXT)
     except OSError:
         pass

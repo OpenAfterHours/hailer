@@ -202,7 +202,8 @@ keys are warnings returned by `validate`, not errors, including the keys removed
 overrides (the complete list): `HAILER_CONFIG`, `HAILER_WORKSPACE`, `HAILER_MODEL`, `HAILER_MODEL_PROVIDER`,
 `HAILER_LOG_LEVEL`, `HAILER_KERNEL`, `HAILER_KERNEL_IMAGE`; `HAILER_TRACING` is read by `hailer.agent` only.
 Folders and the notebook come from the file alone (`HAILER_NOTEBOOK`, `HAILER_NOTEBOOKS_DIR` and
-`HAILER_DATA_DIR` were removed on 2026-09-23 and are not read). Provider tables `[model_providers.<id>]` map 1:1 to
+`HAILER_DATA_DIR` were removed on 2026-09-23 and are not read; since 2026-10-28 Hailer *sets* `HAILER_DATA_DIR`
+and `HAILER_DATA_FOLDERS` for an unsafe-local kernel's notebook code, and `load_config` still never reads them). Provider tables `[model_providers.<id>]` map 1:1 to
 `ProviderConfig`: `base_url`, `wire_api`, `stream`, `stream_options` (both default `true`, valid with either
 `wire_api`), `env_key` (a declared `[model_providers.openai]` without one gets `OPENAI_API_KEY`), `name`,
 `http_headers`, `env_http_headers`, `query_params`. `[web]` maps to `WebConfig` (`allowed_domains` list,
@@ -1123,7 +1124,8 @@ def state_dir(workspace: Path) -> Path          # <workspace>/.hailer, or <works
 def local_config_path(workspace: Path) -> Path  # <workspace>/.hailer/local.toml in both layouts (path only)
 def ensure_state_dir(workspace: Path) -> Path   # ensure_ignored_dir(state_dir(workspace))
 def ensure_ignored_dir(folder: Path) -> Path    # mkdir -p, then write <folder>/.gitignore ("*") unless one exists (never overwritten; a failed write is ignored)
-def ensure_project_gitignore(workspace) -> None # project layout only: .hailer/.gitignore (PROJECT_GITIGNORE_TEXT) unless one exists; never raises
+def ensure_project_gitignore(workspace) -> None # project layout only: .hailer/.gitignore (PROJECT_GITIGNORE_TEXT: also the root state
+    # files a standalone layout left) unless one exists; an unedited standalone "*" one is replaced (it would hide the project's files); never raises
 SANDBOX_MARK_NAME = "sandbox-wrote-notebooks"   # a sandbox copied notebooks here since the user last agreed to run them unsafe-local
 def mark_sandbox_wrote(workspace) -> None; def sandbox_wrote_notebooks(workspace) -> bool; def clear_sandbox_mark(workspace) -> None
 ```

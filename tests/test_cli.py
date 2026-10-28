@@ -1180,6 +1180,36 @@ def test_init_inside_a_project_puts_everything_in_dot_hailer(harness, tmp_path, 
     assert (hailer / "state" / "session.json").is_file(), "state goes to .hailer/state/"
 
 
+def test_moving_a_standalone_workspace_to_the_project_layout_keeps_its_state_out_of_git(harness, tmp_path, monkeypatch):
+    """Regression: .hailer/.gitignore ("*", from the standalone layout) hid the project's files, and the
+    old threads.sqlite at .hailer/ would have been committed with them."""
+    import shutil
+    import subprocess
+
+    if shutil.which("git") is None:
+        pytest.skip("git is not installed")
+    monkeypatch.setattr(cli_setup, "_example_config_dir", lambda: None)
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    subprocess.run(["git", "-C", str(ws), "init", "-q"], check=True)
+    assert init_cmd(ws, "--layout", "standalone").exit_code == 0
+    from hailer import session
+    from hailer.models import SessionState
+
+    session.save_session(ws, SessionState(thread_id="t"))
+    (ws / ".hailer" / "threads.sqlite").write_bytes(b"conversation")
+    (ws / "hailer.toml").unlink()
+    assert init_cmd(ws, "--layout", "project").exit_code == 0
+    listed = subprocess.run(["git", "-C", str(ws), "ls-files", "--others", "--exclude-standard"], capture_output=True, text=True, check=True)
+    names = set(listed.stdout.split())
+    assert ".hailer/hailer.toml" in names and ".hailer/notebooks/analysis.py" in names, names
+    assert not {n for n in names if "threads.sqlite" in n or "session.json" in n}, names
+    custom = ws / ".hailer" / ".gitignore"
+    custom.write_text("# mine\n*\n", encoding="utf-8")
+    assert init_cmd(ws).exit_code == 0
+    assert custom.read_text(encoding="utf-8") == "# mine\n*\n", "a .gitignore the user wrote is never changed"
+
+
 def test_init_layout_can_be_chosen_and_an_existing_layout_is_kept(harness, tmp_path, monkeypatch):
     monkeypatch.setattr(cli_setup, "_example_config_dir", lambda: None)
     ws = tmp_path / "repo"
