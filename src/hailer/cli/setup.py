@@ -173,6 +173,43 @@ _PLACEHOLDERS: dict[str, str] = {
     "prompts/README.md": "# Prompts\n\nEach `<name>.md` can be sent with /prompt <name> [args]; `{{args}}` is replaced.\n",
 }
 INIT_NOTEBOOK_TITLE = "Hailer workspace"
+_PROJECT_README = """\
+# Hailer
+
+This folder holds Hailer's setup for this project. Commit it so everyone gets the same one.
+
+```
+.hailer/
+├── hailer.toml   the settings (model, kernel, data folders, project files)
+├── notebooks/    the marimo notebooks
+├── context/      always-on: every *.md here is sent to the model at the start of each session
+├── skills/       on-demand: <name>/SKILL.md (+ reference/) loaded only when needed
+├── prompts/      reusable prompts: /prompt <name> [args]
+├── data/         the default data folder (not committed)
+├── local.toml    this machine's settings, such as where its data folders are (not committed)
+└── state/        conversations and other state of this machine (not committed)
+```
+
+Everything in `context/`, and every skill or project file the agent reads, is sent to the
+configured model endpoint. Do not put credentials there.
+"""
+
+
+def _choose_layout(workspace: Path, layout: str | None) -> str:
+    """``--layout`` when given; else the layout of the config already there; else ``project`` in a
+    folder that is already a project (``pyproject.toml`` or ``.git``), ``standalone`` otherwise."""
+    from hailer.config import CONFIG_FILENAMES, LAYOUT_PROJECT, LAYOUT_STANDALONE, PROJECT_CONFIG_FILENAME, VALID_LAYOUTS
+
+    if layout is not None:
+        if layout not in VALID_LAYOUTS:
+            raise typer.BadParameter(f"use {' or '.join(VALID_LAYOUTS)}", param_hint="--layout")
+        return layout
+    existing = next((name for name in CONFIG_FILENAMES if (workspace / name).is_file()), None)
+    if existing is not None:
+        return LAYOUT_PROJECT if existing == PROJECT_CONFIG_FILENAME else LAYOUT_STANDALONE
+    if (workspace / "pyproject.toml").is_file() or (workspace / ".git").exists():
+        return LAYOUT_PROJECT
+    return LAYOUT_STANDALONE
 
 
 def _init_notebook_and_data(console: Console, workspace: Path, config_path: Path, *, verbose: bool) -> HailerConfig | None:
@@ -213,36 +250,57 @@ def init(
         help='Write \\[kernel] runtime = "docker" (the default: an isolated container) or "unsafe-local" (notebook code runs as you) into hailer.toml.',
         show_default=False,
     ),
+    layout: str | None = typer.Option(
+        None,
+        "--layout",
+        help="standalone: hailer.toml, notebooks/, data/ and .config/hailer/ in this folder. project: all of "
+        "Hailer's files in .hailer/, for Hailer inside another project. Default: project in a folder with "
+        "pyproject.toml or .git, otherwise standalone (or the layout of the config already here).",
+        show_default=False,
+    ),
 ) -> None:
-    """Set up a workspace: hailer.toml, .config/hailer, the starter notebook and the data folder.
+    """Set up a workspace: hailer.toml, the context, skills and prompts folders, the starter notebook and the data folder.
 
     Only hailer.toml is ever overwritten (with --force); anything else that exists is kept, so running
-    it again fills in whatever is missing.
+    it again fills in whatever is missing. Inside another project (a folder with pyproject.toml or
+    .git) everything goes into .hailer/.
     """
+    from hailer.config import LAYOUT_PROJECT, PROJECT_CONFIG_FILENAME
+    from hailer.statedir import ensure_project_gitignore, project_dir
+
     opts = _opts(ctx)
     console = common.console_factory()
     choice = _kernel_choice(console, kernel)
     workspace = opts.workspace or Path.cwd()
     workspace = workspace.resolve()
-    config_path = workspace / "hailer.toml"
+    chosen = _choose_layout(workspace, layout)
+    in_project = chosen == LAYOUT_PROJECT
+    config_path = workspace / (PROJECT_CONFIG_FILENAME if in_project else "hailer.toml")
     if config_path.exists() and not force:
         console.print(f"{config_path} already exists (use --force to overwrite).", markup=False)
     else:
         from hailer.config import write_default_config
 
-        write_default_config(config_path, overwrite=force, kernel=choice)
+        write_default_config(config_path, overwrite=force, kernel=choice, layout=chosen)
         console.print(f'Wrote {config_path} ([kernel] runtime = "{choice or KERNEL_RUNTIME_DOCKER}")', markup=False)
+    if in_project:
+        ensure_project_gitignore(workspace)
 
-    target = workspace / ".config" / "hailer"
+    target = project_dir(workspace) if in_project else workspace / ".config" / "hailer"
     example = _example_config_dir()
     created: list[str] = []
     for sub in ("context", "skills", "prompts"):
         (target / sub).mkdir(parents=True, exist_ok=True)
+    if in_project and not (target / "README.md").exists():
+        (target / "README.md").write_text(_PROJECT_README, encoding="utf-8")
+        created.append("README.md")
     if example is not None and example != target:
         for src in example.rglob("*"):
             if src.is_dir():
                 continue
             rel = src.relative_to(example)
+            if in_project and rel.parts[0] not in ("context", "skills", "prompts"):
+                continue  # the example's README describes .config/hailer
             dst = target / rel
             if dst.exists():
                 continue
@@ -263,29 +321,32 @@ def init(
     config = _init_notebook_and_data(console, workspace, config_path, verbose=opts.verbose)
     runtime = config.kernel.runtime if config is not None else (choice or KERNEL_RUNTIME_DOCKER)
     kept = choice is not None and config is not None and runtime != choice
+    shown_config = PROJECT_CONFIG_FILENAME if in_project else "hailer.toml"
     if kept:
         console.print(
-            f'hailer.toml was kept, so [kernel] runtime is still "{runtime}". To change it, set '
-            f'runtime = "{choice}" under [kernel] in hailer.toml (add a [kernel] line if there is none), or run '
+            f'{shown_config} was kept, so [kernel] runtime is still "{runtime}". To change it, set '
+            f'runtime = "{choice}" under [kernel] in {shown_config} (add a [kernel] line if there is none), or run '
             f"uvx hailer init --kernel {choice} --force to rewrite the file.",
             markup=False,
         )
     provider = config.model.provider if config is not None else "<provider>"
     data = notebooks.notebook_display_name(config, config.data_dir) if config is not None else "data"
+    run = "uv run hailer" if in_project and (workspace / "pyproject.toml").is_file() else "uvx hailer"
     console.print(
         "\nNext steps:\n"
-        "  1. Edit hailer.toml (model, provider, notebook).\n"
-        f"  2. Store the API key once:   uvx hailer login {provider}\n"
+        f"  1. Edit {shown_config} (model, provider, notebook).\n"
+        f"  2. Store the API key once:   {run} login {provider}\n"
         f"  3. Put the files you want to analyse in {data}/ (CSV, Parquet, JSON or Excel, any name).\n"
-        "  4. Start marimo and chat:     uvx hailer notebook\n"
+        f"     For a folder elsewhere on this machine:   {run} data add <name> <folder>\n"
+        f"  4. Start marimo and chat:     {run} notebook\n"
         '     then ask, for example: "what is in my data?" or "chart revenue by month"',
         markup=False,
     )
-    for line in _kernel_next_steps(runtime, kept=kept):
+    for line in _kernel_next_steps(runtime, kept=kept, config_name=shown_config):
         console.print(line, markup=False)
 
 
-def _kernel_next_steps(runtime: str, *, kept: bool = False) -> list[str]:
+def _kernel_next_steps(runtime: str, *, kept: bool = False, config_name: str = "hailer.toml") -> list[str]:
     """What ``init`` adds to the next steps about where notebook code runs: for docker, how to get
     Docker when it is not on this machine (or opt into unsafe-local); for unsafe-local, that it is
     not isolated (nothing more after the "hailer.toml was kept" advice, which says how to switch)."""
@@ -304,7 +365,7 @@ def _kernel_next_steps(runtime: str, *, kept: bool = False) -> list[str]:
             lines += [
                 f"Docker was not found on this machine. {DOCKER_INSTALL_ADVICE}, start it, then run uvx hailer doctor.",
                 "Or, only if you accept that notebook code then runs as you, with your files and network (not "
-                'isolated): set runtime = "unsafe-local" under [kernel] in hailer.toml '
+                f'isolated): set runtime = "unsafe-local" under [kernel] in {config_name} '
                 "(or run uvx hailer init --kernel unsafe-local --force).",
             ]
         return lines
@@ -312,5 +373,5 @@ def _kernel_next_steps(runtime: str, *, kept: bool = False) -> list[str]:
         return []
     return [
         "\nNotebook code runs on this machine as you, with your files and network (unsafe-local: not isolated). "
-        'To isolate it, install and start Docker, then set runtime = "docker" under [kernel] in hailer.toml.'
+        f'To isolate it, install and start Docker, then set runtime = "docker" under [kernel] in {config_name}.'
     ]

@@ -1,7 +1,9 @@
-"""The workspace's ``.hailer`` folder: Hailer's own state, never user content.
+"""The workspace's state folder: Hailer's own state, never user content.
 
-It holds ``session.json``, ``notebook.json``, ``threads.sqlite``, ``notebook-backups/`` and the
-``sandbox-wrote-notebooks`` mark, and, while a kernel runs, the
+It is ``.hailer/``, or ``.hailer/state/`` in the project layout (a workspace whose config is
+``.hailer/hailer.toml``: there ``.hailer/`` holds the project's notebooks, skills and context, which
+are committed). It holds ``session.json``, ``notebook.json``, ``threads.sqlite``,
+``notebook-backups/`` and the ``sandbox-wrote-notebooks`` mark, and, while a kernel runs, the
 running session's kernel files (a local kernel's record and log, a docker kernel's token folder
 while it starts). It changes on every turn. Everything that writes there creates the folder through :func:`ensure_state_dir`, which
 also puts a ``.gitignore`` containing ``*`` inside it: git then ignores the folder in any repository,
@@ -13,23 +15,69 @@ from __future__ import annotations
 from pathlib import Path
 
 STATE_DIRNAME = ".hailer"
+#: The state folder inside ``.hailer/`` in the project layout.
+PROJECT_STATE_DIRNAME = "state"
+#: The config file that marks the project layout.
+PROJECT_CONFIG_NAME = "hailer.toml"
+#: This machine's settings on top of the project's config (data folder paths, a personal
+#: provider): ``.hailer/local.toml`` in both layouts, never committed.
+LOCAL_CONFIG_NAME = "local.toml"
 GITIGNORE_NAME = ".gitignore"
 GITIGNORE_TEXT = "# Created by Hailer: this folder is local state, not something to commit.\n*\n"
+#: ``.hailer/.gitignore`` in the project layout: what in the project folder stays on this machine.
+PROJECT_GITIGNORE_TEXT = (
+    "# Created by Hailer: these stay on this machine; everything else in .hailer/ is the project's.\n"
+    f"{PROJECT_STATE_DIRNAME}/\n{LOCAL_CONFIG_NAME}\ndata/\n"
+)
 
 
-def state_dir(workspace: Path) -> Path:
-    """``<workspace>/.hailer`` (the path only; see :func:`ensure_state_dir`)."""
+def project_dir(workspace: Path) -> Path:
+    """``<workspace>/.hailer``: the state folder, or in the project layout the project folder."""
     return Path(workspace) / STATE_DIRNAME
 
 
+def is_project_layout(workspace: Path) -> bool:
+    """Whether the workspace uses the project layout (its config is ``.hailer/hailer.toml``)."""
+    return (project_dir(workspace) / PROJECT_CONFIG_NAME).is_file()
+
+
+def state_dir(workspace: Path) -> Path:
+    """``<workspace>/.hailer``, or ``<workspace>/.hailer/state`` in the project layout (the path
+    only; see :func:`ensure_state_dir`)."""
+    folder = project_dir(workspace)
+    return folder / PROJECT_STATE_DIRNAME if is_project_layout(workspace) else folder
+
+
+def local_config_path(workspace: Path) -> Path:
+    """``<workspace>/.hailer/local.toml``: this machine's settings (the path only)."""
+    return project_dir(workspace) / LOCAL_CONFIG_NAME
+
+
+def ensure_project_gitignore(workspace: Path) -> None:
+    """In the project layout, create ``.hailer/.gitignore`` (state, ``local.toml``, ``data/``) when
+    missing; an existing one is never changed. Never raises."""
+    if not is_project_layout(workspace):
+        return
+    try:
+        with open(project_dir(workspace) / GITIGNORE_NAME, "x", encoding="utf-8") as handle:
+            handle.write(PROJECT_GITIGNORE_TEXT)
+    except OSError:
+        pass
+
+
 def ensure_state_dir(workspace: Path) -> Path:
-    """Create ``<workspace>/.hailer`` when missing, with its ``.gitignore``, and return it.
+    """Create the state folder (:func:`state_dir`) when missing, with its ``.gitignore``, and return it.
 
     An existing ``.gitignore`` there is never overwritten, so a user who edits it keeps the edit. The
     ``.gitignore`` is a convenience: failing to write it never stops Hailer (the folder itself raises
     as ``mkdir`` does).
     """
-    folder = state_dir(workspace)
+    return ensure_ignored_dir(state_dir(workspace))
+
+
+def ensure_ignored_dir(folder: Path) -> Path:
+    """Create ``folder`` when missing, with a ``.gitignore`` containing ``*`` (never replacing one)."""
+    folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
     try:
         with open(folder / GITIGNORE_NAME, "x", encoding="utf-8") as handle:  # "x": never replace one

@@ -2,9 +2,10 @@
 
 Sources, lowest to highest precedence:
 
-1. built-in defaults
-2. the project config file (``hailer.toml`` or ``.config/hailer/hailer.toml``)
-3. environment variables (``HAILER_*``)
+1. built-in defaults (in the project layout, folders inside ``.hailer/``)
+2. the project config file (``hailer.toml``, ``.hailer/hailer.toml`` or ``.config/hailer/hailer.toml``)
+3. this machine's ``.hailer/local.toml`` (never committed: data folder paths, a personal provider)
+4. environment variables (``HAILER_*``)
 
 Secrets are never read from the file (API keys come from the environment or the OS credential
 store, see :mod:`hailer.secrets`).
@@ -24,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from hailer.errors import ConfigError
+from hailer.statedir import PROJECT_CONFIG_NAME, STATE_DIRNAME, is_project_layout, local_config_path, state_dir
 from hailer.models import (
     KERNEL_RUNTIME_DOCKER,
     VALID_KERNEL_RUNTIMES,
@@ -37,13 +39,24 @@ from hailer.models import (
     WebConfig,
 )
 
-CONFIG_FILENAMES: tuple[str, ...] = ("hailer.toml", ".config/hailer/hailer.toml")
+#: The config file, looked up in this order in the workspace. ``.hailer/hailer.toml`` is the project
+#: layout (Hailer inside another project: its notebooks, context, skills and prompts in ``.hailer/``).
+PROJECT_CONFIG_FILENAME = f"{STATE_DIRNAME}/{PROJECT_CONFIG_NAME}"
+CONFIG_FILENAMES: tuple[str, ...] = ("hailer.toml", PROJECT_CONFIG_FILENAME, ".config/hailer/hailer.toml")
 
 DEFAULT_NOTEBOOK = "notebooks/analysis.py"
 DEFAULT_DATA_DIR = "data"
 DEFAULT_CONTEXT_DIR = ".config/hailer/context"
 DEFAULT_SKILLS_DIR = ".config/hailer/skills"
 DEFAULT_PROMPTS_DIR = ".config/hailer/prompts"
+#: The same defaults in the project layout: everything of Hailer's in one folder.
+PROJECT_DEFAULTS: dict[str, str] = {
+    "notebook": ".hailer/notebooks/analysis.py",
+    "data_dir": ".hailer/data",
+    "context_dir": ".hailer/context",
+    "skills_dir": ".hailer/skills",
+    "prompts_dir": ".hailer/prompts",
+}
 DEFAULT_LOG_LEVEL = "WARNING"
 
 VALID_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
@@ -166,20 +179,58 @@ runtime = "docker"                   # "docker" or "unsafe-local"
 # --------------------------------------------------------------------------- #
 
 
-def _has_marker(directory: Path) -> bool:
-    if (directory / "pyproject.toml").is_file():
-        return True
+def _has_config(directory: Path) -> bool:
     return any((directory / name).is_file() for name in CONFIG_FILENAMES)
 
 
+def _has_marker(directory: Path) -> bool:
+    return (directory / "pyproject.toml").is_file() or _has_config(directory)
+
+
+def _declares_uv_workspace(pyproject: Path) -> bool:
+    """Whether ``pyproject`` has a ``[tool.uv.workspace]`` table (the root of a uv workspace)."""
+    try:
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return False
+    tool = data.get("tool")
+    uv = tool.get("uv") if isinstance(tool, dict) else None
+    return isinstance(uv, dict) and isinstance(uv.get("workspace"), dict)
+
+
+def _repository_root(origin: Path) -> Path | None:
+    """The nearest folder at or above ``origin`` holding ``.git`` (a folder, or a file in a worktree)."""
+    return next((candidate for candidate in (origin, *origin.parents) if (candidate / ".git").exists()), None)
+
+
 def find_workspace(start: Path | None = None) -> Path:
-    """Return the workspace root: ``start`` (or cwd) or the first parent holding a marker file."""
+    """Return the workspace root for ``start`` (or cwd).
+
+    Inside a git repository, searched up to the repository's root: the nearest folder holding a
+    Hailer config (:data:`CONFIG_FILENAMES`); else the nearest uv workspace root (a
+    ``pyproject.toml`` with ``[tool.uv.workspace]``), so ``uv run hailer`` in a workspace member
+    belongs to the whole repository; else the nearest folder with a ``pyproject.toml``. Outside a
+    repository: the first folder at or above ``start`` holding a ``pyproject.toml`` or a config.
+    Either way ``start`` itself when nothing matches.
+    """
     origin = Path(start) if start is not None else Path.cwd()
     origin = origin.resolve()
+    repository = _repository_root(origin)
+    if repository is None:
+        return next((candidate for candidate in (origin, *origin.parents) if _has_marker(candidate)), origin)
+    first_project: Path | None = None
+    uv_root: Path | None = None
     for candidate in (origin, *origin.parents):
-        if _has_marker(candidate):
+        if _has_config(candidate):
             return candidate
-    return origin
+        pyproject = candidate / "pyproject.toml"
+        if pyproject.is_file():
+            first_project = first_project or candidate
+            if uv_root is None and _declares_uv_workspace(pyproject):
+                uv_root = candidate
+        if candidate == repository:
+            break
+    return uv_root or first_project or origin
 
 
 def find_config_path(
@@ -236,7 +287,7 @@ def _read_toml(path: Path) -> dict[str, Any]:
         ) from exc
 
 
-def _section(data: Mapping[str, Any], name: str, path: Path | None) -> dict[str, Any]:
+def _section(data: Mapping[str, Any], name: str, path: Path | str | None) -> dict[str, Any]:
     value = data.get(name, {})
     if value is None:
         return {}
@@ -259,7 +310,7 @@ def _written(value: object) -> str:
     return f"a {type(value).__name__}"
 
 
-def _str(table: Mapping[str, Any], key: str, section: str, path: Path | None, default: str | None = None) -> str | None:
+def _str(table: Mapping[str, Any], key: str, section: str, path: Path | str | None, default: str | None = None) -> str | None:
     value = table.get(key, default)
     if value is None:
         return None
@@ -271,7 +322,7 @@ def _str(table: Mapping[str, Any], key: str, section: str, path: Path | None, de
     return value
 
 
-def _int(table: Mapping[str, Any], key: str, section: str, path: Path | None, default: int) -> int:
+def _int(table: Mapping[str, Any], key: str, section: str, path: Path | str | None, default: int) -> int:
     value = table.get(key, default)
     if isinstance(value, bool) or not isinstance(value, int):
         raise ConfigError(
@@ -281,7 +332,7 @@ def _int(table: Mapping[str, Any], key: str, section: str, path: Path | None, de
     return value
 
 
-def _number(table: Mapping[str, Any], key: str, section: str, path: Path | None, default: float) -> float:
+def _number(table: Mapping[str, Any], key: str, section: str, path: Path | str | None, default: float) -> float:
     value = table.get(key, default)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ConfigError(
@@ -291,7 +342,7 @@ def _number(table: Mapping[str, Any], key: str, section: str, path: Path | None,
     return float(value)
 
 
-def _bool(table: Mapping[str, Any], key: str, section: str, path: Path | None, default: bool) -> bool:
+def _bool(table: Mapping[str, Any], key: str, section: str, path: Path | str | None, default: bool) -> bool:
     value = table.get(key, default)
     if not isinstance(value, bool):
         raise ConfigError(
@@ -301,7 +352,7 @@ def _bool(table: Mapping[str, Any], key: str, section: str, path: Path | None, d
     return value
 
 
-def _str_map(table: Mapping[str, Any], key: str, section: str, path: Path | None) -> dict[str, str]:
+def _str_map(table: Mapping[str, Any], key: str, section: str, path: Path | str | None) -> dict[str, str]:
     value = table.get(key, {})
     if value is None:
         return {}
@@ -314,7 +365,7 @@ def _str_map(table: Mapping[str, Any], key: str, section: str, path: Path | None
 
 
 def _str_list(
-    table: Mapping[str, Any], key: str, section: str, path: Path | None, example: str = '["docs.pola.rs", "duckdb.org"]'
+    table: Mapping[str, Any], key: str, section: str, path: Path | str | None, example: str = '["docs.pola.rs", "duckdb.org"]'
 ) -> list[str]:
     value = table.get(key, [])
     if value is None:
@@ -342,6 +393,17 @@ def _clean_url(value: str | None) -> str | None:
     return value.rstrip("/") or None
 
 
+def _merge_tables(base: Mapping[str, Any], top: Mapping[str, Any]) -> dict[str, Any]:
+    """``base`` with ``top`` on top: tables merge key by key, any other value replaces."""
+    merged = dict(base)
+    for key, value in top.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_tables(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
 # --------------------------------------------------------------------------- #
 # Loading
 # --------------------------------------------------------------------------- #
@@ -362,84 +424,91 @@ def load_config(
 
     path = find_config_path(ws, config_path, env)
     data: dict[str, Any] = _read_toml(path) if path is not None else {}
+    local = local_config_path(ws)
+    local_path = local.resolve() if local.is_file() and local.resolve() != path else None
+    where: Path | str | None = path
+    if local_path is not None:
+        data = _merge_tables(data, _read_toml(local_path))
+        where = f"{path} or {local_path}" if path is not None else local_path
+    defaults = PROJECT_DEFAULTS if is_project_layout(ws) else {}
 
-    hailer_tbl = _section(data, "hailer", path)
-    model_tbl = _section(data, "model", path)
-    providers_tbl = _section(data, "model_providers", path)
-    web_tbl = _section(data, "web", path)
-    kernel_tbl = _section(data, "kernel", path)
-    checks_tbl = _section(data, "checks", path)
+    hailer_tbl = _section(data, "hailer", where)
+    model_tbl = _section(data, "model", where)
+    providers_tbl = _section(data, "model_providers", where)
+    web_tbl = _section(data, "web", where)
+    kernel_tbl = _section(data, "kernel", where)
+    checks_tbl = _section(data, "checks", where)
 
-    notebook = _str(hailer_tbl, "notebook", "hailer", path, DEFAULT_NOTEBOOK)
-    notebooks_dir = _str(hailer_tbl, "notebooks_dir", "hailer", path)
-    data_dir = _str(hailer_tbl, "data_dir", "hailer", path, DEFAULT_DATA_DIR)
-    context_dir = _str(hailer_tbl, "context_dir", "hailer", path, DEFAULT_CONTEXT_DIR)
-    skills_dir = _str(hailer_tbl, "skills_dir", "hailer", path, DEFAULT_SKILLS_DIR)
-    prompts_dir = _str(hailer_tbl, "prompts_dir", "hailer", path, DEFAULT_PROMPTS_DIR)
-    log_level = (env.get("HAILER_LOG_LEVEL") or _str(hailer_tbl, "log_level", "hailer", path, DEFAULT_LOG_LEVEL) or DEFAULT_LOG_LEVEL).upper()
-    max_tool_output_chars = _int(hailer_tbl, "max_tool_output_chars", "hailer", path, 12_000)
-    max_context_bytes = _int(hailer_tbl, "max_context_bytes", "hailer", path, 24_000)
+    notebook = _str(hailer_tbl, "notebook", "hailer", where, defaults.get("notebook", DEFAULT_NOTEBOOK))
+    notebooks_dir = _str(hailer_tbl, "notebooks_dir", "hailer", where)
+    data_dir = _str(hailer_tbl, "data_dir", "hailer", where, defaults.get("data_dir", DEFAULT_DATA_DIR))
+    context_dir = _str(hailer_tbl, "context_dir", "hailer", where, defaults.get("context_dir", DEFAULT_CONTEXT_DIR))
+    skills_dir = _str(hailer_tbl, "skills_dir", "hailer", where, defaults.get("skills_dir", DEFAULT_SKILLS_DIR))
+    prompts_dir = _str(hailer_tbl, "prompts_dir", "hailer", where, defaults.get("prompts_dir", DEFAULT_PROMPTS_DIR))
+    log_level = (env.get("HAILER_LOG_LEVEL") or _str(hailer_tbl, "log_level", "hailer", where, DEFAULT_LOG_LEVEL) or DEFAULT_LOG_LEVEL).upper()
+    max_tool_output_chars = _int(hailer_tbl, "max_tool_output_chars", "hailer", where, 12_000)
+    max_context_bytes = _int(hailer_tbl, "max_context_bytes", "hailer", where, 24_000)
 
-    model_name = env.get("HAILER_MODEL") or _str(model_tbl, "name", "model", path, ModelConfig().name) or ModelConfig().name
-    model_provider = env.get("HAILER_MODEL_PROVIDER") or _str(model_tbl, "provider", "model", path, ModelConfig().provider) or ModelConfig().provider
-    reasoning_effort = _str(model_tbl, "reasoning_effort", "model", path, ModelConfig().reasoning_effort)
+    model_name = env.get("HAILER_MODEL") or _str(model_tbl, "name", "model", where, ModelConfig().name) or ModelConfig().name
+    model_provider = env.get("HAILER_MODEL_PROVIDER") or _str(model_tbl, "provider", "model", where, ModelConfig().provider) or ModelConfig().provider
+    reasoning_effort = _str(model_tbl, "reasoning_effort", "model", where, ModelConfig().reasoning_effort)
     if reasoning_effort is not None and not reasoning_effort.strip():
         reasoning_effort = None
-    summarize_after_tokens = _int(model_tbl, "summarize_after_tokens", "model", path, ModelConfig().summarize_after_tokens)
+    summarize_after_tokens = _int(model_tbl, "summarize_after_tokens", "model", where, ModelConfig().summarize_after_tokens)
 
     providers: dict[str, ProviderConfig] = {}
     for provider_id, raw in providers_tbl.items():
         section = f"model_providers.{provider_id}"
         if not isinstance(raw, dict):
             raise ConfigError(
-                f"[{section}] in {path} must be a table.",
+                f"[{section}] in {where} must be a table.",
                 hint=f"Write it as [{section}] followed by base_url = ..., env_key = ... lines.",
             )
         providers[provider_id] = ProviderConfig(
             id=provider_id,
-            base_url=_clean_url(_str(raw, "base_url", section, path)),
-            wire_api=_str(raw, "wire_api", section, path, WIRE_API_RESPONSES) or WIRE_API_RESPONSES,
-            stream=_bool(raw, "stream", section, path, True),
-            stream_options=_bool(raw, "stream_options", section, path, True),
-            env_key=_str(raw, "env_key", section, path) or ("OPENAI_API_KEY" if provider_id == "openai" else None),
-            name=_str(raw, "name", section, path),
-            http_headers=_str_map(raw, "http_headers", section, path),
-            env_http_headers=_str_map(raw, "env_http_headers", section, path),
-            query_params=_str_map(raw, "query_params", section, path),
+            base_url=_clean_url(_str(raw, "base_url", section, where)),
+            wire_api=_str(raw, "wire_api", section, where, WIRE_API_RESPONSES) or WIRE_API_RESPONSES,
+            stream=_bool(raw, "stream", section, where, True),
+            stream_options=_bool(raw, "stream_options", section, where, True),
+            env_key=_str(raw, "env_key", section, where) or ("OPENAI_API_KEY" if provider_id == "openai" else None),
+            name=_str(raw, "name", section, where),
+            http_headers=_str_map(raw, "http_headers", section, where),
+            env_http_headers=_str_map(raw, "env_http_headers", section, where),
+            query_params=_str_map(raw, "query_params", section, where),
         )
 
     web = WebConfig(
-        allowed_domains=tuple(d.strip().lower() for d in _str_list(web_tbl, "allowed_domains", "web", path) if d.strip()),
-        max_page_bytes=_int(web_tbl, "max_page_bytes", "web", path, WebConfig().max_page_bytes),
+        allowed_domains=tuple(d.strip().lower() for d in _str_list(web_tbl, "allowed_domains", "web", where) if d.strip()),
+        max_page_bytes=_int(web_tbl, "max_page_bytes", "web", where, WebConfig().max_page_bytes),
     )
 
     kernel_defaults = KernelConfig()
-    runtime = env.get("HAILER_KERNEL") or _str(kernel_tbl, "runtime", "kernel", path, kernel_defaults.runtime)
-    image = env.get("HAILER_KERNEL_IMAGE") or _str(kernel_tbl, "image", "kernel", path)
+    runtime = env.get("HAILER_KERNEL") or _str(kernel_tbl, "runtime", "kernel", where, kernel_defaults.runtime)
+    image = env.get("HAILER_KERNEL_IMAGE") or _str(kernel_tbl, "image", "kernel", where)
     kernel = KernelConfig(
         runtime=(runtime or "").strip().lower() or kernel_defaults.runtime,  # validate() reports unknown values
         image=(image or "").strip() or None,
-        memory=(_str(kernel_tbl, "memory", "kernel", path, kernel_defaults.memory) or "").strip(),  # as written: messages quote it
-        cpus=_number(kernel_tbl, "cpus", "kernel", path, kernel_defaults.cpus),
-        network=_bool(kernel_tbl, "network", "kernel", path, kernel_defaults.network),
+        memory=(_str(kernel_tbl, "memory", "kernel", where, kernel_defaults.memory) or "").strip(),  # as written: messages quote it
+        cpus=_number(kernel_tbl, "cpus", "kernel", where, kernel_defaults.cpus),
+        network=_bool(kernel_tbl, "network", "kernel", where, kernel_defaults.network),
     )
 
     checks_defaults = CodeChecksConfig()
     checks = CodeChecksConfig(
-        lint=_bool(checks_tbl, "lint", "checks", path, checks_defaults.lint),
-        typecheck=_bool(checks_tbl, "typecheck", "checks", path, checks_defaults.typecheck),
-        format=_bool(checks_tbl, "format", "checks", path, checks_defaults.format),
+        lint=_bool(checks_tbl, "lint", "checks", where, checks_defaults.lint),
+        typecheck=_bool(checks_tbl, "typecheck", "checks", where, checks_defaults.typecheck),
+        format=_bool(checks_tbl, "format", "checks", where, checks_defaults.format),
     )
 
-    resolved_notebook = _resolve(ws, notebook or DEFAULT_NOTEBOOK)
+    resolved_notebook = _resolve(ws, notebook or defaults.get("notebook", DEFAULT_NOTEBOOK))
     return HailerConfig(
         workspace=ws,
         notebook=resolved_notebook,
         notebooks_dir=_resolve(ws, notebooks_dir) if notebooks_dir else resolved_notebook.parent,
-        data_dir=_resolve(ws, data_dir or DEFAULT_DATA_DIR),
-        context_dir=_resolve(ws, context_dir or DEFAULT_CONTEXT_DIR),
-        skills_dir=_resolve(ws, skills_dir or DEFAULT_SKILLS_DIR),
-        prompts_dir=_resolve(ws, prompts_dir or DEFAULT_PROMPTS_DIR),
+        data_dir=_resolve(ws, data_dir or defaults.get("data_dir", DEFAULT_DATA_DIR)),
+        context_dir=_resolve(ws, context_dir or defaults.get("context_dir", DEFAULT_CONTEXT_DIR)),
+        skills_dir=_resolve(ws, skills_dir or defaults.get("skills_dir", DEFAULT_SKILLS_DIR)),
+        prompts_dir=_resolve(ws, prompts_dir or defaults.get("prompts_dir", DEFAULT_PROMPTS_DIR)),
         model=ModelConfig(
             name=model_name,
             provider=model_provider,
@@ -452,6 +521,7 @@ def load_config(
         checks=checks,
         log_level=log_level,
         config_path=path,
+        local_config_path=local_path,
         max_tool_output_chars=max_tool_output_chars,
         max_context_bytes=max_context_bytes,
     )
@@ -620,13 +690,18 @@ def docker_mount_problems(config: HailerConfig, *, windows: bool | None = None) 
     windows = _on_windows() if windows is None else windows
     folder = config.data_dir
     workspace = Path(config.workspace)
-    guarded: list[tuple[Path, str]] = [(workspace, "the workspace folder"), (workspace / ".hailer", "Hailer's .hailer folder")]
+    guarded: list[tuple[Path, str]] = [
+        (workspace, "the workspace folder"),
+        (workspace / STATE_DIRNAME, "Hailer's .hailer folder"),
+        (state_dir(workspace), "Hailer's state folder"),
+    ]
     try:
         guarded.insert(0, (Path.home(), "your home folder"))
     except RuntimeError:  # no home folder to protect
         pass
-    if config.config_path is not None:
-        guarded.append((config.config_path, f"the config file {config.config_path.name}"))
+    for path in (config.config_path, config.local_config_path):
+        if path is not None:
+            guarded.append((path, f"the config file {path.name}"))
     guarded += [(config.context_dir, "the context folder"), (config.skills_dir, "the skills folder"), (config.prompts_dir, "the prompts folder")]
     docker = '[kernel] runtime = "docker"'
     fix = "Keep the data folder a folder of its own, such as data/, and point [hailer].data_dir at it."
@@ -797,8 +872,15 @@ def validate(config: HailerConfig) -> list[str]:
 
     problems.extend(_kernel_problems(config))
 
-    if config.config_path is not None and config.config_path.is_file():
-        problems.extend(_unknown_key_warnings(config.config_path))
+    for path in (config.config_path, config.local_config_path):
+        if path is not None and path.is_file():
+            problems.extend(_unknown_key_warnings(path))
+    configs = [name for name in CONFIG_FILENAMES if (Path(config.workspace) / name).is_file()]
+    if len(configs) > 1:
+        problems.append(
+            f"Warning: {config.workspace} has more than one Hailer config ({', '.join(configs)}); "
+            f"{configs[0]} is used. Keep one of them."
+        )
 
     return problems
 
@@ -810,18 +892,44 @@ def validate(config: HailerConfig) -> list[str]:
 
 _KERNEL_RUNTIME_LINE = f'[kernel]\nruntime = "{KERNEL_RUNTIME_DOCKER}"'
 
+#: ``init``'s two layouts: a folder of its own (``hailer.toml``, ``notebooks/``, ``data/``,
+#: ``.config/hailer/``) or Hailer inside another project (all of it in ``.hailer/``).
+LAYOUT_STANDALONE = "standalone"
+LAYOUT_PROJECT = "project"
+VALID_LAYOUTS = (LAYOUT_STANDALONE, LAYOUT_PROJECT)
 
-def config_template(kernel: str | None = None) -> str:
+#: The template's lines that differ in the project layout: (start of the line up to its comment, new value).
+_PROJECT_TEMPLATE_LINES: tuple[tuple[str, str], ...] = (
+    ('notebook = "notebooks/analysis.py"   ', f'notebook = "{PROJECT_DEFAULTS["notebook"]}"'),
+    ('# notebooks_dir = "notebooks"        ', '# notebooks_dir = ".hailer/notebooks"'),
+    ('data_dir = "data"                    ', f'data_dir = "{PROJECT_DEFAULTS["data_dir"]}"'),
+    ('# context_dir = ".config/hailer/context"  ', f'# context_dir = "{PROJECT_DEFAULTS["context_dir"]}"'),
+    ('# skills_dir  = ".config/hailer/skills"   ', f'# skills_dir  = "{PROJECT_DEFAULTS["skills_dir"]}"'),
+    ('# prompts_dir = ".config/hailer/prompts"  ', f'# prompts_dir = "{PROJECT_DEFAULTS["prompts_dir"]}"'),
+)
+_TEMPLATE_WORKSPACE_LINE = "# Relative paths are resolved against the workspace (the folder containing this file)."
+_PROJECT_WORKSPACE_LINE = "# Relative paths are resolved against the workspace (the folder that holds .hailer/)."
+
+
+def config_template(kernel: str | None = None, layout: str = LAYOUT_STANDALONE) -> str:
     """:data:`DEFAULT_CONFIG_TEMPLATE` (``runtime = "docker"``); with ``kernel`` ("docker" or
-    "unsafe-local") its ``[kernel]`` section names that runtime instead."""
+    "unsafe-local") its ``[kernel]`` section names that runtime instead. In the project layout the
+    folders are the ones inside ``.hailer/``."""
+    text = DEFAULT_CONFIG_TEMPLATE
+    if layout not in VALID_LAYOUTS:
+        raise ConfigError(f"Unknown layout {layout!r}; use {' or '.join(repr(name) for name in VALID_LAYOUTS)}.")
+    if layout == LAYOUT_PROJECT:
+        text = text.replace(_TEMPLATE_WORKSPACE_LINE, _PROJECT_WORKSPACE_LINE, 1)
+        for start, value in _PROJECT_TEMPLATE_LINES:  # the comments stay in their column
+            text = text.replace(start + "#", value.ljust(len(start) - 1) + " #", 1)
     if kernel is None:
-        return DEFAULT_CONFIG_TEMPLATE
+        return text
     if kernel not in VALID_KERNEL_RUNTIMES:
         raise ConfigError(runtime_problem(kernel, "kernel runtime"))
-    return DEFAULT_CONFIG_TEMPLATE.replace(_KERNEL_RUNTIME_LINE, f'[kernel]\nruntime = "{kernel}"', 1)
+    return text.replace(_KERNEL_RUNTIME_LINE, f'[kernel]\nruntime = "{kernel}"', 1)
 
 
-def write_default_config(path: Path, *, overwrite: bool = False, kernel: str | None = None) -> None:
+def write_default_config(path: Path, *, overwrite: bool = False, kernel: str | None = None, layout: str = LAYOUT_STANDALONE) -> None:
     """Write :func:`config_template` (``kernel`` sets ``[kernel] runtime``) to ``path`` (parents created)."""
     path = Path(path)
     if path.exists() and not overwrite:
@@ -829,6 +937,6 @@ def write_default_config(path: Path, *, overwrite: bool = False, kernel: str | N
             f"Config file already exists: {path}",
             hint="Edit it in place, or pass --force to replace it with the default template.",
         )
-    text = config_template(kernel)
+    text = config_template(kernel, layout)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8", newline="\n")

@@ -183,6 +183,8 @@ class HailerConfig:
     checks: CodeChecksConfig = field(default_factory=CodeChecksConfig)
     log_level: str = "WARNING"
     config_path: Path | None = None
+    #: This machine's ``.hailer/local.toml`` when it exists (merged over ``config_path``).
+    local_config_path: Path | None = None
     max_tool_output_chars: int = 12_000
     max_context_bytes: int = 24_000
     notebooks_dir: Path | None = None  # load_config always fills it; None only in hand-built test configs

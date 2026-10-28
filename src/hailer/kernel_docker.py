@@ -1213,7 +1213,7 @@ class DockerRuntime:
             owner = acquire_owner_lock(workspace)
         except OSError as err:
             raise KernelRuntimeError(
-                f"Could not create the kernel's owner lock in {workspace / '.hailer'}: {err}",
+                f"Could not create the kernel's owner lock in {state_dir(workspace)}: {err}",
                 hint="Check the permissions and free space in .hailer, then try again.",
             ) from err
         self.owner_id = owner.id
@@ -1245,7 +1245,7 @@ class DockerRuntime:
                 token_file = write_token_file(workspace, token)
             except OSError as err:
                 raise KernelRuntimeError(
-                    f"Could not write the kernel's token file in {workspace / '.hailer'}: {err}",
+                    f"Could not write the kernel's token file in {state_dir(workspace)}: {err}",
                     hint="Check the permissions and free space in .hailer, then try again.",
                 ) from err
         except BaseException:

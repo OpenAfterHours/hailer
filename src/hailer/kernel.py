@@ -46,7 +46,7 @@ from hailer.models import (
     MarimoServer,
 )
 from hailer.sandbox import MarimoSandbox
-from hailer.statedir import clear_sandbox_mark, ensure_state_dir, sandbox_wrote_notebooks, state_dir
+from hailer.statedir import clear_sandbox_mark, ensure_ignored_dir, ensure_state_dir, sandbox_wrote_notebooks, state_dir
 
 #: ``.hailer/marimo-<pid>.log``: the unsafe-local runtime's log, one per Hailer process, deleted on stop.
 LOCAL_LOG_PREFIX = "marimo-"
@@ -206,7 +206,7 @@ def _feed_stdin(proc: Any, text: str) -> None:
 def _fresh_log(log_path: Path) -> Any:
     """``log_path`` emptied and opened for the child (owner-only on POSIX): marimo prints its
     signed-in URL, so an old server's token never stays behind in the log."""
-    ensure_state_dir(log_path.parent.parent)
+    ensure_ignored_dir(log_path.parent)
     fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0), 0o600)
     if os.name != "nt":
         os.chmod(log_path, 0o600)
