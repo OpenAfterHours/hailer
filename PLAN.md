@@ -38,8 +38,9 @@ else: no shell, no approval step, no file tool beyond reading the project's own 
 model writes runs in marimo's scratchpad, and durable changes go through marimo's private code-mode API
 (`marimo._code_mode`), so marimo is pinned (`==0.24.2`) and so is the kernel image's marimo. Code mode
 formats the cells the agent creates or edits with the kernel's ruff before they run, and `code_checks.py`
-checks the changed cells with ruff and ty on this machine, over a snapshot the kernel returns; the findings
-end the tool result (`[checks]` in `hailer.toml` turns each part off).
+checks the changed cells with ruff, ty and its own check for values typed into text on this machine, over a
+snapshot the kernel returns; the findings end the tool result (`[checks]` in `hailer.toml` turns each part
+off).
 
 ## The sandbox contract
 
@@ -133,7 +134,7 @@ src/hailer/
 ├── tools.py           HailerTools (the 15 tools) and hailer_tools(config) -> LangChain tools
 ├── project.py         ProjectFiles: the project's files the project_* tools list, search and read
 ├── datafolders.py     this machine's [data_folders] in .hailer/local.toml (hailer data add|remove, /data)
-├── code_checks.py     ruff and ty on the cells the agent writes (and code mode's ruff formatting)
+├── code_checks.py     ruff, ty and typed-in values on the cells the agent writes (and code mode's ruff formatting)
 ├── sandbox.py         MarimoSandbox, the sandbox contract
 ├── notebook_sync.py   the allow-listed copy between the docker kernel and the host
 ├── kernel.py          runtime_for, the unsafe-local runtime, withheld variables
@@ -158,14 +159,14 @@ it answers questions about the data and about the product it comes from.
 - **Project files.** `[project]` gives the agent `project_files`, `project_search` and `project_read`: the
   project's code, docs and configuration, read-only, on this machine (`hailer.project`); git's view of the
   files minus Hailer's state, the data and notebooks folders and credential files; credential lines withheld
-  (LEARNINGS §16).
+  (LEARNINGS §17).
 - **Data folders.** `[data_folders]` (and `uvx hailer data add <name> <folder>`, `/data`) mount folders from
   anywhere on the machine read-only at `/work/folders/<name>`, as `DATA_FOLDERS["<name>"]` in notebooks, with
-  the data folder's mount rules; paths live in each machine's `local.toml` (LEARNINGS §17).
+  the data folder's mount rules; paths live in each machine's `local.toml` (LEARNINGS §18).
 
 Verified:
 
-- Offline suite on Linux, Python 3.13: 1166 passed, 15 skipped.
+- Offline suite on Linux, Python 3.13: 1174 passed, 15 skipped (with main merged in).
 - `tests/test_docker_integration.py` with `HAILER_DOCKER_TESTS=strict`: 12 passed on Linux with Docker Engine
   29.9.2 and an image built from this checkout (`scripts/build_kernel_image.py --load`, the pinned base image
   digest pulled through a registry mirror), including the new data folder mount.

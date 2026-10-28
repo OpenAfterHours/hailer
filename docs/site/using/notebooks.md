@@ -115,6 +115,44 @@ notebook      = "notebooks/analysis.py"   # the default (and first) notebook
 notebooks_dir = "notebooks"               # where /notebook new and the agent's notebook_create put files
 ```
 
+## Re-running a notebook for a new period {#re-running}
+
+Hailer writes an analysis so that you can run it again on other data without editing it: next month's
+report, or a dashboard you keep open. Three habits make that work, and you will see them in the code:
+
+- **A settings cell.** Every choice the analysis depends on (the file, the reporting period, filters,
+  top-N) sits in one cell named `settings`, above the analysis. Its defaults come from the data: the
+  reporting period is the latest one in the data folder unless you pick another. No other cell has a
+  month, file name or threshold typed into it.
+- **Commentary from the numbers.** A summary is an f-string over values the notebook works out, such as
+  `total_revenue`, `revenue_change_pct` and `top_region`, so the text changes with the figures, including
+  words like *rose* or *fell* and which region leads. Interpretation the data cannot give (a cause you
+  told Hailer about, say) is labelled with the period it was written for, and shows a warning when you
+  look at another period. A check backs this up: see [Formatting and code checks](#code-checks).
+- **Simple code.** One step per cell, named after what it works out, in plain Polars, without helper
+  functions or defensive code the data does not need, so you can read the notebook from top to bottom.
+
+To see another period, pick it in the **Reporting period** dropdown at the top of the notebook, or ask in
+the chat:
+
+```text
+You > show the same for March
+```
+
+Every cell below the settings recalculates; Hailer switches the dropdown rather than copying cells. When
+next month's file arrives (`25-07 sales.parquet`, say), put it in the data folder and open the notebook:
+the dropdown now includes July and opens on it.
+
+To make an older notebook re-runnable, ask for it; Hailer finds the typed-in values with its checks:
+
+```text
+You > make this notebook re-runnable for other months
+```
+
+The settings cell also reads a period from marimo's command line (`-- --period 2025-04`). Running a
+notebook with marimo yourself, outside Hailer, runs its code on your machine as you, not in the Docker
+kernel; see [Kernel runtimes](../security/runtimes.md#kernel-runtimes).
+
 ## Formatting and code checks {#code-checks}
 
 The code the agent writes into your notebook is formatted and checked as it goes in:
@@ -128,6 +166,11 @@ The code the agent writes into your notebook is formatted and checked as it goes
   that are real mistakes before it carries on: an undefined or misspelt name, a method the dataframe does
   not have, a wrong argument, a mutable default argument. ty sees the whole notebook in the order marimo
   runs it, so it knows that `sales` from another cell is a Polars `DataFrame`.
+- **Typed-in values.** Hailer's own check looks at the text a reader sees, `mo.md(...)` and chart titles,
+  for numbers, dates and month names typed in rather than formatted from a variable: `"Revenue rose 5.6%
+  in March"` is reported, `f"Revenue rose {change_pct:.1%} in {report_period}"` is not. The agent rewrites
+  such text so that it follows the data when the notebook is [re-run](#re-running). Numbered lists and
+  names such as `Q2` are left alone.
 
 Ask the agent to check the whole notebook at any time (it has a `notebook_check` tool for that):
 
@@ -138,7 +181,8 @@ You > check the notebook for mistakes
 Findings about what cells do on purpose are left out: an import meant for a later cell, top-level `await`,
 a cell whose last line is just a value to display, a missing package (the cell fails when it runs anyway).
 ruff runs with Hailer's own small rule set, so a `ruff.toml` or `pyproject.toml` in the workspace does not
-change the checks. Both tools come with Hailer and run on this machine, whichever kernel runtime you use.
+change the checks. ruff and ty come with Hailer, and all three checks run on this machine, whichever
+kernel runtime you use.
 The checks usually take a fraction of a second and do not change the notebook; the agent fixes findings through
 ordinary cell edits.
 
@@ -148,5 +192,6 @@ To switch parts off, add a `[checks]` section to `hailer.toml`:
 [checks]
 lint      = true    # ruff
 typecheck = true    # ty
+hardcoded = true    # numbers, dates and months typed into notebook text
 format    = false   # leave the agent's cells as it wrote them
 ```

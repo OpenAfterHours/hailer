@@ -39,6 +39,10 @@ to add a calculation or explanation to the notebook when you want to keep it.
 Type `/exit` to finish. Run `uvx hailer` from the same folder to resume your conversation and active notebook.
 `/new` starts a fresh conversation; it does not clear your notebook.
 
+Analyses are built to run again: when next month's file arrives, put it in the data folder and open the
+notebook, or pick another period at the top of it. See
+[re-running a notebook for a new period](notebooks.md#re-running).
+
 For a different analysis, ask Hailer to create a notebook or use:
 
 ```text

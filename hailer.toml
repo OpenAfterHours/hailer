@@ -77,10 +77,12 @@ runtime = "docker"                   # "docker" or "unsafe-local"
 # exclude = ["tests/fixtures/**"]    # never these
 
 # The cells the agent writes. After each notebook change Hailer checks the changed cells with ruff
-# (lint) and ty (types) and hands the findings back to the agent; code mode formats new and edited
-# cells with ruff before marimo applies them. All three are on by default.
+# (lint), ty (types) and its own check for values typed into notebook text, and hands the findings
+# back to the agent; code mode formats new and edited cells with ruff before marimo applies them.
+# All four are on by default.
 #
 # [checks]
 # lint      = true                   # ruff: undefined names, unused variables, likely bugs
 # typecheck = true                   # ty: wrong attributes, arguments and types across cells
+# hardcoded = true                   # numbers, dates and months typed into text instead of variables
 # format    = true                   # ruff format, with marimo's line length

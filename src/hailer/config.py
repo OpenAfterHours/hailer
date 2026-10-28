@@ -91,7 +91,7 @@ _KNOWN_PROVIDER = {
 }
 _KNOWN_WEB = {"allowed_domains", "max_page_bytes"}
 _KNOWN_KERNEL = {"runtime", "image", "memory", "cpus", "network"}
-_KNOWN_CHECKS = {"lint", "typecheck", "format"}
+_KNOWN_CHECKS = {"lint", "typecheck", "hardcoded", "format"}
 _KNOWN_PROJECT = {"root", "include", "exclude", "enabled"}
 _KNOWN_DATA_FOLDER = {"path", "description"}
 #: A data folder's name: its folder in the kernel (``/work/folders/<name>``) and its key in ``DATA_FOLDERS``.
@@ -189,12 +189,14 @@ runtime = "docker"                   # "docker" or "unsafe-local"
 # exclude = ["tests/fixtures/**"]    # never these
 
 # The cells the agent writes. After each notebook change Hailer checks the changed cells with ruff
-# (lint) and ty (types) and hands the findings back to the agent; code mode formats new and edited
-# cells with ruff before marimo applies them. All three are on by default.
+# (lint), ty (types) and its own check for values typed into notebook text, and hands the findings
+# back to the agent; code mode formats new and edited cells with ruff before marimo applies them.
+# All four are on by default.
 #
 # [checks]
 # lint      = true                   # ruff: undefined names, unused variables, likely bugs
 # typecheck = true                   # ty: wrong attributes, arguments and types across cells
+# hardcoded = true                   # numbers, dates and months typed into text instead of variables
 # format    = true                   # ruff format, with marimo's line length
 """
 
@@ -558,6 +560,7 @@ def load_config(
     checks = CodeChecksConfig(
         lint=_bool(checks_tbl, "lint", "checks", where, checks_defaults.lint),
         typecheck=_bool(checks_tbl, "typecheck", "checks", where, checks_defaults.typecheck),
+        hardcoded=_bool(checks_tbl, "hardcoded", "checks", where, checks_defaults.hardcoded),
         format=_bool(checks_tbl, "format", "checks", where, checks_defaults.format),
     )
 

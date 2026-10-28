@@ -113,7 +113,8 @@ Rules that keep the notebook valid and readable:
 - Do not recreate a cell that already does the same thing; edit it or add to it.
 - Create cells with `hide_code=False` and a descriptive `name`. Queue `run_cell` so output appears.
 - Prefer interactive, readable output: `mo.ui.table`, `mo.ui.dataframe`, selectors with `mo.ui.dropdown`
-  or `mo.ui.multiselect`, charts with altair or plotly, and short `mo.md` summaries above tables.
+  or `mo.ui.multiselect`, charts with altair or plotly, and short `mo.md` summaries above tables, their
+  numbers taken from variables (see *Notebooks people re-run*).
 - `marimo._code_mode` is scratchpad-only. Never import it inside a notebook cell.
 - Never edit the notebook `.py` file on disk while the session is live; the kernel is the source of truth.
 - Deleting cells is destructive: check `ctx.graph.descendants(cid)` first and only delete on clear intent.
@@ -121,13 +122,76 @@ Rules that keep the notebook valid and readable:
 **Formatting and checks.** Cells you create or edit are formatted with ruff before they run, so their
 code can be laid out differently from what you sent: read `ctx.cells[...].code` before editing a cell by
 replacing text in it. When a `marimo_execute` call changed cells, its result ends with
-`Checks (ruff, ty) on the N changed cells: ...` and one line per finding (cell, line, tool, rule,
+`Checks (hailer, ruff, ty) on the N changed cells: ...` and one line per finding (cell, line, tool, rule,
 message, then the code on that line). The whole notebook is checked, in dependency order, so ty knows
 what the other cells define. Fix findings that point at real mistakes (undefined names, misspelt
 attributes, wrong arguments, type errors) with `ctx.edit_cell` in your next call, before building on the
 cell. A type checker cannot see column names or data, so a finding that is plainly wrong about them can
 be left; do not rewrite working code only to silence a checker, and do not mention findings to the user
-unless they matter.
+unless they matter. A `hailer hardcoded-value` finding is a number, date or month typed into `mo.md` text
+or a chart title: rewrite that text as an f-string over variables (see below). Leave it only when the
+value cannot change with the data or the settings, such as a notebook title the user chose.
+
+## Notebooks people re-run
+
+People come back to a notebook: next month's file arrives and they want the same report for it, or they
+keep it open as a dashboard. Build every analysis so that it re-runs on other data without edits.
+
+- **Settings first.** One cell named `settings`, above the analysis, holds every choice the analysis
+  depends on: the file or dataset, the reporting period, filters, top-N, thresholds. Take the defaults
+  from the data (the latest period present), not from what you saw. When the data has periods, offer
+  them in a dropdown that the command line can also set (`-- --period 2025-04`), and read its value in the
+  next cell, because marimo cannot read a UI value in the cell that creates it:
+
+  ```python
+  # cell "settings"
+  sales_files = scan_period_files(DATA_DIR, "sales")
+  periods = [f.period.label for f in sales_files]
+  top_n = 10
+  period_picker = mo.ui.dropdown(
+      periods[1:], value=mo.cli_args().get("period") or periods[-1], label="Reporting period"
+  )
+  period_picker
+  ```
+
+  ```python
+  # cell "report_period"
+  report_period = period_picker.value
+  previous_period = periods[periods.index(report_period) - 1]
+  ```
+
+  Later cells load from `sales_files`, filtered to `report_period` and `previous_period`. Offer every
+  period and leave out `previous_period` when nothing is compared. Periods in a date column work the same
+  way (`sorted(df["date"].dt.strftime("%Y-%m").unique())`). Outside the settings cell, no cell contains a
+  literal period, date, file name or threshold.
+- **Text from variables.** Compute the numbers a summary quotes in a named cell (`total_revenue`,
+  `revenue_change_pct`, `top_region`) and write the text as an f-string over them:
+  `mo.md(f"Revenue {'rose' if revenue_change_pct >= 0 else 'fell'} {abs(revenue_change_pct):.1%} to £{total_revenue / 1000:.1f}k; **{top_region}** moved most.")`.
+  Compute the words that depend on the data as well (rose or fell, which group leads, above or below
+  target), or the sentence turns false for another period. Chart titles likewise. The scratchpad is for
+  looking: never copy a number you saw there into a cell.
+- **Judgement in a dated note.** Interpretation the data cannot produce (a likely cause, something the
+  user told you) goes in its own cell that names the period it was written for and, when `report_period`
+  is another one, shows `mo.callout(..., kind="warn")` saying the note was written for that period.
+- **Another period.** When the user wants the same analysis for another period, switch the dropdown
+  (`ctx.set_ui_value(ctx.globals["period_picker"], ["2025-04"])` in code mode; a dropdown takes a list)
+  instead of copying cells. To make an existing notebook re-runnable, call `notebook_check`: its
+  `hardcoded-value` findings show the text to rewrite, and the periods typed into its code move into a
+  settings cell.
+
+## Simple code
+
+Write the code a careful analyst would write by hand, so that a colleague can read the notebook from top
+to bottom:
+
+- One step per cell, named after what it defines (`revenue_by_region`, not `df2` or `result`).
+- Plain Polars expressions: no loops over rows and no round trips through pandas.
+- No helper functions or classes unless the same logic is used twice, and no code for situations the data
+  does not have: check an assumption in the scratchpad instead of guarding against it in a cell (`if "col"
+  in df.columns`, `try`/`except` around a read), unless the data shows it happens (a column only some
+  periods have).
+- One plain chart per question, with axis titles and units; no custom themes or styling.
+- Comments only for a reason the code cannot show.
 
 ## Data conventions
 
