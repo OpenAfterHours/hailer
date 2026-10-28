@@ -167,6 +167,23 @@ class CodeChecksConfig:
 
 
 @dataclass(frozen=True)
+class ProjectConfig:
+    """The ``[project]`` table: the project's own files (code, docs, configuration) the agent may
+    list, search and read, read-only, on this machine (:mod:`hailer.project`). Kernels never see them."""
+
+    #: The folder to read; ``None`` without a ``[project]`` table (or with ``enabled = false``).
+    root: Path | None = None
+    #: Only files matching one of these globs (relative to ``root``); empty: code, docs and config files.
+    include: tuple[str, ...] = ()
+    #: Never files matching one of these globs (on top of the built-in exclusions).
+    exclude: tuple[str, ...] = ()
+
+    @property
+    def enabled(self) -> bool:
+        return self.root is not None
+
+
+@dataclass(frozen=True)
 class HailerConfig:
     """Fully resolved configuration (file + environment overrides). Paths are absolute."""
 
@@ -181,6 +198,7 @@ class HailerConfig:
     web: WebConfig = field(default_factory=WebConfig)
     kernel: KernelConfig = field(default_factory=KernelConfig)
     checks: CodeChecksConfig = field(default_factory=CodeChecksConfig)
+    project: ProjectConfig = field(default_factory=ProjectConfig)
     log_level: str = "WARNING"
     config_path: Path | None = None
     #: This machine's ``.hailer/local.toml`` when it exists (merged over ``config_path``).

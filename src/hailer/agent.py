@@ -290,8 +290,30 @@ def system_prompt(config: HailerConfig, bundle: ContextBundle, server: MarimoSer
             "project context only."
         )
 
+    parts.append(_project_section(config))
     parts.append(_workspace_section(config, server))
     return "\n\n".join(p.rstrip() for p in parts) + "\n"
+
+
+def _project_section(config: HailerConfig) -> str:
+    """Whether the project's own files can be read (``[project]``), and from where."""
+    root = config.project.root
+    if root is None:
+        return (
+            "## Project files\n\nNo project files are available: the config has no [project] section, so "
+            "`project_files`, `project_search` and `project_read` refuse. When the user asks how the product "
+            'or its code works, say that adding [project] with root = "." to the Hailer config lets you read it.'
+        )
+    try:
+        shown = root.relative_to(config.workspace).as_posix()
+        shown = "the workspace" if shown == "." else f"{shown} in the workspace"
+    except ValueError:
+        shown = str(root)
+    return (
+        f"## Project files\n\nYou can read the project's own code, docs and configuration ({shown}) with "
+        "`project_files`, `project_search` and `project_read`: read-only, on the user's machine. The kernel "
+        "cannot see these files, so notebook code cannot import or open them."
+    )
 
 
 def _workspace_section(config: HailerConfig, server: MarimoServer | None = None) -> str:

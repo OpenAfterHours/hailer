@@ -25,15 +25,24 @@ _SECRET_PATTERNS: tuple[tuple[re.Pattern[str], bool], ...] = (
     (re.compile(r"\bsk-[A-Za-z0-9_\-]{16,}"), False),
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), False),
     (re.compile(r"\b[A-Fa-f0-9]{40,}\b"), False),
+    (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----"), False),
     (re.compile(r"(?i)\bbearer\s+([A-Za-z0-9._\-]{16,})"), True),
-    (re.compile(r"(?i)\b(api[_-]?key|secret|token|password|passwd)\b\s*[:=]\s*['\"]?([A-Za-z0-9_\-./+=]{12,})"), True),
+    # The name may end a longer one: db_password, client_secret, SECRET_KEY, aws_secret_access_key.
+    (_ASSIGNMENT := re.compile(
+        r"(?i)(?:\b|(?<=_))(api[_-]?key|secret(?:[_-]?access)?[_-]?key|private[_-]?key|access[_-]?key|secret|token|password|passwd|pwd)"
+        r"\b\s*[:=]\s*['\"]?([A-Za-z0-9_\-./+=]{12,})"
+    ), True),
 )
 _ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _PLACEHOLDER_RE = re.compile(r"^[<$\{].*|.*(your|example|placeholder|xxx|\.\.\.).*$", re.IGNORECASE)
 
 
-def looks_like_secret(text: str) -> bool:
-    """Heuristic: does the text contain something that looks like a credential?"""
+def looks_like_secret(text: str, *, code: bool = False) -> bool:
+    """Heuristic: does the text contain something that looks like a credential?
+
+    ``code``: the text is source code, where ``token = request.headers.get(...)`` is an
+    expression, so a ``key = value`` match counts only when the value is a quoted literal.
+    """
     for pattern, apply_exclusions in _SECRET_PATTERNS:
         for match in pattern.finditer(text):
             if not apply_exclusions:
@@ -41,6 +50,8 @@ def looks_like_secret(text: str) -> bool:
             value = match.group(match.lastindex) if match.lastindex else match.group(0)
             if _ENV_NAME_RE.match(value) or _PLACEHOLDER_RE.match(value):
                 continue  # an env var *name* or an obvious placeholder, not a value
+            if code and pattern is _ASSIGNMENT and text[match.start(match.lastindex) - 1 : match.start(match.lastindex)] not in ("'", '"'):
+                continue  # an expression (a name, an attribute, a call), not a literal
             return True
     return False
 

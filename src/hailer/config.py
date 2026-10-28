@@ -35,6 +35,7 @@ from hailer.models import (
     HailerConfig,
     KernelConfig,
     ModelConfig,
+    ProjectConfig,
     ProviderConfig,
     WebConfig,
 )
@@ -63,7 +64,7 @@ VALID_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 
 # Known keys per section; anything else is reported by validate() as a warning.
-_KNOWN_TOP = {"hailer", "model", "model_providers", "web", "kernel", "checks"}
+_KNOWN_TOP = {"hailer", "model", "model_providers", "web", "kernel", "checks", "project"}
 _KNOWN_HAILER = {
     "notebook",
     "notebooks_dir",
@@ -90,6 +91,7 @@ _KNOWN_PROVIDER = {
 _KNOWN_WEB = {"allowed_domains", "max_page_bytes"}
 _KNOWN_KERNEL = {"runtime", "image", "memory", "cpus", "network"}
 _KNOWN_CHECKS = {"lint", "typecheck", "format"}
+_KNOWN_PROJECT = {"root", "include", "exclude", "enabled"}
 
 # docker --memory: a number with an optional b/k/m/g unit ("4g", "512m", "1.5g").
 _MEMORY_RE = re.compile(r"^(\d+(?:\.\d+)?)[bkmg]?$", re.IGNORECASE)
@@ -162,6 +164,16 @@ runtime = "docker"                   # "docker" or "unsafe-local"
 # memory  = "4g"                     # docker: container memory limit (no swap on top)
 # cpus    = 2                        # docker: container CPU limit
 # network = false                    # docker: true lets notebook code reach the internet and this machine
+
+# The project's own files (code, docs, configuration) that the agent may list, search and read,
+# read-only, on this machine; the kernel never sees them. Files git ignores, Hailer's own state,
+# the data folders and files that look like credentials are always left out. What the agent reads
+# is sent to the model endpoint. Without this section the agent reads no project files.
+#
+# [project]
+# root    = "."                      # the folder to read (default: the workspace)
+# include = ["**/*.py", "docs/**"]   # only these (default: code, docs and config files)
+# exclude = ["tests/fixtures/**"]    # never these
 
 # The cells the agent writes. After each notebook change Hailer checks the changed cells with ruff
 # (lint) and ty (types) and hands the findings back to the agent; code mode formats new and edited
@@ -438,6 +450,7 @@ def load_config(
     web_tbl = _section(data, "web", where)
     kernel_tbl = _section(data, "kernel", where)
     checks_tbl = _section(data, "checks", where)
+    project_tbl = _section(data, "project", where) if "project" in data else None
 
     notebook = _str(hailer_tbl, "notebook", "hailer", where, defaults.get("notebook", DEFAULT_NOTEBOOK))
     notebooks_dir = _str(hailer_tbl, "notebooks_dir", "hailer", where)
@@ -500,6 +513,14 @@ def load_config(
         format=_bool(checks_tbl, "format", "checks", where, checks_defaults.format),
     )
 
+    project = ProjectConfig()
+    if project_tbl is not None and _bool(project_tbl, "enabled", "project", where, True):
+        project = ProjectConfig(
+            root=_resolve(ws, _str(project_tbl, "root", "project", where, ".") or "."),
+            include=tuple(g.strip() for g in _str_list(project_tbl, "include", "project", where, '["**/*.py", "docs/**"]') if g.strip()),
+            exclude=tuple(g.strip() for g in _str_list(project_tbl, "exclude", "project", where, '["tests/fixtures/**"]') if g.strip()),
+        )
+
     resolved_notebook = _resolve(ws, notebook or defaults.get("notebook", DEFAULT_NOTEBOOK))
     return HailerConfig(
         workspace=ws,
@@ -519,6 +540,7 @@ def load_config(
         web=web,
         kernel=kernel,
         checks=checks,
+        project=project,
         log_level=log_level,
         config_path=path,
         local_config_path=local_path,
@@ -594,6 +616,9 @@ def _unknown_key_warnings(path: Path) -> list[str]:
     checks_tbl = data.get("checks") or {}
     if isinstance(checks_tbl, dict):
         check(checks_tbl, _KNOWN_CHECKS, "checks")
+    project_tbl = data.get("project") or {}
+    if isinstance(project_tbl, dict):
+        check(project_tbl, _KNOWN_PROJECT, "project")
     return warnings
 
 
@@ -735,6 +760,36 @@ def docker_mount_problems(config: HailerConfig, *, windows: bool | None = None) 
     return []
 
 
+def project_problems(config: HailerConfig, *, windows: bool | None = None) -> list[str]:
+    """Reasons not to let the agent read ``[project].root`` (empty when it is fine, or off).
+
+    Everything the agent reads there is sent to the model endpoint, so the folder may not be a whole
+    drive, be or contain the home folder, or be, contain or sit inside a folder that holds credentials
+    (:data:`CREDENTIAL_FOLDERS`). A missing folder is a warning: the tools say so when asked.
+    """
+    root = config.project.root
+    if root is None:
+        return []
+    windows = _on_windows() if windows is None else windows
+    fix = 'Point [project].root at the project\'s own folder (root = "." is the workspace).'
+    if not root.is_dir():
+        return [f"Warning: the project folder {root} ([project].root) does not exist; the agent cannot read project files. {fix}"]
+    if _is_drive_root(root):
+        return [f"The project folder ({root}) is a whole drive; the agent would read files from all of it. {fix}"]
+    try:
+        home = Path.home()
+    except RuntimeError:
+        home = None
+    if home is not None and _inside_or_equal(home, root):
+        relation = "is" if _same_folder(home, root) else "contains"
+        return [f"The project folder ({root}) {relation} your home folder; the agent would read files from all of it. {fix}"]
+    for secret in _credential_folders(windows):
+        if _inside_or_equal(secret, root) or _inside_or_equal(root, secret):
+            relation = "is" if _same_folder(secret, root) else ("contains" if _inside_or_equal(secret, root) else "is inside")
+            return [f"The project folder ({root}) {relation} {secret}, a folder that holds credentials. {fix}"]
+    return []
+
+
 def runtime_problem(runtime: str, where: str = "[kernel].runtime") -> str:
     """Why ``runtime``, read from ``where``, is not a kernel runtime. The retired ``local`` gets its
     own message: the unisolated runtime is only ever chosen by writing ``unsafe-local``."""
@@ -871,6 +926,7 @@ def validate(config: HailerConfig) -> list[str]:
         problems.append("[hailer].max_context_bytes must be a positive integer.")
 
     problems.extend(_kernel_problems(config))
+    problems.extend(project_problems(config))
 
     for path in (config.config_path, config.local_config_path):
         if path is not None and path.is_file():
@@ -907,6 +963,9 @@ _PROJECT_TEMPLATE_LINES: tuple[tuple[str, str], ...] = (
     ('# skills_dir  = ".config/hailer/skills"   ', f'# skills_dir  = "{PROJECT_DEFAULTS["skills_dir"]}"'),
     ('# prompts_dir = ".config/hailer/prompts"  ', f'# prompts_dir = "{PROJECT_DEFAULTS["prompts_dir"]}"'),
 )
+#: In the project layout the agent reads the project's files: the [project] section is on.
+_TEMPLATE_PROJECT_SECTION = '# [project]\n# root    = "."                      #'
+_PROJECT_PROJECT_SECTION = '[project]\nroot    = "."                        #'
 _TEMPLATE_WORKSPACE_LINE = "# Relative paths are resolved against the workspace (the folder containing this file)."
 _PROJECT_WORKSPACE_LINE = "# Relative paths are resolved against the workspace (the folder that holds .hailer/)."
 
@@ -920,6 +979,7 @@ def config_template(kernel: str | None = None, layout: str = LAYOUT_STANDALONE) 
         raise ConfigError(f"Unknown layout {layout!r}; use {' or '.join(repr(name) for name in VALID_LAYOUTS)}.")
     if layout == LAYOUT_PROJECT:
         text = text.replace(_TEMPLATE_WORKSPACE_LINE, _PROJECT_WORKSPACE_LINE, 1)
+        text = text.replace(_TEMPLATE_PROJECT_SECTION, _PROJECT_PROJECT_SECTION, 1)
         for start, value in _PROJECT_TEMPLATE_LINES:  # the comments stay in their column
             text = text.replace(start + "#", value.ljust(len(start) - 1) + " #", 1)
     if kernel is None:

@@ -57,6 +57,16 @@ runtime = "docker"                   # "docker" or "unsafe-local"
 # cpus    = 2                        # docker: container CPU limit
 # network = false                    # docker: true lets notebook code reach the internet and this machine
 
+# The project's own files (code, docs, configuration) that the agent may list, search and read,
+# read-only, on this machine; the kernel never sees them. Files git ignores, Hailer's own state,
+# the data folders and files that look like credentials are always left out. What the agent reads
+# is sent to the model endpoint. Without this section the agent reads no project files.
+#
+# [project]
+# root    = "."                      # the folder to read (default: the workspace)
+# include = ["**/*.py", "docs/**"]   # only these (default: code, docs and config files)
+# exclude = ["tests/fixtures/**"]    # never these
+
 # The cells the agent writes. After each notebook change Hailer checks the changed cells with ruff
 # (lint) and ty (types) and hands the findings back to the agent; code mode formats new and edited
 # cells with ruff before marimo applies them. All three are on by default.
