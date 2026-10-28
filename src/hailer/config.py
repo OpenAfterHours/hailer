@@ -815,12 +815,7 @@ def _mount_problems(config: HailerConfig, folder: Path, label: str, windows: boo
             f"{label} ({folder}) {relation} {name}. With {docker} it is mounted into the container, "
             f"so notebook code could read Hailer's own files. {fix}"
         ]
-    credentials = _credential_folders(windows)
-    secret = next((target for target in credentials if _inside_or_equal(target, folder)), None)
-    if secret is None:
-        appdata = [Path(os.environ[var]) for var in CREDENTIAL_FOLDER_VARS if windows and os.environ.get(var)]
-        secret = next((target for target in credentials if _inside_or_equal(folder, target)
-                       and not (_in_temp(folder) and any(_same_folder(target, app) for app in appdata))), None)
+    secret = _credential_folder_for(folder, windows)
     if secret is not None:
         relation = "is" if _same_folder(secret, folder) else ("contains" if _inside_or_equal(secret, folder) else "is inside")
         return [
@@ -828,6 +823,19 @@ def _mount_problems(config: HailerConfig, folder: Path, label: str, windows: boo
             f"mounted into the container, so notebook code could read them. {fix}"
         ]
     return []
+
+
+def _credential_folder_for(folder: Path, windows: bool) -> Path | None:
+    """The credential folder (:func:`_credential_folders`) that ``folder`` is, contains or sits inside, or
+    ``None``. "Sits inside" does not count within the temporary folder, which on Windows is inside
+    %LOCALAPPDATA%."""
+    credentials = _credential_folders(windows)
+    secret = next((target for target in credentials if _inside_or_equal(target, folder)), None)
+    if secret is None:
+        appdata = [Path(os.environ[var]) for var in CREDENTIAL_FOLDER_VARS if windows and os.environ.get(var)]
+        secret = next((target for target in credentials if _inside_or_equal(folder, target)
+                       and not (_in_temp(folder) and any(_same_folder(target, app) for app in appdata))), None)
+    return secret
 
 
 def available_data_folders(config: HailerConfig) -> list[DataFolder]:
@@ -875,10 +883,10 @@ def project_problems(config: HailerConfig, *, windows: bool | None = None) -> li
     if home is not None and _inside_or_equal(home, root):
         relation = "is" if _same_folder(home, root) else "contains"
         return [f"The project folder ({root}) {relation} your home folder; the agent would read files from all of it. {fix}"]
-    for secret in _credential_folders(windows):
-        if _inside_or_equal(secret, root) or _inside_or_equal(root, secret):
-            relation = "is" if _same_folder(secret, root) else ("contains" if _inside_or_equal(secret, root) else "is inside")
-            return [f"The project folder ({root}) {relation} {secret}, a folder that holds credentials. {fix}"]
+    secret = _credential_folder_for(root, windows)
+    if secret is not None:
+        relation = "is" if _same_folder(secret, root) else ("contains" if _inside_or_equal(secret, root) else "is inside")
+        return [f"The project folder ({root}) {relation} {secret}, a folder that holds credentials. {fix}"]
     return []
 
 

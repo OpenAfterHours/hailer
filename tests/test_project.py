@@ -126,7 +126,7 @@ def test_in_a_git_repository_ignored_files_hailers_files_and_credentials_are_lef
     _git(ws, "add", "README.md")  # tracked; the rest is new and still listed unless ignored
     files = ProjectFiles.for_config(_config(ws)).files()
     assert set(files) == EXPECTED, set(files) ^ EXPECTED
-    assert files["README.md"] == len("# Shop\nRevenue is net of refunds.\n")
+    assert files["README.md"] == (ws / "README.md").stat().st_size
 
 
 def test_without_git_the_folder_is_walked_with_the_same_exclusions(tmp_path: Path) -> None:
@@ -370,3 +370,23 @@ def test_the_startup_panel_says_which_project_files_the_agent_reads(tmp_path: Pa
 
     assert _project_line(_config(tmp_path)).startswith("the workspace (read-only;")
     assert _project_line(HailerConfig(**{**_config(tmp_path).__dict__, "project": ProjectConfig()})) == "none"
+
+
+def test_a_project_in_the_temporary_folder_is_fine_on_windows_but_not_elsewhere_in_localappdata(tmp_path, monkeypatch):
+    """Regression (Windows CI): %TEMP% is inside %LOCALAPPDATA%, which holds credentials; the data folder's
+    rules already left the temporary folder out, the project folder's did not."""
+    import tempfile
+
+    from hailer.config import project_problems
+
+    local = tmp_path / "AppData" / "Local"
+    temp = local / "Temp"
+    (temp / "repo").mkdir(parents=True)
+    (local / "Google" / "repo").mkdir(parents=True)
+    monkeypatch.setenv("LOCALAPPDATA", str(local))
+    monkeypatch.setattr(tempfile, "tempdir", str(temp))
+    in_temp = HailerConfig(**{**_config(temp / "repo").__dict__})
+    assert project_problems(in_temp, windows=True) == []
+    elsewhere = HailerConfig(**{**_config(local / "Google" / "repo").__dict__})
+    [problem] = project_problems(elsewhere, windows=True)
+    assert "is inside" in problem and "holds credentials" in problem

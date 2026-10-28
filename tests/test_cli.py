@@ -1226,7 +1226,8 @@ def test_init_layout_can_be_chosen_and_an_existing_layout_is_kept(harness, tmp_p
     assert (other / ".hailer" / "hailer.toml").is_file()
     assert "uvx hailer login" in result.output, "no pyproject.toml: Hailer is not a dependency here"
     result = runner.invoke(cli.app, ["--workspace", str(other), "init", "--layout", "monorepo"])
-    assert result.exit_code != 0 and "--layout" in result.output
+    shown = re.sub(r"\x1b\[[0-9;]*m", "", result.output)  # Rich colours the error panel in CI
+    assert result.exit_code == 2 and "--layout" in shown and "standalone or project" in shown, shown
 
 
 def test_init_again_keeps_the_notebook_and_fills_in_what_is_missing(harness, tmp_path, monkeypatch):
