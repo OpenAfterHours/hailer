@@ -29,9 +29,10 @@ on a command you chose this way runs it at once when it takes no arguments (`/he
 `/context`, `/reload`, `/clear`, `/exit`, `/notebook list`); a command that takes arguments is completed with
 a space and the menu then offers them: the `/notebook` subcommands, notebook names after `/notebook open` or
 `/notebook close`, skill names after `/skill`, saved prompts after `/prompt`, and after `/model` the current
-model and each provider as `<provider>:`. If you have not chosen anything, Enter sends a command you typed in
-full (with a whole argument, if it has one) as typed, and otherwise only completes it to the first entry
-without running it: `/n` then Enter gives `/new`, and a second Enter starts the new conversation. Esc closes
+model and each provider as `<provider>:` (suggestions only: a model name you type is sent as typed). If you
+have not chosen anything, Enter sends a command you typed in full (with a whole argument, if it has one) as
+typed, and otherwise only completes it to the first entry without running it: `/n` then Enter gives `/new`,
+and a second Enter starts the new conversation. Esc closes
 the menu (while a turn runs, the first Esc closes the menu and the next one cancels the turn). The menu only
 completes at the end of what you typed; Tab also opens it for the word being typed.
 

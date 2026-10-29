@@ -2751,8 +2751,9 @@ def test_prompt_ctrl_c_ctrl_d_and_ctrl_z_enter():
             reader.read()
 
 
-def type_at_prompt(reader, keys, screen, text: str) -> str:
-    """read() with ``text`` typed once the prompt is on screen, as a person would type it."""
+def type_at_prompt(reader, keys, screen, text: str, *, history: int = 0) -> str:
+    """read() with ``text`` typed once the prompt is on screen, as a person would type it (and,
+    with ``history``, once that many entries are loaded into the prompt's buffer)."""
     shown = screen.getvalue().count("You > ")
     result: list[str] = []
     thread = threading.Thread(target=lambda: result.append(reader.read()), daemon=True)
@@ -2761,6 +2762,8 @@ def type_at_prompt(reader, keys, screen, text: str) -> str:
     while screen.getvalue().count("You > ") <= shown and time.monotonic() < deadline:
         time.sleep(0.02)
     time.sleep(0.1)  # history loads in the background when the prompt starts
+    while history and len(reader._session.default_buffer._working_lines) <= history and time.monotonic() < deadline:
+        time.sleep(0.02)
     keys.send_text(text)
     thread.join(10)
     return result[0]
@@ -2781,7 +2784,7 @@ def test_prompt_recalls_an_earlier_sessions_messages_from_the_history_file(tmp_p
         assert type_at_prompt(reader, keys, screen, "\x1b[200~two\nlines\x1b[201~\r") == "two\nlines"
     with terminal() as (reader, keys, screen):
         reader.history_file = path
-        assert type_at_prompt(reader, keys, screen, "\x1b[A\r") == "two\nlines", "a pasted block comes back whole"
+        assert type_at_prompt(reader, keys, screen, "\x1b[A\r", history=2) == "two\nlines", "a pasted block comes back whole"
     with terminal() as (reader, keys, screen):  # the setting off: this session's history only
         assert type_at_prompt(reader, keys, screen, "\x1b[Anew\r") == "new"
 

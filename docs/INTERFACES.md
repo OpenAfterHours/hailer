@@ -1358,8 +1358,10 @@ opens it). Enter (`ChatUI._enter`, the same with or without the menu on screen):
 (`/help /status /new /context /reload /clear /exit /notebook list`: no arguments); without a choice,
 `SlashCompleter.enter_pick` decides from the draft alone, computed then, so neither typing speed nor a paste
 changes it: a draft that already is a command (any case) or a command and a whole argument (exactly as typed:
-`first-look` beside `first-look-v2`, `sales.py` beside `Sales.py`), or that nothing completes, is submitted as
-typed; any other slash draft is completed to the first item and nothing runs (`/n` Enter gives `/new`, a
+`first-look` beside `first-look-v2`, `sales.py` beside `Sales.py`), a free-text argument
+(`completion.FREE_FORM`: `/model`, whose menu only suggests; `/model gpt-5` is never made `gpt-5.5`), or that
+nothing completes (`/exec` code, a skill's message, a prompt's arguments, a new notebook's name), is submitted
+as typed; any other slash draft is completed to the first item and nothing runs (`/n` Enter gives `/new`, a
 second Enter sends it). A command that takes arguments is completed with its space, so its own menu follows,
 except one typed in full. Esc closes the menu and restores the typed text; it does not cancel a running turn
 while the menu is open (the next Esc does). Arguments: `/notebook` `list|new|open|close`
@@ -1370,11 +1372,14 @@ match as typed first; names pass `single_line`. `completions()` returns `models.
 `active_notebook`, `skills`, `prompts`, `model`, `providers`) and, like `footer`, must only read state the
 controller holds: `ChatController.completions` takes the notebook names from `_notebook_names`. A `/notebook`
 command's own listing (`_names`, `/notebook list`'s) fills it on that command's worker; otherwise
-`_refresh_names_soon` lists in a background `asyncio.to_thread` task nothing awaits (after the startup
-notebook wait, after `/notebook new`, at the end of each composer turn): one listing at a time (a request
-during one makes it list once more after), never through `_blocking` or its stop flag, so neither
-`ready_to_answer` nor a turn's cleanup waits for it. `run_interactive` settles it (`_settle_names`) before
-the agent closes and the CLI stops the kernel, and a result that arrives after that is ignored. The completer
+`_refresh_names_soon` lists in the background, nothing awaiting it (after the startup notebook wait, after
+`/notebook new`, at the end of each composer turn): on a daemon thread (`hailer-notebook-names`, never the
+loop's default executor, which `asyncio.run` joins at exit: §4), all its marimo requests under one
+`request_deadline(chat.NAMES_DEADLINE_SEC)` = 10 s (a kernel can trickle `/api/files`: §13), one listing at a
+time (a request during one makes it list once more after), never through `_blocking` or its stop flag, so
+neither `ready_to_answer` nor a turn's cleanup waits for it. `run_interactive` settles it (`_settle_names`)
+before the agent closes and the CLI stops the kernel: it waits at most `NAMES_SETTLE_SEC` = 1 s, then leaves
+the thread behind, and a result that arrives after that is ignored. The completer
 never lists notebooks itself; a failing `completions` callable leaves the command names. Every submission
 still goes through `parse_command`.
 
@@ -1400,7 +1405,11 @@ frame) when the encoding cannot write it (a cp1252 console); there is no setting
 Startup is a separate preparation gate: typing and paste work from the first render, and one early
 submission waits until both agent and notebook preparation settle. Repeated Enter cannot submit it
 twice. Startup failure retains the pending message and next draft instead of dispatching them. The UI
-settles its startup task on shutdown before the controller closes the agent. Notebook waiting uses
+settles its startup task on shutdown before the controller closes the agent; that shutdown refuses
+cancellation until it is done, so nothing in it may wait on a task that can be gone: `flush` waits for the
+transcript writer only while the writer runs, and a writer cancelled with a dying loop's tasks (an error
+escaping the coroutine that runs the composer: `asyncio.run` cancels them all) leaves its queue to be
+printed directly. Notebook waiting uses
 its own cooperative stop flag and must finish before the CLI stops a kernel it owns.
 `ChatController.startup_failed` records an actual preparation error, so leaving the retained-draft
 interface still returns exit code 1; intentional startup cancellation does not set it.

@@ -966,6 +966,39 @@ def test_listing_names_never_delays_startup_or_turns_and_settles_before_shutdown
     assert running[1] == 1
 
 
+def test_a_listing_that_hangs_is_left_behind_at_exit_under_a_deadline(harness, monkeypatch):
+    from hailer import chat as chat_module
+    from hailer import marimo_client
+
+    harness.agent = AsyncFakeAgent()
+    sandbox = harness.sandbox
+    release = threading.Event()
+    deadlines: list[float | None] = []
+    threads: list[threading.Thread] = []
+
+    def stuck_listing() -> Any:  # a kernel that trickles /api/files
+        deadlines.append(marimo_client._deadline())
+        threads.append(threading.current_thread())
+        release.wait(15)
+        return []
+
+    sandbox.list_notebooks = stuck_listing  # type: ignore[method-assign]
+    exited: list[float] = []
+
+    async def scenario(controller: Any, ui: StubUI) -> None:
+        await ui.submit("/exit")
+        exited.append(time.monotonic())
+
+    try:
+        run_session(harness, scenario, sandbox=sandbox)  # asyncio.run itself must not wait for the listing
+        took = time.monotonic() - exited[0]
+    finally:
+        release.set()
+    assert took < chat_module.NAMES_SETTLE_SEC + 1.5, f"exit waited {took:.1f}s for the listing"
+    assert threads and threads[0].daemon and threads[0].name == "hailer-notebook-names"
+    assert deadlines[0] is not None and deadlines[0] - time.monotonic() <= chat_module.NAMES_DEADLINE_SEC
+
+
 @pytest.mark.parametrize("on", [True, False], ids=["history-on", "history-off"])
 def test_the_composer_and_the_plain_prompt_keep_history_in_the_file_while_the_setting_is_on(harness, monkeypatch, on):
     from dataclasses import replace

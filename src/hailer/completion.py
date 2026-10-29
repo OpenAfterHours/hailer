@@ -11,8 +11,8 @@ the menu under the composer's frame.
 
 Enter runs a command at once only when the user chose it in the menu (arrows or Tab) and it takes no
 arguments (:data:`RUN_ON_ENTER`). Otherwise a draft that already is a command, or a command and a
-whole argument, is sent as typed, and any other slash draft is completed to the first item without
-running it (:meth:`SlashCompleter.enter_pick`), so ``/n`` and Enter never starts a new conversation,
+whole argument, or a free-text argument (a model name), is sent as typed, and any other slash draft is
+completed to the first item without running it (:meth:`SlashCompleter.enter_pick`), so ``/n`` and Enter never starts a new conversation,
 however fast it was typed or pasted.
 """
 
@@ -32,6 +32,9 @@ from hailer.transcript import Glyphs
 
 #: What Enter runs at once when the menu writes it: the commands that take no arguments.
 RUN_ON_ENTER = frozenset({f"/{name}" for name, (usage, _summary) in COMMAND_USAGE.items() if not usage} | {"/notebook list"})
+#: Commands whose argument is free text: the menu suggests (the current model, ``<provider>:``), but
+#: only a choice writes one; Enter sends what is typed (``/model gpt-5`` is never made ``gpt-5.5``).
+FREE_FORM = frozenset({"model"})
 #: The menu's rows; more completions scroll, with a "N more" line under them.
 MENU_ROWS = 6
 
@@ -78,6 +81,8 @@ class SlashCompleter(Completer):
         unless the draft is already a command (or a command and a whole argument) as typed, or
         nothing completes it. ``None``: Enter sends the draft as it is. Computed here and now, so
         the result never depends on how fast the keys came or whether the menu had shown yet."""
+        if free_form(document):
+            return None
         completions = list(self.get_completions(document, CompleteEvent()))
         if not completions or typed_in_full(document, completions):
             return None
@@ -122,7 +127,15 @@ def enter_action(buffer: Any) -> str:
     if state is not None and state.complete_index is not None:
         new_text, _cursor = state.new_text_and_position()
         return "run" if new_text.strip() in RUN_ON_ENTER else "complete"
-    return "send" if typed_in_full(buffer.document, state.completions if state is not None else []) else "complete"
+    if free_form(buffer.document) or typed_in_full(buffer.document, state.completions if state is not None else []):
+        return "send"
+    return "complete"
+
+
+def free_form(document: Document) -> bool:
+    """Whether the word being typed is a free-text argument (:data:`FREE_FORM`), not a closed set."""
+    head, space, _rest = document.text_before_cursor[1:].partition(" ")
+    return document.text_before_cursor.startswith("/") and bool(space) and head.lower() in FREE_FORM
 
 
 def menu_open(buffer: Any) -> bool:
