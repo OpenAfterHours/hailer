@@ -37,7 +37,7 @@ from hailer.models import (
     TurnSummary,
 )
 from hailer.steps import Receipt, StepTracker
-from hailer.transcript import callout, console_glyphs, plain_step_row, turn_stats
+from hailer.transcript import callout, clean_reply, console_glyphs, plain_step_row, turn_stats
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only; the runtimes import it when a kernel starts
     from hailer.sandbox import MarimoSandbox
@@ -562,9 +562,14 @@ class _TurnDisplay:
         """The turn ended without an answer (an error): rows for the steps that were left."""
         self._rows(self.steps.finish())
 
-    def cancel(self) -> None:
-        """Ctrl+C: the running steps may still finish, so their effect is unknown."""
-        self._rows(self.steps.cancel())
+    def cancel(self) -> bool:
+        """Ctrl+C: the running steps may still finish, so their effect is unknown. Their rows start
+        on a new line (the terminal has echoed ``^C`` where the cursor was); True when it printed."""
+        receipts = self.steps.cancel()
+        if receipts:
+            self.console.print()
+        self._rows(receipts)
+        return bool(receipts)
 
     def _rows(self, receipts: list[Receipt]) -> None:
         for receipt in receipts:
@@ -580,7 +585,7 @@ class _TurnDisplay:
     def finish(self, summary: TurnSummary) -> None:
         self._rows(self.steps.finish())
         elapsed = summary.duration_ms / 1000 if summary.duration_ms is not None else time.monotonic() - self.started
-        final = (summary.final_response or "").strip()
+        final = clean_reply(summary.final_response or "").strip()  # no escape sequence reaches the terminal
         if self.steps.count:
             self.console.print()
         self.console.print(Text(ANSWER_HEADER, style="dim"))

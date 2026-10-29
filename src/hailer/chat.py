@@ -497,8 +497,7 @@ class ChatController:
                 summary: TurnSummary = self.agent.run_turn(text, on_event=display, skill=skill, preamble=preamble)
             except KeyboardInterrupt:  # the agent has already cancelled the turn
                 self._pending_preamble = None  # the notice went out with the interrupted turn
-                display.cancel()
-                self.console.print("\nInterrupted.")
+                self.console.print("Interrupted." if display.cancel() else "\nInterrupted.")
                 return
             except BaseException:
                 display.stop()

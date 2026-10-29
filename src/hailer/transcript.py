@@ -7,6 +7,7 @@ lives with the composer). Colours are ANSI names, so the terminal's own theme de
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -14,6 +15,7 @@ from typing import Any
 from rich import box
 from rich.cells import cell_len
 from rich.console import Console, ConsoleOptions, Group, RenderableType, RenderResult
+from rich.measure import Measurement
 from rich.panel import Panel
 from rich.segment import Segment
 from rich.style import Style
@@ -54,6 +56,7 @@ class Glyphs:
     spinner: str  # one character per frame
     up: str
     ellipsis: str
+    bullet: str
     ascii: bool = False
     brand: str = "◆"  # the startup header's mark
     resume: str = "↺"  # a resumed or new conversation
@@ -73,11 +76,11 @@ class Glyphs:
 
 UNICODE = Glyphs(
     user="▌", reply="●", ok="✓", fail="✗", warn="▲", on="●", off="○", sep="·", link="↗", prompt="›",
-    rule="─", bar="│", corners="╭╮╰╯", spinner="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏", up="↑", ellipsis="…",
+    rule="─", bar="│", corners="╭╮╰╯", spinner="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏", up="↑", ellipsis="…", bullet="•",
 )
 ASCII = Glyphs(
     user="|", reply="*", ok="+", fail="x", warn="!", on="*", off="o", sep="-", link="->", prompt=">",
-    rule="-", bar="|", corners="++++", spinner="|/-\\", up="up", ellipsis="...",
+    rule="-", bar="|", corners="++++", spinner="|/-\\", up="up", ellipsis="...", bullet="-",
     ascii=True, brand="#", resume="~",
 )
 
@@ -116,6 +119,24 @@ def tokens(value: int) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# The model's text
+# --------------------------------------------------------------------------- #
+
+# A whole escape sequence (CSI, OSC up to its terminator), then any other C0 or C1 control character
+# but the newline and the tab: Rich's Text and markup=False keep ESC, so a reply could recolour,
+# move or retitle the terminal.
+_ESCAPE_SEQUENCE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x9b[0-?]*[ -/]*[@-~]")
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def clean_reply(text: str) -> str:
+    """The model's reply as the terminal may print it: escape sequences and control characters
+    removed (newlines kept), tabs as spaces (every 4 columns, which also keeps Markdown's indents)."""
+    text = _ESCAPE_SEQUENCE.sub("", (text or "").replace("\r\n", "\n"))
+    return _CONTROL.sub("", text).expandtabs(4)
+
+
+# --------------------------------------------------------------------------- #
 # Layout pieces
 # --------------------------------------------------------------------------- #
 
@@ -138,8 +159,10 @@ class Gutter:
         elif isinstance(self.body, Text) and "://" in self.body.plain:
             lines = self._url_lines(console, options)
         else:
+            # Laid out narrower, not cropped: a line a renderable leaves longer (a URL a reply keeps
+            # whole) reaches the terminal whole, which wraps it.
             width = max(10, options.max_width - cell_len(self.first))
-            lines = console.render_lines(self.body, options.update(width=width, no_wrap=False), pad=False)
+            lines = list(Segment.split_lines(console.render(self.body, options.update(width=width, no_wrap=False))))
         style = console.get_style(self.style) if self.style else None
         for index, line in enumerate(lines):
             line = _rstrip(line)
@@ -159,7 +182,7 @@ class Gutter:
             if "://" in part.plain:
                 lines += Segment.split_lines(console.render(part, options.update(no_wrap=True, overflow="ignore")))
             else:
-                lines += console.render_lines(part, options.update(width=width, no_wrap=False), pad=False)
+                lines += Segment.split_lines(console.render(part, options.update(width=width, no_wrap=False)))
         return lines
 
 
@@ -176,6 +199,26 @@ def _rstrip(line: list[Segment]) -> list[Segment]:
             break
         line.pop()
     return line
+
+
+class Clip:
+    """``text`` on one line in the width it gets, shortened with the glyph set's ``ellipsis``: Rich's
+    own ``…`` would print as ``?`` on an ASCII console."""
+
+    def __init__(self, text: Text, ellipsis: str) -> None:
+        self.text, self.ellipsis = text, ellipsis
+
+    def __rich_measure__(self, console: Console, options: ConsoleOptions) -> Measurement:
+        return Measurement(min(self.text.cell_len, cell_len(self.ellipsis) + 1), self.text.cell_len)
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        text = self.text.copy()
+        text.no_wrap, text.overflow = True, "crop"
+        if text.cell_len > options.max_width:
+            text.truncate(max(0, options.max_width - cell_len(self.ellipsis)), overflow="crop")
+            text.rstrip()
+            text.append(self.ellipsis)
+        yield text
 
 
 def user_message(glyphs: Glyphs, text: str) -> RenderableType:
@@ -207,6 +250,7 @@ class _Row:
     took: float | None = None
     #: One line, its detail cut with an ellipsis; otherwise (a failure, a warning) the detail wraps.
     worked: bool = True
+    ellipsis: str = "…"  # the glyph set's
 
     def grid(self) -> Table:
         """Every column has a fixed width, so durations line up across separately printed rows and
@@ -215,11 +259,13 @@ class _Row:
         grid = Table.grid(expand=True, padding=(0, 1))
         grid.add_column(width=ICON_WIDTH, no_wrap=True)
         grid.add_column(width=self.label_width, no_wrap=True)
-        grid.add_column(ratio=1, no_wrap=self.worked, overflow="ellipsis" if self.worked else "fold")
+        grid.add_column(ratio=1, no_wrap=self.worked, overflow="fold")
         grid.add_column(width=SECONDS_WIDTH, justify="right", no_wrap=True)
+        detail = Text(self.detail, style=detail_style)
         grid.add_row(
-            Text(f"  {self.icon}", style=icon_style), Text(self.label, style=label_style),
-            Text(self.detail, style=detail_style), Text(seconds(self.took) if self.took is not None else "", style=MUTED),
+            Text(f"  {self.icon}", style=icon_style), Clip(Text(self.label, style=label_style), self.ellipsis),
+            Clip(detail, self.ellipsis) if self.worked else detail,
+            Text(seconds(self.took) if self.took is not None else "", style=MUTED),
         )
         return grid
 
@@ -244,7 +290,7 @@ def _step(glyphs: Glyphs, receipt: Receipt) -> _Row:
     ok = receipt.status == "ok"
     return _Row(
         glyphs.icon(receipt.status), (style, "" if ok else style, MUTED), receipt.label, LABEL_WIDTH,
-        glyphs.join(receipt.target, receipt.outcome), receipt.seconds, worked=ok,
+        glyphs.join(receipt.target, receipt.outcome), receipt.seconds, worked=ok, ellipsis=glyphs.ellipsis,
     )
 
 
@@ -275,10 +321,10 @@ def turn_footer(glyphs: Glyphs, stats: str, notebook: str = "", url: str = "") -
     stats keep their room; a narrow terminal shortens the link."""
     grid = Table.grid(expand=True)
     grid.add_column(no_wrap=True, width=cell_len(stats) + 4)  # "  " before the stats, two spaces after
-    grid.add_column(ratio=1, justify="right", no_wrap=True, overflow="ellipsis")
+    grid.add_column(ratio=1, justify="right", no_wrap=True)
     # A Style, not a style string: a URL is never parsed as style words.
     link = Text(f"{glyphs.link} {notebook}", style=Style(dim=True, link=url)) if notebook and url else Text("")
-    grid.add_row(Text(f"  {stats}", style=MUTED), link)
+    grid.add_row(Text(f"  {stats}", style=MUTED), Clip(link, glyphs.ellipsis))
     return grid
 
 
@@ -313,6 +359,7 @@ class SessionRow:
         self.row = _Row(
             glyphs.icon(status), SESSION_STYLES.get(status, SESSION_STYLES["warn"]), single_line(label),
             SESSION_LABEL_WIDTH, single_line(detail), took, worked=status in ("ok", "resume", "wait"),
+            ellipsis=glyphs.ellipsis,
         )
 
     def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
@@ -373,7 +420,7 @@ def status_card(glyphs: Glyphs, rows: Sequence[tuple[str | None, str, str]], *, 
     grid = Table.grid(padding=(0, 1))
     grid.add_column(width=1, no_wrap=True)
     grid.add_column(style=MUTED, no_wrap=True, width=max((cell_len(label) for _h, label, _v in rows), default=0) + 1)
-    grid.add_column(ratio=1)
+    grid.add_column(ratio=1, overflow="fold")  # fold, not Rich's "…" (a "?" on an ASCII console)
     marks = {"ok": (glyphs.on, OK), "warn": (glyphs.warn, WARN), "off": (glyphs.off, MUTED)}
     for health, label, value in rows:
         mark, style = marks.get(health or "", (" ", ""))
@@ -413,7 +460,7 @@ class _HelpCard:
             grid.add_column(width=group_width, style=MUTED, no_wrap=True)
         grid.add_column(width=command_width if beside else None, no_wrap=beside)
         if beside:
-            grid.add_column(ratio=1)
+            grid.add_column(ratio=1, overflow="fold")
         for group, names in COMMAND_GROUPS.items():
             if not side_by_side:
                 grid.add_row(Text(group, style=MUTED), *[Text("")] * (len(grid.columns) - 1))
@@ -428,7 +475,7 @@ class _HelpCard:
             grid.add_row(*[Text("")] * len(grid.columns))
         footer = Table.grid(padding=(0, 2))
         footer.add_column(width=group_width, style=MUTED, no_wrap=True)
-        footer.add_column(ratio=1, style=MUTED)
+        footer.add_column(ratio=1, style=MUTED, overflow="fold")
         footer.add_row(Text("Keys"), Text(keys))
         yield Group(grid, footer)
 
@@ -450,7 +497,7 @@ class NotebookRow:
 def notebook_table(glyphs: Glyphs, rows: Sequence[NotebookRow], note: str = "") -> RenderableType:
     """The notebooks with headers; the active one and those with a kernel session are marked."""
     table = Table(box=simple_head(glyphs), show_edge=False, pad_edge=False, header_style=MUTED, border_style=MUTED)
-    table.add_column("Notebook", no_wrap=True)
+    table.add_column("Notebook", overflow="fold")  # a long name folds rather than ending in Rich's "…"
     table.add_column("Modified", style=MUTED, no_wrap=True)
     table.add_column("Size", justify="right", style=MUTED, no_wrap=True)
     table.add_column("", no_wrap=True)
@@ -473,7 +520,7 @@ def detail_card(glyphs: Glyphs, sections: Sequence[tuple[str, Sequence[Renderabl
     """Labelled sections, one value per line (``/context``); warnings after them."""
     grid = Table.grid(padding=(0, 2))
     grid.add_column(style=MUTED, no_wrap=True)
-    grid.add_column(ratio=1)
+    grid.add_column(ratio=1, overflow="fold")
     for label, values in sections:
         for index, value in enumerate(values or [""]):
             grid.add_row(Text(label if index == 0 else ""), Text(value) if isinstance(value, str) else value)

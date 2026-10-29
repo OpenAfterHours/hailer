@@ -1384,8 +1384,9 @@ Before `finish` the controller reads the active notebook from the state file (`_
 read: no marimo request, no browser), so the footer and the reply's link name a notebook a tool switched to;
 `_sync_active_notebook` still reports the switch, and opens it, after the answer. `finish(summary:
 TurnSummary)` prints, once, the steps still open (`no result, effect unknown`), the reply behind `●` (`chat_ui.ReplyMarkdown`: left-aligned headings,
-tables with only a header rule and their column alignment, code behind a thin bar, ANSI colours only) and a
-muted line `N steps · 7.7s · 3.1k in · 612 out` (`steps`, `duration_ms` and the token counts; unknown or zero
+tables with only a header rule and their column alignment, code behind a thin bar, the glyph set's bullets and
+quote bars, ANSI colours only; paragraphs wrap at words and a longer word, a URL, gets a line of its own that
+the terminal wraps, in lists and quotes too) and a muted line `N steps · 7.7s · 3.1k in · 612 out` (`steps`, `duration_ms` and the token counts; unknown or zero
 parts left out) with `↗ <notebook>` as an OSC 8 hyperlink to the token-free URL (the stats keep their room, a
 narrow terminal shortens the link). A cancelled turn ends with a
 `▲ Cancelled.` callout, and `The conversation continues; the model is told the last step's effect is unknown.`
@@ -1394,8 +1395,12 @@ the composer prints with `soft_wrap=False` and `crop=False`, so Rich wraps at wo
 indented plain line (an error's hints) keeps its indent, except a string containing `://`, printed
 soft-wrapped, and a line of a gutter's text that holds a URL (`✗ Could not fetch <url>`), written whole: a
 URL is never cut. Everything from outside (names, errors, warnings, model output) reaches Rich as `Text`
-or with `markup=False`, never as markup: a notebook called `q[/].py` prints as itself. Glyphs: `transcript.glyphs_for(console.encoding)` is the Unicode set, or `ASCII` (`| * + x ! >`, `+-|`
-frame) when the encoding cannot write it (a cp1252 console); there is no setting for it.
+or with `markup=False`, never as markup: a notebook called `q[/].py` prints as itself. The reply passes
+`transcript.clean_reply` in both modes first: escape sequences (CSI, OSC) and other C0/C1 control characters
+are removed, newlines kept, tabs expanded to every 4 columns (Rich's `Text` and `markup=False` keep ESC). Glyphs: `transcript.glyphs_for(console.encoding)` is the Unicode set, or `ASCII` (`| * + x ! >`, `+-|`
+frame) when the encoding cannot write it (a cp1252 console); there is no setting for it. Nothing relies on
+Rich's own `…`, which an ASCII console prints as `?`: one-line cells are `transcript.Clip`s, shortened with the
+set's ellipsis (`...`), and wrapping columns fold.
 
 Startup is a separate preparation gate: typing and paste work from the first render, and one early
 submission waits until both agent and notebook preparation settle. Repeated Enter cannot submit it
@@ -1476,7 +1481,7 @@ parallel ones) and, from one second, a right-aligned timer; between steps it sho
 commentary next to its tool calls and then the answer, which printed the answer twice). Plain mode prints the
 same rows as whole lines when the results arrive (no live row, spinner, cursor control or hard wrap), then
 `Hailer >`, `final_response` once (or `(no reply)`) and `  N steps · 1.5s · 3.1k in · 612 out`; Ctrl+C prints
-the cancelled rows, then `Interrupted.`. After a turn the CLI adds the turn and its tokens to the session file.
+the cancelled rows, from a new line (the terminal has echoed `^C` where the cursor was), then `Interrupted.`. After a turn the CLI adds the turn and its tokens to the session file.
 Errors (`common._print_error`, in both modes and the other commands): a red `✗ <message>` callout, then the hint
 lines indented four spaces, both texts unchanged; exit code 1 when startup fails, the REPL carries on after a
 failed turn; traceback only with `--verbose`.
