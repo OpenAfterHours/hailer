@@ -18,7 +18,7 @@ from hailer.cli import chat as cli_chat
 from hailer.cli import common
 from hailer import notebooks
 from hailer.errors import HailerError
-from hailer.models import ContextBundle, SessionState, SkillInfo
+from hailer.models import AgentEvent, ContextBundle, SessionState, SkillInfo
 from hailer.session import load_session, save_session
 from hailer.transcript import FooterData
 from test_cli import FakeAgent, Harness, harness, runner, url_for, write_notebook  # noqa: F401 - shared offline fixture
@@ -88,6 +88,7 @@ class StubUI:
         self.scenario = scenario
         self.answers: list[str] = []
         self.summaries: list[Any] = []
+        self.links: list[Any] = []
         self.events: list[Any] = []
         self.activities: list[str] = []
         self.exited = False
@@ -108,6 +109,7 @@ class StubUI:
     def finish(self, summary: Any) -> None:
         self.answers.append(summary.final_response)
         self.summaries.append(summary)
+        self.links.append(self.context().notebook_url if callable(self.context) else None)  # what the reply would link
         self.console.print(summary.final_response, markup=False)
 
     def on_event(self, event: Any) -> None:
@@ -345,6 +347,77 @@ def test_async_turn_syncs_notebook_after_failure_or_cancellation_and_preserves_n
     assert harness.opened == [url_for(other)]
     assert ui.answers == ["Answer to: continue"]
     assert ("endpoint failed" in output) is not cancelled
+
+
+def test_reply_links_the_notebook_a_tool_switched_to_and_the_switch_is_reported_after_it(harness):
+    harness.agent = AsyncFakeAgent()
+    other = write_notebook(harness.config, "other")
+    harness.agent.on_turn = lambda: notebooks.save_active_notebook(harness.config, "other.py")
+
+    async def scenario(controller: Any, ui: StubUI) -> None:
+        await ui.submit("make another notebook")
+        assert controller.notebook == "other.py" and ui.context().notebook == "other.py"
+
+    _controller, ui, output = run_session(harness, scenario)
+    assert ui.links == [harness.sandbox.notebook_url("other.py")]  # not the notebook from before the turn
+    assert "access_token" not in ui.links[0]
+    assert output.count("Active notebook is now other.py.") == 1
+    assert output.index("Answer to: make another notebook") < output.index("Active notebook is now other.py.")
+    assert harness.opened == [url_for(other)]  # still opened once, after the answer
+
+
+def test_composer_ends_open_steps_before_a_failed_turn_prints_its_error(harness):
+    from test_chat_ui import terminal, until
+
+    class FailingAgent(AsyncFakeAgent):
+        async def arun_turn(self, text: str, *, on_event: Any = None, **_kwargs: Any) -> Any:
+            self.turns.append((text, None))
+            on_event(AgentEvent("tool_call", "marimo_execute", {"args": {"code": "x = 1\n"}, "id": "a"}))
+            raise HailerError("The model endpoint failed.", hint="Try again.")
+
+    async def scenario():
+        harness.agent = FailingAgent()
+        controller = cli_chat.ChatLoop(Console(file=io.StringIO()), harness.config, common.CliOptions())
+        with terminal(controller.ahandle, controller.footer) as (ui, keys, _screen, transcript, _size):
+            running = asyncio.create_task(controller.run_interactive(ui_factory=lambda *_args: ui))
+            await until(lambda: ui.application.is_running and not ui._preparing)
+            keys.send_text("fail\r")
+            await until(lambda: "Try again." in transcript.getvalue() and not ui.busy)
+            out = transcript.getvalue()
+            assert re.search(r"▲ Ran code\s+1 line · no result, effect unknown", out)
+            assert out.index("no result, effect unknown") < out.index("✗ The model endpoint failed.")  # as in plain mode
+            assert out.count("effect unknown") == 1
+            ui.exit()
+            await asyncio.wait_for(running, 5)
+
+    asyncio.run(scenario())
+
+
+def test_composer_cards_print_bracketed_names_as_text(harness):
+    """Names from the workspace and the user are never Rich markup in the cards."""
+    harness.agent = AsyncFakeAgent()
+    workspace = harness.config.workspace
+    (workspace / "[red]ctx.md").write_text("hello", encoding="utf-8")
+    harness.bundle = ContextBundle(
+        context_text="x",
+        context_files=[workspace / "[red]ctx.md"],
+        skills=[SkillInfo("[bold]recon", "Reconcile [/] months", harness.config.skills_dir / "recon")],
+        prompts={"[i]monthly": harness.config.prompts_dir / "monthly.md"},
+        warnings=["[/]ctx.md looks like it contains a secret"],
+    )
+    write_notebook(harness.config, "q[/]")
+    write_notebook(harness.config, "[bold]x")
+
+    async def scenario(controller: Any, ui: StubUI) -> None:
+        await ui.submit("/model [bold]gpt")
+        await ui.submit("/model")
+        for command in ("/status", "/notebook list", "/context"):
+            await ui.submit(command)
+
+    _controller, _ui, output = run_session(harness, scenario)
+    for text in ("q[/].py", "[bold]x.py", "[red]ctx.md", "[bold]recon", "Reconcile [/] months", "[i]monthly", "[/]ctx.md looks like", "Model: [bold]gpt"):
+        assert text in output, text
+    assert re.search(r"Model\s+\[bold\]gpt", output)
 
 
 def test_async_notebook_command_queues_notice_for_next_turn(harness):

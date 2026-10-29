@@ -926,7 +926,7 @@ block, so a SKILL.md quoting it changes nothing); `read_skill_file` `N lines` / 
 `12.3 KB` (the size of the text the model got; `, truncated` when the status says the reply was cut or the
 `Source:` line says `(first N bytes only)`; `, redirected to <host[:port]>` when the page came from another host) or `not text
 (<type>)` when the whole reply is fetch_page's not-text notice. A summary is one line of at most
-`SUMMARY_LIMIT` printable characters (`...` when cut; `str.isprintable`, as `chat_ui._single_line`), counts and
+`SUMMARY_LIMIT` printable characters (`...` when cut; `str.isprintable`, as `steps.single_line`), counts and
 names only. An unknown tool or reply format gives `""`.
 
 ## `code_checks.py`  (owner: code checks, 2026-09-22)
@@ -1215,29 +1215,41 @@ redraw, so `ChatController.footer` only reads state it holds (the URL is made on
 `● name` (open), `○ name` (not open) or `name` (unknown), `docker · isolated` or a yellow
 `▲ unsafe-local · not isolated`, the model and `N turns · Xk tokens` (`working 3.1s` during a turn); when narrow
 it drops tokens, turns, the model and a docker kernel, then shortens the notebook, never the unsafe-local
-warning. Widths are terminal cells. A redraw ticker runs only while busy, starting or showing a flash: every
-80 ms, and every 250 ms while the chat prepares (agent imports then run on a worker thread, and each redraw
-takes the GIL from them; `scripts/benchmark_startup.py` shows the difference in `ready_to_answer`).
+warning. Widths are terminal cells. Every row but the composer is one window that draws its whole line at the
+terminal's width (the frame's sides are margins of the composer's window): rows of `VSplit`s doubled the cost
+of a redraw. A redraw ticker runs every 80 ms during a turn; while the chat prepares nothing animates and the
+live row's timer redraws once a second (agent imports then run on a worker thread and every redraw takes the
+GIL from them: §10, `scripts/benchmark_startup.py`); while idle nothing ticks, and a flash schedules the one
+redraw that ends it.
 Rich transcript output goes through `run_in_terminal`; log handlers are temporarily routed through the same
 queue, retaining redaction. Bracketed paste stays enabled throughout the live composer and is restored on exit.
-Enter submits once; Alt+Enter (Esc Enter) inserts a newline; history is in memory. A busy submission leaves the
-draft intact, does not enqueue a request and flashes `Still working · esc cancels · your draft is kept` in the
-border for 2.5 s instead of replacing the activity (a flash ends with the turn or with startup). Esc cancels
-active work through the same path as Ctrl+C and does nothing while idle (`ttimeoutlen` 0.1 s, `timeoutlen`
-0.3 s, so a lone Esc acts quickly and Esc Enter still completes). Ctrl+C cancels active work and awaits
-cleanup, or exits while idle; Ctrl+D exits only empty and idle; Ctrl+Z then Enter exits while idle. `/exit`
-and `/quit` also exit.
+Enter submits once; Alt+Enter (Esc Enter) and Ctrl+J insert a newline (Ctrl+J never involves Esc, for
+terminals that do not send Alt as Meta); history is in memory. A busy submission leaves the draft intact, does
+not enqueue a request and flashes `Still working · esc cancels · your draft is kept` in the border for 2.5 s
+instead of replacing the activity (a flash ends with the turn or with startup). Esc cancels a running turn
+through the same path as Ctrl+C: only during a turn are the key timeouts short (`ttimeoutlen` 0.1 s,
+`timeoutlen` 0.3 s) so a lone Esc acts at once; while idle prompt_toolkit's own (0.5 s, 1.0 s) stay, Esc alone
+does nothing and Esc then Enter within about 1.5 s is still a newline. Events that arrive after a cancel do
+not replace `Cancelling`. Ctrl+C cancels active work and awaits cleanup, or exits while idle; Ctrl+D exits only
+empty and idle; Ctrl+Z then Enter exits while idle. `/exit` and `/quit` also exit.
 
-The transcript: a submission is echoed behind `▌`. `finish(summary: TurnSummary)` prints, once, the steps still
-open (`no result, effect unknown`), the reply behind `●` (`chat_ui.ReplyMarkdown`: left-aligned headings,
+The transcript: a submission is echoed behind `▌`. `settle_steps()` ends the steps still open as `no result,
+effect unknown`; `ChatController._aturn` calls it when `arun_turn` raises, so those rows come before the error.
+Before `finish` the controller reads the active notebook from the state file (`_peek_active_notebook`, a local
+read: no marimo request, no browser), so the footer and the reply's link name a notebook a tool switched to;
+`_sync_active_notebook` still reports the switch, and opens it, after the answer. `finish(summary:
+TurnSummary)` prints, once, the steps still open (`no result, effect unknown`), the reply behind `●` (`chat_ui.ReplyMarkdown`: left-aligned headings,
 tables with only a header rule and their column alignment, code behind a thin bar, ANSI colours only) and a
 muted line `N steps · 7.7s · 3.1k in · 612 out` (`steps`, `duration_ms` and the token counts; unknown or zero
-parts left out) with `↗ <notebook>` as an OSC 8 hyperlink to the token-free URL. A cancelled turn ends with a
+parts left out) with `↗ <notebook>` as an OSC 8 hyperlink to the token-free URL (the stats keep their room, a
+narrow terminal shortens the link). A cancelled turn ends with a
 `▲ Cancelled.` callout, and `The conversation continues; the model is told the last step's effect is unknown.`
 when a step was still running. The console stays soft-wrapped (`console_factory`, for plain mode and pipes);
-the composer prints with `soft_wrap=False`, so Rich wraps at words inside gutters and an indented plain line
-(an error's hints) keeps its indent, except a string containing `://`, printed soft-wrapped so a URL is never
-cut. Glyphs: `transcript.glyphs_for(console.encoding)` is the Unicode set, or `ASCII` (`| * + x ! >`, `+-|`
+the composer prints with `soft_wrap=False` and `crop=False`, so Rich wraps at words inside gutters and an
+indented plain line (an error's hints) keeps its indent, except a string containing `://`, printed
+soft-wrapped, and a line of a gutter's text that holds a URL (`✗ Could not fetch <url>`), written whole: a
+URL is never cut. Everything from outside (names, errors, warnings, model output) reaches Rich as `Text`
+or with `markup=False`, never as markup: a notebook called `q[/].py` prints as itself. Glyphs: `transcript.glyphs_for(console.encoding)` is the Unicode set, or `ASCII` (`| * + x ! >`, `+-|`
 frame) when the encoding cannot write it (a cp1252 console); there is no setting for it.
 
 Startup is a separate preparation gate: typing and paste work from the first render, and one early
@@ -1323,6 +1335,7 @@ a rounded `Session` card with a mark per row (`●` fine, `▲` missing credenti
 running, `○` notebook not open in a browser) holding every row of the plain table (model, provider and
 credentials; kernel; marimo; notebook and session; notebooks folder; thread, turns and tokens; web access).
 `/help`: the commands by `COMMAND_GROUPS` with their `COMMAND_USAGE` signature and description, then the keys
+(`enter send · alt+enter or ctrl+j new line · esc cancel · ↑ history · ctrl+c exit`)
 (groups in their own column when wide, above their commands when narrow, descriptions under the commands
 when very narrow). `/notebook list`: `Notebook  Modified  Size` with `● open`, `○ not open` and `active`.
 `/context`: labelled sections, warnings as `▲` lines. `scripts/chat_ui_demo.py` drives the real composer with
