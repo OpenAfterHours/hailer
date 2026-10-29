@@ -837,7 +837,8 @@ def test_reply_footer_links_the_notebook_without_its_token():
             ui.finish(summary("Answer", steps=2, duration_ms=7700, input_tokens=3140, output_tokens=612))
 
         buffer = io.StringIO()
-        console = Console(file=buffer, force_terminal=True, color_system="standard", width=90)
+        # Rich leaves hyperlinks out on a legacy Windows console; the link itself is what is tested here.
+        console = Console(file=buffer, force_terminal=True, color_system="standard", width=90, legacy_windows=False)
         with terminal(submit, lambda: data, console=console) as (ui, keys, _screen, _transcript, _size):
             running = await start(ui)
             keys.send_text("hi\r")

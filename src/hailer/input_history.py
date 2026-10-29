@@ -257,7 +257,7 @@ def _parse(data: bytes, *, cut: bool = False) -> tuple[list[str], bool]:
     run the end of an entry: both are dropped."""
     entries: list[str] = []
     dropped = False
-    pieces = data.split(b"\n")
+    pieces = [piece.removesuffix(b"\r") for piece in data.split(b"\n")]  # CRLF too (an editor, Windows text mode)
     lines: list[bytes] | None = None if cut else []
     size = 0
 

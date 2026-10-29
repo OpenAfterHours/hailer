@@ -710,8 +710,9 @@ def test_composer_startup_commits_the_checklist_rows_as_each_part_gets_ready(har
             await until(lambda: waiting.is_set() and ui.activity == "Notebook")
             live = "".join(text for _style, text in ui._live_line())
             assert re.match(r"  . Notebook   opening analysis\.py in your browser", live), live
+            # The agent prepares beside the notebook wait, not before it: wait for its row.
+            await until(lambda: bool(rows(transcript.getvalue(), "Agent", "gpt-5.5", "openai", "OPENAI_API_KEY from keyring")))
             await ui.flush()
-            assert rows(transcript.getvalue(), "Agent", "gpt-5.5", "openai", "OPENAI_API_KEY from keyring")
             assert rows(transcript.getvalue(), "Resumed", "2 earlier turns", "/new starts fresh", icon="↺")
             release.set()
             await until(lambda: not ui._preparing)

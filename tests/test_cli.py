@@ -1095,7 +1095,9 @@ def test_the_kernels_url_and_log_are_shown_with_verbose_and_in_status(harness, n
     result = notebook_cmd(input_text="/status\n/exit\n")
     assert result.exit_code == 0, result.output
     assert "Marimo is running at" not in result.output
-    assert re.search(rf"Kernel log +{re.escape(log)}", result.output), "/status"
+    # The card folds a value longer than its width (a Windows temp path): read it across its lines and borders.
+    squashed = re.sub(r"[\s│|]", "", result.output)
+    assert "Kernellog" + re.sub(r"\s", "", log) in squashed, "/status"
     result = chat(args=["--verbose", "notebook"])
     assert result.exit_code == 0, result.output
     assert f"{' ' * 15}Marimo is running at http://127.0.0.1:2718  (log: {log})" in result.output.splitlines()

@@ -179,6 +179,12 @@ def test_only_the_end_of_a_file_larger_than_any_hailer_writes_is_read(tmp_path, 
     assert all(text.startswith("entry ") and text.count("\n") == 1 for text in loaded), "no half entries"
 
 
+def test_a_file_with_windows_line_endings_loads_without_carriage_returns(tmp_path):
+    path = tmp_path / "history"
+    path.write_bytes(b"\r\n# t\r\n+first line\r\n+second line\r\n\r\n# t\r\n+question\r\n")
+    assert entries(path) == ["first line\nsecond line", "question"]
+
+
 def test_a_corrupt_file_loads_what_it_can(tmp_path):
     path = tmp_path / "history"
     path.write_bytes(b"\x00\xff\xfe garbage\n+kept \xff entry\nnot an entry\n++double\n\n\n+last")
