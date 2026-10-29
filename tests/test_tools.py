@@ -698,10 +698,10 @@ def test_the_tools_never_touch_the_notebooks_or_data_folders():
 # --------------------------------------------------------------------------- #
 
 
-def test_hailer_tools_registers_twelve_tools_with_descriptions_and_schemas(tmp_path):
+def test_hailer_tools_registers_fifteen_tools_with_descriptions_and_schemas(tmp_path):
     tools = hailer_tools(make_config(tmp_path))
     assert [t.name for t in tools] == list(TOOL_NAMES)
-    assert len(tools) == 12
+    assert len(tools) == 15
     assert all(t.description and len(t.description) > 40 for t in tools)
     by_name = {t.name: t for t in tools}
     schema = {name: t.tool_call_schema.model_json_schema() for name, t in by_name.items()}
@@ -709,6 +709,10 @@ def test_hailer_tools_registers_twelve_tools_with_descriptions_and_schemas(tmp_p
     assert schema["notebook_create"]["required"] == ["name"]
     assert schema["notebook_open"]["required"] == ["notebook"]
     assert schema["read_skill_file"]["required"] == ["name", "path"]
+    assert schema["project_search"]["required"] == ["query"]
+    assert schema["project_read"]["required"] == ["path"]
+    assert set(schema["project_read"]["properties"]) == {"path", "start_line", "end_line"}
+    assert not schema["project_files"].get("required")
     assert not schema["notebook_close"].get("required")
     assert not schema["marimo_status"].get("required")
     assert not schema["notebook_check"].get("required")

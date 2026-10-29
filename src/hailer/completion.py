@@ -26,7 +26,7 @@ from prompt_toolkit.document import Document
 from prompt_toolkit.utils import get_cwidth
 
 from hailer.models import CompletionData
-from hailer.session import COMMAND_USAGE, NOTEBOOK_SUBCOMMANDS
+from hailer.session import COMMAND_USAGE, DATA_SUBCOMMANDS, NOTEBOOK_SUBCOMMANDS
 from hailer.text import fit, single_line
 from hailer.transcript import Glyphs
 
@@ -92,6 +92,8 @@ class SlashCompleter(Completer):
         """(value, description, what follows it) for the word after ``/command`` and ``before``."""
         if command == "notebook" and not before:
             return [(sub, summary, "" if sub == "list" else " ") for sub, summary in NOTEBOOK_SUBCOMMANDS.items()]
+        if command == "data" and not before:
+            return [(sub, summary, " ") for sub, summary in DATA_SUBCOMMANDS.items()]
         data = self.data()
         if command == "notebook" and len(before) == 1 and before[0].lower() in ("open", "close"):
             return [(name, "active" if name == data.active_notebook else "", "") for name in data.notebooks]

@@ -1413,6 +1413,90 @@ def test_init_creates_the_notebook_and_data_folder_so_notebook_can_start(harness
     assert "uv run" not in result.output, "no project .venv is needed"
 
 
+def test_init_inside_a_project_puts_everything_in_dot_hailer(harness, tmp_path, monkeypatch):
+    """In a folder that is already a project (pyproject.toml or .git), init writes .hailer/: the
+    config, notebooks, context, skills and prompts to commit, and a .gitignore for the rest."""
+    from hailer.config import load_config, validate
+
+    ws = tmp_path / "monorepo"
+    ws.mkdir()
+    (ws / "pyproject.toml").write_text('[project]\nname = "x"\n[tool.uv.workspace]\nmembers = []\n', encoding="utf-8")
+    monkeypatch.setattr(cli_setup, "_example_config_dir", lambda: Path(__file__).resolve().parents[1] / ".config" / "hailer")
+    result = init_cmd(ws)
+    assert result.exit_code == 0, result.output
+    hailer = ws / ".hailer"
+    assert (hailer / "hailer.toml").is_file() and not (ws / "hailer.toml").exists()
+    assert not (ws / ".config").exists() and not (ws / "notebooks").exists() and not (ws / "data").exists()
+    assert "# Hailer workspace" in (hailer / "notebooks" / "analysis.py").read_text(encoding="utf-8")
+    assert (hailer / "data").is_dir()
+    for sub in ("context", "skills", "prompts"):
+        assert (hailer / sub).is_dir()
+    assert (hailer / "skills" / "example-skill" / "SKILL.md").is_file(), "the example skills are copied"
+    assert ".config/hailer" not in (hailer / "README.md").read_text(encoding="utf-8")
+    ignored = (hailer / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert {"state/", "local.toml", "data/"} <= set(ignored)
+    assert "uv run hailer login openai" in result.output and "uv run hailer notebook" in result.output
+    assert "data add" in result.output
+    config = load_config(workspace=ws)
+    assert validate(config) == [], validate(config)
+    harness.config = config
+    from hailer import session
+    from hailer.models import SessionState
+
+    session.save_session(ws, SessionState(thread_id="t"))
+    assert (hailer / "state" / "session.json").is_file(), "state goes to .hailer/state/"
+
+
+def test_moving_a_standalone_workspace_to_the_project_layout_keeps_its_state_out_of_git(harness, tmp_path, monkeypatch):
+    """Regression: .hailer/.gitignore ("*", from the standalone layout) hid the project's files, and the
+    old threads.sqlite at .hailer/ would have been committed with them."""
+    import shutil
+    import subprocess
+
+    if shutil.which("git") is None:
+        pytest.skip("git is not installed")
+    monkeypatch.setattr(cli_setup, "_example_config_dir", lambda: None)
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    subprocess.run(["git", "-C", str(ws), "init", "-q"], check=True)
+    assert init_cmd(ws, "--layout", "standalone").exit_code == 0
+    from hailer import session
+    from hailer.models import SessionState
+
+    session.save_session(ws, SessionState(thread_id="t"))
+    (ws / ".hailer" / "threads.sqlite").write_bytes(b"conversation")
+    (ws / "hailer.toml").unlink()
+    assert init_cmd(ws, "--layout", "project").exit_code == 0
+    listed = subprocess.run(["git", "-C", str(ws), "ls-files", "--others", "--exclude-standard"], capture_output=True, text=True, check=True)
+    names = set(listed.stdout.split())
+    assert ".hailer/hailer.toml" in names and ".hailer/notebooks/analysis.py" in names, names
+    assert not {n for n in names if "threads.sqlite" in n or "session.json" in n}, names
+    custom = ws / ".hailer" / ".gitignore"
+    custom.write_text("# mine\n*\n", encoding="utf-8")
+    assert init_cmd(ws).exit_code == 0
+    assert custom.read_text(encoding="utf-8") == "# mine\n*\n", "a .gitignore the user wrote is never changed"
+
+
+def test_init_layout_can_be_chosen_and_an_existing_layout_is_kept(harness, tmp_path, monkeypatch):
+    monkeypatch.setattr(cli_setup, "_example_config_dir", lambda: None)
+    ws = tmp_path / "repo"
+    (ws / ".git").mkdir(parents=True)
+    result = init_cmd(ws, "--layout", "standalone")
+    assert result.exit_code == 0, result.output
+    assert (ws / "hailer.toml").is_file() and not (ws / ".hailer" / "hailer.toml").exists()
+    result = init_cmd(ws)  # again: the standalone config already here decides
+    assert result.exit_code == 0 and not (ws / ".hailer" / "hailer.toml").exists()
+    other = tmp_path / "plain"
+    other.mkdir()
+    result = init_cmd(other, "--layout", "project")
+    assert result.exit_code == 0, result.output
+    assert (other / ".hailer" / "hailer.toml").is_file()
+    assert "uvx hailer login" in result.output, "no pyproject.toml: Hailer is not a dependency here"
+    result = runner.invoke(cli.app, ["--workspace", str(other), "init", "--layout", "monorepo"])
+    shown = re.sub(r"\x1b\[[0-9;]*m", "", result.output)  # Rich colours the error panel in CI
+    assert result.exit_code == 2 and "--layout" in shown and "standalone or project" in shown, shown
+
+
 def test_init_again_keeps_the_notebook_and_fills_in_what_is_missing(harness, tmp_path, monkeypatch):
     ws = tmp_path / "fresh"
     ws.mkdir()

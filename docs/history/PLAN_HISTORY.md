@@ -5,6 +5,37 @@
 > runtime, kernels shared between terminals and the writable notebooks mount), not the current one, which is
 > in [PLAN.md](../../PLAN.md).
 
+## 2026-10-28: Hailer inside another project
+
+Hailer can live inside an existing project (a uv workspace monorepo included) as a support chat for analysts:
+it answers questions about the data and about the product it comes from.
+
+- **Discovery and layout.** Inside a git repository the workspace is the nearest folder with a Hailer config up
+  to the repository root, else the uv workspace root, so `uv run hailer` in a member belongs to the whole
+  repository. `.hailer/hailer.toml` marks the project layout: notebooks, context, skills and prompts in
+  `.hailer/` (committed), state in `.hailer/state/` (ignored); `init` picks it in a folder with `pyproject.toml`
+  or `.git` (`--layout`). `.hailer/local.toml` is this machine's settings, merged over the project's.
+- **Project files.** `[project]` gives the agent `project_files`, `project_search` and `project_read`: the
+  project's code, docs and configuration, read-only, on this machine (`hailer.project`); git's view of the
+  files minus Hailer's state, the data and notebooks folders and credential files; credential lines withheld
+  (LEARNINGS §17).
+- **Data folders.** `[data_folders]` (and `uvx hailer data add <name> <folder>`, `/data`) mount folders from
+  anywhere on the machine read-only at `/work/folders/<name>`, as `DATA_FOLDERS["<name>"]` in notebooks, with
+  the data folder's mount rules; paths live in each machine's `local.toml` (LEARNINGS §18).
+
+Verified:
+
+- Offline suite on Linux, Python 3.13: 1174 passed, 15 skipped (with main merged in).
+- `tests/test_docker_integration.py` with `HAILER_DOCKER_TESTS=strict`: 12 passed on Linux with Docker Engine
+  29.9.2 and an image built from this checkout (`scripts/build_kernel_image.py --load`, the pinned base image
+  digest pulled through a registry mirror), including the new data folder mount.
+- Live, with a real marimo kernel and headless Chromium, in a uv workspace in the project layout: unsafe-local and
+  docker kernels both define `DATA_FOLDERS` from a folder `hailer data add` added, `list_periods` and doctor list
+  it, and the project tools read the repository.
+
+Still owed: a live turn against a real model with the project tools; the Docker integration run on Windows and
+macOS (and a data folder on a mapped drive there); a physical Ctrl+C in a Windows console.
+
 ## 2026-10-28: notebooks that re-run
 
 The agent wrote its commentary as typed-in markdown (it saw `5.6%` in the scratchpad and typed it), so a

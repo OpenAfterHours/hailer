@@ -14,24 +14,27 @@ Terminal ── hailer.cli (Typer) ── hailer.chat / chat_ui (composer, comma
                │
 agent.py       LangChain create_agent + ChatOpenAI ──HTTPS──► model endpoint (OpenAI or a custom base_url,
                │  API key and conversation stay here            Responses API or Chat Completions)
-tools.py       12 tools: marimo_execute, marimo_status, notebook_cells, notebook_check, notebook_list,
-               │  notebook_create, notebook_open, notebook_close, list_periods, load_skill, read_skill_file,
-               │  fetch_page
+tools.py       15 tools: marimo_execute, marimo_status, notebook_cells, notebook_check, notebook_list,
+               │  notebook_create, notebook_open, notebook_close, list_periods, project_files,
+               │  project_search, project_read, load_skill, read_skill_file, fetch_page
+project.py     the project's own files for the project_* tools: read-only, on this machine, never in a kernel
                ▼
 sandbox.py     MarimoSandbox: the kernel this process started (endpoint, stop, notebooks and data by name)
                │  HTTP + SSE with the kernel's token (marimo_client.py)
                ▼
 docker (default)  hailer-kernel-<id>-<suffix> on an --internal network, reached through a forwarder
-                  container on 127.0.0.1; /work/notebooks a tmpfs of its own, /work/data the data folder
-                  read-only; no network, no host environment, non-root, read-only root, capped memory/CPU/pids
+                  container on 127.0.0.1; /work/notebooks a tmpfs of its own, /work/data the data folder and
+                  /work/folders/<name> the data folders, read-only; no network, no host environment,
+                  non-root, read-only root, capped memory/CPU/pids
 unsafe-local      marimo in Hailer's own Python, as the user; secret-looking variables withheld (opt-in only)
                │
                ▼
 Browser UI     the notebook tab; a kernel session exists only while it is open
 ```
 
-One Python process holds the CLI, the agent and the tools. The model gets those twelve tools and nothing
-else: no shell, no file tool, no approval step; `fetch_page` reaches only `[web].allowed_domains`. Code the
+One Python process holds the CLI, the agent and the tools. The model gets those fifteen tools and nothing
+else: no shell, no approval step, no file tool beyond reading the project's own files when `[project]` is set;
+`fetch_page` reaches only `[web].allowed_domains`. Code the
 model writes runs in marimo's scratchpad, and durable changes go through marimo's private code-mode API
 (`marimo._code_mode`), so marimo is pinned (`==0.24.2`) and so is the kernel image's marimo. Code mode
 formats the cells the agent creates or edits with the kernel's ruff before they run, and `code_checks.py`
@@ -89,15 +92,15 @@ runtime works on the host folder directly and syncs nothing.
 
 ## What leaves the machine
 
-Only to the configured model endpoint: the user's messages, the system prompt with `.config/hailer/context`,
-skill bodies when loaded, tool arguments (code) and truncated tool results (which can include data samples),
-and pages fetched from allowed domains. Raw data stays local unless code prints it. The API key is resolved in
+Only to the configured model endpoint: the user's messages, the system prompt with the context folder,
+skill bodies when loaded, tool arguments (code) and truncated tool results (which can include data samples and
+the project files the agent reads, credential lines withheld), and pages fetched from allowed domains. Raw data stays local unless code prints it. The API key is resolved in
 the Hailer process (environment variable or OS credential store) and never enters the kernel, a file, a
 prompt or a log. LangSmith tracing is off unless `HAILER_TRACING` is set.
 
 Environment overrides: `HAILER_CONFIG`, `HAILER_WORKSPACE`, `HAILER_MODEL`, `HAILER_MODEL_PROVIDER`,
 `HAILER_KERNEL`, `HAILER_KERNEL_IMAGE`, `HAILER_LOG_LEVEL`, `HAILER_TRACING`. Everything else comes from
-`hailer.toml`. `HAILER_DOCKER_TESTS` and `HAILER_TEST_CHROME` steer the opt-in Docker integration test only.
+`hailer.toml` (or `.hailer/hailer.toml` in the project layout) with this machine's `.hailer/local.toml` on top. `HAILER_DOCKER_TESTS` and `HAILER_TEST_CHROME` steer the opt-in Docker integration test only.
 
 ## Risks
 
@@ -116,19 +119,25 @@ Environment overrides: `HAILER_CONFIG`, `HAILER_WORKSPACE`, `HAILER_MODEL`, `HAI
   gateway; `langchain`, `langchain-openai` and `langgraph-checkpoint-sqlite` are pinned below their next
   major versions.
 - **Large outputs:** tool results are capped (head and tail), rich outputs replaced by a placeholder.
+- **Project files are sent to the model as read:** credential lines are withheld by a heuristic
+  (`looks_like_secret`, code-aware), not a guarantee; the folder is opt-in (`[project]`) and shown in the
+  startup panel, and git-ignored files, Hailer's state, the data and credential-named files are never listed.
 
 ## Package layout
 
 ```
 src/hailer/
 ├── cli/               Typer app and main (__init__), chat and notebook (chat), kernel pull|build|stop (kernel),
-│                      init, login, logout, doctor, status (setup), shared collaborators and checks (common)
+│                      data list|add|remove (data), init, login, logout, doctor, status (setup), shared
+│                      collaborators and checks (common)
 ├── chat.py, chat_ui.py   ChatController (slash commands, notebook switches), the persistent composer
 ├── steps.py, transcript.py   tool calls in plain words; what the composer and plain mode print (rows, cards)
 ├── completion.py, input_history.py   the command menu's completions; the input history file
 ├── agent.py           build_model, HailerAgent (threads, streamed turns, Ctrl+C), system prompt, error mapping
-├── tools.py           HailerTools (the 12 tools) and hailer_tools(config) -> LangChain tools
+├── tools.py           HailerTools (the 15 tools) and hailer_tools(config) -> LangChain tools
 ├── tool_outcomes.py   a tool call's one-line outcome from its reply and status (the receipts)
+├── project.py         ProjectFiles: the project's files the project_* tools list, search and read
+├── datafolders.py     this machine's [data_folders] in .hailer/local.toml (hailer data add|remove, /data)
 ├── code_checks.py     ruff, ty and typed-in values on the cells the agent writes (and code mode's ruff formatting)
 ├── sandbox.py         MarimoSandbox, the sandbox contract
 ├── notebook_sync.py   the allow-listed copy between the docker kernel and the host
@@ -149,11 +158,11 @@ becomes one receipt line in plain words with its outcome and time (`AgentEvent("
 graph's `tools` node, the outcome decided from a status the tool returns beside its reply, never from the
 reply's text); the answer is printed once under a footer of steps, time and tokens; the composer has a
 state-coloured frame, a footer with the notebook, kernel and model, a `/` command menu with argument
-completion, Esc to cancel a running turn and an input history kept in `.hailer/` by default; the session ends
+completion, Esc to cancel a running turn and an input history kept in Hailer's state folder by default; the session ends
 with a summary. The signed-in notebook URL is printed only when the user must open it by hand. What reaches
 the model is byte-identical (the strict fake gateway, streamed and not, for Chat Completions; LangChain's
 Responses conversion of the same messages). The lessons and their
-regression tests are in [LEARNINGS.md](docs/LEARNINGS.md) §17.
+regression tests are in [LEARNINGS.md](docs/LEARNINGS.md) §19.
 
 Built by implement-and-challenge rounds, each part reviewed independently before it merged; the design was
 prototyped first. Verified: the offline suite on Linux, Python 3.13; `scripts/benchmark_startup.py` against

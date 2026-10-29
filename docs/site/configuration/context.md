@@ -1,6 +1,8 @@
 # Context, skills and prompts {#project-context-skills-and-prompts}
 
-`.config/hailer/` holds what the agent knows about *this* project. Commit it with the notebook.
+`.config/hailer/` holds what the agent knows about *this* project. Commit it with the notebook. Inside
+another project these folders are in `.hailer/` instead (see [Inside another project](project.md#hailer-folder)),
+and the agent can also read the project's own code and docs ([project files](project.md#project-files)).
 
 ```
 .config/hailer/
@@ -21,3 +23,6 @@
 
 Everything in `context/`, and any skill you load, is sent to the configured model endpoint. Keep
 credentials, customer names and row-level data out of it.
+
+For a support chat, a context file is the place to say who the users are and how to answer them, for example
+*The people asking are analysts: explain how figures are derived in business terms and name the source file*.

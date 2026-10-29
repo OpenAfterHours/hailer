@@ -163,7 +163,9 @@ def test_start_passes_the_token_on_stdin_and_scrubs_the_environment(tmp_path):
     assert log_path.name == f"marimo-{os.getpid()}.log", "one log per Hailer process"
     assert cmd == [sys.executable, "-m", "marimo", "edit", "notebooks", "--token-password-file", "-", "--headless", "--port", "2718", "--skip-update-check"]
     assert stdin_text == TOKEN and TOKEN not in " ".join(cmd)
-    assert env == {"PATH": "p"}, "no API key in the kernel's environment"
+    assert env == {"PATH": "p", "HAILER_DATA_DIR": str(tmp_path / "data"), "HAILER_DATA_FOLDERS": "{}"}, (
+        "no API key in the kernel's environment; where its data is"
+    )
     assert procs.calls[1] == ("health", "http://127.0.0.1:2718", k.START_TIMEOUT_SEC, TOKEN), "waits for its own token"
     assert running.server == MarimoServer(url="http://127.0.0.1:2718", pid=4242, token=TOKEN, runtime="unsafe-local")
     assert running.log_hint == str(log_path)

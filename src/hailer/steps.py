@@ -41,6 +41,9 @@ VERBS: dict[str, tuple[str, str]] = {
     "load_skill": ("Loading a skill", "Loaded a skill"),
     "read_skill_file": ("Reading a skill file", "Read a skill file"),
     "fetch_page": ("Fetching a page", "Fetched a page"),
+    "project_files": ("Listing project files", "Listed project files"),
+    "project_search": ("Searching the project", "Searched the project"),
+    "project_read": ("Reading a project file", "Read a project file"),
 }
 
 # Code-mode calls in a marimo_execute script, and how a script that only makes one kind reads.
@@ -85,6 +88,9 @@ def describe_call(name: str, args: Mapping[str, Any] | None = None) -> Step:
         "load_skill": lambda: arg("name"),
         "read_skill_file": lambda: "/".join(part for part in (arg("name"), arg("path")) if part),
         "fetch_page": lambda: url_host(arg("url"), port=False),
+        "project_files": lambda: arg("pattern"),
+        "project_search": lambda: arg("query"),
+        "project_read": lambda: arg("path") + (f":{arg('start_line') or 1}-{arg('end_line')}" if arg("end_line") not in ("", "0") else ""),
     }
     live, done = VERBS.get(name, (name, name))
     target = targets[name]() if name in targets else ""

@@ -293,8 +293,30 @@ def system_prompt(config: HailerConfig, bundle: ContextBundle, server: MarimoSer
             "project context only."
         )
 
+    parts.append(_project_section(config))
     parts.append(_workspace_section(config, server))
     return "\n\n".join(p.rstrip() for p in parts) + "\n"
+
+
+def _project_section(config: HailerConfig) -> str:
+    """Whether the project's own files can be read (``[project]``), and from where."""
+    root = config.project.root
+    if root is None:
+        return (
+            "## Project files\n\nNo project files are available: the config has no [project] section, so "
+            "`project_files`, `project_search` and `project_read` refuse. When the user asks how the product "
+            'or its code works, say that adding [project] with root = "." to the Hailer config lets you read it.'
+        )
+    try:
+        shown = root.relative_to(config.workspace).as_posix()
+        shown = "the workspace" if shown == "." else f"{shown} in the workspace"
+    except ValueError:
+        shown = str(root)
+    return (
+        f"## Project files\n\nYou can read the project's own code, docs and configuration ({shown}) with "
+        "`project_files`, `project_search` and `project_read`: read-only, on the user's machine. The kernel "
+        "cannot see these files, so notebook code cannot import or open them."
+    )
 
 
 def _workspace_section(config: HailerConfig, server: MarimoServer | None = None) -> str:
@@ -306,7 +328,7 @@ def _workspace_section(config: HailerConfig, server: MarimoServer | None = None)
     changes with /notebook and the notebook tools during a conversation; the model learns it from
     marimo_status() and from CLI notices. The Marimo URL never carries the server's token.
     """
-    from hailer.kernel import KERNEL_DATA_DIR, KERNEL_NOTEBOOKS_DIR, KERNEL_WORKDIR, runtime_prompt_notes
+    from hailer.kernel import KERNEL_DATA_DIR, KERNEL_NOTEBOOKS_DIR, KERNEL_WORKDIR, kernel_data_folders, runtime_prompt_notes
 
     if config.kernel.runtime == KERNEL_RUNTIME_DOCKER:
         lines = [
@@ -320,6 +342,15 @@ def _workspace_section(config: HailerConfig, server: MarimoServer | None = None)
             f"- Notebooks folder: {config.notebooks_root}",
             f"- Data directory: {config.data_dir}",
         ]
+    from hailer.config import available_data_folders
+
+    descriptions = {folder.name: folder.description for folder in config.data_folders}
+    for name, path in kernel_data_folders(config).items():
+        about = f": {descriptions[name]}" if descriptions.get(name) else ""
+        lines.append(f'- Data folder "{name}": {path} (read-only; DATA_FOLDERS["{name}"] in notebooks){about}')
+    missing = [folder.name for folder in config.data_folders if folder not in available_data_folders(config)]
+    if missing:
+        lines.append(f"- Data folders not on this machine (the user can add them with `hailer data add`): {', '.join(missing)}")
     if server is not None:
         lines.append(f"- Marimo URL: {server.url}")
     return "## Workspace\n\n" + "\n".join(lines) + "\n" + runtime_prompt_notes(config.kernel)

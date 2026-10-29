@@ -23,9 +23,10 @@ COMMANDS: dict[str, str] = {
     "notebook": "Show or switch the active notebook. Usage: /notebook [list | new <name> [--empty] | open <name> | close [name]]",
     "exec": "Run Python in the active notebook's kernel and print the result (not sent to the model). Usage: /exec <code>",
     "context": "List loaded context files, skills, prompts and the web allowlist.",
+    "data": "List the data folders; add one from anywhere on this machine. Usage: /data [add <name> <folder> | remove <name>]",
     "skill": "Run a turn with a project skill attached. Usage: /skill <name> [message]",
-    "prompt": "Send a saved prompt from .config/hailer/prompts. Usage: /prompt <name> [args]",
-    "reload": "Re-read .config/hailer; applies from your next message.",
+    "prompt": "Send a saved prompt from the prompts folder. Usage: /prompt <name> [args]",
+    "reload": "Re-read the context, skills and prompts; applies from your next message.",
     "clear": "Clear the screen.",
     "exit": "Exit Hailer.",
     "quit": "Exit Hailer.",
@@ -42,9 +43,10 @@ COMMAND_USAGE: dict[str, tuple[str, str]] = {
     "notebook": ("[list|new|open|close]", "List, create, open or close notebooks"),
     "exec": ("<code>", "Run Python in the notebook's kernel; the model does not see it"),
     "context": ("", "Context files, skills and prompts"),
+    "data": ("[add|remove]", "Data folders; add one from anywhere on this machine"),
     "skill": ("<name> [message]", "Run a turn with a project skill"),
     "prompt": ("<name> [args]", "Send a saved prompt"),
-    "reload": ("", "Re-read .config/hailer"),
+    "reload": ("", "Re-read the context, skills and prompts"),
     "clear": ("", "Clear the screen"),
     "exit": ("", "Leave Hailer"),
 }
@@ -57,10 +59,16 @@ NOTEBOOK_SUBCOMMANDS: dict[str, str] = {
     "close": "Free a notebook's kernel session",
 }
 
+# /data's subcommands with a short description: the command menu's second level.
+DATA_SUBCOMMANDS: dict[str, str] = {
+    "add": "Add a folder from anywhere on this machine, read-only in the kernel",
+    "remove": "Remove a data folder from .hailer/local.toml",
+}
+
 # The /help card's groups, by task, in order; every COMMAND_USAGE entry appears once.
 COMMAND_GROUPS: dict[str, tuple[str, ...]] = {
     "Conversation": ("new", "model", "skill", "prompt"),
-    "Notebook": ("notebook", "exec"),
+    "Notebook": ("notebook", "data", "exec"),
     "Session": ("status", "context", "help", "reload", "clear", "exit"),
 }
 

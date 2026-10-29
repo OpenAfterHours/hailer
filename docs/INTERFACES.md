@@ -155,18 +155,46 @@ For the original marimo verification, see [PLAN_HISTORY.md](history/PLAN_HISTORY
 ## `config.py`  (owner: wave 1 / A)
 
 ```python
-CONFIG_FILENAMES = ("hailer.toml", ".config/hailer/hailer.toml")
+CONFIG_FILENAMES = ("hailer.toml", ".hailer/hailer.toml", ".config/hailer/hailer.toml")   # looked up in this order
+PROJECT_DEFAULTS: dict[str, str]        # the [hailer] folder defaults of the project layout (all in .hailer/)
+DATA_FOLDER_NAME_RE                     # ^[a-z0-9][a-z0-9_-]{0,39}$: a [data_folders] name
+LAYOUT_STANDALONE, LAYOUT_PROJECT, VALID_LAYOUTS = "standalone", "project", (...)
 DEFAULT_CONFIG_TEMPLATE: str            # commented hailer.toml written by `hailer init`, with [kernel] runtime = "docker"
-def find_workspace(start: Path | None = None) -> Path      # cwd or first parent containing a config file / pyproject.toml; else cwd
+def find_workspace(start: Path | None = None) -> Path      # see "Workspace discovery" below
 def find_config_path(workspace: Path, explicit: Path | None = None, env: Mapping[str, str] = os.environ) -> Path | None
 def load_config(workspace: Path | None = None, config_path: Path | None = None, env: Mapping[str, str] = os.environ) -> HailerConfig
 def validate(config: HailerConfig) -> list[str]            # human-readable problems, empty if fine
 def docker_mount_problems(config: HailerConfig, *, windows: bool | None = None) -> list[str]   # every docker-mode data-folder rule (below)
+def available_data_folders(config: HailerConfig) -> list[DataFolder]   # the [data_folders] with a path that is a folder here
+def data_folder_problems(config: HailerConfig) -> list[str]            # warnings: no path on this machine, or no folder there
+def data_folder_fix(name: str) -> str                                  # the advice for a data folder that may not be mounted
+def project_problems(config: HailerConfig, *, windows: bool | None = None) -> list[str]   # [project].root rules (below)
 def is_unc_path(path) -> bool                              # \\server\share\... or \\?\UNC\...
-def config_template(kernel: str | None = None) -> str      # DEFAULT_CONFIG_TEMPLATE; kernel="docker"|"unsafe-local" names that runtime in its [kernel] section
+def config_template(kernel: str | None = None, layout: str = "standalone") -> str   # kernel names the [kernel] runtime; "project": folders in .hailer/, [project] on
 def runtime_problem(runtime: str, where: str = "[kernel].runtime") -> str   # why a value is not a runtime; the retired "local" has its own message
-def write_default_config(path: Path, *, overwrite: bool = False, kernel: str | None = None) -> None
+def write_default_config(path: Path, *, overwrite: bool = False, kernel: str | None = None, layout: str = "standalone") -> None
 ```
+
+**Workspace discovery (2026-10-28).** Inside a git repository (a folder at or above `start` holding
+`.git`), searched up to the repository root: the nearest folder holding one of `CONFIG_FILENAMES`; else the
+nearest uv workspace root (a `pyproject.toml` with a `[tool.uv.workspace]` table), so `uv run hailer` in a
+workspace member belongs to the whole repository; else the nearest `pyproject.toml`. Outside a repository,
+the first folder at or above `start` holding a `pyproject.toml` or a config (the behaviour before). Either
+way `start` itself when nothing matches. `hailer init` never discovers: it sets up `--workspace` or the
+current folder.
+
+**The project layout.** A workspace whose `.hailer/hailer.toml` exists (`statedir.is_project_layout`) takes its
+`[hailer]` defaults from `PROJECT_DEFAULTS` (`.hailer/notebooks/analysis.py`, `.hailer/data`,
+`.hailer/context`, `.hailer/skills`, `.hailer/prompts`) and keeps its state in `.hailer/state/`. Relative paths
+still resolve against the workspace, not `.hailer/`. More than one config file in a workspace is a warning;
+the first of `CONFIG_FILENAMES` is used.
+
+**`.hailer/local.toml`** (`statedir.local_config_path`, both layouts; `HailerConfig.local_config_path` when it
+exists): this machine's settings, merged table by table over the project's file (a non-table value
+replaces), below the environment. A `[data_folders]` entry written as a string is read as `{ path = ... }` on
+both sides first, so a machine's path merges into a folder the project declares with its description.
+Messages about a merged value name both files (`<config> or <local.toml>`); unknown keys in either are
+warnings naming that file.
 Rules: missing file → defaults (not an error); unparsable → `ConfigError` naming the file and line; unknown
 keys are warnings returned by `validate`, not errors, including the keys removed with the Codex SDK
 (`[hailer].codex_home`, `[web].allow_shell_network`, provider `merge_messages`, `parallel_tool_calls`,
@@ -174,13 +202,14 @@ keys are warnings returned by `validate`, not errors, including the keys removed
 overrides (the complete list): `HAILER_CONFIG`, `HAILER_WORKSPACE`, `HAILER_MODEL`, `HAILER_MODEL_PROVIDER`,
 `HAILER_LOG_LEVEL`, `HAILER_KERNEL`, `HAILER_KERNEL_IMAGE`; `HAILER_TRACING` is read by `hailer.agent` only.
 Folders and the notebook come from the file alone (`HAILER_NOTEBOOK`, `HAILER_NOTEBOOKS_DIR` and
-`HAILER_DATA_DIR` were removed on 2026-09-23 and are not read). Provider tables `[model_providers.<id>]` map 1:1 to
+`HAILER_DATA_DIR` were removed on 2026-09-23 and are not read; since 2026-10-28 Hailer *sets* `HAILER_DATA_DIR`
+and `HAILER_DATA_FOLDERS` for an unsafe-local kernel's notebook code, and `load_config` still never reads them). Provider tables `[model_providers.<id>]` map 1:1 to
 `ProviderConfig`: `base_url`, `wire_api`, `stream`, `stream_options` (both default `true`, valid with either
 `wire_api`), `env_key` (a declared `[model_providers.openai]` without one gets `OPENAI_API_KEY`), `name`,
 `http_headers`, `env_http_headers`, `query_params`. `[web]` maps to `WebConfig` (`allowed_domains` list,
 `max_page_bytes`). `[hailer]` keys: `notebook`, `notebooks_dir`, `data_dir`, `context_dir`,
 `skills_dir`, `prompts_dir`, `max_tool_output_chars`, `max_context_bytes`, `log_level`, `input_history`
-(bool, default `true`: the chat's input history persists in `.hailer/input_history`; `false` keeps it in
+(bool, default `true`: the chat's input history persists in `input_history` in the state folder (`statedir.input_history_path`); `false` keeps it in
 memory for the session; `HailerConfig.input_history`; the template shows it commented out) (the removed
 `marimo_url` and `marimo_token` are reported as unknown keys; their values are never quoted); `[model]` keys: `name`,
 `provider`, `reasoning_effort` (`""` = send none), `summarize_after_tokens` (`ModelConfig`, default 100000,
@@ -216,11 +245,13 @@ warning naming the fix, not "unknown key". The CLI's `config` row turns warnings
 they show at session start too.
 
 `docker_mount_problems(config, *, windows=None)` is the one place for every docker-mode mount rule. Only
-the data folder is mounted (read-only; the kernel's notebooks folder is its own tmpfs), so the rules are
-about it, at most one message with its fix, in this order: Windows UNC path ("The data folder
+the data folder and the available data folders are mounted (read-only; the kernel's notebooks folder is its
+own tmpfs), so the rules are about them, at most one message per folder with its fix (a data folder's names
+it, `The data folder 'finance' (...)`, and its fix is `data_folder_fix`; a UNC data folder is refused without
+`is_dir()` touching the share), in this order: Windows UNC path ("The data folder
 \\server\share\sales is on a network share (UNC path), which Docker cannot mount. ..."; checked first, nothing
-touches the share); a drive root; is or contains `Path.home()`, the workspace, `<workspace>/.hailer`,
-`config.config_path`, `context_dir`, `skills_dir` or `prompts_dir` (compared resolved and by
+touches the share); a drive root; is or contains `Path.home()`, the workspace, `<workspace>/.hailer`, the
+state folder, `config.config_path`, `config.local_config_path`, `context_dir`, `skills_dir` or `prompts_dir` (compared resolved and by
 `os.path.samefile`); is, contains or sits inside a credential folder (`CREDENTIAL_FOLDERS` under home:
 `.config`, `.ssh`, `.aws`, `.azure`, `.gnupg`, `.docker`, `.kube`; on Windows also `%APPDATA%` and
 `%LOCALAPPDATA%`; "sits inside" does not apply within `tempfile.gettempdir()`). `validate` runs it for docker
@@ -233,6 +264,19 @@ or a notebook that is not UTF-8 text). For the kernel runtimes: `KernelRuntimeEr
 runtime cannot start or reach marimo: the process exited, Docker is missing or down, an image problem). Types added to `models.py`: `KernelConfig` (above),
 `KERNEL_RUNTIME_DOCKER` / `KERNEL_RUNTIME_UNSAFE_LOCAL` / `VALID_KERNEL_RUNTIMES`, `KERNEL_IMAGE_REPOSITORY`, the
 `MarimoServer` fields listed under `marimo_client.py`, and `HailerConfig.kernel`.
+
+`[project]` maps to `ProjectConfig` (models.py, `HailerConfig.project`): with the table (even empty) `root`
+(default `"."`, the workspace) is set and the agent may read project files (`hailer.project`); `include` and
+`exclude` are lists of globs; `enabled = false` (for example in `local.toml`) leaves `root` `None`, as no
+table does. `project_problems` (run by `validate`): a missing folder is a warning; a drive root, a folder that
+is or contains `Path.home()`, or one that is, contains or sits inside a `CREDENTIAL_FOLDERS` folder is fatal.
+
+`[data_folders]` maps to `HailerConfig.data_folders`, a tuple of `DataFolder(name, path, description)` in the
+order written: `name = "<path>"` or `name = { path = "...", description = "..." }` (path optional: `None`
+means "set on each machine"; relative to the workspace, `~` expanded). A name that does not match
+`DATA_FOLDER_NAME_RE`, or a value that is neither a string nor a table, is a `ConfigError`; unknown keys in an
+entry are warnings. `data_folder_problems` warns (never fatal) about entries without a path or whose path is not
+a folder; those are not mounted (`available_data_folders`).
 
 `[checks]` maps to `CodeChecksConfig` (models.py, `HailerConfig.checks`): `lint`, `typecheck`, `hardcoded`,
 `format`, all booleans defaulting to `true` (a non-boolean is a `ConfigError`, an unknown key a warning). `lint`,
@@ -358,11 +402,13 @@ MAX_NOTEBOOKS = 500; MAX_NOTEBOOK_FOLDERS = 200   # the listing's bounds
 SKIPPED_FOLDERS = {"node_modules", "venv", "site-packages"}   # never listed, like folders starting with "." or "__"
 @dataclass(frozen=True) class NotebookFile: name: str; modified: float; size: int   # .stem: the file name without .py
 @dataclass(frozen=True) class DataFile: name: str; modified: float; size: int
+@dataclass(frozen=True) class SandboxFolder: path: str; host: Path   # a [data_folders] entry: as notebook code reaches it, and the host folder
 @dataclass(frozen=True) class SandboxEntry: name: str; folder: bool; modified: float; size: int; marimo: bool   # anything in the notebooks folder
 MAX_TREE_ENTRIES = 5000                    # list_tree's bound
 def notebook_digest(source: str) -> str   # sha256 with \r\n normalised to \n (update writes the kernel's line endings)
 @dataclass class MarimoSandbox:
     server: MarimoServer; notebooks_path: str = ""; data_path: str = ""; data_dir: Path | None = None
+    data_folders: dict[str, SandboxFolder] = {}   # the data folders the kernel got, by name (/work/folders/<name> in a container)
     native_paths: bool = False; log_hint: str = ""; ended: str = ""; notice: Callable[[str], None] | None = None
     # notebooks_path / data_path: the folders as notebook code reaches them (/work/notebooks and /work/data in a
     # container); data_dir: the host folder behind data_path; ended: why wait() returned (empty after Ctrl+C);
@@ -388,8 +434,10 @@ def notebook_digest(source: str) -> str   # sha256 with \r\n normalised to \n (u
         # for an existing file, which is never touched (a create that loses a race: marimo writes <stem>_1.py, which is
         # deleted again). A Windows kernel: a case variant is the existing file and the result has the listing's
         # spelling. A local kernel: refused when the resolved target leaves the folder (marimo follows links)
-    def list_data(self) -> list[DataFile]                     # the files directly in the data folder (not hidden); HailerError "Data directory does not exist: <data_path>"
-    def data_schema(self, name: str) -> dict[str, str]        # a Parquet file's columns and types as text; MalformedParquetError; a name with a separator or a leading dot → HailerError
+    def data_path_of(self, folder: str | None = None) -> str  # data_path, or the data folder's path in the kernel
+    def list_data(self, folder: str | None = None) -> list[DataFile]   # the files directly in the data folder, or the data folder named folder (not hidden);
+                                                              # HailerError "Data directory does not exist: <path>"; an unknown folder → HailerError naming the folders
+    def data_schema(self, name: str, folder: str | None = None) -> dict[str, str]   # a Parquet file's columns and types as text; MalformedParquetError; a name with a separator or a leading dot → HailerError
     def sync_soon(self) -> None                               # wake the background copy back (after a turn, on a notebook switch); returns at once.
     # The only sync hook: a no-op here and for the local kernel (its notebooks folder is the host's own); DockerKernel wakes its
     # notebook_sync.NotebookSync (kernel.sync), which DockerRuntime.start and DockerKernel.stop drive.
@@ -463,6 +511,8 @@ or attaches to a kernel another process started.
 LOCAL_LOG_PREFIX = "marimo-"              # .hailer/marimo-<pid>.log: the unsafe-local runtime's log, one per process, deleted on stop
 START_TIMEOUT_SEC = 60.0                  # the start's wait, counted after any image pull
 KERNEL_WORKDIR, KERNEL_NOTEBOOKS_DIR, KERNEL_DATA_DIR   # PurePosixPath: /work, /work/notebooks (docker: the kernel's own tmpfs), /work/data (read-only mount)
+KERNEL_FOLDERS_DIR                        # /work/folders: a docker kernel mounts each available [data_folders] entry at /work/folders/<name>, read-only
+DATA_DIR_VARIABLE, DATA_FOLDERS_VARIABLE  # "HAILER_DATA_DIR", "HAILER_DATA_FOLDERS": an unsafe-local kernel's data folder and data folders (JSON, by name)
 KERNEL_SECRET_SUFFIXES   # SECRET_ENV_SUFFIXES (_KEY _TOKEN _SECRET _PASSWORD) + _PASSWD _PWD _CREDENTIALS _CONNECTION_STRING APIKEY
 KERNEL_SECRET_NAMES = ("PGPASSWORD", "MYSQL_PWD", "PASSWORD", "SECRET", "TOKEN")
 LOCAL_PROMPT_NOTES; DOCKER_PROMPT_NOTES; DOCKER_NETWORK_PROMPT_NOTES   # what the model is told about the kernel
@@ -475,6 +525,9 @@ def withheld_variables(config: HailerConfig, environ: Mapping[str, str]) -> list
     # env_http_headers variable, KERNEL_SECRET_NAMES, and names ending in KERNEL_SECRET_SUFFIXES (any case);
     # no setting lets one through. Exact names compare case-insensitively on Windows
 def kernel_environment(config, environ) -> dict[str, str]                # environ minus withheld_variables
+def kernel_data_folders(config, runtime=None) -> dict[str, str]          # available data folders by name, as notebook code reaches them (docker: /work/folders/<name>)
+def data_variables(data_path, folders) -> dict[str, str]                 # DATA_DIR_VARIABLE and DATA_FOLDERS_VARIABLE; LocalRuntime.start adds them to kernel_environment.
+    # A docker kernel gets no environment variables at all: its folders are always /work/data and /work/folders/<name>
 def describe_runtime(kernel: KernelConfig) -> str   # <contract> is kernel_image.contract_tag()
     # "docker (hailer-kernel <contract>; no network; data read-only)" |
     # "docker (hailer-kernel <contract>; network on: the internet and this machine; data read-only)" |
@@ -488,7 +541,8 @@ def log_tail(path, lines=15, *, token=None) -> list[str]                  # the 
 @dataclass class LocalProcesses: spawn, attach, kill_tree, wait_for_health   # the OS layer; tests replace members
 
 @dataclass class LocalKernel(MarimoSandbox): proc; log_path; procs
-    # notebooks_path = notebook_file_key(notebooks_root), data_path = str(data_dir), native_paths = True
+    # notebooks_path = notebook_file_key(notebooks_root), data_path = str(data_dir), native_paths = True,
+    # data_folders = the available data folders where they are
     # stop: its process (tree on Windows), then the log (it holds the signed-in URL)
     # wait: "marimo shut itself down." (exit 0) / "marimo stopped (exit code N): it was ended from outside
     # this terminal (uvx hailer kernel stop, Task Manager or kill), or it failed; its own output is above."
@@ -569,7 +623,8 @@ def data_path_problems(data_dir, *, windows=None, drive_type=None) -> list[str]
     # endpoints" is retried (NETWORK_RM_RETRIES x NETWORK_RM_RETRY_SEC). Before anything is reported as failed,
     # `docker inspect --type container|network` checks it is still there
 @dataclass class DockerKernel(MarimoSandbox):
-    # notebooks_path = "/work/notebooks", data_path = "/work/data", data_dir = the host data folder, native_paths = False
+    # notebooks_path = "/work/notebooks", data_path = "/work/data", data_dir = the host data folder, native_paths = False,
+    # data_folders = the available data folders as /work/folders/<name> over their host folders
     runner; containers; container_ids; network; network_id; owner (OwnerLock)   # what this session started; removed and inspected by id
     sync: NotebookSync | None              # set by start after the copy in; None again once stop made the last copy
     def sync_soon(self) -> None            # sync.soon() (nothing without one)
@@ -589,7 +644,8 @@ class DockerRuntime:
     name = "docker"; names: DockerNames (unique per object); image: str (config.kernel.effective_image)
     owner_id: str                          # the current start's OwnerLock id (its owner label)
     def check(self) -> list[Check]         # kernel; docker ("Docker <v> (Linux engine)" or the error); image (missing = non-fatal warning,
-                                           # another kernel contract = fatal; "<image> (kernel contract <c>)"); data (path warnings; no row for a UNC folder: the config row fails it).
+                                           # another kernel contract = fatal; "<image> (kernel contract <c>)"); data (path warnings; no row for a UNC folder: the config row fails it);
+                                           # data:<name> per available data folder, the same way
                                            # No notebooks row: the notebooks folder is never mounted
     def engine_version(self) -> str        # docker version --format "{{.Server.Version}} {{.Server.Os}}"; not installed / not running / non-Linux engine → KernelRuntimeError
     def engine_cpus(self) -> int | None
@@ -605,9 +661,11 @@ class DockerRuntime:
         # [--user U:G -e HOME=/home/analyst on Linux]
         # --cap-drop ALL --security-opt no-new-privileges --pids-limit 256 --memory M --memory-swap M --cpus C -w /work
         # labels (workspace, contract, role, owner)
-        # --mount <data_dir>:/work/data,readonly --mount <token_file>:/run/secrets/hailer-token,readonly <image>
+        # --mount <data_dir>:/work/data,readonly [--mount <folder>:/work/folders/<name>,readonly per available data folder]
+        # --mount <token_file>:/run/secrets/hailer-token,readonly <image>
         # marimo edit notebooks --host 0.0.0.0 --port 2718 --headless --skip-update-check --token-password-file /run/secrets/hailer-token
-        # The token is never an argument or environment variable (docker inspect shows both)
+        # The token is never an argument or environment variable (docker inspect shows both); no -e at all: the starter
+        # notebook finds the data folders by listing /work/folders
     def forwarder_command(self, port: int) -> list[str]
         # create --pull never --name hailer-fwd-<id>-<suffix> -p 127.0.0.1:<port>:2718 --init --read-only --cap-drop ALL
         # --security-opt no-new-privileges --pids-limit 64 --memory 64m labels <image> python -m hailer._forward hailer-kernel-<id>-<suffix> 2718 2718
@@ -799,16 +857,56 @@ def parse_skill_frontmatter(text: str) -> dict[str, str]
 def read_skill(config: HailerConfig, name: str) -> str        # SKILL.md body + list of files under the skill dir
 def read_skill_file(config: HailerConfig, name: str, relative: str) -> str   # path-traversal safe
 def render_prompt(config: HailerConfig, name: str, args: str) -> str   # replaces {{args}}
-def looks_like_secret(text: str) -> bool                       # sk-..., "api_key =", "Bearer ", long hex/base64 tokens
+def looks_like_secret(text: str, *, code: bool = False) -> bool   # sk-..., AKIA..., 40+ hex, a PEM private-key line, "Bearer <token>",
+    # "<name> = <value>" for api_key, secret, token, password, passwd, pwd, secret_key, private_key, access_key, also ending a longer
+    # name (db_password, client_secret, aws_secret_access_key); env-var names and placeholders as values do not count.
+    # code=True (source code): such an assignment counts only with a quoted value (token = request.headers.get(...) is an expression)
 ```
+
+## `project.py`  (project files, 2026-10-28)
+
+The project's own files for the agent (`project_files`, `project_search`, `project_read`), read on this
+machine, read-only; no kernel sees them and nothing here writes. Imports `context` and `statedir`; runs
+`git` when it lists.
+
+```python
+SKIPPED_DIRS: frozenset[str]       # .git .hg .svn .venv venv node_modules site-packages __pycache__ caches __marimo__ .idea .vscode ...: never listed
+TEXT_SUFFIXES, TEXT_NAMES          # code, docs and config files: what is read without [project].include
+CODE_SUFFIXES                      # source code: looks_like_secret(line, code=True) there
+MAX_FILE_BYTES = 1 MiB; MAX_FILES = 50_000; MAX_LISTED = 200; MAX_MATCHES = 100; MAX_LINE_CHARS = 240; MAX_READ_LINES = 400
+SEARCH_BUDGET_SEC = 15.0; REFRESH_SEC = 30.0; GIT_TIMEOUT_SEC = 20.0
+WITHHELD = "[line withheld: it looks like a credential]"
+def secret_named(name: str) -> bool                # .env(.*) but .env.example etc., *.pem *.key *.p12 *.pfx *.jks *.kdbx *.tfstate *.tfvars ..., id_rsa*, .netrc .pgpass .pypirc .npmrc .git-credentials, credentials(.*), secrets.<config type>, *service-account*.json
+def glob_matcher(pattern: str) -> re.Pattern[str]  # case-insensitive; * ? in one folder, ** across; no "/" (or only a trailing one): any part of the path; with "/": from the root; a folder match covers everything in it
+def withheld(lines, *, code=False) -> Iterator[bool]   # per line: looks_like_secret, or inside a private-key block (BEGIN line, then while the lines look like key material, to END)
+def redact(lines, *, code=False) -> Iterator[str]      # WITHHELD for every withheld line
+class ProjectFiles:
+    def __init__(self, root, *, include=(), exclude=(), excluded_folders=(), git="git", clock=time.monotonic)
+    @classmethod
+    def for_config(cls, config) -> ProjectFiles     # [project] off → HailerError (with how to turn it on); excluded: state folder, local.toml, notebooks folder, data folder, data folders
+    def files(self) -> dict[str, int]                # POSIX name relative to the root -> size; cached REFRESH_SEC, thread-safe
+    def listing(self, pattern: str = "") -> str      # project_files: names with sizes, or past MAX_LISTED a summary by folder (depth 1-3, at most 60 rows)
+    def search(self, query: str, pattern: str = "", *, budget_sec=SEARCH_BUDGET_SEC) -> str   # project_search: "path:line: text", MAX_MATCHES, the
+                                                     # time budget; an invalid regex is searched literally (said so); withheld matches only counted
+    def read(self, path: str, start_line=1, end_line=0, *, max_chars=12_000) -> str            # project_read: "<name>, lines a-b of n:", numbered lines,
+                                                     # at most MAX_READ_LINES and max_chars - 300, then "(more: project_read(...))"; a name not in files()
+                                                     # (also ../, absolute outside, excluded) → HailerError; another spelling (./x, case, \\, absolute inside) is resolved
+```
+Which files: in a git work tree `git -c core.fsmonitor=false -c core.quotepath=off -C <root> ls-files -z --cached --others
+--exclude-standard` (with `GIT_TERMINAL_PROMPT=0`, `GIT_OPTIONAL_LOCKS=0`); git missing or not a work tree → `os.walk`
+without following links, pruning `SKIPPED_DIRS` and folders holding `pyvenv.cfg`. Then: no `SKIPPED_DIRS` part,
+not `secret_named`, not inside an excluded folder (casefolded), not matching `exclude`, matching `include` (else
+`TEXT_SUFFIXES` / `TEXT_NAMES` / the `.env` examples), a regular file of at most `MAX_FILE_BYTES`, and a link only when
+it resolves inside the root. A binary file (NUL in its first 8 KiB) is listed but never searched or read.
 
 ## `tools.py`  (owner: LangChain migration, 2026-09-18)
 
 The agent's tools, run inside the Hailer process (no server, no transport). They are everything the model has:
-no shell, no file tool, all Python runs in the marimo kernel.
+no shell, no file tool beyond reading the project's own files (`project_*`, through `hailer.project`), all
+Python runs in the marimo kernel.
 
 ```python
-TOOL_NAMES: tuple[str, ...]      # the 12 names in the table, in the order they are offered to the model
+TOOL_NAMES: tuple[str, ...]      # the 15 names in the table, in the order they are offered to the model
 DEFAULT_SESSION_WAIT_SEC = 30.0
 NOTEBOOK_LINK_TIP = "The user can also run /notebook in the chat to get the link."
 class HailerTools:               # one plain method per tool, each -> str (a ToolReply); the method's docstring is the description the model sees
@@ -872,7 +970,10 @@ text, truncated to `config.max_tool_output_chars` with head/tail and a `[... tru
 | `notebook_create` | `name: str, template: str = "starter"` | `notebooks.new_notebook` + `sandbox.write_notebook(..., replace=False)` (+ `save_active_notebook`), then bring-up (below); text: `Created <name> from the <kind> template; it is now the active notebook.` + session line + a reminder of what the template defines; unknown template → `ERROR: unknown template ...`; existing name / unusable name → the `NotebookExistsError` / `NotebookPathError` text |
 | `notebook_open` | `notebook: str` | `notebooks.resolve_notebook(ref, <sandbox.list_notebooks() names>, folders=notebooks.reference_folders(config, sandbox.notebooks_path))` (the model sees `/work/notebooks/...` in docker mode and may pass it back) (+ `save_active_notebook`), bring-up, then when a session exists the cell listing (`Cells (id, name, status, errors, first line):`); text starts `<name> is now the active notebook.`; unknown / outside-folder references → the `NotebookNotFoundError` / `NotebookPathError` text and the active notebook is unchanged |
 | `notebook_close` | `notebook: str = ""` | resolve like `notebook_open` (empty = active), `client.resolve_session`, `client.shutdown_session(id)`; says the kernel is freed and, for the active notebook, that it stays active but must be reopened; no session → `<name> is not open (no kernel session), so there is nothing to close.`; marimo down → `marimo is not running, so <name> has no kernel session to close.` + error + hint |
-| `list_periods` | `name: str = ""` | the `YY-MM <dataset>.parquet` names in `sandbox.list_data()` (optionally one dataset), summarised by `periods.describe_periods(..., schema=<sandbox.data_schema>)` (count, span, common columns, columns in some periods, type changes), plus a line naming the other data files with a `periods.DATA_SUFFIXES` type (at most 20); names the data folder as notebook code reaches it (`data_path`: `/work/data` for docker); a missing folder → `ERROR: Data directory does not exist: <data_path>` |
+| `list_periods` | `name: str = "", folder: str = ""` | the `YY-MM <dataset>.parquet` names in `sandbox.list_data(folder)` (optionally one dataset), summarised by `periods.describe_periods(..., schema=<sandbox.data_schema>)` (count, span, common columns, columns in some periods, type changes), plus a line naming the other data files with a `periods.DATA_SUFFIXES` type (at most 20); names the folder as notebook code reaches it (`data_path`: `/work/data` for docker); a missing folder → `ERROR: Data directory does not exist: <path>`. Without `folder`, it ends with `More data folders (describe one with list_periods(folder='<name>')):` and `- <name>: <path> (<n> data file(s))` per `sandbox.data_folders`; with one, it starts `Data folder '<name>' (<path>, DATA_FOLDERS['<name>'] in notebooks):`; an unknown name → `ERROR: There is no data folder named ...` |
+| `project_files` | `pattern: str = ""` | `ProjectFiles.for_config(config).listing(pattern)` (made on first use, then reused) |
+| `project_search` | `query: str, pattern: str = ""` | `.search(query, pattern)` |
+| `project_read` | `path: str, start_line: int = 1, end_line: int = 0` | `.read(path, start_line, end_line, max_chars=config.max_tool_output_chars)`; without `[project]` all three answer `ERROR: Project files are not available: ...` |
 | `load_skill` | `name: str` | `read_skill` |
 | `read_skill_file` | `name: str, path: str` | `read_skill_file` |
 | `fetch_page` | `url: str` | `web.fetch_page`; denial text lists allowed domains |
@@ -1141,15 +1242,25 @@ class HailerAgent:
 
 ```python
 STATE_DIRNAME = ".hailer"; GITIGNORE_NAME = ".gitignore"; GITIGNORE_TEXT   # a comment line, then "*"
-def state_dir(workspace: Path) -> Path          # <workspace>/.hailer (path only)
-def ensure_state_dir(workspace: Path) -> Path   # mkdir -p, then write .hailer/.gitignore unless one exists (never overwritten; a failed write is ignored)
+PROJECT_STATE_DIRNAME = "state"; PROJECT_CONFIG_NAME = "hailer.toml"; LOCAL_CONFIG_NAME = "local.toml"
+PROJECT_GITIGNORE_TEXT                          # .hailer/.gitignore in the project layout: state/, local.toml, data/
+def project_dir(workspace: Path) -> Path        # <workspace>/.hailer
+def is_project_layout(workspace: Path) -> bool  # <workspace>/.hailer/hailer.toml is a file
+def state_dir(workspace: Path) -> Path          # <workspace>/.hailer, or <workspace>/.hailer/state in the project layout (path only)
+def local_config_path(workspace: Path) -> Path  # <workspace>/.hailer/local.toml in both layouts (path only)
+def ensure_state_dir(workspace: Path) -> Path   # ensure_ignored_dir(state_dir(workspace))
+def ensure_ignored_dir(folder: Path) -> Path    # mkdir -p, then write <folder>/.gitignore ("*") unless one exists (never overwritten; a failed write is ignored)
+def ensure_project_gitignore(workspace) -> None # project layout only: .hailer/.gitignore (PROJECT_GITIGNORE_TEXT: also the root state
+    # files a standalone layout left) unless one exists; an unedited standalone "*" one is replaced (it would hide the project's files); never raises
 SANDBOX_MARK_NAME = "sandbox-wrote-notebooks"   # a sandbox copied notebooks here since the user last agreed to run them unsafe-local
 def mark_sandbox_wrote(workspace) -> None; def sandbox_wrote_notebooks(workspace) -> bool; def clear_sandbox_mark(workspace) -> None
-INPUT_HISTORY_NAME = "input_history"; def input_history_path(workspace) -> Path   # .hailer/input_history (hailer.input_history)
+INPUT_HISTORY_NAME = "input_history"; def input_history_path(workspace) -> Path   # <state_dir>/input_history (hailer.input_history)
 ```
 The only place `.hailer/` is created: `session.save_session`, `notebooks.save_active_notebook`,
 `HailerAgent` (the default `threads.sqlite`), `input_history.InputHistory` and the kernel runtimes' record, log and token folders all go through `ensure_state_dir`, so the
-folder ignores itself in any git repository. The user's own `.gitignore` is never touched.
+folder ignores itself in any git repository. The user's own `.gitignore` is never touched. In the project layout
+`.hailer/` itself is committed (config, notebooks, context, skills, prompts) and only its `state/` ignores
+itself; `init` and `hailer data add` write `.hailer/.gitignore` for `state/`, `local.toml` and `data/`.
 
 ## `input_history.py`
 
@@ -1215,7 +1326,8 @@ stored: the system prompt is sent with every turn, so `/reload` applies from the
 The `hailer.cli` package: `__init__.py` holds the Typer `app` (global options, command registration) and
 `main()`, the console entry (`hailer = "hailer.cli:main"`). `chat.py` has bare `hailer`, `notebook` and the
 session code (`_run_session`, `_start_kernel`, `_run_foreground`, `_wait_for_notebook`, `ChatLoop`);
-`kernel.py` the `kernel pull|build|stop` sub-app; `setup.py` `init`, `login`, `logout`, `doctor` and `status`.
+`kernel.py` the `kernel pull|build|stop` sub-app; `data.py` the `data [list]|add|remove` sub-app (and
+`folder_lines`, which `/data` reuses); `setup.py` `init`, `login`, `logout`, `doctor` and `status`.
 `common.py` holds what they share: `CliOptions`, the injectable collaborators (`console_factory`,
 `_load_config`, `_runtime_for`, `_make_agent`, `_resolve_key`, `_wait_for_session`, `_open_browser`, ...),
 output helpers, the preflight checks (`local_checks`, `kernel_checks`) and the chat's terminal pieces
@@ -1321,7 +1433,14 @@ model endpoint (an unsafe-local runtime is a WARN `kernel` row with `UNSAFE_LOCA
 unsafe-local that it is not isolated); `login` and `logout` manage
 provider credentials; `kernel pull`, `kernel build [--tag]` and `kernel stop` manage the image and every kernel
 of the workspace. Global options include `--verbose/-v`, `--config`, `--workspace`, `--new`, `--plain` and
-`--version`. Human-facing links include the token; tool-result links omit it. The doctor's `notebook` row is
+`--version`. `init [--layout standalone|project]` (`_choose_layout`): the flag, else the layout of a config already
+there, else `project` in a folder with `pyproject.toml` or `.git`; the project layout writes `.hailer/hailer.toml`
+(`config_template(layout="project")`), `.hailer/.gitignore`, `.hailer/README.md`, copies only the example's
+context, skills and prompts into `.hailer/`, and its next steps say `uv run hailer` when the folder has a
+`pyproject.toml`. `data add <name> <folder> [--description]` / `data remove <name>` call
+`hailer.datafolders.add_data_folder` / `remove_data_folder` and say that a running chat sees the change at its next
+start; `data` and `data list` print `folder_lines`. The startup panel has a `Project:` line (`_project_line`:
+`none`, or the folder, read-only). Human-facing links include the token; tool-result links omit it. The doctor's `notebook` row is
 host-side: the active notebook's file in the notebooks folder (`(active)`), else the configured one
 (`(configured)`).
 
@@ -1560,14 +1679,40 @@ when very narrow). `/notebook list`: `Notebook  Modified  Size` with `● open`,
 `/context`: labelled sections, warnings as `▲` lines. `scripts/chat_ui_demo.py` drives the real composer with
 the agent's events (ids, summaries, parallel, failed and cancelled steps) and these cards.
 
+## `datafolders.py`  (data folders, 2026-10-28)
+
+```python
+LOCAL_HEADER                                   # the comment a new .hailer/local.toml starts with
+def check_name(name: str) -> str               # DATA_FOLDER_NAME_RE or ConfigError
+def add_data_folder(config, name, folder, *, description=None) -> Path   # the folder as written (absolute, resolved; relative to cwd)
+def remove_data_folder(config, name) -> bool   # False when local.toml does not have it
+def reload(config) -> HailerConfig             # load_config(workspace, config_path) again
+```
+`add_data_folder` refuses (`ConfigError`) a bad name, a path that is not a folder and a folder
+`config._mount_problems` refuses (the docker mount rules, whatever the runtime). It edits `.hailer/local.toml`
+line by line: the `name = ...` line in `[data_folders]` is replaced or added after the table's last line (a new
+table at the end when there is none), the result is parsed with `tomllib` and must hold the new path, then it is
+written atomically (temp file + `os.replace`); other settings and comments stay. A form it does not edit (a
+`[data_folders.<name>]` table, invalid TOML) is refused with "edit it by hand" and the file is unchanged. The value is
+a JSON string (a valid TOML basic string), or `{ path = ..., description = ... }`. Before writing it makes sure git
+ignores the file (`ensure_project_gitignore` in the project layout, else `ensure_state_dir`). `/data` in the chat
+(`ChatController._data`) lists `folder_lines(reload(config))`, and `/data add <name> <folder>` (quotes stripped) /
+`/data remove <name>` call the same functions.
+
 ## `prompts/system.md`  (owner: wave 2 / E, reviewed by D)
 
 The agent persona and rules: the tool list (every `TOOL_NAMES` entry appears as `` `name(` ``, checked by
-`test_agent.py`) with the statement that there is no shell and no file tool, the one-active-notebook rules, the
+`test_agent.py`) with the statement that there is no shell and that the only files read directly are the project's
+own (the `project_*` tools), "Questions about the project" (search, then read the part; answer for an analyst with
+file and line references; notebook code cannot import project files; never claim to have changed them), the
+`DATA_FOLDERS` global, the one-active-notebook rules, the
 `[Hailer]` notice rule (a CLI notice, "not the user's words"), the scratchpad semantics and the canonical `cm`
 patterns, formatting and the check findings (fix real mistakes, leave findings a checker cannot judge), the data conventions with the "compact outputs only" rule, safety, and how to reply. The web
-allowlist, project context, skills index and workspace (with the kernel runtime's notes, which carry the
-package-install rule) are appended by `agent.system_prompt`. Loaded with
+allowlist, project context, skills index, "## Project files" (`agent._project_section`: whether `[project]` is on,
+and which folder) and workspace (with a `- Data folder "<name>": <path as the kernel sees it> (read-only;
+DATA_FOLDERS["<name>"] in notebooks): <description>` line per available data folder, a line naming the declared
+ones not on this machine, and the kernel runtime's notes, which carry the package-install rule) are appended by
+`agent.system_prompt`. Loaded with
 `importlib.resources.files("hailer").joinpath("prompts/system.md")`.
 
 ## Tests (each owner writes their own; `uv run pytest` must pass offline)
@@ -1581,6 +1726,15 @@ package-install rule) are appended by `agent.system_prompt`. Loaded with
   the folder never followed, case variants on Windows, both tokens on every request, HTTP errors as
   `HailerError`s, the normalised digest) and the data folder
 - `test_web.py`, `test_context.py`: C. `test_notebooks.py`, `test_browser.py`: notebook feature
+- `test_project.py`: project files. Which files (a real `git` repository and the walk, ignored files, Hailer's
+  state, `local.toml`, the notebooks and data folders, credential names, links out of the root, size), globs,
+  listing and its folder summary, search (caps, time budget, literal fallback), read (windows, budget, refusals,
+  other spellings), withheld credential lines (code-aware, key blocks), `[project]` parsing and `project_problems`,
+  the prompt section and the tools
+- `test_data_folders.py`: data folders. `[data_folders]` parsing and the `local.toml` merge, warnings and mount
+  rules, the docker command's read-only mounts (and no `-e`), the unsafe-local variables, the starter notebook run
+  by marimo with and without them, `list_periods`, the prompt, `hailer.datafolders` editing (comments kept,
+  refusals, git ignore in both layouts), `uvx hailer data` and `/data`
 - `test_code_checks.py`: code checks. The real ruff and ty on small notebooks (types across cells, the
   rules left out for notebooks, syntax errors, deduplication, missing tools), the typed-in values check (what
   it reports and leaves, its line numbers, the starter template and the system prompt's own examples passing
@@ -1644,7 +1798,8 @@ package-install rule) are appended by `agent.system_prompt`. Loaded with
   until fixture teardown (DevTools captures the diagnostic screenshot), then: code runs as
   non-root in `/work` on the mounted data and the starter notebook ran on open; a code-mode cell is saved in
   the host notebook; notebooks are listed, created, read and replaced through marimo's file API in the
-  container; data writes, network and DNS are refused; neither a host secret nor the token is in the
+  container; a data folder outside the workspace is mounted read-only at `/work/folders/exports` and the starter
+  notebook names it in `DATA_FOLDERS`; data writes, network and DNS are refused; neither a host secret nor the token is in the
   kernel's environment or `docker inspect`; the containers carry this session's live owner lock and the
   contract label; stopping leaves no container, network or token folder. The *Docker kernel* job in `.github/workflows/test.yml` builds the image for the checkout
   (`scripts/build_kernel_image.py --load`) and runs it with `strict`.

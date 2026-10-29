@@ -13,7 +13,8 @@ Terminal ─────► │  conversation   │   (create_agent + ChatOpenAI
                 │                 │
                 │  marimo_execute, marimo_status, notebook_cells, notebook_check,
                 │  notebook_list, notebook_create, notebook_open, notebook_close,
-                │  list_periods, load_skill, read_skill_file, fetch_page
+                │  list_periods, project_files, project_search, project_read,
+                │  load_skill, read_skill_file, fetch_page
                 └────────┬────────┘
                          │ HTTP + SSE  (/api/sessions, /api/kernel/execute),
                          │ with the server's token
@@ -22,12 +23,13 @@ Terminal ─────► │  conversation   │   (create_agent + ChatOpenAI
                 │ Polars · DuckDB │   marimo._code_mode for durable cells
                 │ Python          │
                 └────────┬────────┘   docker (default): a Linux container with copies of
-                         │            the notebooks and, read-only, the data folder
+                         │            the notebooks and, read-only, the data folders
                     Browser UI        unsafe-local: Hailer's own Python, as you
 ```
 
 The CLI runs the agent in its own process, with the model and provider taken from `hailer.toml`. The agent
-has exactly the twelve tools above and nothing else: no shell, no file editing. The tools talk to the
+has exactly the fifteen tools above and nothing else: no shell, no file editing; the project files it can
+read are read on this machine, read-only, and the kernel never sees them. The tools talk to the
 running marimo server over plain HTTP. Code from the agent runs in marimo's *scratchpad*, a temporary
 namespace that can read every notebook variable, and durable changes (new cells, edits, runs) go through
 marimo's code-mode API so they appear immediately in the browser. marimo writes the notebook file itself,

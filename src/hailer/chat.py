@@ -697,6 +697,8 @@ class ChatController:
             self.console.clear()
         elif name == "context":
             self._context()
+        elif name == "data":
+            self._data(args)
         elif name == "skill":
             self._skill(args)
         elif name == "prompt":
@@ -1183,6 +1185,46 @@ class ChatController:
         if bundle.context_files:
             sections.insert(1, ("", [Text("sent with every session", style="dim")]))
         self.console.print(detail_card(self._glyphs(), sections, bundle.warnings))
+
+    def _data(self, args: str) -> None:
+        """``/data``: the data folders; ``/data add <name> <folder>`` / ``/data remove <name>`` edit
+        this machine's ``.hailer/local.toml`` (the kernel gets the change at the next start)."""
+        from hailer.cli.data import folder_lines
+        from hailer.datafolders import add_data_folder, reload, remove_data_folder
+
+        out = self.console
+        action, _, rest = args.strip().partition(" ")
+        action, rest = action.lower(), rest.strip()
+        restart = "Notebooks see it from the next start: /exit, then start Hailer again."
+        try:
+            if action == "add":
+                name, _, folder = rest.partition(" ")
+                folder = folder.strip().strip("\"'")
+                if not name or not folder:
+                    out.print("Usage: /data add <name> <folder>", markup=False)
+                    return
+                target = add_data_folder(self.config, name, folder)
+                out.print(f"Data folder {name!r} is {target}; saved in .hailer/local.toml. {restart}", markup=False)
+                return
+            if action == "remove":
+                if not rest:
+                    out.print("Usage: /data remove <name>", markup=False)
+                    return
+                removed = remove_data_folder(self.config, rest)
+                out.print(
+                    f"Removed data folder {rest!r} from .hailer/local.toml. {restart}" if removed else f"There is no data folder {rest!r} in .hailer/local.toml.",
+                    markup=False,
+                )
+                return
+            if action:
+                out.print("Usage: /data [add <name> <folder> | remove <name>]", markup=False)
+                return
+            for line in folder_lines(reload(self.config)):
+                out.print(f"  {line}", markup=False)
+        except HailerError as err:
+            out.print(self._cli._labelled("error", "red", f"  {err}"))
+            if err.hint:
+                out.print(f"  {err.hint}", markup=False)
 
     def _skill(self, args: str) -> None:
         request = self._skill_request(args)

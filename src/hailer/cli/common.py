@@ -254,6 +254,15 @@ def _describe_provider(provider: ProviderConfig) -> str:
     return f"{provider.id} ({', '.join(notes)})"
 
 
+def _project_line(config: HailerConfig) -> str:
+    """Which project files the agent may read: ``none``, or the folder (read-only)."""
+    root = config.project.root
+    if root is None:
+        return "none"
+    shown = _relative(root, config.workspace)
+    return f"{'the workspace' if shown == '.' else shown} (read-only; what the agent reads goes to the model)"
+
+
 def _web_line(config: HailerConfig) -> str:
     domains = list(config.web.allowed_domains)
     if not domains:
@@ -292,6 +301,7 @@ def _settings_panel(console: Console, config: HailerConfig, notebook: str | None
             Text(f"Workspace:  {config.workspace}"),
             Text(f"Kernel:     {_kernel_line(config)}", style=_kernel_style(config)),
             Text(f"Web access: {_web_line(config)}"),
+            Text(f"Project:    {_project_line(config)}"),
         ]
     )
     console.print(Panel(body, title="Hailer", expand=False))

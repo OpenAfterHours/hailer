@@ -113,10 +113,10 @@ def test_menu_rows_mark_the_chosen_item_scroll_and_count_the_rest():
     assert menu_height(buffer) == MENU_ROWS + 1
     shown = rows(menu_fragments(buffer, UNICODE, 100))
     assert shown[0] == "  › /help       Commands and keys"
-    assert shown[5].startswith("    /exec       Run Python") and shown[6] == "    6 more"
+    assert shown[5].startswith("    /exec       Run Python") and shown[6] == "    7 more"
     # Choosing the eighth command scrolls it into the last row.
     shown = rows(menu_fragments(buffer_with("/", index=7), UNICODE, 100))
-    assert shown[0].startswith("    /new") and shown[5].startswith("  › /skill")
+    assert shown[0].startswith("    /new") and shown[5].startswith("  › /data")
     styles = {style for style, _text in menu_fragments(buffer, UNICODE, 100)}
     assert not any(style.startswith("class:menu") for style in styles), "prompt_toolkit paints class:menu grey"
 

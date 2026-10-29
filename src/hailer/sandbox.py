@@ -113,6 +113,15 @@ def _skipped(folder: str) -> bool:
     return folder.startswith((".", "__")) or folder.lower() in SKIPPED_FOLDERS
 
 
+@dataclass(frozen=True)
+class SandboxFolder:
+    """One of a kernel's data folders: ``path`` as notebook code reaches it (``/work/folders/<name>``
+    in a container), ``host`` the folder of this machine behind it."""
+
+    path: str
+    host: Path
+
+
 @dataclass
 class MarimoSandbox:
     """A started kernel and its files.
@@ -121,7 +130,8 @@ class MarimoSandbox:
     folder (the unsafe-local runtime: the host folder as :func:`~hailer.marimo_client.notebook_file_key`
     writes it; docker: ``/work/notebooks``, the container's own) and ``native_paths`` says the
     kernel's paths are this machine's; ``data_path`` is the data folder as notebook code reaches it
-    and ``data_dir`` the host folder behind it (a read-only mount in a container). ``log_hint``
+    and ``data_dir`` the host folder behind it (a read-only mount in a container), ``data_folders``
+    the ``[data_folders]`` the kernel got, by name. ``log_hint``
     says where the kernel's log is; ``ended`` why :meth:`wait` returned when the kernel stopped by
     itself (empty after Ctrl+C). ``notice`` shows a warning line (the chat points it at its own
     console; default: print); the notebook copies call it from any thread.
@@ -131,6 +141,7 @@ class MarimoSandbox:
     notebooks_path: str = ""
     data_path: str = ""
     data_dir: Path | None = None
+    data_folders: dict[str, SandboxFolder] = field(default_factory=dict)
     native_paths: bool = False
     log_hint: str = ""
     ended: str = ""
@@ -356,14 +367,29 @@ class MarimoSandbox:
 
     # -- data ---------------------------------------------------------------- #
 
-    def list_data(self) -> list[DataFile]:
-        """The files directly in the data folder (not hidden), sorted by name. ``HailerError`` when
-        the folder does not exist."""
-        folder = self.data_dir
-        if folder is None or not folder.is_dir():
-            raise HailerError(f"Data directory does not exist: {self.data_path or folder}")
+    def _data_folder(self, folder: str | None) -> tuple[Path | None, str]:
+        """(host folder, path in the kernel) of the data folder, or of the data folder named
+        ``folder``; ``HailerError`` naming the folders there are for another name."""
+        if not folder:
+            return self.data_dir, self.data_path
+        found = self.data_folders.get(folder)
+        if found is None:
+            names = ", ".join(sorted(self.data_folders)) or "none"
+            raise HailerError(f"There is no data folder named {folder!r} (data folders: {names}).", hint="Use a name list_periods reported.")
+        return found.host, found.path
+
+    def data_path_of(self, folder: str | None = None) -> str:
+        """The data folder (or the one named ``folder``) as notebook code reaches it."""
+        return self._data_folder(folder)[1]
+
+    def list_data(self, folder: str | None = None) -> list[DataFile]:
+        """The files directly in the data folder, or the data folder named ``folder`` (not hidden),
+        sorted by name. ``HailerError`` when the folder does not exist."""
+        host, shown = self._data_folder(folder)
+        if host is None or not host.is_dir():
+            raise HailerError(f"Data directory does not exist: {shown or host}")
         found: list[DataFile] = []
-        for path in folder.iterdir():
+        for path in host.iterdir():
             if path.name.startswith("."):
                 continue
             try:
@@ -375,15 +401,16 @@ class MarimoSandbox:
             found.append(DataFile(path.name, stat.st_mtime, stat.st_size))
         return sorted(found, key=lambda info: info.name.lower())
 
-    def data_schema(self, name: str) -> dict[str, str]:
-        """The columns of the Parquet file ``name`` in the data folder, with their types as text.
-        ``MalformedParquetError`` when it cannot be read."""
+    def data_schema(self, name: str, folder: str | None = None) -> dict[str, str]:
+        """The columns of the Parquet file ``name`` in the data folder (or the data folder named
+        ``folder``), with their types as text. ``MalformedParquetError`` when it cannot be read."""
         name = _check_data_name(name)
-        if self.data_dir is None:
+        host = self._data_folder(folder)[0]
+        if host is None:
             raise MarimoUnavailableError("This kernel has no data folder.")
         import polars as pl  # lazy: heavy, and only list_periods needs it
 
-        path = self.data_dir / name
+        path = host / name
         try:
             return {column: str(dtype) for column, dtype in pl.read_parquet_schema(path).items()}
         except (pl.exceptions.PolarsError, OSError, ValueError, TypeError) as err:
@@ -404,5 +431,6 @@ __all__ = [
     "MarimoSandbox",
     "NotebookFile",
     "SandboxEntry",
+    "SandboxFolder",
     "notebook_digest",
 ]

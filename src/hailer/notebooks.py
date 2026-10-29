@@ -120,7 +120,11 @@ def _():
 def _(Path, mo):
     # Workspace layout: the workspace is the first folder above this notebook that holds
     # pyproject.toml or hailer.toml (falls back to the notebook folder's parent); data lives
-    # in <workspace>/data/.
+    # in <workspace>/data/ and more data folders in <workspace>/folders/<name>/, unless Hailer
+    # says where they are (HAILER_DATA_DIR, HAILER_DATA_FOLDERS).
+    import json as _json
+    import os as _os
+
     _notebook_dir = mo.notebook_dir()
     _start = (_notebook_dir if _notebook_dir is not None else Path.cwd()).resolve()
     WORKSPACE = next(
@@ -131,8 +135,16 @@ def _(Path, mo):
         ),
         _start.parent,
     )
-    DATA_DIR = WORKSPACE / "data"
-    return DATA_DIR, WORKSPACE
+    DATA_DIR = Path(_os.environ.get("HAILER_DATA_DIR") or WORKSPACE / "data")
+    _named = _os.environ.get("HAILER_DATA_FOLDERS")
+    _folders = WORKSPACE / "folders"
+    if _named:
+        DATA_FOLDERS = {_name: Path(_path) for _name, _path in _json.loads(_named).items()}
+    elif _folders.is_dir():
+        DATA_FOLDERS = {_p.name: _p for _p in sorted(_folders.iterdir()) if _p.is_dir()}
+    else:
+        DATA_FOLDERS = {}
+    return DATA_DIR, DATA_FOLDERS, WORKSPACE
 
 
 @app.cell
@@ -143,7 +155,7 @@ def _(DATA_DIR, list_data_files, scan_period_files):
 
 
 @app.cell
-def _(DATA_DIR, WORKSPACE, data_files, describe_periods, mo, period_files, pl):
+def _(DATA_DIR, DATA_FOLDERS, WORKSPACE, data_files, describe_periods, mo, period_files, pl):
     # Welcome / status cell. Hailer adds analysis cells below this one.
     _header = mo.md(
         f"""
@@ -158,6 +170,10 @@ def _(DATA_DIR, WORKSPACE, data_files, describe_periods, mo, period_files, pl):
     """
     )
     _parts = [_header]
+    if DATA_FOLDERS:
+        _parts.append(
+            mo.md("**More data folders** (`DATA_FOLDERS`): " + ", ".join(f"`{_n}` → `{_p}`" for _n, _p in DATA_FOLDERS.items()))
+        )
     if data_files:
         _periods = {pf.path.name: pf.period.label for pf in period_files}
         _columns = {
@@ -196,8 +212,8 @@ if __name__ == "__main__":
     app.run()
 '''
 """The starter notebook: the same cells as notebooks/analysis.py (imports, hailer.periods
-helpers, WORKSPACE / DATA_DIR, data_files and period_files, welcome cell) with the notebook title
-as heading."""
+helpers, WORKSPACE / DATA_DIR / DATA_FOLDERS, data_files and period_files, welcome cell) with the
+notebook title as heading."""
 
 
 # --------------------------------------------------------------------------- #

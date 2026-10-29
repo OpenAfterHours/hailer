@@ -96,10 +96,27 @@ which sees your data folder read-only and has no network. Where Docker is not an
 See [Security](https://openafterhours.github.io/hailer/security/data-handling/#security) and
 [kernel runtimes](https://openafterhours.github.io/hailer/security/runtimes/#kernel-runtimes) for details.
 
+## Inside another project
+
+Hailer can also live inside an existing project, a uv workspace monorepo included, as a support chat that
+answers questions about both the data and the product:
+
+```bash
+uv add --dev hailer
+uv run hailer init
+uv run hailer data add finance "~/Shared/Finance exports"
+uv run hailer
+```
+
+`init` puts everything in `.hailer/` (settings, notebooks, context and skills to commit; data, state and this
+machine's `local.toml` ignored by git). The agent can search and read the project's code and docs, read-only,
+and `data add` mounts a folder from anywhere on the machine read-only in the kernel as
+`DATA_FOLDERS["finance"]`. See [Inside another project](https://openafterhours.github.io/hailer/configuration/project/).
+
 ## Documentation
 
 - **Using Hailer:** [everyday workflow](https://openafterhours.github.io/hailer/using/workflow/), [notebooks and sessions](https://openafterhours.github.io/hailer/using/notebooks/), [data and Excel](https://openafterhours.github.io/hailer/using/data/).
-- **Configuration:** [models and endpoints](https://openafterhours.github.io/hailer/configuration/models/), [context, skills and prompts](https://openafterhours.github.io/hailer/configuration/context/).
+- **Configuration:** [models and endpoints](https://openafterhours.github.io/hailer/configuration/models/), [context, skills and prompts](https://openafterhours.github.io/hailer/configuration/context/), [inside another project](https://openafterhours.github.io/hailer/configuration/project/).
 - **Security:** [data handling](https://openafterhours.github.io/hailer/security/data-handling/), [kernel runtimes](https://openafterhours.github.io/hailer/security/runtimes/).
 - **Help:** [installation and upgrades](https://openafterhours.github.io/hailer/getting-started/installation/), [troubleshooting](https://openafterhours.github.io/hailer/reference/troubleshooting/), [known limitations](https://openafterhours.github.io/hailer/reference/limitations/).
 

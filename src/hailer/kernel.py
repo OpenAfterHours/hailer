@@ -26,6 +26,7 @@ Import order: this module imports :mod:`hailer.marimo_client` and :mod:`hailer.s
 
 from __future__ import annotations
 
+import json
 import os
 import secrets
 import subprocess
@@ -45,8 +46,8 @@ from hailer.models import (
     KernelConfig,
     MarimoServer,
 )
-from hailer.sandbox import MarimoSandbox
-from hailer.statedir import clear_sandbox_mark, ensure_state_dir, sandbox_wrote_notebooks, state_dir
+from hailer.sandbox import MarimoSandbox, SandboxFolder
+from hailer.statedir import clear_sandbox_mark, ensure_ignored_dir, ensure_state_dir, sandbox_wrote_notebooks, state_dir
 
 #: ``.hailer/marimo-<pid>.log``: the unsafe-local runtime's log, one per Hailer process, deleted on stop.
 LOCAL_LOG_PREFIX = "marimo-"
@@ -61,6 +62,13 @@ FOREGROUND_GRACE_SEC = 10.0
 KERNEL_WORKDIR = PurePosixPath("/work")
 KERNEL_NOTEBOOKS_DIR = PurePosixPath("/work/notebooks")
 KERNEL_DATA_DIR = PurePosixPath("/work/data")
+#: Where a docker kernel mounts the ``[data_folders]``: ``/work/folders/<name>``, read-only.
+KERNEL_FOLDERS_DIR = PurePosixPath("/work/folders")
+#: The environment variables that tell an unsafe-local kernel's notebook code where the data is (the
+#: starter notebook reads them): the data folder, and a JSON object of the data folders' paths by
+#: name. A docker kernel gets none: its folders are always /work/data and /work/folders/<name>.
+DATA_DIR_VARIABLE = "HAILER_DATA_DIR"
+DATA_FOLDERS_VARIABLE = "HAILER_DATA_FOLDERS"
 
 #: Names that mark an environment variable as a secret the unsafe-local kernel does not get: the log
 #: redaction suffixes plus these (any case), and the exact names below.
@@ -153,6 +161,21 @@ def withheld_variables(config: HailerConfig, environ: Mapping[str, str]) -> list
     return sorted(name for name in environ if fold(name) in dropped or name.upper().endswith(KERNEL_SECRET_SUFFIXES))
 
 
+def kernel_data_folders(config: HailerConfig, runtime: str | None = None) -> dict[str, str]:
+    """The data folders a kernel gets (:func:`~hailer.config.available_data_folders`), by name, as
+    notebook code reaches them: ``/work/folders/<name>`` in a docker kernel, the folder itself in
+    an unsafe-local one."""
+    from hailer.config import available_data_folders  # lazy: hailer.config is large
+
+    docker = (runtime or config.kernel.runtime) == KERNEL_RUNTIME_DOCKER
+    return {folder.name: str(KERNEL_FOLDERS_DIR / folder.name) if docker else str(folder.path) for folder in available_data_folders(config)}
+
+
+def data_variables(data_path: str, folders: Mapping[str, str]) -> dict[str, str]:
+    """:data:`DATA_DIR_VARIABLE` and :data:`DATA_FOLDERS_VARIABLE` for a kernel."""
+    return {DATA_DIR_VARIABLE: data_path, DATA_FOLDERS_VARIABLE: json.dumps(dict(folders), ensure_ascii=False)}
+
+
 def kernel_environment(config: HailerConfig, environ: Mapping[str, str]) -> dict[str, str]:
     """``environ`` without the secrets :func:`withheld_variables` names, for a marimo server Hailer
     starts on this machine. Notebook code can still read the OS credential store and files, which
@@ -207,7 +230,7 @@ def _feed_stdin(proc: Any, text: str) -> None:
 def _fresh_log(log_path: Path) -> Any:
     """``log_path`` emptied and opened for the child (owner-only on POSIX): marimo prints its
     signed-in URL, so an old server's token never stays behind in the log."""
-    ensure_state_dir(log_path.parent.parent)
+    ensure_ignored_dir(log_path.parent)
     fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0), 0o600)
     if os.name != "nt":
         os.chmod(log_path, 0o600)
@@ -477,7 +500,8 @@ class LocalRuntime:
         url = f"http://127.0.0.1:{port}"
         cmd = marimo_server_command(config.notebooks_root, workspace, port)
         token = self._token_factory()
-        env = kernel_environment(config, self.environ)
+        folders = kernel_data_folders(config, self.name)
+        env = {**kernel_environment(config, self.environ), **data_variables(str(config.data_dir), folders)}
         log_path = None if foreground else self.log_path
         try:
             if foreground:
@@ -495,6 +519,7 @@ class LocalRuntime:
             notebooks_path=notebook_file_key(config.notebooks_root),
             data_path=str(config.data_dir),
             data_dir=config.data_dir,
+            data_folders={name: SandboxFolder(path, Path(path)) for name, path in folders.items()},
             native_paths=True,
             log_hint=str(log_path) if log_path is not None else "this terminal",
             proc=proc,
@@ -556,7 +581,10 @@ def runtime_for(config: HailerConfig, runner: Any = None) -> KernelRuntime:
 
 
 __all__ = [
+    "DATA_DIR_VARIABLE",
+    "DATA_FOLDERS_VARIABLE",
     "KERNEL_DATA_DIR",
+    "KERNEL_FOLDERS_DIR",
     "KERNEL_NOTEBOOKS_DIR",
     "KERNEL_WORKDIR",
     "KernelRuntime",
