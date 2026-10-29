@@ -10,6 +10,7 @@ import logging
 import signal
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -905,6 +906,23 @@ def interrupt_after(seconds: float) -> threading.Timer:
     return timer
 
 
+def interrupt_when(ready: Callable[[], bool], timeout: float = 10.0) -> threading.Event:
+    """Ctrl+C as soon as ``ready()`` holds, not after a fixed delay: on a slow runner (Windows CI) a
+    0.7 s timer fired before the tool call's event. Set the returned event to call it off."""
+    stop = threading.Event()
+
+    def watch() -> None:
+        deadline = time.monotonic() + timeout
+        while not stop.is_set() and time.monotonic() < deadline:
+            if ready():
+                _press_ctrl_c()
+                return
+            stop.wait(0.005)
+
+    threading.Thread(target=watch, daemon=True).start()
+    return stop
+
+
 def test_ctrl_c_during_a_model_call_cancels_the_turn_at_once(harness):
     async def never(_messages: list[Any]) -> AIMessage:
         await asyncio.sleep(30)
@@ -1220,12 +1238,13 @@ def test_ctrl_c_during_a_tool_emits_no_result(harness):
     h = harness([call("slow", {"seconds": 30}, "call_slow"), say("carried on")])
     h.agent.start()
     events: list[AgentEvent] = []
-    timer = interrupt_after(0.7)
+    # Once the call is announced and the tool is running: the event and the tool's start are not ordered.
+    stop = interrupt_when(lambda: "slow:start" in h.tool_log and bool(steps_of(events)))
     try:
         with pytest.raises(KeyboardInterrupt):
             h.agent.run_turn("run the slow thing", on_event=events.append)
     finally:
-        timer.cancel()
+        stop.set()
     assert steps_of(events) == [("tool_call", "slow", "call_slow")]
     later: list[AgentEvent] = []
     assert h.agent.run_turn("what happened?", on_event=later.append).steps == 0
