@@ -1119,6 +1119,8 @@ folder ignores itself in any git repository. The user's own `.gitignore` is neve
 SESSION_FILENAME = "session.json"   # in statedir.state_dir(workspace)
 COMMANDS: dict[str, str]     # name -> one-line help, for /help
 EXIT_COMMANDS = ("exit", "quit")
+COMMAND_USAGE: dict[str, tuple[str, str]]   # name -> (argument signature, short description): the composer's /help card; every COMMANDS name but the alias quit
+COMMAND_GROUPS: dict[str, tuple[str, ...]]  # the card's groups (Conversation, Notebook, Session), each COMMAND_USAGE name once
 def parse_command(line: str) -> Command | None      # "/model gpt-5.5" -> Command("model", "gpt-5.5"); "/exit" ; non-slash -> None; unknown slash -> Command(name, args) (CLI reports unknown); the name ends at the first whitespace, so "/exec\n<code>" keeps its lines
 def session_path(workspace: Path) -> Path
 def load_session(workspace: Path) -> SessionState   # .hailer/session.json, tolerant of missing/corrupt
@@ -1201,13 +1203,42 @@ in yellow (`common._kernel_style`) for unsafe-local, as the startup panel and `-
 unsupported terminals use `Console.input` without starting prompt_toolkit; their Rich console also
 disables live status/cursor controls, including during startup and notebook waits.
 
-`chat_ui.py:ChatUI` owns one inline prompt_toolkit application (no alternate screen, mouse capture or CPR),
-a bounded multiline composer, context/activity lines, and a serialized output queue. Rich transcript
-output goes through `run_in_terminal`; log handlers are temporarily routed through the same queue,
-retaining redaction. Bracketed paste stays enabled throughout the live composer and is restored on exit.
-Enter submits once; Alt+Enter inserts a newline; history is in memory. A busy submission leaves the draft
-intact and does not enqueue a request. Ctrl+C cancels active work and awaits cleanup, or exits while idle;
-Ctrl+D exits only empty and idle; Ctrl+Z then Enter exits while idle. `/exit` and `/quit` also exit.
+`chat_ui.py:ChatUI(console, on_submit, footer, *, pt_input=None, pt_output=None)` owns one inline prompt_toolkit
+application (no alternate screen, mouse capture or CPR) and a serialized output queue. Top to bottom: the live
+row (only while busy or starting), a bounded multiline composer in a rounded frame coloured by state (ANSI cyan
+ready, bright black busy or starting, red once startup failed) with a `›` prompt, a two-space continuation
+indent, a placeholder that says what Enter does now and key hints in the frame's bottom border that follow the
+state, then a one-line footer. `footer()` returns `transcript.FooterData` (notebook, `notebook_open`
+True/False/None, kernel runtime, model, turns, tokens, the notebook's token-free URL) and is called on every
+redraw, so `ChatController.footer` only reads state it holds (the URL is made once per notebook name;
+`notebook_open` is what startup, a switch, `/status`, `/notebook` or `/exec` last learned). The footer shows
+`● name` (open), `○ name` (not open) or `name` (unknown), `docker · isolated` or a yellow
+`▲ unsafe-local · not isolated`, the model and `N turns · Xk tokens` (`working 3.1s` during a turn); when narrow
+it drops tokens, turns, the model and a docker kernel, then shortens the notebook, never the unsafe-local
+warning. Widths are terminal cells. A redraw ticker runs only while busy, starting or showing a flash: every
+80 ms, and every 250 ms while the chat prepares (agent imports then run on a worker thread, and each redraw
+takes the GIL from them; `scripts/benchmark_startup.py` shows the difference in `ready_to_answer`).
+Rich transcript output goes through `run_in_terminal`; log handlers are temporarily routed through the same
+queue, retaining redaction. Bracketed paste stays enabled throughout the live composer and is restored on exit.
+Enter submits once; Alt+Enter (Esc Enter) inserts a newline; history is in memory. A busy submission leaves the
+draft intact, does not enqueue a request and flashes `Still working · esc cancels · your draft is kept` in the
+border for 2.5 s instead of replacing the activity (a flash ends with the turn or with startup). Esc cancels
+active work through the same path as Ctrl+C and does nothing while idle (`ttimeoutlen` 0.1 s, `timeoutlen`
+0.3 s, so a lone Esc acts quickly and Esc Enter still completes). Ctrl+C cancels active work and awaits
+cleanup, or exits while idle; Ctrl+D exits only empty and idle; Ctrl+Z then Enter exits while idle. `/exit`
+and `/quit` also exit.
+
+The transcript: a submission is echoed behind `▌`. `finish(summary: TurnSummary)` prints, once, the steps still
+open (`no result, effect unknown`), the reply behind `●` (`chat_ui.ReplyMarkdown`: left-aligned headings,
+tables with only a header rule and their column alignment, code behind a thin bar, ANSI colours only) and a
+muted line `N steps · 7.7s · 3.1k in · 612 out` (`steps`, `duration_ms` and the token counts; unknown or zero
+parts left out) with `↗ <notebook>` as an OSC 8 hyperlink to the token-free URL. A cancelled turn ends with a
+`▲ Cancelled.` callout, and `The conversation continues; the model is told the last step's effect is unknown.`
+when a step was still running. The console stays soft-wrapped (`console_factory`, for plain mode and pipes);
+the composer prints with `soft_wrap=False`, so Rich wraps at words inside gutters and an indented plain line
+(an error's hints) keeps its indent, except a string containing `://`, printed soft-wrapped so a URL is never
+cut. Glyphs: `transcript.glyphs_for(console.encoding)` is the Unicode set, or `ASCII` (`| * + x ! >`, `+-|`
+frame) when the encoding cannot write it (a cp1252 console); there is no setting for it.
 
 Startup is a separate preparation gate: typing and paste work from the first render, and one early
 submission waits until both agent and notebook preparation settle. Repeated Enter cannot submit it
@@ -1260,13 +1291,42 @@ without opening a browser, at the start of `/notebook` and `/status`: on a chang
 prints `Active notebook is now <name>.` and (turn end only) opens the URL once when the notebook has no session;
 no preamble is queued because the model made the switch itself. `COMMANDS["notebook"]` =
 `Show or switch the active notebook. Usage: /notebook [list | new <name> [--empty] | open <name> | close [name]]`.
-Progress (plain `_TurnDisplay`, interactive `ChatUI.on_event`): a single activity line updated from `AgentEvent`s: `Thinking...`, `Using: <tool>`
-on `tool_call`, `Writing reply...` at the first `message_delta`, the text of a `status` event. Deltas are
-never printed (a model can stream commentary next to its tool calls and then the answer, which printed the
-answer twice); `finish` prints `final_response` once, or `(no reply)`. Interactive answers use Rich Markdown
-under `Hailer`; plain answers retain `Hailer >`. After a turn the CLI
-adds the turn and its tokens to the session file. Errors: print message + hint; exit code 1 when startup
-fails, the REPL carries on after a failed turn; traceback only with `--verbose`.
+Progress (plain `_TurnDisplay`, interactive `ChatUI.on_event`), through `steps.StepTracker`: a `tool_call`
+starts a step keyed by `detail["id"]` (unique in a turn; a call without one gets a private key that only the
+turn's end closes); the `tool_result` with that id commits one row, `✓|✗ <done verb>  <target · summary>
+<seconds>`, with the event's `seconds` (a summary that starts with the target loses that repeat). Several steps
+may be open; rows appear in result order; a result for no open step prints nothing. On cancellation every open
+step is committed as `▲ <done verb>  <target · cancelled, effect unknown>` (§4: cancelling is not a rollback);
+a turn that ends with steps open (an error) commits them as `no result, effect unknown`. A worked step's row
+is one line (its detail cut with `…`); a failed or cancelled step's detail wraps in its column. The composer's
+live row shows a spinner, the oldest open step's live verb and target in the rows' columns (`+N more` for
+parallel ones) and, from one second, a right-aligned timer; between steps it shows the latest activity
+(`Thinking`, `Writing the answer` at a `message_delta`, a `status` event's text, the text a slash command gives
+`console.status(...)` or `set_activity`, without a trailing `...`). Deltas are never printed (a model can stream
+commentary next to its tool calls and then the answer, which printed the answer twice). Plain mode prints the
+same rows as whole lines when the results arrive (no live row, spinner, cursor control or hard wrap), then
+`Hailer >`, `final_response` once (or `(no reply)`) and `  N steps · 1.5s · 3.1k in · 612 out`; Ctrl+C prints
+the cancelled rows, then `Interrupted.`. After a turn the CLI adds the turn and its tokens to the session file.
+Errors (`common._print_error`, in both modes and the other commands): a red `✗ <message>` callout, then the hint
+lines indented four spaces, both texts unchanged; exit code 1 when startup fails, the REPL carries on after a
+failed turn; traceback only with `--verbose`.
+
+Wording: `steps.describe_call(name, args) -> Step(live, done, target)` (`steps.VERBS`: "Running code"/"Ran
+code", "Reading the notebook"/"Read the notebook", "Scanning the data"/"Scanned the data", ...;
+`marimo_execute` is `<n> lines`, or "Adding a cell", "Editing 2 cells", "Changing cells" for a code-mode
+script; the target comes from the arguments: notebook, data name, skill, `skill/path`, the URL's host, the
+cells pattern; an unknown tool shows its name). Labels pass `steps.single_line`. `hailer/transcript.py` holds
+what both presentations print, Rich only: the glyph sets, `Gutter`, `user_message`, `callout`,
+`step_row`/`plain_step_row`, `turn_stats`/`turn_footer`, the cards and `FooterData`. In the composer
+(`ChatController.interactive`) slash commands print cards; plain mode keeps its lines and tables. `/status`:
+a rounded `Session` card with a mark per row (`●` fine, `▲` missing credentials, unsafe-local or marimo not
+running, `○` notebook not open in a browser) holding every row of the plain table (model, provider and
+credentials; kernel; marimo; notebook and session; notebooks folder; thread, turns and tokens; web access).
+`/help`: the commands by `COMMAND_GROUPS` with their `COMMAND_USAGE` signature and description, then the keys
+(groups in their own column when wide, above their commands when narrow, descriptions under the commands
+when very narrow). `/notebook list`: `Notebook  Modified  Size` with `● open`, `○ not open` and `active`.
+`/context`: labelled sections, warnings as `▲` lines. `scripts/chat_ui_demo.py` drives the real composer with
+the agent's events (ids, summaries, parallel, failed and cancelled steps) and these cards.
 
 ## `prompts/system.md`  (owner: wave 2 / E, reviewed by D)
 
