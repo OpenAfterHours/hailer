@@ -7,7 +7,9 @@ row, the footer, the cards and the callouts are the ones ``uvx hailer`` prints.
 Try: ask anything (parallel steps, then a reply with a table), /failstep (a step that fails and a
 turn that carries on), /fail (an error callout), /slow then Esc or Ctrl+C (a cancelled step),
 /status, /help, /notebook list, /notebook open <name>, /context, /long (scrollback), Enter while a
-turn runs (your draft is kept), resizing the terminal, /exit. ``--unsafe-local`` shows the kernel
+turn runs (your draft is kept), resizing the terminal, /exit. Type / for the command menu (Tab after
+"/notebook open " lists the notebooks). ``--history FILE`` keeps Up's history in FILE across runs, as
+``.hailer/input_history`` does (its grey suggestion: → accepts it). ``--unsafe-local`` shows the kernel
 warning in the footer; ``PYTHONIOENCODING=ascii`` shows the ASCII glyphs a cp1252 console gets.
 """
 
@@ -16,6 +18,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import time
+from pathlib import Path
 
 from rich.console import Console
 from rich.text import Text
@@ -23,7 +26,7 @@ from rich.text import Text
 from hailer.chat_ui import ChatUI
 from hailer.cli.common import _print_error, _reconfigure_streams
 from hailer.errors import HailerError
-from hailer.models import AgentEvent, TurnSummary
+from hailer.models import AgentEvent, CompletionData, TurnSummary
 from hailer.transcript import FooterData, NotebookRow, detail_card, help_card, notebook_table, status_card
 
 URL = "http://127.0.0.1:2718/?file=/work/notebooks/{name}&view-as=present"
@@ -64,19 +67,26 @@ figure is net of them. The table is in `analysis.py` as `growth_by_region`, with
 
 
 class Demo:
-    def __init__(self, console: Console, *, delay: float, unsafe_local: bool) -> None:
+    def __init__(self, console: Console, *, delay: float, unsafe_local: bool, history: Path | None = None) -> None:
         self.delay = delay
         self.notebook = "analysis.py"
         self.notebook_open: bool | None = None
         self.kernel = "unsafe-local" if unsafe_local else "docker"
         self.model = "gpt-5.5"
         self.turns, self.tokens, self.calls = 3, 14_820, 0
-        self.ui = ChatUI(console, self.submit, self.footer)
+        self.ui = ChatUI(console, self.submit, self.footer, completions=self.completions, history_file=history)
 
     def footer(self) -> FooterData:
         return FooterData(
             notebook=self.notebook, notebook_open=self.notebook_open, kernel=self.kernel, model=self.model,
             turns=self.turns, tokens=self.tokens, notebook_url=URL.format(name=self.notebook),
+        )
+
+    def completions(self) -> CompletionData:
+        return CompletionData(
+            notebooks=("analysis.py", "q2-review.py", "returns.py"), active_notebook=self.notebook,
+            skills=(("example-skill", "How this team writes period reports"),), prompts=("first-look",),
+            model=self.model, providers=("internal", "openai"),
         )
 
     async def pause(self, seconds: float) -> None:
@@ -262,9 +272,10 @@ if __name__ == "__main__":
     parser.add_argument("--delay", type=float, default=1.0, help="multiplier for the simulated durations")
     parser.add_argument("--timeout", type=float, default=600, help="maximum demo lifetime in seconds")
     parser.add_argument("--unsafe-local", action="store_true", help="show the unsafe-local kernel warning")
+    parser.add_argument("--history", type=Path, help="keep the input history in this file across runs")
     args = parser.parse_args()
     if args.delay < 0 or args.timeout <= 0:
         parser.error("--delay must be nonnegative and --timeout must be positive")
     _reconfigure_streams()  # as uvx hailer does: a character the console cannot encode prints as "?"
-    demo = Demo(Console(highlight=False, soft_wrap=True), delay=args.delay, unsafe_local=args.unsafe_local)
+    demo = Demo(Console(highlight=False, soft_wrap=True), delay=args.delay, unsafe_local=args.unsafe_local, history=args.history)
     asyncio.run(demo.run(args.timeout))
