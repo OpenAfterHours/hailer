@@ -27,6 +27,10 @@ branch and tag atomically. The tag triggers `.github/workflows/release.yml`, whi
    (which creates the tag and so starts the workflow), the files are attached to that release and its title
    and notes are kept.
 
+**If a release run fails**, re-run its failed jobs rather than moving the tag. PyPI never accepts different
+files under a version it already has, and the sdist holds the whole repository, so once a version is on PyPI
+a tag moved to any later commit fails the PyPI step, even when the package code is unchanged.
+
 **Changing the kernel image.** The image is defined by `src/hailer/docker/Dockerfile`, the modules in
 `hailer.kernel_image.IMAGE_MODULES` (`errors.py`, `periods.py`, `_forward.py`) and the exact versions in
 `IMAGE_PACKAGES`. The tag is computed from them (`marimo<version>-<first 12 hex of their sha256>`, line
