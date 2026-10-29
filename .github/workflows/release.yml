@@ -11,7 +11,9 @@
 # the job. Only if all of that
 # succeeds does it publish through the "pypi" environment using PyPI trusted publishing
 # (OIDC, no API token to store) and then create the GitHub release with the
-# distributions attached, so no released Hailer points at a missing image.
+# distributions attached, so no released Hailer points at a missing image. When the
+# release was published in the web interface (which pushes the tag that triggers this
+# run), the distributions are attached to that release instead.
 #
 # PyPI's trusted publisher for this project is configured as:
 #   owner OpenAfterHours, repository hailer, workflow release.yml, environment pypi.
@@ -152,6 +154,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.build.outputs.version }}
         run: |
+          # Publishing a release in the web interface creates the tag too, so its release
+          # already exists here: keep its title and notes and attach the distributions.
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "A release for ${GITHUB_REF_NAME} already exists; attaching the distributions to it"
+            gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+            exit 0
+          fi
           flags=()
           case "$VERSION" in
             *[a-z]*) flags+=(--prerelease) ;;
