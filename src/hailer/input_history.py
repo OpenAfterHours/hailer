@@ -30,9 +30,8 @@ from pathlib import Path
 from prompt_toolkit.history import History, InMemoryHistory, ThreadedHistory
 
 from hailer.log import redact
-from hailer.statedir import STATE_DIRNAME, ensure_state_dir, state_dir
+from hailer.statedir import STATE_DIRNAME, ensure_state_dir
 
-HISTORY_FILENAME = "input_history"
 MAX_ENTRIES = 1000
 #: Only the end of a larger file is read; the entry it cuts in two is dropped.
 MAX_READ_BYTES = 2 * 1024 * 1024
@@ -43,11 +42,6 @@ _OWNER_ONLY = 0o600
 _BINARY = getattr(os, "O_BINARY", 0)  # Windows: no newline translation
 
 log = logging.getLogger(__name__)
-
-
-def input_history_path(workspace: Path) -> Path:
-    """``<workspace>/.hailer/input_history``."""
-    return state_dir(workspace) / HISTORY_FILENAME
 
 
 def input_history(path: Path | None) -> History:

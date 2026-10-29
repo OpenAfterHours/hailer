@@ -11,6 +11,8 @@ import textwrap
 import threading
 from collections.abc import Awaitable, Callable
 from datetime import datetime
+from functools import partial
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from rich.console import Console, RenderableType
@@ -20,7 +22,9 @@ from rich.text import Text
 from hailer import notebooks
 from hailer.errors import HailerError, MarimoUnavailableError, NoSessionError
 from hailer.models import ContextBundle, HailerConfig, MarimoSession, ProviderConfig, SessionState, SkillInfo, TurnSummary
+from hailer.models import CompletionData
 from hailer.session import EXIT_COMMANDS, help_text, load_session, parse_command, save_session
+from hailer.statedir import input_history_path
 from hailer.steps import plural
 from hailer.transcript import FooterData, NotebookRow, console_glyphs, detail_card, help_card, notebook_table, status_card
 
@@ -75,6 +79,10 @@ class ChatController:
             if opts.plain
             else self._cli._make_line_reader(console)
         )
+        self.reader.history_file = self._input_history_file()
+        #: The sandbox's notebooks as last listed off the UI loop (after startup, /notebook and each
+        #: turn), for the command menu's /notebook open and close.
+        self._notebook_names: tuple[str, ...] = ()
         # One-line notice sent with the next user message after a /notebook switch (the model
         # learns about switches it made itself from its own tool results).
         self._pending_preamble: str | None = None
@@ -173,6 +181,30 @@ class ChatController:
             notebook_url=self._notebook_link(),
         )
 
+    def completions(self) -> CompletionData:
+        """The command menu's arguments, from state this controller already holds (like ``footer``:
+        it is read while a slash command is typed)."""
+        return CompletionData(
+            notebooks=self._notebook_names,
+            active_notebook=self.notebook,
+            skills=tuple((skill.name, skill.description) for skill in self.bundle.skills),
+            prompts=tuple(sorted(self.bundle.prompts)),
+            model=self.state.model or self.config.model.name,
+            providers=tuple(sorted({"openai", *self.config.providers})),
+        )
+
+    def _refresh_notebook_names(self) -> None:
+        """List the sandbox's notebooks for the command menu (blocking: run it off the UI loop)."""
+        try:
+            self._notebook_names = tuple(self._names())
+        except Exception:  # noqa: BLE001 - the menu only keeps its last list
+            pass
+
+    def _input_history_file(self) -> Path | None:
+        """``.hailer/input_history`` while ``[hailer].input_history`` is on (Up recalls earlier
+        sessions); ``None`` keeps this session's history in memory."""
+        return input_history_path(self.config.workspace) if self.config.input_history else None
+
     def _notebook_link(self) -> str:
         """The active notebook's URL without its token (it is shown, not opened), made once per name."""
         name, url = self._link_cache
@@ -201,7 +233,7 @@ class ChatController:
         if ui_factory is None:
             from hailer.chat_ui import ChatUI
 
-            ui_factory = ChatUI
+            ui_factory = partial(ChatUI, completions=self.completions, history_file=self._input_history_file())
         original_console = self.console
         self.startup_failed = False
         self.ui = ui_factory(original_console, self.ahandle, self.footer)
@@ -221,8 +253,9 @@ class ChatController:
                         self.notebook_open = opened
                 if timings is not None:
                     timings.mark("notebook_wait_complete")
+                await self._blocking(self._refresh_notebook_names)  # the command menu's names
 
-            tasks = [asyncio.create_task(agent_ready()), asyncio.create_task(notebook_ready())]
+            tasks =[asyncio.create_task(agent_ready()), asyncio.create_task(notebook_ready())]
             try:
                 await asyncio.gather(*tasks)
                 if timings is not None:
@@ -323,8 +356,14 @@ class ChatController:
             self._record_turn(summary)
         finally:
             # A tool may have switched notebooks before cancellation or failure.
-            await self._blocking(self._sync_active_notebook)
+            await self._blocking(self._sync_after_turn)
             self._copy_notebooks_back()
+
+    def _sync_after_turn(self) -> None:
+        """The composer's turn end, off the UI loop: a switch a tool made, then the notebooks a tool
+        may have created for the command menu."""
+        self._sync_active_notebook()
+        self._refresh_notebook_names()
 
     # -- REPL -------------------------------------------------------------- #
 
@@ -449,7 +488,11 @@ class ChatController:
         elif name == "model":
             self._model(args)
         elif name == "notebook":
-            self._notebook(args)
+            try:
+                self._notebook(args)
+            finally:
+                if self.interactive and not (self._stop_event is not None and self._stop_event.is_set()):
+                    self._refresh_notebook_names()  # on the command's worker: a new or renamed notebook
         elif name == "exec":
             self._exec(args)
         elif name == "clear":

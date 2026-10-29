@@ -480,10 +480,11 @@ class _LineReader:
 
     In a terminal it is a prompt_toolkit prompt. While it waits, bracketed paste is on
     (``ESC[?2004h``), so a pasted block arrives as one message with its newlines, and it is off
-    again (``ESC[?2004l``) before the prompt returns, so before the turn runs. Up/Down recall this
-    session's messages (in memory only). No mouse capture and no alternate screen, so the
+    again (``ESC[?2004l``) before the prompt returns, so before the turn runs. Up/Down recall
+    earlier messages, from earlier sessions too when ``history_file`` is set (the controller sets
+    it while ``[hailer].input_history`` is on). No mouse capture and no alternate screen, so the
     terminal's own scrollback and selection keep working. Without a terminal (a pipe, the tests)
-    it is Rich's plain ``Console.input``, as before.
+    it is Rich's plain ``Console.input``, as before, and keeps no history.
 
     Ctrl+C at the prompt raises ``KeyboardInterrupt``; Ctrl+D on an empty line, or Ctrl+Z then
     Enter, raises ``EOFError``. ``pt_input`` / ``pt_output`` replace the terminal (tests).
@@ -495,6 +496,8 @@ class _LineReader:
         self._pt_input = pt_input
         self._pt_output = pt_output
         self._session: Any = None
+        #: ``.hailer/input_history`` (see :mod:`hailer.input_history`); read when the prompt starts.
+        self.history_file: Path | None = None
 
     def read(self) -> str:
         if self.interactive:
@@ -509,9 +512,10 @@ class _LineReader:
         if self._session is None:
             from prompt_toolkit import PromptSession
             from prompt_toolkit.formatted_text import FormattedText
-            from prompt_toolkit.history import InMemoryHistory
             from prompt_toolkit.output import create_output
             from prompt_toolkit.output.vt100 import Vt100_Output
+
+            from hailer.input_history import input_history
 
             output = self._pt_output or create_output()
             if isinstance(output, Vt100_Output):
@@ -520,7 +524,7 @@ class _LineReader:
                 output.enable_cpr = False
             self._session = PromptSession(
                 FormattedText([("bold ansicyan", PROMPT)]),
-                history=InMemoryHistory(),
+                history=input_history(self.history_file),
                 mouse_support=False,
                 input=self._pt_input,
                 output=output,

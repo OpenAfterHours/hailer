@@ -1,8 +1,8 @@
 """The workspace's ``.hailer`` folder: Hailer's own state, never user content.
 
-It holds ``session.json``, ``notebook.json``, ``threads.sqlite``, ``notebook-backups/`` and the
-``sandbox-wrote-notebooks`` mark, and, while a kernel runs, the
-running session's kernel files (a local kernel's record and log, a docker kernel's token folder
+It holds ``session.json``, ``notebook.json``, ``threads.sqlite``, ``notebook-backups/``, the
+``sandbox-wrote-notebooks`` mark, the chat's ``input_history`` (and its ``.lock``) and, while a
+kernel runs, the running session's kernel files (a local kernel's record and log, a docker kernel's token folder
 while it starts). It changes on every turn. Everything that writes there creates the folder through :func:`ensure_state_dir`, which
 also puts a ``.gitignore`` containing ``*`` inside it: git then ignores the folder in any repository,
 without an entry in the user's own ``.gitignore`` (which Hailer never touches). Standard library only.
@@ -20,6 +20,15 @@ GITIGNORE_TEXT = "# Created by Hailer: this folder is local state, not something
 def state_dir(workspace: Path) -> Path:
     """``<workspace>/.hailer`` (the path only; see :func:`ensure_state_dir`)."""
     return Path(workspace) / STATE_DIRNAME
+
+
+#: ``.hailer/input_history``: what the user typed in the chat, recalled with Up in later sessions
+#: (:mod:`hailer.input_history`; off with ``[hailer].input_history = false``).
+INPUT_HISTORY_NAME = "input_history"
+
+
+def input_history_path(workspace: Path) -> Path:
+    return state_dir(workspace) / INPUT_HISTORY_NAME
 
 
 def ensure_state_dir(workspace: Path) -> Path:
