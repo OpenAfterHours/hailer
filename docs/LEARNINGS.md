@@ -400,3 +400,57 @@ ruff 0.16 enables several hundred rules by default and reads any project configu
 tests in `tests/test_tools.py`. After upgrading marimo, ruff or ty, rerun them and repeat a live create/edit
 through `marimo_execute`: the snapshot and the formatting flag use private marimo attributes
 (`ctx._document`, `ctx._kernel.user_config`).
+
+## 16. The terminal reports the user's work; decide nothing from text the user's code controls
+
+The October 2026 terminal refinement (receipts, composer, command menu, input history, startup checklist)
+went through an implement-and-challenge review per part. The findings that shaped it:
+
+- **A step's ✓ or ✗ never comes from the reply's text.** The first build read `ERROR: ` at the start of a
+  tool reply as a failure, but `marimo_execute` returns the code's own stdout, so a cell printing
+  `ERROR: customer ACME owes …` showed a ✗ and put that data on screen. Tools now return a `ToolReply` whose
+  status (ok, truncated, checks, the cells that raised) is set where the tool knows it and travels as the
+  LangChain artifact; the text the model reads is byte-identical
+  (`test_tool_replies_carry_a_status_and_hand_it_to_langchain_as_the_artifact`,
+  `test_wire_tool_status_never_reaches_the_endpoint`, `test_the_status_is_left_out_of_both_wire_formats`).
+  Failure summaries use a fixed wording per error class, never the error's message. A summary does not
+  repeat the target the UI already shows from the arguments.
+- **Event ids are unique per turn** (`<id>#<n>` for a repeat, `call#<n>` when missing), so the UI matches
+  results purely by id; a result for no call of the turn emits nothing
+  (`test_receipts_follow_ids_for_parallel_and_failed_steps_and_the_reply_prints_once`).
+- **The answer is still printed once**, after the turn: deltas only move the live row (the progress contract
+  in INTERFACES.md) (`test_streamed_answer_is_not_printed_twice`, `test_commentary_deltas_are_not_printed_and_answer_appears_once`).
+- **Nothing new runs on the UI loop.** Reviews measured three regressions before they shipped: the startup
+  spinner cost ~0.2 s of `ready_to_answer` and doubled paste latency (five `VSplit` border rows made each
+  redraw ~9 ms; each border is now one window and nothing animates while the chat prepares); saving input
+  history on Enter froze the composer behind another process's file lock (saves now go to one ordered writer
+  thread, `test_saving_happens_on_the_writer_thread_not_the_callers`); and listing notebooks for the menu was
+  awaited before `ready_to_answer` and at the end of every turn (it is now a background task nothing awaits,
+  `test_the_menus_notebook_names_are_listed_off_the_ui_loop_and_never_by_the_completer`). Run
+  `scripts/benchmark_startup.py` against the base for any composer change.
+- **Names reach Rich as text.** A notebook the model may legally name `q[/].py` was rendered as Rich markup in
+  `/notebook list` and raised inside the transcript writer, which ends the application
+  (`test_bracketed_names_print_as_text_never_as_markup`, `test_composer_cards_print_bracketed_names_as_text`).
+  Every externally supplied string goes through `Text(...)` or `markup=False`, and one-line rows through
+  `steps.single_line`.
+- **The history file is a file Hailer must not trust.** `.hailer/` can arrive with a cloned folder: a planted
+  `input_history.tmp` link to `~/.bashrc` would have been overwritten by the trim. History and lock files are
+  opened without following links, must be regular files, and rewrites go through `mkstemp`
+  (`test_a_planted_temporary_link_is_never_written_through_by_the_trim`,
+  `test_a_linked_history_or_lock_file_means_memory_only_logged_once`). Entries over 64 KB and entries that
+  look like they hold a credential are kept in memory only; a file nothing could be read from is never
+  rewritten.
+- **Enter never depends on typing speed.** With `/n` typed, Enter ran `/new` if the menu had appeared and sent
+  `/n` if it had not. Now Enter runs a menu item at once only when the user chose it; otherwise an exact
+  command is sent as typed and anything else is completed first
+  (`test_enter_runs_a_command_at_once_only_when_it_was_chosen_in_the_menu`). Esc cancels only while a turn
+  runs (short key timeouts then); idle, prompt_toolkit's defaults keep Esc-then-Enter a newline, and Ctrl+J
+  always is (`test_escape_cancels_a_turn_like_ctrl_c_and_is_harmless_while_idle`,
+  `test_esc_closes_the_menu_during_a_turn_and_only_then_cancels_it`).
+- **The signed-in notebook URL is printed only when the user must open it by hand** (`--no-browser`, a tab
+  that did not open in time), whole, on its own line, never as a hyperlink
+  (`test_a_normal_start_and_switch_open_the_signed_in_link_without_printing_it`,
+  `test_no_browser_holds_for_switches_too_and_prints_each_link_at_once`,
+  `test_a_link_to_open_by_hand_is_written_whole_and_never_as_a_hyperlink`). `--foreground` still prints it:
+  it is the only way into that kernel.
+- **The kernel stops whatever the terminal does**, and the exit line reports the last copy's own record (§13).

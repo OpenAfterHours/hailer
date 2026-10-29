@@ -10,7 +10,7 @@ behind the design in [docs/LEARNINGS.md](docs/LEARNINGS.md), user-facing behavio
 ## What runs where
 
 ```
-Terminal ── hailer.cli (Typer) ── hailer.chat / chat_ui (composer, slash commands)
+Terminal ── hailer.cli (Typer) ── hailer.chat / chat_ui (composer, command menu, step receipts)
                │
 agent.py       LangChain create_agent + ChatOpenAI ──HTTPS──► model endpoint (OpenAI or a custom base_url,
                │  API key and conversation stay here            Responses API or Chat Completions)
@@ -83,7 +83,8 @@ runtime works on the host folder directly and syncs nothing.
   locally.
 - Docker is the default. Without a usable Docker a start fails closed and names the two ways on: install or
   start Docker, or write `runtime = "unsafe-local"`. The retired `local` value is an error, not an alias.
-- Conversations are LangGraph checkpoints in `.hailer/threads.sqlite`; only the latest thread is resumed.
+- Conversations are LangGraph checkpoints in `.hailer/threads.sqlite`; only the latest thread is resumed. What
+  the user typed is kept in `.hailer/input_history` unless `[hailer] input_history = false`.
 
 ## What leaves the machine
 
@@ -122,8 +123,11 @@ src/hailer/
 ├── cli/               Typer app and main (__init__), chat and notebook (chat), kernel pull|build|stop (kernel),
 │                      init, login, logout, doctor, status (setup), shared collaborators and checks (common)
 ├── chat.py, chat_ui.py   ChatController (slash commands, notebook switches), the persistent composer
+├── steps.py, transcript.py   tool calls in plain words; what the composer and plain mode print (rows, cards)
+├── completion.py, input_history.py   the command menu's completions; the input history file
 ├── agent.py           build_model, HailerAgent (threads, streamed turns, Ctrl+C), system prompt, error mapping
 ├── tools.py           HailerTools (the 12 tools) and hailer_tools(config) -> LangChain tools
+├── tool_outcomes.py   a tool call's one-line outcome from its reply and status (the receipts)
 ├── code_checks.py     ruff and ty on the cells the agent writes (and code mode's ruff formatting)
 ├── sandbox.py         MarimoSandbox, the sandbox contract
 ├── notebook_sync.py   the allow-listed copy between the docker kernel and the host
@@ -136,24 +140,24 @@ src/hailer/
 └── periods.py         YY-MM period files and multi-period loaders, also used inside the image
 ```
 
-## 2026-09-23: the sandbox simplification
+## 2026-10-29: the refined chat terminal
 
-Phases 0–4 of [docs/ARCHITECTURE_PROPOSAL.md](docs/ARCHITECTURE_PROPOSAL.md) are implemented on branch
-`worktree-sandbox-simplification`: the image is versioned by its content and its token is off the command
-line (R5, F7); each process owns one kernel and cross-terminal reuse, `kernel.json`, `marimo_url`,
-`--keep-marimo` and `hailer exec` are gone (R2); notebook and data access goes through `MarimoSandbox` and
-`PathMap` is gone (R1); the docker kernel's notebooks live in a tmpfs and come back through the allow-listed
-sync, which replaced the notebooks mount rules and the planted-file scan (R3); Docker is the default and the
-unisolated runtime is `unsafe-local` (R4); `cli.py` became the `hailer.cli` package, the unused environment
-overrides went and the history moved to `docs/history/` (R7). The GCP runtime (R6) is not started.
+The chat terminal now reports the user's work instead of Hailer's plumbing. A session starts with a
+checklist (Kernel, Agent, Notebook rows that resolve in place) instead of the settings panel; each tool call
+becomes one receipt line in plain words with its outcome and time (`AgentEvent("tool_result")` from the
+graph's `tools` node, the outcome decided from a status the tool returns beside its reply, never from the
+reply's text); the answer is printed once under a footer of steps, time and tokens; the composer has a
+state-coloured frame, a footer with the notebook, kernel and model, a `/` command menu with argument
+completion, Esc to cancel a running turn and an input history kept in `.hailer/` by default; the session ends
+with a summary. The signed-in notebook URL is printed only when the user must open it by hand. What reaches
+the model is byte-identical (checked against the strict gateway in both wire formats). The lessons and their
+regression tests are in [LEARNINGS.md](docs/LEARNINGS.md) §16.
 
-Verified:
+Built by implement-and-challenge rounds, each part reviewed independently before it merged; the design was
+prototyped first. Verified: the offline suite on Linux, Python 3.13; `scripts/benchmark_startup.py` against
+the previous composer (`input_ready`, `ready_to_answer` and paste latency within noise); recorded-terminal
+captures at 100 and 64 columns and with an ASCII console encoding.
 
-- Offline suite on Windows 11, Python 3.13: 1024 passed, 14 skipped (no key, no Docker, loopback only).
-- `tests/test_docker_integration.py` with `HAILER_DOCKER_TESTS=strict`: 11 passed on Windows 11 with Docker
-  Desktop 29.4.3, including the token absent from `docker inspect`, planted files
-  (`.git/`, `conftest.py`, `.vscode/`, a non-notebook `.py`) never reaching the host while notebook edits do,
-  and nothing left behind after stop.
-
-Still owed: the Docker integration run on Linux, macOS and `linux/arm64`; a live turn against a paid model on
-this branch; a physical Ctrl+C in a Windows console.
+Still owed: a physical check on Windows Terminal and the legacy console (cp1252 glyphs, Esc timing, file
+locking for the history), on macOS Terminal (Option not set as Meta: Ctrl+J for a newline), and a live turn
+against a paid model with parallel tool calls.
