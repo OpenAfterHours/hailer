@@ -48,6 +48,7 @@ async def _sample(notebook_delay: float) -> dict[str, float]:
     from hailer.chat import ChatController
     from hailer.chat_ui import ChatUI
     from hailer.models import HailerConfig, ModelConfig, ProviderConfig
+    from hailer.statedir import input_history_path
 
     ticks: list[float] = []
 
@@ -89,8 +90,16 @@ async def _sample(notebook_delay: float) -> dict[str, float]:
             sent_at: float | None = None
             accepted_at: float | None = None
 
+            # As uvx hailer runs it: the command menu's data and a full input history file (the cap).
+            history = input_history_path(workspace)
+            history.parent.mkdir(parents=True, exist_ok=True)
+            history.write_text("".join(f"\n# t\n+earlier question {index}\n" for index in range(1_000)), encoding="utf-8")
+
             def factory(console, on_submit, context):
-                ui = ChatUI(console, on_submit, context, pt_input=keys, pt_output=output)
+                ui = ChatUI(
+                    console, on_submit, context, pt_input=keys, pt_output=output,
+                    completions=controller.completions, history_file=history,
+                )
                 made.append(ui)
 
                 def send_on_first_render(_application) -> None:
