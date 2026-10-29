@@ -150,7 +150,8 @@ reply's text); the answer is printed once under a footer of steps, time and toke
 state-coloured frame, a footer with the notebook, kernel and model, a `/` command menu with argument
 completion, Esc to cancel a running turn and an input history kept in `.hailer/` by default; the session ends
 with a summary. The signed-in notebook URL is printed only when the user must open it by hand. What reaches
-the model is byte-identical (checked against the strict gateway in both wire formats). The lessons and their
+the model is byte-identical (the strict fake gateway, streamed and not, for Chat Completions; LangChain's
+Responses conversion of the same messages). The lessons and their
 regression tests are in [LEARNINGS.md](docs/LEARNINGS.md) §16.
 
 Built by implement-and-challenge rounds, each part reviewed independently before it merged; the design was

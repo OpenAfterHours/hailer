@@ -7,7 +7,7 @@
 
 ## 2026-09-23: the sandbox simplification
 
-Phases 0–4 of [docs/ARCHITECTURE_PROPOSAL.md](docs/ARCHITECTURE_PROPOSAL.md) are implemented on branch
+Phases 0–4 of [docs/ARCHITECTURE_PROPOSAL.md](../ARCHITECTURE_PROPOSAL.md) are implemented on branch
 `worktree-sandbox-simplification`: the image is versioned by its content and its token is off the command
 line (R5, F7); each process owns one kernel and cross-terminal reuse, `kernel.json`, `marimo_url`,
 `--keep-marimo` and `hailer exec` are gone (R2); notebook and data access goes through `MarimoSandbox` and
