@@ -33,6 +33,29 @@ COMMANDS: dict[str, str] = {
 
 EXIT_COMMANDS = ("exit", "quit")
 
+# name -> (argument signature, short description): the composer's /help card. /quit is an alias of /exit.
+COMMAND_USAGE: dict[str, tuple[str, str]] = {
+    "help": ("", "Commands and keys"),
+    "status": ("", "Model, kernel, notebook and usage"),
+    "new": ("", "Start a new conversation"),
+    "model": ("<name>", "Switch model; starts a new conversation"),
+    "notebook": ("[list|new|open|close]", "List, create, open or close notebooks"),
+    "exec": ("<code>", "Run Python in the notebook's kernel; the model does not see it"),
+    "context": ("", "Context files, skills and prompts"),
+    "skill": ("<name> [message]", "Run a turn with a project skill"),
+    "prompt": ("<name> [args]", "Send a saved prompt"),
+    "reload": ("", "Re-read .config/hailer"),
+    "clear": ("", "Clear the screen"),
+    "exit": ("", "Leave Hailer"),
+}
+
+# The /help card's groups, by task, in order; every COMMAND_USAGE entry appears once.
+COMMAND_GROUPS: dict[str, tuple[str, ...]] = {
+    "Conversation": ("new", "model", "skill", "prompt"),
+    "Notebook": ("notebook", "exec"),
+    "Session": ("status", "context", "help", "reload", "clear", "exit"),
+}
+
 
 def parse_command(line: str) -> Command | None:
     """Parse a slash command. Returns ``None`` for ordinary conversation text.
