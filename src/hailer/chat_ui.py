@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from prompt_toolkit.application import Application, run_in_terminal
-from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+from prompt_toolkit.auto_suggest import AutoSuggestFromHistory, ThreadedAutoSuggest
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text.utils import fragment_list_width
 from prompt_toolkit.key_binding import KeyBindings, merge_key_bindings
@@ -48,7 +48,7 @@ from rich.table import Table
 from rich.text import Text
 from rich.theme import Theme
 
-from hailer.completion import RUN_ON_ENTER, SlashCompleter, menu_fragments, menu_height, menu_open
+from hailer.completion import RUN_ON_ENTER, SlashCompleter, enter_action, menu_fragments, menu_height, menu_open
 from hailer.input_history import input_history
 from hailer.log import redact
 from hailer.models import KERNEL_RUNTIME_DOCKER, KERNEL_RUNTIME_UNSAFE_LOCAL, AgentEvent, CompletionData, TurnSummary
@@ -457,12 +457,14 @@ class ChatUI:
         self._tail = "blank"
         self._output = _PersistentPasteOutput(pt_output or create_output())
 
+        self._completer = SlashCompleter(completions)
         self.composer = TextArea(
             multiline=True,
-            history=input_history(history_file),  # a file's is read on a worker thread at the first render
-            completer=SlashCompleter(completions),
+            # A file's history is read on a worker thread at the first render and written on another.
+            history=input_history(history_file),
+            completer=self._completer,
             complete_while_typing=Condition(lambda: self.buffer.text.startswith("/")),
-            auto_suggest=AutoSuggestFromHistory(),
+            auto_suggest=ThreadedAutoSuggest(AutoSuggestFromHistory()),  # searched off the UI loop
             height=Dimension(min=1, max=6),
             dont_extend_height=True,
             wrap_lines=True,
@@ -580,16 +582,12 @@ class ChatUI:
         bindings = KeyBindings()
         menu = Condition(self._menu_open)
 
-        @bindings.add("enter", filter=~menu)
-        def submit(_event: Any) -> None:
-            self.submit()
+        @bindings.add("enter")
+        def enter(_event: Any) -> None:
+            self._enter()
 
-        # The command menu: Up/Down (auto_up/auto_down below) and Tab/Shift+Tab choose, Enter takes
-        # the chosen command (the first while none is) and runs it when it takes no arguments, Esc
-        # closes it, even during a turn (Esc then cancels only once the menu is closed).
-        @bindings.add("enter", filter=menu)
-        def accept(_event: Any) -> None:
-            self._accept_completion()
+        # The command menu: Up/Down (auto_up/auto_down below) and Tab/Shift+Tab choose, Enter acts
+        # as _enter says, Esc closes it, even during a turn (Esc cancels only once it is closed).
 
         @bindings.add("tab", filter=menu)
         def next_item(event: Any) -> None:
@@ -655,14 +653,21 @@ class ChatUI:
     def _menu_open(self) -> bool:
         return menu_open(self.buffer)
 
-    def _accept_completion(self) -> None:
+    def _enter(self) -> None:
+        """Enter: a menu item the user chose (arrows or Tab) is written, and run when it takes no
+        arguments. Without a choice, a slash draft that is not yet a whole command is completed to
+        the first item and nothing runs; everything else is submitted as typed."""
         state = self.buffer.complete_state
-        if state is None or not state.completions:
-            self.submit()
+        if state is not None and state.complete_index is not None and state.current_completion is not None:
+            self.buffer.apply_completion(state.current_completion)
+            if self.buffer.text.strip() in RUN_ON_ENTER:
+                self.submit()
             return
-        self.buffer.apply_completion(state.current_completion or state.completions[0])
-        if self.buffer.text.strip() in RUN_ON_ENTER:
+        pick = self._completer.enter_pick(self.buffer.document)
+        if pick is None:
             self.submit()
+        else:
+            self.buffer.apply_completion(pick)
 
     def _sync_timeouts(self) -> None:
         """Short key timeouts while a lone Esc acts (a turn runs, or the menu is open), so it acts at
@@ -1029,7 +1034,8 @@ class ChatUI:
         else:
             style = "class:hint"
             if self._menu_open():
-                text = g.join(f"{'up/down' if g.ascii else '↑↓'} choose", "tab complete", "enter run", "esc close")
+                arrows = "up/down" if g.ascii else "↑↓"
+                text = g.join(f"{arrows} choose", "tab complete", f"enter {enter_action(self.buffer)}", "esc close")
             elif self._cancelling:
                 text = "cancelling"
             elif self.busy and self._executing:

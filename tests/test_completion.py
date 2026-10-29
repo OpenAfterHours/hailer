@@ -128,3 +128,54 @@ def test_menu_descriptions_shorten_to_the_width_with_the_glyph_sets_ellipsis():
         assert shown[0].endswith(ellipsis) and shown[0].startswith(f"  {glyphs.prompt} /exec")
     few = buffer_with("/notebook open ")
     assert menu_height(few) == 3 and rows(menu_fragments(few, UNICODE, 64))[-1].startswith("    returns.py")
+
+
+def test_nothing_completes_unless_the_cursor_is_at_the_end_of_the_draft():
+    completer = SlashCompleter(lambda: DATA)
+    middle = Document("/notebo open analysis.py", cursor_position=len("/notebo"))
+    assert list(completer.get_completions(middle, CompleteEvent())) == []
+    assert completer.enter_pick(middle) is None, "Enter sends it as typed"
+    spaces = Document("/no   ", cursor_position=3)
+    assert [c.text for c in completer.get_completions(spaces, CompleteEvent())] == ["/notebook "]
+
+
+def test_names_that_match_as_typed_come_first():
+    data = CompletionData(notebooks=("Sales.py", "sales-2024.py", "sales.py"))
+    assert [name for _result, name, _meta in complete("/notebook open sa", data)] == ["sales-2024.py", "sales.py", "Sales.py"]
+    assert [name for _result, name, _meta in complete("/notebook open SA", data)] == ["Sales.py", "sales-2024.py", "sales.py"]
+
+
+@pytest.mark.parametrize(
+    ("text", "picked"),
+    [
+        ("/n", "/new"), ("/", "/help"), ("/exi", "/exit"), ("/no", "/notebook "), ("/notebook ", "/notebook list"),
+        ("/notebook open SALES.PY", "/notebook open Sales.py"), ("/skill rep", "/skill report-weekly"),
+        # whole as typed, or nothing completes it: Enter sends the draft
+        ("/new", None), ("/Help", None), ("/model", None), ("/notebook", None), ("/notebook open", None),
+        ("/notebook open sales.py", None), ("/notebook open Sales.py", None), ("/skill report", None),
+        ("/prompt first-look", None), ("/model gpt-5.5", None), ("/exec print(1)", None), ("/unknown", None),
+        ("a question", None), ("/skill report summarise it", None),
+    ],
+)
+def test_enter_without_a_choice_completes_a_partial_command_and_sends_a_whole_one(text, picked):
+    data = CompletionData(
+        notebooks=("Sales.py", "sales.py"), skills=(("report-weekly", "w"), ("report", "r")),
+        prompts=("first-look", "first-look-v2"), model="gpt-5.5",
+    )
+    pick = SlashCompleter(lambda: data).enter_pick(Document(text))
+    result = None if pick is None else text[: len(text) + pick.start_position] + pick.text
+    assert result == picked
+
+
+def test_the_hint_says_what_enter_will_do():
+    from hailer.completion import enter_action
+
+    def action(text: str, index: int | None = None) -> str:
+        buffer = buffer_with(text, index=index)
+        buffer.document = Document(text)
+        return enter_action(buffer)
+
+    assert action("/") == "complete"
+    assert action("/", index=0) == "run", "a chosen /help runs"
+    assert action("/", index=3) == "complete", "a chosen /model takes arguments"
+    assert action("/prompt first-look") == "send"

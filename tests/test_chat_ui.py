@@ -7,6 +7,7 @@ import io
 import logging
 import re
 import threading
+import time
 from contextlib import contextmanager
 
 import pytest
@@ -935,7 +936,7 @@ MENU_DATA = CompletionData(
     skills=(("example-skill", "How this team writes period reports"),), prompts=("first-look",),
     model="gpt-5.5", providers=("internal", "openai"),
 )
-MENU_HINTS = "↑↓ choose · tab complete · enter run · esc close"
+MENU_HINTS = "↑↓ choose · tab complete · enter {} · esc close"
 
 
 def hints(ui):
@@ -957,12 +958,12 @@ def test_slash_opens_the_command_menu_under_the_frame_and_keys_choose_and_close_
             keys.send_text("/")
             await until(ui._menu_open)
             await until(lambda: "Commands and keys" in screen.getvalue())
-            assert hints(ui) == MENU_HINTS
-            assert ui.composer.window.render_info is not None
+            assert hints(ui) == MENU_HINTS.format("complete"), "nothing chosen: Enter would complete, not run"
             await until(lambda: (ui.application.ttimeoutlen, ui.application.timeoutlen) == (0.1, 0.3))  # Esc acts at once
             for key, text in [("\t", "/help"), ("\t", "/status"), ("\x1b[Z", "/help"), ("\x1b[B", "/status"), ("\x1b[A", "/help")]:
                 keys.send_text(key)
                 await until(lambda text=text: ui.buffer.text == text)
+            assert hints(ui) == MENU_HINTS.format("run"), "a chosen command without arguments runs"
             keys.send_text("\x1b")
             await until(lambda: not ui._menu_open())
             assert ui.buffer.text == "/" and ui.application.is_running and not submissions
@@ -974,7 +975,7 @@ def test_slash_opens_the_command_menu_under_the_frame_and_keys_choose_and_close_
     asyncio.run(scenario())
 
 
-def test_enter_in_the_menu_runs_a_command_without_arguments_and_completes_the_others():
+def test_enter_runs_a_command_at_once_only_when_it_was_chosen_in_the_menu():
     async def scenario():
         submissions = []
 
@@ -983,30 +984,123 @@ def test_enter_in_the_menu_runs_a_command_without_arguments_and_completes_the_ot
 
         with terminal(submit, completions=lambda: MENU_DATA) as (ui, keys, _screen, _transcript, _size):
             running = await start(ui)
-            keys.send_text("/he")
+            keys.send_text("/")
             await until(ui._menu_open)
+            keys.send_text("\t")  # chooses /help
+            await until(lambda: ui.buffer.text == "/help")
             keys.send_text("\r")
             await until(lambda: submissions == ["/help"] and not ui.busy)
-            keys.send_text("/no")
+            keys.send_text("/notebook ")
             await until(ui._menu_open)
-            keys.send_text("\r")  # /notebook takes arguments: Enter completes it and its menu follows
-            await until(lambda: ui.buffer.text == "/notebook " and ui._menu_open())
-            assert [item.display_text for item in ui.buffer.complete_state.completions] == ["list", "new", "open", "close"]
-            keys.send_text("\r")  # the first, list, takes none: it runs
+            keys.send_text("\x1b[B")  # chooses list, which takes no arguments
+            await until(lambda: ui.buffer.text == "/notebook list")
+            keys.send_text("\r")
             await until(lambda: submissions == ["/help", "/notebook list"] and not ui.busy)
-            keys.send_text("/notebook open q")
+            keys.send_text("/notebook o")
             await until(ui._menu_open)
+            keys.send_text("\t")  # chooses open, which takes a name: Enter completes it, and the names follow
+            await until(lambda: ui.buffer.text == "/notebook open ")
             keys.send_text("\r")
+            await until(lambda: ui._menu_open() and ui.buffer.complete_state.completions[0].text == "analysis.py")
+            keys.send_text("\x1b[B\x1b[B")  # q2-review.py
             await until(lambda: ui.buffer.text == "/notebook open q2-review.py")
-            await asyncio.sleep(0.2)
-            assert len(submissions) == 2 and not ui._menu_open(), "a name is sent by its own Enter"
+            assert hints(ui) == MENU_HINTS.format("complete")
             keys.send_text("\r")
-            await until(lambda: submissions[-1] == "/notebook open q2-review.py" and not ui.busy)
-            keys.send_text("/model")  # typed in full: no menu, so Enter sends it as typed
             await asyncio.sleep(0.3)
-            assert not ui._menu_open()
+            assert len(submissions) == 2 and ui.buffer.text == "/notebook open q2-review.py", "a name waits for its own Enter"
+            keys.send_text("\r")  # now a command and a whole argument: sent as typed
+            await until(lambda: submissions[-1] == "/notebook open q2-review.py")
+            ui.exit()
+            await asyncio.wait_for(running, 5)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("how", ["typed", "burst", "pasted"])
+def test_enter_without_a_choice_completes_and_never_runs_however_the_draft_arrived(how):
+    async def scenario():
+        submissions = []
+
+        async def submit(text):
+            submissions.append(text)
+
+        with terminal(submit, completions=lambda: MENU_DATA) as (ui, keys, _screen, _transcript, _size):
+            running = await start(ui)
+            for draft, completed in [
+                ("/n", "/new"), ("/ne", "/new"), ("/exi", "/exit"), ("/cl", "/clear"), ("/", "/help"),
+                ("/no", "/notebook "), ("/notebook ", "/notebook list"), ("/notebook open q", "/notebook open q2-review.py"),
+                ("/mo", "/model "), ("/model ", "/model gpt-5.5"),
+            ]:
+                if how == "typed":
+                    keys.send_text(draft)
+                    await until(ui._menu_open)
+                    keys.send_text("\r")
+                elif how == "burst":
+                    keys.send_text(draft + "\r")
+                else:
+                    keys.send_text(f"\x1b[200~{draft}\x1b[201~\r")
+                await until(lambda completed=completed: ui.buffer.text == completed)
+                await asyncio.sleep(0.05)
+                assert not submissions and ui.application.is_running, f"{draft!r} + Enter ran something"
+                ui.buffer.reset()
+            for typed in ("/model", "/help", "/notebook list", "/skill example-skill", "/prompt first-look", "/unknown", "/path/to/file is odd"):
+                keys.send_text(typed + "\r")  # already whole (or nothing completes it): sent as typed
+                await until(lambda typed=typed: submissions[-1:] == [typed] and not ui.busy)
+            ui.exit()
+            await asyncio.wait_for(running, 5)
+
+    asyncio.run(scenario())
+
+
+def test_a_whole_argument_is_sent_as_typed_beside_longer_and_case_variant_names():
+    data = CompletionData(
+        notebooks=("Sales.py", "sales.py"), active_notebook="sales.py",
+        skills=(("report-weekly", "w"), ("report", "r")), prompts=("first-look", "first-look-v2"),
+    )
+
+    async def scenario():
+        submissions = []
+
+        async def submit(text):
+            submissions.append(text)
+
+        with terminal(submit, completions=lambda: data) as (ui, keys, _screen, _transcript, _size):
+            running = await start(ui)
+            for typed in ("/prompt first-look", "/skill report", "/notebook open sales.py", "/notebook open Sales.py"):
+                keys.send_text(typed)
+                await until(ui._menu_open)  # the longer or differently cased names show
+                assert hints(ui) == MENU_HINTS.format("send")
+                keys.send_text("\r")
+                await until(lambda typed=typed: submissions[-1:] == [typed] and not ui.busy)
+            keys.send_text("/notebook open SALES.PY\r")  # no exact name: the first is written, then sent
+            await until(lambda: ui.buffer.text == "/notebook open Sales.py")
             keys.send_text("\r")
-            await until(lambda: submissions[-1] == "/model")
+            await until(lambda: len(submissions) == 5 and not ui.busy)
+            assert submissions[-1] == "/notebook open Sales.py"
+            ui.exit()
+            await asyncio.wait_for(running, 5)
+
+    asyncio.run(scenario())
+
+
+def test_nothing_completes_in_the_middle_of_the_draft():
+    async def scenario():
+        submissions = []
+
+        async def submit(text):
+            submissions.append(text)
+
+        with terminal(submit, completions=lambda: MENU_DATA) as (ui, keys, _screen, _transcript, _size):
+            running = await start(ui)
+            keys.send_text("/notebok open analysis.py")
+            await until(lambda: ui.buffer.text == "/notebok open analysis.py")
+            keys.send_text("\x1b[D" * len("k open analysis.py"))
+            await until(lambda: ui.buffer.document.text_before_cursor == "/notebo")
+            keys.send_text("o\t")  # fix the typo; Tab offers nothing mid-word
+            await asyncio.sleep(0.3)
+            assert ui.buffer.text == "/notebook open analysis.py" and not ui._menu_open()
+            keys.send_text("\r")
+            await until(lambda: submissions == ["/notebook open analysis.py"])
             ui.exit()
             await asyncio.wait_for(running, 5)
 
@@ -1030,8 +1124,10 @@ def test_esc_closes_the_menu_during_a_turn_and_only_then_cancels_it():
             await until(lambda: ui.busy)
             keys.send_text("/he")
             await until(ui._menu_open)
-            assert hints(ui) == MENU_HINTS
-            keys.send_text("\r")  # runs /help, but a turn is running: the draft is kept, nothing queued
+            assert hints(ui) == MENU_HINTS.format("complete")
+            keys.send_text("\r")  # completes /help without running it
+            await until(lambda: ui.buffer.text == "/help")
+            keys.send_text("\r")  # sends it: a turn is running, so the draft is kept and nothing is queued
             await until(lambda: "draft is kept" in ui.flash_text)
             assert ui.buffer.text == "/help" and submissions == ["slow"]
             keys.send_text("\x7f\x7f")
@@ -1054,8 +1150,72 @@ def test_esc_closes_the_menu_during_a_turn_and_only_then_cancels_it():
     asyncio.run(scenario())
 
 
-def test_history_persists_across_composers_and_its_suggestion_is_offered(tmp_path):
+def test_enter_never_waits_for_the_history_file_and_its_entry_is_written_later(tmp_path):
+    from hailer import input_history
+
     path = tmp_path / ".hailer" / "input_history"
+    path.parent.mkdir()
+
+    async def scenario():
+        submissions = []
+
+        async def submit(text):
+            submissions.append(text)
+
+        with terminal(submit, history_file=path) as (ui, keys, _screen, _transcript, _size):
+            running = await start(ui)
+            held, release = threading.Event(), threading.Event()
+
+            def other_chat():
+                with input_history._locked(path.with_name("input_history.lock")):
+                    held.set()
+                    release.wait(5)
+
+            holder = threading.Thread(target=other_chat)
+            holder.start()
+            held.wait(5)
+            gaps, last = [], time.monotonic()
+
+            async def ticker():
+                nonlocal last
+                while True:
+                    await asyncio.sleep(0.005)
+                    gaps.append(time.monotonic() - last)
+                    last = time.monotonic()
+
+            pulse = asyncio.create_task(ticker())
+            keys.send_text("a question while another chat holds the lock\r")
+            await until(lambda: len(submissions) == 1 and not ui.busy)
+            await asyncio.sleep(0.2)
+            pulse.cancel()
+            assert max(gaps) < 0.25, f"the UI loop stalled {max(gaps):.3f}s"
+            paste = "\x1b[200~" + "a,b,c\n" * 12_000 + "\x1b[201~\r"  # a 72 KB paste: more than the pipe holds
+            await asyncio.to_thread(keys.send_text, paste)
+            await until(lambda: len(submissions) == 2 and not ui.busy)
+            release.set()
+            holder.join(5)
+            assert await asyncio.to_thread(ui.buffer.history.history.flush, 10)
+            assert "another chat holds the lock" in path.read_text(encoding="utf-8")
+            assert "a,b,c" not in path.read_text(encoding="utf-8"), "a large paste stays in memory"
+            assert ui.buffer.history.get_strings()[-1].startswith("a,b,c"), "but Up still recalls it"
+            ui.exit()
+            await asyncio.wait_for(running, 5)
+
+    asyncio.run(scenario())
+
+
+def test_history_persists_across_composers_and_its_suggestion_is_offered(tmp_path, monkeypatch):
+    from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+
+    path = tmp_path / ".hailer" / "input_history"
+    searched_on: list[threading.Thread] = []
+    get_suggestion = AutoSuggestFromHistory.get_suggestion
+
+    def recording(self, buffer, document):
+        searched_on.append(threading.current_thread())
+        return get_suggestion(self, buffer, document)
+
+    monkeypatch.setattr(AutoSuggestFromHistory, "get_suggestion", recording)
 
     async def submit(_text):
         pass
@@ -1081,6 +1241,7 @@ def test_history_persists_across_composers_and_its_suggestion_is_offered(tmp_pat
             keys.send_text("Wh")
             await until(ui._suggesting)
             assert ui.buffer.suggestion.text == "ich region grew fastest?"
+            assert searched_on and threading.current_thread() not in searched_on, "history is searched off the UI loop"
             assert hints(ui) == "→ accept · enter send · alt+enter new line"
             await until(lambda: "ich region grew fastest?" in screen.getvalue())
             keys.send_text("\x1b[C")

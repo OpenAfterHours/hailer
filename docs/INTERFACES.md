@@ -1119,27 +1119,42 @@ folder ignores itself in any git repository. The user's own `.gitignore` is neve
 ## `input_history.py`
 
 ```python
-MAX_ENTRIES = 1000; MAX_READ_BYTES = 2 MiB; LOCK_WAIT_SECONDS = 0.25
+MAX_ENTRIES = 1000; MAX_ENTRY_BYTES = 64 KiB; MAX_READ_BYTES = MAX_ENTRIES * (MAX_ENTRY_BYTES + 64)
+LOCK_WAIT_SECONDS = 2.0; EXIT_FLUSH_SECONDS = 0.5
 def input_history(path: Path | None) -> History   # ThreadedHistory(InputHistory(path)), or InMemoryHistory() for None (the setting off)
-def storable(text: str) -> bool                    # not blank and hailer.log.redact(text) == text
+def storable(text: str) -> bool                    # not blank, <= MAX_ENTRY_BYTES, no credential shape (below)
 class InputHistory(History):                       # prompt_toolkit History kept in path (FileHistory's format)
     def load_history_strings(self) -> Iterable[str]   # newest first; never raises ([] on any failure)
-    def store_string(self, string: str) -> None       # appends; never raises
+    def store_string(self, string: str) -> None       # queues it for the writer thread; never checks, waits or raises
+    def flush(self, timeout: float = LOCK_WAIT_SECONDS) -> bool   # waits for the queued entries
 ```
 The composer (`ChatUI(history_file=...)`) and plain mode's prompt (`_LineReader.history_file`) use it while
 `[hailer].input_history` is on; the controller passes `statedir.input_history_path(workspace)`. The file is
 prompt_toolkit's `FileHistory` format (`# <time>` line, then each line of the entry behind `+`), so multi-line
 entries round-trip. prompt_toolkit's `ThreadedHistory` reads it on a worker thread when the first render
-creates the buffer's content: nothing waits for it, and Up recalls entries as they load. Reading keeps the last
-`MAX_ENTRIES` (and at most the file's last `MAX_READ_BYTES`, dropping the entry the cut lands in) and rewrites a
-longer file through `input_history.tmp` and `os.replace`. An entry `storable` refuses (a bearer token, an
-`sk-` key, the value of a `*_KEY`/`*_TOKEN`/`*_SECRET`/`*_PASSWORD` variable: what `redact` masks) stays in
-the session's memory only. Appends (one `os.write` of the whole entry, `O_APPEND`), reads and the rewrite hold
-an exclusive lock on `input_history.lock` (`fcntl.flock`; `msvcrt.locking` on Windows), waiting at most
-`LOCK_WAIT_SECONDS` and otherwise skipping the write: two chats in one workspace interleave whole entries
-and lose none to a rewrite. A file system without locks is used unlocked. The files are created `0o600`.
-Any `OSError` (read-only workspace, permissions, a folder in the way) or corrupt bytes (decoded with
-`errors="replace"`; lines without `+` end an entry) only means less history; it is logged at debug level.
+creates the buffer's content: nothing waits for it, and Up recalls entries as they load. Saving never runs
+on the UI loop: `store_string` (called by `Buffer.reset(append_to_history=True)` on Enter) only queues the
+entry; one daemon writer thread per process (`_WRITER`) checks it (`storable`, the size first, so a pasted
+file costs nothing), waits up to `LOCK_WAIT_SECONDS` for the lock and appends it, in submission order. An
+`atexit` handler gives queued entries `EXIT_FLUSH_SECONDS`, then leaves the thread (an entry still waiting
+for another chat's lock is lost, never half written). A read first waits for this process's queued entries.
+Reading keeps the last `MAX_ENTRIES` and rewrites a longer file, or one holding an entry over
+`MAX_ENTRY_BYTES` (written by an older build), through `tempfile.mkstemp` in the same folder and
+`os.replace`; a file it could read nothing from is never rewritten. Only a file larger than any Hailer writes
+is read from its last `MAX_READ_BYTES`. Not written (kept in the session's memory): an entry over
+`MAX_ENTRY_BYTES`, and one `storable` refuses: what `hailer.log.redact` masks (a bearer token or
+`Authorization:` value, an `sk-` key, the value of a `*_KEY`/`*_TOKEN`/`*_SECRET`/`*_PASSWORD` environment
+variable of 8 characters or more), a URL with a password (`scheme://user:password@`), a GitHub token
+(`ghp_`, `gho_`, `ghs_`, `ghu_`, `ghr_`, `github_pat_`) or an AWS access key ID (`AKIA`/`ASIA` and 16
+characters). `/exec` entries are written like any other. Appends (`O_APPEND`), reads and the rewrite hold an
+exclusive lock on `input_history.lock` (`fcntl.flock`; on Windows `msvcrt.locking`, where only `EACCES` and
+`EDEADLOCK` mean "held"): two chats in one workspace interleave whole entries and lose none to a rewrite. A
+file system without locks (any other locking error) is used unlocked. Links: the history and lock files are
+opened with `O_NOFOLLOW` (where it exists) and `O_NONBLOCK`, checked with `lstat` before and `fstat` after;
+anything but a regular file (a symlink a cloned repository ships, a FIFO) switches that history to memory
+only, logged once at info level. The files are created `0o600`. Any `OSError` (read-only workspace,
+permissions, a folder in the way) or corrupt bytes (decoded with `errors="replace"`; lines without `+` end an
+entry) only means less history; it is logged at debug level.
 
 ## `session.py`  (owner: wave 2 / E)
 
@@ -1256,7 +1271,8 @@ Enter submits once; Alt+Enter (Esc Enter) and Ctrl+J insert a newline (Ctrl+J ne
 terminals that do not send Alt as Meta). Up/Down move through a multiline draft and recall history at its
 edges: `history_file` (the controller passes `.hailer/input_history` while `[hailer].input_history` is on;
 see `input_history.py`) or, for `None`, this session's only. History is read on a worker thread after the
-first render, never before it. As you type, `AutoSuggestFromHistory` shows the rest of the latest matching
+first render, never before it; entries are saved on a writer thread. As you type,
+`ThreadedAutoSuggest(AutoSuggestFromHistory())` (searched off the UI loop) shows the rest of the latest matching
 history line in grey (`auto-suggestion`, bright black); → (or Ctrl+E, Ctrl+F) at the end of the draft takes
 it (`load_auto_suggest_bindings`), and the border says `→ accept · enter send · alt+enter new line`
 (`right accept` in ASCII). A busy submission leaves the draft intact, does
@@ -1266,34 +1282,42 @@ through the same path as Ctrl+C: only during a turn, or while the command menu i
 short (`ttimeoutlen` 0.1 s, `timeoutlen` 0.3 s; `_sync_timeouts` after every render) so a lone Esc acts at
 once; otherwise prompt_toolkit's own (0.5 s, 1.0 s) stay, Esc alone does nothing and Esc then Enter within
 about 1.5 s is still a newline. Events that arrive after a cancel do
-not replace `Cancelling`.
-
-The command menu (`completion.py`): a draft that starts with `/` and has no line break completes while
-typing (`SlashCompleter`); the completions show in a window under the frame, above the footer, while there
-are any: `  › /help       Commands and keys` (the mark on the chosen item, the first while none is), names in
-one column, descriptions (`COMMAND_USAGE`'s short forms) shortened with the glyph set's ellipsis to the
-width, at most `MENU_ROWS` = 6 rows scrolled to the chosen one and a muted `N more` line. Styles
-`palette.pick`, `palette.name`, `palette.name.current` (ANSI cyan bold), `palette.meta` (bright black):
-never `menu.*`, which prompt_toolkit's default style paints grey. The border says
-`↑↓ choose · tab complete · enter run · esc close` (`up/down` in ASCII) while it is open, also during a turn.
-Up/Down and Tab/Shift+Tab choose (Tab without a menu opens it); Enter takes the chosen item (or the first)
-and, when the draft is then one of `completion.RUN_ON_ENTER` (`/help /status /new /context /reload /clear
-/exit /notebook list`: no arguments), submits it at once; otherwise the draft keeps the completion (a
-command that takes arguments gets its trailing space, so its own menu follows) for its own Enter. Esc closes
-the menu and restores the typed text; it does not cancel a running turn while the menu is open (the next
-Esc does). A command or subcommand typed in full gets no completion that only adds a space, so its menu
-steps aside and Enter sends it as typed (`/model` prints the model and usage). Arguments: `/notebook`
-`list|new|open|close` (`session.NOTEBOOK_SUBCOMMANDS`); after `open`/`close` the notebook names
-(`active` marks the active one); `/skill` and `/prompt` names (the skill's description, `saved prompt`);
-`/model` the current model (`current`) and `<provider>:` for `openai` and each declared provider. Matching is
-a case-insensitive prefix; names pass `single_line`. `completions()` returns `models.CompletionData`
-(`notebooks`, `active_notebook`, `skills`, `prompts`, `model`, `providers`) and, like `footer`, must only
-read state the controller holds: `ChatController.completions` takes the notebook names from
-`_notebook_names`, which `_refresh_notebook_names` fills on a worker (`_blocking`): after the notebook wait
-in startup preparation, after every `/notebook` command (on its worker, unless it was stopped) and in
-`_sync_after_turn` at the end of every composer turn. The completer never lists notebooks itself; a failing
-`completions` callable leaves the command names. Every submission still goes through `parse_command`. Ctrl+C cancels active work and awaits cleanup, or exits while idle; Ctrl+D exits only
+not replace `Cancelling`. Ctrl+C cancels active work and awaits cleanup, or exits while idle; Ctrl+D exits only
 empty and idle; Ctrl+Z then Enter exits while idle. `/exit` and `/quit` also exit.
+
+The command menu (`completion.py`): a one-line draft that starts with `/` completes while typing
+(`SlashCompleter`), only while the cursor is at its end (or only spaces follow it). The completions show in a
+window under the frame, above the footer, while there are any: `  › /help       Commands and keys` (the mark
+on the chosen item, the first while none is), names in one column, descriptions (`COMMAND_USAGE`'s short
+forms) shortened with the glyph set's ellipsis to the width, at most `MENU_ROWS` = 6 rows scrolled to the
+chosen one and a muted `N more` line. Styles `palette.pick`, `palette.name`, `palette.name.current` (ANSI cyan
+bold), `palette.meta` (bright black): never `menu.*`, which prompt_toolkit's default style paints grey. The
+border says `↑↓ choose · tab complete · enter <run|send|complete> · esc close` (`up/down` in ASCII) while it
+is open, also during a turn (`completion.enter_action`). Up/Down and Tab/Shift+Tab choose (Tab without a menu
+opens it). Enter (`ChatUI._enter`, the same with or without the menu on screen): an item the user chose
+(arrows or Tab) is written, and submitted at once when the draft is then one of `completion.RUN_ON_ENTER`
+(`/help /status /new /context /reload /clear /exit /notebook list`: no arguments); without a choice,
+`SlashCompleter.enter_pick` decides from the draft alone, computed then, so neither typing speed nor a paste
+changes it: a draft that already is a command (any case) or a command and a whole argument (exactly as typed:
+`first-look` beside `first-look-v2`, `sales.py` beside `Sales.py`), or that nothing completes, is submitted as
+typed; any other slash draft is completed to the first item and nothing runs (`/n` Enter gives `/new`, a
+second Enter sends it). A command that takes arguments is completed with its space, so its own menu follows,
+except one typed in full. Esc closes the menu and restores the typed text; it does not cancel a running turn
+while the menu is open (the next Esc does). Arguments: `/notebook` `list|new|open|close`
+(`session.NOTEBOOK_SUBCOMMANDS`); after `open`/`close` the notebook names (`active` marks the active one);
+`/skill` and `/prompt` names (the skill's description, `saved prompt`); `/model` the current model (`current`)
+and `<provider>:` for `openai` and each declared provider. Matching is a case-insensitive prefix, names that
+match as typed first; names pass `single_line`. `completions()` returns `models.CompletionData` (`notebooks`,
+`active_notebook`, `skills`, `prompts`, `model`, `providers`) and, like `footer`, must only read state the
+controller holds: `ChatController.completions` takes the notebook names from `_notebook_names`. A `/notebook`
+command's own listing (`_names`, `/notebook list`'s) fills it on that command's worker; otherwise
+`_refresh_names_soon` lists in a background `asyncio.to_thread` task nothing awaits (after the startup
+notebook wait, after `/notebook new`, at the end of each composer turn): one listing at a time (a request
+during one makes it list once more after), never through `_blocking` or its stop flag, so neither
+`ready_to_answer` nor a turn's cleanup waits for it. `run_interactive` settles it (`_settle_names`) before
+the agent closes and the CLI stops the kernel, and a result that arrives after that is ignored. The completer
+never lists notebooks itself; a failing `completions` callable leaves the command names. Every submission
+still goes through `parse_command`.
 
 The transcript: a submission is echoed behind `▌`. `settle_steps()` ends the steps still open as `no result,
 effect unknown`; `ChatController._aturn` calls it when `arun_turn` raises, so those rows come before the error.
@@ -1455,12 +1479,19 @@ package-install rule) are appended by `agent.system_prompt`. Loaded with
 - `test_session.py`, `test_cli.py` (Typer `CliRunner`; slash commands; preflight messages with fakes; a
   `FakeAgent` with the `HailerAgent` surface the CLI uses): E
 - `test_completion.py`: the command menu's completions from `CompletionData` only (commands, a command typed
-  in full, each command's arguments, nothing outside a one-line slash draft, a failing data source, names that
-  cannot add rows) and its rows (mark, scroll, `N more`, ellipsis per glyph set, no `menu.*` style).
-  `test_input_history.py`: the history file's format and round trip, the cap and tail read, secret
-  filtering, corrupt files, failures that never raise, owner-only files, a held lock, two processes appending
-  while one trims, and the off switch. The composer's keys for both are in `test_chat_ui.py`; the controller's
-  cached names (listed on a worker, never by the completer) and the history file it hands out in `test_chat.py`
+  in full, each command's arguments, nothing outside a one-line slash draft or before the end of it, a failing
+  data source, names that cannot add rows, as-typed names first), what Enter does without a choice
+  (`enter_pick`: whole commands and arguments sent, partial ones completed) and the hint, and the rows (mark,
+  scroll, `N more`, ellipsis per glyph set, no `menu.*` style). `test_input_history.py`: the history file's
+  format and round trip, saving on the writer thread, the cap, oversized entries, a file never rewritten when
+  nothing could be read, credential filtering, corrupt files, failures that never raise, owner-only files,
+  planted links and FIFOs, a short and a long hold of the lock (the shipped wait), Windows lock errors (a fake
+  `msvcrt`), two processes appending while one trims, exit that writes the queue but never waits long, and
+  the off switch. The composer's keys for both are in `test_chat_ui.py` (Enter runs only a chosen command,
+  typed, burst and pasted drafts, as-typed names beside longer ones, no completion mid-draft, Esc during a
+  turn, Enter never waiting for the history file, suggestions off the UI loop); the controller's cached names
+  (listed off the UI loop, never awaited by startup or turns, one at a time, settled before shutdown, never by
+  the completer) and the history file it hands out in `test_chat.py`
 - Kernel runtimes (docker kernel, 2026-09-19), none of which start anything: `test_kernel.py` (the withheld
   variables, with no way through, the unsafe-local sandbox's folders and URLs, prompt notes, `LocalRuntime` with
   `LocalProcesses` faked, and a start that never adopts another server on its port), `test_kernel_docker.py`

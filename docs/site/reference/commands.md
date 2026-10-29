@@ -24,21 +24,27 @@ message. You can draft your next message while Hailer works; Enter preserves tha
 operation finishes or is cancelled. Requests are not queued.
 
 **Command menu.** Typing `/` at the start of a message opens a menu of the commands under the input box,
-each with a short description. Keep typing to narrow it; Up and Down (or Tab and Shift+Tab) choose; Enter
-takes the chosen command, or the first one. A command without arguments (`/help`, `/status`, `/new`,
-`/context`, `/reload`, `/clear`, `/exit`, `/notebook list`) runs at once; a command that takes arguments is
-completed with a space and the menu then offers them: the `/notebook` subcommands, notebook names after
-`/notebook open` or `/notebook close`, skill names after `/skill`, saved prompts after `/prompt`, and after
-`/model` the current model and each provider as `<provider>:`. Esc closes the menu (while a turn runs, the
-first Esc closes the menu and the next one cancels the turn). A command typed in full is sent as typed.
-Tab also opens the menu for the word being typed.
+each with a short description. Keep typing to narrow it; Up and Down (or Tab and Shift+Tab) choose. Enter
+on a command you chose this way runs it at once when it takes no arguments (`/help`, `/status`, `/new`,
+`/context`, `/reload`, `/clear`, `/exit`, `/notebook list`); a command that takes arguments is completed with
+a space and the menu then offers them: the `/notebook` subcommands, notebook names after `/notebook open` or
+`/notebook close`, skill names after `/skill`, saved prompts after `/prompt`, and after `/model` the current
+model and each provider as `<provider>:`. If you have not chosen anything, Enter sends a command you typed in
+full (with a whole argument, if it has one) as typed, and otherwise only completes it to the first entry
+without running it: `/n` then Enter gives `/new`, and a second Enter starts the new conversation. Esc closes
+the menu (while a turn runs, the first Esc closes the menu and the next one cancels the turn). The menu only
+completes at the end of what you typed; Tab also opens it for the word being typed.
 
 **History.** Up and Down move through multiline input and recall earlier messages at its boundaries,
 including messages from earlier sessions in this workspace. As you type, the rest of the latest earlier
 message that starts the same way appears in grey; → (Right) accepts it. History is kept in
-`.hailer/input_history` (the last 1,000 messages; a message that looks like it contains an API key or token
-is never written there). To keep history for the current session only, set `input_history = false` under
-`[hailer]` in `hailer.toml`.
+`.hailer/input_history`: the last 1,000 messages and commands. Two kinds stay in memory for the current
+session only and are never written there: a message over 64 KB (a large paste), and one that contains
+something that looks like a credential: a bearer token or `Authorization:` value, an `sk-` key, a URL with a
+password in it (`user:password@`), a GitHub token (`ghp_`, `gho_`, `ghs_`, `ghu_`, `ghr_`, `github_pat_`), an
+AWS access key ID (`AKIA...`), or the value of an environment variable ending in `_KEY`, `_TOKEN`, `_SECRET`
+or `_PASSWORD`. Other secrets, such as a password typed on its own or a private key, are not recognised. To
+keep history for the current session only, set `input_history = false` under `[hailer]` in `hailer.toml`.
 
 The interface uses normal terminal scrollback and text selection. It does not capture the mouse or
 switch to an alternate screen. Use `uvx hailer --plain` or `uvx hailer notebook --plain` for the line-oriented

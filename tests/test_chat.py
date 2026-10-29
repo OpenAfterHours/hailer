@@ -809,7 +809,12 @@ def test_the_menus_notebook_names_are_listed_off_the_ui_loop_and_never_by_the_co
 
     sandbox.list_notebooks = listing  # type: ignore[method-assign]
 
+    async def listed(controller: Any) -> None:
+        if controller._names_task is not None:
+            await asyncio.wait({controller._names_task})
+
     async def scenario(controller: Any, ui: StubUI) -> None:
+        await listed(controller)
         data = controller.completions()
         assert "other.py" in data.notebooks and data.active_notebook == controller.notebook, "listed at startup"
         assert data.skills == (("example-skill", "How this team writes reports"),) and data.prompts == ("first-look",)
@@ -821,13 +826,69 @@ def test_the_menus_notebook_names_are_listed_off_the_ui_loop_and_never_by_the_co
         assert len(listed_on) == listings, "the completer reads the cached names"
         write_notebook(harness.config, "made-by-hand")
         await ui.submit("/notebook")
-        assert "made-by-hand.py" in controller.completions().notebooks, "refreshed after a /notebook command"
+        assert "made-by-hand.py" in controller.completions().notebooks, "the /notebook command's own listing"
+        write_notebook(harness.config, "listed-by-the-command")
+        before = len(listed_on)
+        await ui.submit("/notebook list")
+        assert len(listed_on) == before + 1, "/notebook list lists once and the menu keeps that list"
+        assert "listed-by-the-command.py" in controller.completions().notebooks
+        await ui.submit("/notebook new fresh")
+        await listed(controller)
+        assert "fresh.py" in controller.completions().notebooks, "refreshed after /notebook new"
         write_notebook(harness.config, "made-by-a-tool")
         await ui.submit("a question")
+        await listed(controller)
         assert "made-by-a-tool.py" in controller.completions().notebooks, "refreshed after a turn"
 
     run_session(harness, scenario, sandbox=sandbox)
     assert listed_on and threading.main_thread() not in listed_on, "never on the UI loop's thread"
+
+
+def test_listing_names_never_delays_startup_or_turns_and_settles_before_shutdown(harness):
+    harness.agent = AsyncFakeAgent()
+    sandbox = harness.sandbox
+    release, guard = threading.Event(), threading.Lock()
+    order: list[str] = []
+    running = [0, 0]  # now, most at once
+    list_notebooks = sandbox.list_notebooks
+
+    def slow_listing() -> Any:
+        with guard:
+            running[0] += 1
+            running[1] = max(running[1], running[0])
+        release.wait(10)
+        with guard:
+            running[0] -= 1
+        order.append("listed")
+        return list_notebooks()
+
+    sandbox.list_notebooks = slow_listing  # type: ignore[method-assign]
+    close = harness.agent.aclose
+
+    async def aclose() -> None:
+        order.append("agent closed")
+        await close()
+
+    harness.agent.aclose = aclose  # type: ignore[method-assign]
+
+    async def scenario(controller: Any, ui: StubUI) -> None:
+        assert controller._stop_event is None, "the listing never borrows a command's stop flag"
+        task = controller._names_task
+        assert task is not None and not task.done(), "startup finished while its listing still runs"
+        await ui.submit("a question")
+        await ui.submit("another question")
+        assert len(harness.agent.turns) == 2 and running[1] == 1, "turns never wait for a listing; one at a time"
+        release.set()
+        await asyncio.wait({controller._names_task})
+        assert order == ["listed", "listed"], "one more listing for the requests made meanwhile"
+        release.clear()
+        await ui.submit("a third question")  # its listing is still running when the chat ends
+        threading.Timer(0.3, release.set).start()
+        await ui.submit("/exit")
+
+    run_session(harness, scenario, sandbox=sandbox)
+    assert order == ["listed", "listed", "listed", "agent closed"], "settled before the agent (and the kernel) close"
+    assert running[1] == 1
 
 
 @pytest.mark.parametrize("on", [True, False], ids=["history-on", "history-off"])

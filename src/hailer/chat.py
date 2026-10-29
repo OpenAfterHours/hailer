@@ -79,9 +79,12 @@ class ChatController:
             else self._cli._make_line_reader(console)
         )
         self.reader.history_file = self._input_history_file()
-        #: The sandbox's notebooks as last listed off the UI loop (after startup, /notebook and each
-        #: turn), for the command menu's /notebook open and close.
+        #: The sandbox's notebooks as last listed, never on the UI loop (a /notebook command's own
+        #: listing, or _refresh_names_soon after startup and turns): the command menu's names.
         self._notebook_names: tuple[str, ...] = ()
+        self._names_task: asyncio.Task[None] | None = None
+        self._names_again = False
+        self._names_closed = False
         # One-line notice sent with the next user message after a /notebook switch (the model
         # learns about switches it made itself from its own tool results).
         self._pending_preamble: str | None = None
@@ -192,12 +195,42 @@ class ChatController:
             providers=tuple(sorted({"openai", *self.config.providers})),
         )
 
-    def _refresh_notebook_names(self) -> None:
-        """List the sandbox's notebooks for the command menu (blocking: run it off the UI loop)."""
-        try:
-            self._notebook_names = tuple(self._names())
-        except Exception:  # noqa: BLE001 - the menu keeps its last list
-            pass
+    def _refresh_names_soon(self) -> None:
+        """List the notebooks for the command menu on a worker thread that nothing waits for (call on
+        the UI loop). One listing at a time: a request during one makes it list once more after."""
+        if self._names_closed or self.sandbox is None:
+            return
+        if self._names_task is not None and not self._names_task.done():
+            self._names_again = True
+            return
+        self._names_task = asyncio.ensure_future(self._list_names())
+
+    async def _list_names(self) -> None:
+        while True:
+            self._names_again = False
+            try:
+                names: tuple[str, ...] | None = await asyncio.to_thread(self._listed_names)
+            except Exception:  # noqa: BLE001 - the menu keeps its last list
+                names = None
+            if self._names_closed:
+                return  # the session is over: its kernel may be stopping
+            if names is not None:
+                self._notebook_names = names
+            if not self._names_again:
+                return
+
+    def _listed_names(self) -> tuple[str, ...]:
+        return tuple(info.name for info in self.sandbox.list_notebooks()) if self.sandbox is not None else ()
+
+    async def _settle_names(self) -> None:
+        """At shutdown, before the kernel stops: no listing is left talking to it, and none starts."""
+        self._names_closed = True
+        task = self._names_task
+        if task is not None and not task.done():
+            try:
+                await asyncio.wait({task})
+            except asyncio.CancelledError:  # a second interrupt: leave the worker, finish shutting down
+                pass
 
     def _input_history_file(self) -> Path | None:
         """``.hailer/input_history`` while ``[hailer].input_history`` is on (Up recalls earlier
@@ -252,7 +285,7 @@ class ChatController:
                         self.notebook_open = opened
                 if timings is not None:
                     timings.mark("notebook_wait_complete")
-                await self._blocking(self._refresh_notebook_names)  # the command menu's names
+                self._refresh_names_soon()  # the command menu's names, in the background
 
             tasks = [asyncio.create_task(agent_ready()), asyncio.create_task(notebook_ready())]
             try:
@@ -293,6 +326,7 @@ class ChatController:
             await self.ui.run()
         finally:
             try:
+                await self._settle_names()
                 if self.agent is not None:
                     await self.agent.aclose()
             finally:
@@ -330,7 +364,11 @@ class ChatController:
                 bundle = await self._blocking(self._cli._load_context, self.config)
                 self._apply_bundle(bundle)
             else:
-                await self._blocking(self._command, command)
+                try:
+                    await self._blocking(self._command, command)
+                finally:
+                    if command.name == "notebook" and command.args.lower().split()[:1] == ["new"]:
+                        self._refresh_names_soon()  # a notebook was (perhaps) created
         except HailerError as err:
             self._cli._print_error(self.console, err, verbose=self.opts.verbose)
         except Exception as exc:  # keep the composer usable after a failed operation
@@ -355,14 +393,9 @@ class ChatController:
             self._record_turn(summary)
         finally:
             # A tool may have switched notebooks before cancellation or failure.
-            await self._blocking(self._sync_after_turn)
+            await self._blocking(self._sync_active_notebook)
             self._copy_notebooks_back()
-
-    def _sync_after_turn(self) -> None:
-        """The composer's turn end, off the UI loop: a switch a tool made, then the notebooks a tool
-        may have created for the command menu."""
-        self._sync_active_notebook()
-        self._refresh_notebook_names()
+            self._refresh_names_soon()  # a tool may have created one: the menu's names, in the background
 
     # -- REPL -------------------------------------------------------------- #
 
@@ -487,11 +520,7 @@ class ChatController:
         elif name == "model":
             self._model(args)
         elif name == "notebook":
-            try:
-                self._notebook(args)
-            finally:
-                if self.interactive and not (self._stop_event is not None and self._stop_event.is_set()):
-                    self._refresh_notebook_names()  # on the command's worker: a new or renamed notebook
+            self._notebook(args)
         elif name == "exec":
             self._exec(args)
         elif name == "clear":
@@ -701,8 +730,10 @@ class ChatController:
             self.console.print(f"Unknown /notebook subcommand {sub!r}. {self._cli.NOTEBOOK_USAGE}", markup=False)
 
     def _names(self) -> list[str]:
-        """The notebooks in the sandbox; empty without a kernel."""
-        return [info.name for info in self.sandbox.list_notebooks()] if self.sandbox is not None else []
+        """The notebooks in the sandbox; empty without a kernel. The command menu keeps the list."""
+        names = [info.name for info in self.sandbox.list_notebooks()] if self.sandbox is not None else []
+        self._notebook_names = tuple(names)
+        return names
 
     def _resolve(self, ref: str) -> str:
         """``ref`` as the name of an existing notebook (a name, a file name or a path in the folder)."""
@@ -751,6 +782,7 @@ class ChatController:
             self.console.print("Marimo is not running, so the notebooks cannot be listed.", markup=False)
             return
         infos = self.sandbox.list_notebooks()
+        self._notebook_names = tuple(info.name for info in infos)  # the command menu's list, too
         if not infos:
             self.console.print(f"No notebooks in {folder} yet. Create one with /notebook new <name>.", markup=False)
             return

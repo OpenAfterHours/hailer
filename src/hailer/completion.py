@@ -8,6 +8,12 @@ for ``/model`` the current model and each provider as ``<provider>:``. They come
 nothing here asks marimo or the disk. A submission still goes through
 :func:`~hailer.session.parse_command`; the menu only writes the draft. :func:`menu_fragments` draws
 the menu under the composer's frame.
+
+Enter runs a command at once only when the user chose it in the menu (arrows or Tab) and it takes no
+arguments (:data:`RUN_ON_ENTER`). Otherwise a draft that already is a command, or a command and a
+whole argument, is sent as typed, and any other slash draft is completed to the first item without
+running it (:meth:`SlashCompleter.enter_pick`), so ``/n`` and Enter never starts a new conversation,
+however fast it was typed or pasted.
 """
 
 from __future__ import annotations
@@ -47,7 +53,8 @@ class SlashCompleter(Completer):
 
     def get_completions(self, document: Document, complete_event: CompleteEvent) -> Iterable[Completion]:
         text = document.text_before_cursor
-        if not text.startswith("/") or "\n" in text:
+        # Only at the end of a one-line slash draft: completing in the middle of a word would garble it.
+        if not text.startswith("/") or "\n" in text or document.text_after_cursor.strip():
             return
         head, space, rest = text[1:].partition(" ")
         # A command or subcommand that takes arguments gets its space, so their menu follows, but
@@ -60,10 +67,21 @@ class SlashCompleter(Completer):
             return
         words = rest.split(" ")
         partial = words[-1]
-        for value, meta, then in self._arguments(head.lower(), words[:-1]):
-            if value.casefold().startswith(partial.casefold()):
-                then = then if value != partial else ""
-                yield Completion(value + then, -len(partial), display=single_line(value), display_meta=single_line(meta))
+        found = [option for option in self._arguments(head.lower(), words[:-1]) if option[0].casefold().startswith(partial.casefold())]
+        found.sort(key=lambda option: not option[0].startswith(partial))  # names that match as typed first
+        for value, meta, then in found:
+            then = then if value != partial else ""
+            yield Completion(value + then, -len(partial), display=single_line(value), display_meta=single_line(meta))
+
+    def enter_pick(self, document: Document) -> Completion | None:
+        """What Enter writes into the draft when no menu item was chosen: the first completion,
+        unless the draft is already a command (or a command and a whole argument) as typed, or
+        nothing completes it. ``None``: Enter sends the draft as it is. Computed here and now, so
+        the result never depends on how fast the keys came or whether the menu had shown yet."""
+        completions = list(self.get_completions(document, CompleteEvent()))
+        if not completions or typed_in_full(document, completions):
+            return None
+        return completions[0]
 
     def _arguments(self, command: str, before: list[str]) -> list[tuple[str, str, str]]:
         """(value, description, what follows it) for the word after ``/command`` and ``before``."""
@@ -82,6 +100,29 @@ class SlashCompleter(Completer):
         if command == "prompt":
             return [(name, "saved prompt", "") for name in data.prompts]
         return []
+
+
+def typed_in_full(document: Document, completions: Iterable[Completion]) -> bool:
+    """Whether the word being completed already is one of ``completions``: a command name in any
+    case (commands ignore case), an argument exactly as typed (``first-look`` beside
+    ``first-look-v2``, ``sales.py`` beside ``Sales.py``)."""
+    text = document.text_before_cursor
+    for completion in completions:
+        typed = text[len(text) + completion.start_position:]
+        value = completion.text.rstrip(" ")
+        if typed == value or (typed.startswith("/") and typed.lower() == value):
+            return True
+    return False
+
+
+def enter_action(buffer: Any) -> str:
+    """What Enter does while the menu is open, for the border's hint: "run" (a chosen command that
+    takes no arguments), "send" (the draft as typed) or "complete" (the chosen or first item)."""
+    state = buffer.complete_state
+    if state is not None and state.complete_index is not None:
+        new_text, _cursor = state.new_text_and_position()
+        return "run" if new_text.strip() in RUN_ON_ENTER else "complete"
+    return "send" if typed_in_full(buffer.document, state.completions if state is not None else []) else "complete"
 
 
 def menu_open(buffer: Any) -> bool:

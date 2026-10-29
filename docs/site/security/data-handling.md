@@ -89,10 +89,15 @@ third party. Set `HAILER_TRACING=1` if you do want the tracing variables in your
 is stored unencrypted in `.hailer/threads.sqlite` inside the workspace until `/new` or `hailer --new`
 replaces it. What you type in the chat, messages and commands alike, is also kept unencrypted in
 `.hailer/input_history` (the last 1,000 entries, which Up recalls in later sessions); it stays on this
-machine and is never sent anywhere. A message that looks like it holds a key or token (what Hailer masks in
-its logs: a bearer token, an `sk-` key, the value of an environment variable ending in `_KEY`, `_TOKEN`,
-`_SECRET` or `_PASSWORD`) is not written there. Set `input_history = false` under `[hailer]` in
-`hailer.toml` to keep history in memory for the session only, and delete the file to clear it. While an unsafe-local kernel runs, `.hailer/marimo-<pid>.log` holds its output, including its
+machine and is never sent anywhere. Not written there (kept in memory for the session only): a message
+over 64 KB, and one containing a bearer token or `Authorization:` value, an `sk-` key, a URL with a password
+in it (`user:password@`), a GitHub token (`ghp_`, `gho_`, `ghs_`, `ghu_`, `ghr_`, `github_pat_`), an AWS
+access key ID (`AKIA...`), or the value of an environment variable ending in `_KEY`, `_TOKEN`, `_SECRET` or
+`_PASSWORD`. Other secrets (a password typed on its own, a private key) are not recognised and would be
+kept, so do not type them into the chat. If `.hailer/input_history` or its lock file is a link (a cloned
+repository could ship one), Hailer never follows it and keeps history in memory instead. Set
+`input_history = false` under `[hailer]` in `hailer.toml` to keep history in memory for the session only,
+and delete the file to clear it. While an unsafe-local kernel runs, `.hailer/marimo-<pid>.log` holds its output, including its
 signed-in URL; it is deleted when the kernel stops, also after a failed start. The kernel's token is kept
 in memory only. A docker kernel's token file exists only while the kernel starts, and
 `.hailer/owner-<id>.lock` marks a running docker session (it holds no secret). `.hailer/sandbox-wrote-notebooks` marks notebooks a docker kernel
