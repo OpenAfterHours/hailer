@@ -9,9 +9,10 @@
 | `/notebook`, `/notebook list`, `/notebook new <name> [--empty]`, `/notebook open <name>`, `/notebook close [name]` | Show or switch the active notebook (see *Working with several notebooks*). |
 | `/exec <code>` | Run Python in the active notebook's kernel and print its output, result and errors. Nothing is sent to the model. The notebook must be open in the browser; a pasted block keeps its lines and is dedented. |
 | `/context` | List loaded context files, skills, prompts and the web allowlist. |
+| `/data`, `/data add <name> <folder>`, `/data remove <name>` | List the [data folders](../configuration/project.md#data-folders), or add or remove one in `.hailer/local.toml`; the kernel gets the change at the next start. |
 | `/skill <name> [message]` | Run a turn with a project skill attached. |
-| `/prompt <name> [args]` | Send a saved prompt from `.config/hailer/prompts`. |
-| `/reload` | Re-read `.config/hailer`; applies from your next message. |
+| `/prompt <name> [args]` | Send a saved prompt from the prompts folder (`.config/hailer/prompts`, or `.hailer/prompts` [inside a project](../configuration/project.md#hailer-folder)). |
+| `/reload` | Re-read the context, skills and prompts; applies from your next message. |
 | `/clear` | Clear the screen. |
 | `/exit`, `/quit` | Exit Hailer (Ctrl+C at the prompt, Ctrl+D on an empty line, or Ctrl+Z then Enter, also exit). |
 
@@ -45,7 +46,8 @@ Other subcommands:
 | `uvx hailer status` | Configuration, credentials and this workspace's running Docker kernels (whenever Docker is installed). |
 | `uvx hailer doctor` | The startup checks with fixes: configuration, credentials, Docker, the kernel image and folders. It starts no kernel. |
 | `uvx hailer login <provider>`, `uvx hailer logout <provider>` | Store or remove a provider's API key. |
-| `uvx hailer init [--force] [--kernel RUNTIME]` | Set up a workspace (see Quick start). `hailer.toml` gets `[kernel] runtime = "docker"`, or the `--kernel` runtime. |
+| `uvx hailer init [--force] [--kernel RUNTIME] [--layout standalone\|project]` | Set up a workspace (see Quick start). `hailer.toml` gets `[kernel] runtime = "docker"`, or the `--kernel` runtime. In a folder with `pyproject.toml` or `.git` everything goes into `.hailer/` (see [Inside another project](../configuration/project.md#hailer-folder)). |
+| `uvx hailer data [list]`, `uvx hailer data add <name> <folder> [--description TEXT]`, `uvx hailer data remove <name>` | The [data folders](../configuration/project.md#data-folders) notebooks see as `DATA_FOLDERS["<name>"]`, read-only in the kernel; `add` and `remove` edit this machine's `.hailer/local.toml`. |
 | `uvx hailer kernel pull` | Download the kernel image for this Hailer (or `[kernel].image`). |
 | `uvx hailer kernel build [--tag <name>]` | Build the kernel image, discovering host pip/uv mirror settings. `--pip-config FILE` overrides discovery; `--no-host-config` disables it. See [corporate mirrors](../security/docker.md#building-with-corporate-mirrors). |
 | `uvx hailer kernel stop` | Remove every Docker container and network of this workspace, whichever session started it, and say what was removed. |
@@ -55,7 +57,8 @@ Global options go before the subcommand: `--verbose`, `--config <path>`, `--work
 
 ## Environment variables {#environment-variables}
 
-Everything else comes from `hailer.toml`; a variable wins over the file, and a command-line option over both.
+Everything else comes from `hailer.toml` and this machine's `.hailer/local.toml` (which wins over it); a
+variable wins over the files, and a command-line option over all of them.
 
 | Variable | Overrides |
 |---|---|

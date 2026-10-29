@@ -5,6 +5,26 @@
 > runtime, kernels shared between terminals and the writable notebooks mount), not the current one, which is
 > in [PLAN.md](../../PLAN.md).
 
+## 2026-10-28: notebooks that re-run
+
+The agent wrote its commentary as typed-in markdown (it saw `5.6%` in the scratchpad and typed it), so a
+notebook could not be re-run for next month's data. Now:
+
+- The system prompt asks for one `settings` cell (defaults from the data; the period in a
+  `mo.ui.dropdown` that `mo.cli_args()` can preset), summaries as f-strings over computed values,
+  interpretation in a note labelled with its period, switching the dropdown for another period, and
+  simple code (one step per cell, plain Polars, no helpers or defensive code the data does not need).
+- `code_checks.hardcoded_values` reports numbers, dates and month names typed into `mo.md` text or a
+  chart `title=` as `hailer hardcoded-value` findings, next to ruff and ty; `[checks] hardcoded` turns it
+  off.
+- The example skill and context in `.config/hailer`, the notebooks page of the docs, INTERFACES and
+  LEARNINGS §16 follow.
+
+Verified: the offline suite, and a live run through `HailerTools` on an unsafe-local kernel with headless
+Chromium (no model): the settings pattern runs and is clean, `set_ui_value` on the dropdown (it takes a
+list) re-runs the summary for the other period, and typed-in text is reported on the right line. Still
+owed: a live turn against a paid model, to see the agent follow the instructions.
+
 ## 2026-09-23: the sandbox simplification
 
 Phases 0–4 of [docs/ARCHITECTURE_PROPOSAL.md](../ARCHITECTURE_PROPOSAL.md) are implemented on branch

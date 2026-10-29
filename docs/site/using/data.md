@@ -3,6 +3,10 @@
 Any CSV, Parquet, JSON or Excel file in `data/` can be analysed, whatever it is called: the starter notebook lists
 them in `data_files`, and the agent loads them with Polars or queries them with DuckDB when you ask.
 
+Data somewhere else on your machine, such as a shared drive or another project's exports folder, can be added
+without copying it: `uvx hailer data add finance "~/Shared/Finance"` makes it `DATA_FOLDERS["finance"]` in
+notebooks, read-only, from the next start (see [Data folders](../configuration/project.md#data-folders)).
+
 Excel reading is included in both the Docker kernel and Hailer's own installation (the unsafe-local runtime) through
 [Polars' Calamine engine (`fastexcel`)](https://docs.pola.rs/api/python/stable/reference/api/polars.read_excel.html).
 Put an `.xlsx`, `.xls` or `.xlsb` workbook in `data/` and ask, for example, *Explore the Sales worksheet in
@@ -34,5 +38,5 @@ columns that only appear in later months.
 | `describe_periods(files)` | Compact text: months found, common columns, columns present only in some months. |
 
 A monthly file that cannot be read raises `MalformedParquetError` naming the file. The starter notebook
-(`notebooks/analysis.py`) defines `WORKSPACE`, `DATA_DIR`, `data_files` and `period_files` and shows a
-table of the data files it found.
+(`notebooks/analysis.py`) defines `WORKSPACE`, `DATA_DIR`, `DATA_FOLDERS`, `data_files` and `period_files` and
+shows a table of the data files it found. The helpers take any folder: `list_data_files(DATA_FOLDERS["finance"])`.

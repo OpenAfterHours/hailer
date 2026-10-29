@@ -264,17 +264,21 @@ last copy when Hailer is killed or a second Ctrl+C interrupts the last copy (it 
 
 ## Which data folder can be mounted
 
-The data folder is the only folder of your machine a docker kernel sees (read-only). Hailer refuses one
-that would hand notebook code Hailer's own files or your credentials. `uvx hailer doctor` reports it in the
-`config` row, and every start stops on it, `--foreground` included (the same rules, in one place):
+The data folder and the [data folders](../configuration/project.md#data-folders) (mounted at
+`/work/folders/<name>`) are the only folders of your machine a docker kernel sees, all read-only. Hailer
+refuses one that would hand notebook code Hailer's own files or your credentials. `uvx hailer doctor`
+reports it in the `config` row, and every start stops on it, `--foreground` included (the same rules, in one
+place, for each folder):
 
-- It may not be, or contain, a drive root, your home folder, the workspace folder, `.hailer/`, the config
-  file, or the context, skills and prompts folders.
+- It may not be, or contain, a drive root, your home folder, the workspace folder, `.hailer/` (or its
+  `state/` folder), the config file, `.hailer/local.toml`, or the context, skills and prompts folders.
 - It may not be, contain or sit inside a folder that holds credentials: `~/.config`, `~/.ssh`, `~/.aws`,
   `~/.azure`, `~/.gnupg`, `~/.docker`, `~/.kube`, and on Windows `%APPDATA%` and `%LOCALAPPDATA%` (the
   temporary folder inside it is fine).
-- The default, `data/` in the workspace, passes. The data folder can be anywhere else on the machine: set
-  `[hailer].data_dir` to an absolute path and it is mounted read-only where it is.
+- The default, `data/` in the workspace (`.hailer/data/` in the project layout), passes. The data folder
+  can be anywhere else on the machine: set `[hailer].data_dir` to an absolute path and it is mounted read-only
+  where it is. For more folders, `uvx hailer data add <name> <folder>`; each gets a `data:<name>` row in
+  `doctor`.
 - Windows: a data folder on a network share (a UNC path such as `\\server\share\sales`) cannot be mounted:
   it is an error in `doctor`'s `config` row and stops the start, with the same message. A mapped network
   drive gets a `data` warning: Docker Desktop usually cannot see it. Symlinks and junctions inside the data

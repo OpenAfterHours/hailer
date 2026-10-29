@@ -891,3 +891,130 @@ def test_temp_directory_does_not_exempt_ssh_credentials(tmp_path: Path, monkeypa
     monkeypatch.setattr(cfg, "_in_temp", lambda folder: True)
     config = make_config(tmp_path / "workspace", data_dir=secret / "nested", kernel=KernelConfig(runtime="docker"))
     assert "credentials" in " ".join(cfg.docker_mount_problems(config))
+
+
+# --------------------------------------------------------------------------- #
+# Hailer inside another project: discovery, the project layout, .hailer/local.toml
+# --------------------------------------------------------------------------- #
+
+
+def _uv_workspace(tmp_path: Path) -> Path:
+    """A git repository holding a uv workspace with one member, ``packages/etl``."""
+    root = tmp_path / "repo"
+    (root / ".git").mkdir(parents=True)
+    _write(root / "pyproject.toml", '[project]\nname = "root"\n\n[tool.uv.workspace]\nmembers = ["packages/*"]\n')
+    _write(root / "packages" / "etl" / "pyproject.toml", '[project]\nname = "etl"\n')
+    (root / "packages" / "etl" / "src").mkdir(parents=True)
+    return root
+
+
+def test_a_command_in_a_uv_workspace_member_belongs_to_the_whole_repository(tmp_path: Path) -> None:
+    """Regression: the first pyproject.toml above the folder was the workspace, so `uv run hailer`
+    in packages/etl/ got its own .hailer state and never saw the root's config."""
+    root = _uv_workspace(tmp_path)
+    member = root / "packages" / "etl" / "src"
+    assert find_workspace(member) == root.resolve(), "no config yet: the uv workspace root"
+    _write(root / ".hailer" / "hailer.toml", "[hailer]\n")
+    assert find_workspace(member) == root.resolve(), "the config at the root"
+    _write(root / "packages" / "etl" / "hailer.toml", "[hailer]\n")
+    assert find_workspace(member) == (root / "packages" / "etl").resolve(), "the nearest config wins"
+
+
+def test_the_search_stops_at_the_repository_root(tmp_path: Path) -> None:
+    _write(tmp_path / "hailer.toml", "[hailer]\n")  # above the repository: not this project's
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    _write(repo / "lib" / "pyproject.toml", '[project]\nname = "lib"\n')
+    assert find_workspace(repo / "lib") == (repo / "lib").resolve(), "no uv workspace: the nearest pyproject.toml"
+    assert find_workspace(repo) == repo.resolve()
+
+
+def test_outside_a_repository_the_first_marker_still_wins(tmp_path: Path) -> None:
+    _write(tmp_path / "hailer.toml", "[hailer]\n")
+    _write(tmp_path / "proj" / "pyproject.toml", '[project]\nname = "p"\n')
+    (tmp_path / "proj" / "a").mkdir()
+    assert find_workspace(tmp_path / "proj" / "a") == (tmp_path / "proj").resolve()
+
+
+def test_the_project_layout_keeps_everything_in_dot_hailer(tmp_path: Path) -> None:
+    root = _uv_workspace(tmp_path)
+    config_file = _write(root / ".hailer" / "hailer.toml", "[hailer]\n")
+    config = load_config(workspace=root, env={})
+    hailer = (root / ".hailer").resolve()
+    assert config.config_path == config_file.resolve()
+    assert config.notebook == hailer / "notebooks" / "analysis.py"
+    assert config.notebooks_root == hailer / "notebooks"
+    assert config.data_dir == hailer / "data"
+    assert (config.context_dir, config.skills_dir, config.prompts_dir) == (hailer / "context", hailer / "skills", hailer / "prompts")
+    assert CONFIG_FILENAMES.index(".hailer/hailer.toml") == 1
+
+
+def test_the_state_folder_of_the_project_layout_is_dot_hailer_state(tmp_path: Path) -> None:
+    from hailer.statedir import ensure_state_dir, state_dir
+
+    ws = _make_workspace(tmp_path)
+    assert state_dir(ws) == ws / ".hailer", "the standalone layout is unchanged"
+    _write(ws / ".hailer" / "hailer.toml", "[hailer]\n")
+    assert state_dir(ws) == ws / ".hailer" / "state"
+    folder = ensure_state_dir(ws)
+    assert (folder / ".gitignore").read_text(encoding="utf-8").endswith("*\n")
+    assert not (ws / ".hailer" / ".gitignore").exists(), "the project folder itself is committed"
+
+
+def test_local_toml_is_this_machines_settings_on_top_of_the_project_config(tmp_path: Path) -> None:
+    ws = _make_workspace(tmp_path, '[model]\nname = "team-model"\nprovider = "openai"\n[web]\nallowed_domains = ["docs.pola.rs"]\n')
+    local = _write(ws / ".hailer" / "local.toml", '[model]\nname = "my-model"\n')
+    config = load_config(workspace=ws, env={})
+    assert config.model.name == "my-model" and config.model.provider == "openai", "tables merge key by key"
+    assert config.web.allowed_domains == ("docs.pola.rs",)
+    assert config.local_config_path == local.resolve()
+    assert load_config(workspace=ws, env={"HAILER_MODEL": "env-model"}).model.name == "env-model", "the environment still wins"
+
+
+def test_a_wrong_type_in_local_toml_names_both_files(tmp_path: Path) -> None:
+    ws = _make_workspace(tmp_path, "[hailer]\n")
+    _write(ws / ".hailer" / "local.toml", "[hailer]\nmax_context_bytes = \"lots\"\n")
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(workspace=ws, env={})
+    assert "hailer.toml or " in str(excinfo.value) and "local.toml" in str(excinfo.value)
+
+
+def test_unknown_keys_in_local_toml_are_warnings_too(tmp_path: Path) -> None:
+    ws = _make_workspace(tmp_path, "[hailer]\n")
+    _write(ws / ".hailer" / "local.toml", "[hailer]\nfavourite_colour = 'blue'\n")
+    problems = validate(load_config(workspace=ws, env={}))
+    assert any("favourite_colour" in p and "local.toml" in p for p in problems), problems
+
+
+def test_two_configs_in_one_workspace_are_a_warning(tmp_path: Path) -> None:
+    ws = _make_workspace(tmp_path, "[hailer]\n")
+    _write(ws / ".hailer" / "hailer.toml", "[hailer]\n")
+    problems = validate(load_config(workspace=ws, env={}))
+    assert any(p.startswith("Warning:") and "more than one Hailer config" in p for p in problems), problems
+
+
+def test_docker_refuses_the_state_folder_and_local_toml_as_the_data_folder(tmp_path: Path) -> None:
+    root = _uv_workspace(tmp_path)
+    _write(root / ".hailer" / "hailer.toml", '[hailer]\ndata_dir = ".hailer/state"\n[kernel]\nruntime = "docker"\n')
+    _write(root / ".hailer" / "notebooks" / "analysis.py", "import marimo\n")
+    errors = _errors(validate(load_config(workspace=root, env={})))
+    assert any("is Hailer's state folder" in e for e in errors), errors
+    _write(root / ".hailer" / "hailer.toml", "[kernel]\nruntime = \"docker\"\n")
+    config = load_config(workspace=root, env={})
+    assert docker_mount_problems(config) == [], "the default .hailer/data is fine"
+
+
+def test_the_project_template_points_every_folder_into_dot_hailer(tmp_path: Path) -> None:
+    from hailer.config import LAYOUT_PROJECT, PROJECT_DEFAULTS
+
+    text = config_template(layout=LAYOUT_PROJECT)
+    for value in PROJECT_DEFAULTS.values():
+        assert f'"{value}"' in text, value
+    assert ".config/hailer" not in text and '"notebooks/analysis.py"' not in text
+    root = _uv_workspace(tmp_path)
+    write_default_config(root / ".hailer" / "hailer.toml", layout=LAYOUT_PROJECT)
+    config = load_config(workspace=root, env={})
+    assert config.notebook == (root / ".hailer" / "notebooks" / "analysis.py").resolve()
+    assert config.data_dir == (root / ".hailer" / "data").resolve()
+    with pytest.raises(ConfigError):
+        config_template(layout="monorepo")

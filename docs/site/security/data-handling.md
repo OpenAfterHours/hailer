@@ -3,7 +3,9 @@
 **Sent to the configured model endpoint:** your messages; Hailer's system prompt plus everything in
 `.config/hailer/context`; the name and description of each skill, and a skill's full body once loaded; every
 tool call argument (that is, the Python the agent writes) and the tool results, truncated to
-`max_tool_output_chars`; and pages fetched from allowed domains. The instructions name the workspace,
+`max_tool_output_chars`, including the [project files](../configuration/project.md#project-files) the agent
+lists, searches and reads (lines that look like credentials withheld); and pages fetched from allowed
+domains. The instructions name the workspace,
 notebooks and data folders by path (with the docker kernel, the container's `/work` paths). With the `openai` provider this goes to OpenAI; with a custom provider,
 to the `base_url` you configured, and nowhere else: when older turns are summarised, the same endpoint and
 model write the summary.
@@ -16,8 +18,9 @@ anywhere else to be checked.
 instructed to inspect schemas, samples and aggregates and to keep outputs compact); API keys or other
 secrets (the key stays inside the Hailer process and is masked in logs).
 
-**What the agent can do:** it has Hailer's twelve tools and nothing else: no shell, no file tools, no
-tools from other software on your machine. Nothing asks for approval before a tool runs. The tool that
+**What the agent can do:** it has Hailer's fifteen tools and nothing else: no shell, no tools from other
+software on your machine, and no file tools beyond reading the project's own files when `[project]` turns that
+on (read-only, on this machine; the kernel never sees them). Nothing asks for approval before a tool runs. The tool that
 matters is `marimo_execute`: it runs the Python the model writes in the notebook kernel. That is what
 makes the analysis possible. What the code can reach depends on the kernel runtime:
 
@@ -25,7 +28,8 @@ makes the analysis possible. What the code can reach depends on the kernel runti
   and the data folder (read-only), with no network, none of your environment variables, as a non-root user
   with resource limits (see [Isolated kernel (Docker)](docker.md#isolated-kernel-docker)). It cannot write to
   your machine: Hailer copies notebooks back, and only marimo notebooks with plain names (see
-  [Notebook copies](docker.md#notebook-copies)). Hailer refuses to mount a data folder that would expose its
+  [Notebook copies](docker.md#notebook-copies)). The [data folders](../configuration/project.md#data-folders)
+  you add are mounted read-only too. Hailer refuses to mount a data folder that would expose its
   own files or your credentials (`~/.ssh`, `~/.aws`, `%APPDATA%`, ...), on every start path (see
   [Which data folder can be mounted](docker.md#which-data-folder-can-be-mounted)). Without a usable Docker a
   start stops; it never falls back to running notebook code on your machine.
@@ -94,3 +98,6 @@ in memory only. A docker kernel's token file exists only while the kernel starts
 copied back that you have not yet agreed to run unsafe-local, and `.hailer/notebook-backups/` keeps your versions of notebooks a docker kernel's copy
 replaced (see [Notebook copies](docker.md#notebook-copies)). On macOS and Linux these files are readable by you only. `.hailer/` is never mounted into a docker kernel and is
 kept out of git by its own `.gitignore` containing `*`; Hailer never edits your repository's `.gitignore`.
+[Inside another project](../configuration/project.md#hailer-folder) these files are in `.hailer/state/`, which
+ignores itself the same way, and `.hailer/.gitignore` keeps `state/`, `local.toml` (this machine's settings,
+such as data folder paths) and `data/` out of git.

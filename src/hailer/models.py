@@ -170,6 +170,35 @@ class CodeChecksConfig:
 
 
 @dataclass(frozen=True)
+class DataFolder:
+    """A ``[data_folders]`` entry: a folder of this machine, outside or inside the workspace, whose
+    files notebooks may read (a docker kernel mounts it read-only at ``/work/folders/<name>``)."""
+
+    name: str  # lower-case letters, digits, "-" and "_": the folder's name in the kernel
+    #: Absolute; ``None`` when the folder is declared without a path (the project's config names it,
+    #: each machine's ``.hailer/local.toml`` says where it is).
+    path: Path | None = None
+    description: str = ""
+
+
+@dataclass(frozen=True)
+class ProjectConfig:
+    """The ``[project]`` table: the project's own files (code, docs, configuration) the agent may
+    list, search and read, read-only, on this machine (:mod:`hailer.project`). Kernels never see them."""
+
+    #: The folder to read; ``None`` without a ``[project]`` table (or with ``enabled = false``).
+    root: Path | None = None
+    #: Only files matching one of these globs (relative to ``root``); empty: code, docs and config files.
+    include: tuple[str, ...] = ()
+    #: Never files matching one of these globs (on top of the built-in exclusions).
+    exclude: tuple[str, ...] = ()
+
+    @property
+    def enabled(self) -> bool:
+        return self.root is not None
+
+
+@dataclass(frozen=True)
 class HailerConfig:
     """Fully resolved configuration (file + environment overrides). Paths are absolute."""
 
@@ -184,8 +213,13 @@ class HailerConfig:
     web: WebConfig = field(default_factory=WebConfig)
     kernel: KernelConfig = field(default_factory=KernelConfig)
     checks: CodeChecksConfig = field(default_factory=CodeChecksConfig)
+    project: ProjectConfig = field(default_factory=ProjectConfig)
+    #: More data folders besides ``data_dir`` (``[data_folders]``), in the order they were declared.
+    data_folders: tuple[DataFolder, ...] = ()
     log_level: str = "WARNING"
     config_path: Path | None = None
+    #: This machine's ``.hailer/local.toml`` when it exists (merged over ``config_path``).
+    local_config_path: Path | None = None
     max_tool_output_chars: int = 12_000
     max_context_bytes: int = 24_000
     notebooks_dir: Path | None = None  # load_config always fills it; None only in hand-built test configs

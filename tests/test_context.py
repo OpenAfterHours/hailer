@@ -89,6 +89,11 @@ def test_frontmatter_literal_block_and_missing():
         "token=" + "a1" * 25,
         "AKIAIOSFODNN7QWERTYU",
         "password: hunter2hunter2hunter2",
+        'db_password = "correct-horse-battery"',
+        "SECRET_KEY=django-insecure-0123456789",
+        "client_secret: 0123456789abcdefXYZ",
+        "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG",
+        "-----BEGIN OPENSSH PRIVATE KEY-----",
     ],
 )
 def test_looks_like_secret_positive(text):
@@ -104,10 +109,28 @@ def test_looks_like_secret_positive(text):
         "api_key = ${INTERNAL_MODEL_API_KEY}",
         "Report RWA in GBP millions with one decimal place.",
         "The token budget is 10000 tokens per skill.",
+        "password_hash = hash_of_the_password",
     ],
 )
 def test_looks_like_secret_negative(text):
     assert not looks_like_secret(text)
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ('token = request.headers.get("Authorization")', False),
+        ("password = settings.database_password", False),
+        ("self.api_key = api_key_from_vault()", False),
+        ('db_password = "correct-horse-battery"', True),
+        ("API_KEY = 'sk-live-0123456789abcdefghij'", True),
+        ("headers = {'Authorization': 'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9abc'}", True),
+    ],
+)
+def test_in_code_only_a_quoted_value_is_a_credential(text, secret):
+    """Code assigns names, attributes and calls to token/password variables all the time; reading a
+    project's code would otherwise withhold half its request handling."""
+    assert looks_like_secret(text, code=True) is secret
 
 
 # --------------------------------------------------------------------------- #

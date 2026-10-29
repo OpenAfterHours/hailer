@@ -1,4 +1,4 @@
-"""Hailer's tools: the agent's only bridge to the live marimo kernel and the web.
+"""Hailer's tools: the agent's only bridge to the live marimo kernel, the project's files and the web.
 
 The tools run inside the Hailer process. :class:`HailerTools` holds the implementations
 (plain methods, unit-testable); :func:`hailer_tools` hands them to the agent as LangChain
@@ -26,6 +26,10 @@ notebook's cells (:mod:`hailer.code_checks`): the first also switches on code mo
 formatting in the kernel, and the cells that differ afterwards are checked with ruff, ty and
 Hailer's check for values typed into text, the findings appended to the result (``[checks]`` in
 ``hailer.toml`` turns each part off).
+
+``project_files``, ``project_search`` and ``project_read`` read the project's own code and docs on
+this machine, read-only, through :class:`hailer.project.ProjectFiles` (only with ``[project]`` in the
+config); no kernel sees those files.
 """
 
 from __future__ import annotations
@@ -61,6 +65,9 @@ TOOL_NAMES = (
     "notebook_open",
     "notebook_close",
     "list_periods",
+    "project_files",
+    "project_search",
+    "project_read",
     "load_skill",
     "read_skill_file",
     "fetch_page",
@@ -198,6 +205,8 @@ class HailerTools:
         self.open_url: UrlOpener = open_url or _default_open_url
         #: How long to wait for a kernel session after opening the browser.
         self.session_wait_sec = session_wait_sec
+        #: The project's files (:class:`hailer.project.ProjectFiles`), made on first use.
+        self._project: Any = None
 
     # -- plumbing ----------------------------------------------------------- #
 
@@ -597,18 +606,21 @@ class HailerTools:
 
     # -- data, skills, web ------------------------------------------------- #
 
-    def list_periods(self, name: str = "") -> str:
+    def list_periods(self, name: str = "", folder: str = "") -> str:
         """Describe the data directory: monthly files named like '25-01 sales.parquet'
         (YY-MM then the dataset name) with the periods available, common columns and columns
         that only appear in some months, plus the names of any other data files (CSV, JSON,
-        ...). Optional dataset name filter for the monthly files, e.g. 'sales'."""
+        ...). Optional dataset name filter for the monthly files, e.g. 'sales'. The data folders
+        besides it (DATA_FOLDERS in notebooks) are listed by name at the end; pass folder='<name>'
+        to describe one of them the same way."""
 
         def go() -> str:
             from . import periods  # lazy
 
             sandbox = self._kernel()
-            shown = sandbox.data_path
-            files = sandbox.list_data()
+            chosen = folder.strip() or None
+            shown = sandbox.data_path_of(chosen)
+            files = sandbox.list_data(chosen)
             wanted = name.strip().lower() or None
             found = []
             for info in files:
@@ -616,21 +628,66 @@ class HailerTools:
                 if pf is not None and (wanted is None or pf.stem == wanted):
                     found.append(pf)
             if found:
-                text = periods.describe_periods(found, schema=lambda pf: sandbox.data_schema(pf.path.name))
+                text = periods.describe_periods(found, schema=lambda pf: sandbox.data_schema(pf.path.name, chosen))
             else:
                 text = (
                     f"No period files found in {shown}"
                     + (f" for '{name.strip()}'" if name.strip() else "")
                     + ". Monthly files are named like '25-01 sales.parquet' (YY-MM then the dataset name)."
                 )
+            if chosen:
+                text = f"Data folder {chosen!r} ({shown}, DATA_FOLDERS[{chosen!r}] in notebooks):\n" + text
             listed = {pf.path.name for pf in found}
             others = [f.name for f in files if f.name.lower().endswith(periods.DATA_SUFFIXES) and f.name not in listed]
             if others:
-                shown = ", ".join(others[:20]) + (f" (and {len(others) - 20} more)" if len(others) > 20 else "")
-                text += f"\nOther data files (load them directly with Polars or DuckDB): {shown}"
+                more = ", ".join(others[:20]) + (f" (and {len(others) - 20} more)" if len(others) > 20 else "")
+                text += f"\nOther data files (load them directly with Polars or DuckDB): {more}"
+            if not chosen and sandbox.data_folders:
+                lines = []
+                for folder_name, extra in sandbox.data_folders.items():
+                    try:
+                        count = sum(1 for f in sandbox.list_data(folder_name) if f.name.lower().endswith(periods.DATA_SUFFIXES))
+                        state = f"{count} data file(s)"
+                    except HailerError as err:
+                        state = str(err)
+                    lines.append(f"- {folder_name}: {extra.path} ({state})")
+                text += "\nMore data folders (describe one with list_periods(folder='<name>')):\n" + "\n".join(lines)
             return text
 
         return self._run(go)
+
+    # -- the project's own files ------------------------------------------ #
+
+    def _project_files(self) -> Any:
+        if self._project is None:
+            from .project import ProjectFiles  # lazy
+
+            self._project = ProjectFiles.for_config(self.config)
+        return self._project
+
+    def project_files(self, pattern: str = "") -> str:
+        """List the project's own files you may read (code, docs, configuration), as paths
+        relative to the project root. The optional pattern is a glob that narrows the list:
+        '*.sql', 'packages/billing/**', 'src/**/models/*.py'. Without one, a large project is
+        summarised by folder. Use it with project_search and project_read to answer questions
+        about how the product or a pipeline works; notebook code cannot see these files."""
+        return self._run(lambda: self._project_files().listing(pattern))
+
+    def project_search(self, query: str, pattern: str = "") -> str:
+        """Search the project's files for a regular expression (Python syntax, case-insensitive),
+        e.g. 'def net_revenue', 'churn_rate|churned', 'class \\w+Order'. The optional pattern is a
+        glob limiting the files ('*.py', 'packages/billing/**'). Returns path:line: text for up
+        to 100 matching lines; lines that look like credentials are withheld."""
+        return self._run(lambda: self._project_files().search(query, pattern))
+
+    def project_read(self, path: str, start_line: int = 1, end_line: int = 0) -> str:
+        """Read a project file (a path as project_files or project_search show it) with line
+        numbers, from start_line to end_line inclusive (end_line 0: as much as fits, at most 400
+        lines). Read the part you need; a longer file says how to continue. Lines that look
+        like credentials are withheld."""
+        return self._run(
+            lambda: self._project_files().read(path, start_line, end_line, max_chars=self.config.max_tool_output_chars)
+        )
 
     def load_skill(self, name: str) -> str:
         """Load a project skill (its SKILL.md instructions and the list of bundled files) by
