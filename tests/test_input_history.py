@@ -77,6 +77,20 @@ def test_reading_keeps_the_last_thousand_and_trims_the_file(tmp_path):
     assert entries(path)[-1] == "one more" and len(entries(path)) == 1_000
 
 
+def test_a_trim_that_fails_still_loads_the_history(tmp_path, monkeypatch):
+    path = tmp_path / "history"
+    path.write_text("".join(f"\n# t\n+message {index}\n" for index in range(1_010)), encoding="utf-8")
+
+    def locked(*_args):
+        raise PermissionError("another program has the file open")
+
+    monkeypatch.setattr(module.os, "replace", locked)
+    loaded = list(InputHistory(path).load_history_strings())
+    assert len(loaded) == 1_000 and loaded[0] == "message 1009"
+    assert path.read_text(encoding="utf-8").count("+message") == 1_010, "left as it was"
+    assert not (tmp_path / "history.tmp").exists()
+
+
 def test_only_the_end_of_a_huge_file_is_read_and_a_cut_entry_is_dropped(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "MAX_READ_BYTES", 200)
     path = tmp_path / "history"

@@ -72,7 +72,10 @@ class InputHistory(History):
             with _locked(self.lock_path):
                 entries, rewrite = self._read()
                 if rewrite:
-                    self._rewrite(entries)
+                    try:
+                        self._rewrite(entries)
+                    except Exception as exc:  # noqa: BLE001 - the file stays long until a later session trims it
+                        log.debug("Input history at %s not trimmed: %s", self.path, exc)
         except Exception as exc:  # noqa: BLE001 - history must never break the chat
             log.debug("Input history not read from %s: %s", self.path, exc)
             return []
@@ -117,7 +120,11 @@ class InputHistory(History):
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
-        os.replace(temporary, self.path)
+        try:
+            os.replace(temporary, self.path)
+        except OSError:
+            temporary.unlink(missing_ok=True)
+            raise
 
 
 def _parse(data: bytes, *, cut: bool = False) -> list[str]:
