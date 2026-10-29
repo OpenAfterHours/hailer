@@ -2501,6 +2501,19 @@ def test_prompt_up_arrow_recalls_earlier_messages():
         assert type_at_prompt(reader, keys, screen, "\x1b[A\x1b[A\r") == "first"  # Up, Up, Enter
 
 
+def test_prompt_recalls_an_earlier_sessions_messages_from_the_history_file(tmp_path):
+    path = tmp_path / ".hailer" / "input_history"
+    with terminal() as (reader, keys, screen):
+        reader.history_file = path
+        assert type_at_prompt(reader, keys, screen, "first session\r") == "first session"
+        assert type_at_prompt(reader, keys, screen, "\x1b[200~two\nlines\x1b[201~\r") == "two\nlines"
+    with terminal() as (reader, keys, screen):
+        reader.history_file = path
+        assert type_at_prompt(reader, keys, screen, "\x1b[A\r") == "two\nlines", "a pasted block comes back whole"
+    with terminal() as (reader, keys, screen):  # the setting off: this session's history only
+        assert type_at_prompt(reader, keys, screen, "\x1b[Anew\r") == "new"
+
+
 def test_prompt_falls_back_to_plain_input_without_a_terminal(monkeypatch):
     monkeypatch.setattr(common, "_stdio_is_terminal", lambda: False)
     monkeypatch.setattr(Console, "input", lambda self, prompt="", **kw: "typed")

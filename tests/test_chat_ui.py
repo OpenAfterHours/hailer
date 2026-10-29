@@ -16,7 +16,7 @@ from prompt_toolkit.output.vt100 import Vt100_Output
 from rich.console import Console
 
 from hailer.chat_ui import ChatUI
-from hailer.models import AgentEvent, TurnSummary
+from hailer.models import AgentEvent, CompletionData, TurnSummary
 from hailer.transcript import ASCII, UNICODE, FooterData, glyphs_for
 
 PASTE_ON, PASTE_OFF = "\x1b[?2004h", "\x1b[?2004l"
@@ -24,13 +24,13 @@ FOOTER = FooterData(notebook="analysis.py", notebook_open=True, kernel="docker",
 
 
 @contextmanager
-def terminal(on_submit, footer=lambda: FOOTER, console=None):
+def terminal(on_submit, footer=lambda: FOOTER, console=None, **options):
     with create_pipe_input() as keys:
         screen, transcript = io.StringIO(), io.StringIO()
         size = [Size(rows=24, columns=100)]
         output = Vt100_Output(screen, lambda: size[0], term="xterm-256color")
         console = console or Console(file=transcript, force_terminal=False, color_system=None, width=90)
-        ui = ChatUI(console, on_submit, footer, pt_input=keys, pt_output=output)
+        ui = ChatUI(console, on_submit, footer, pt_input=keys, pt_output=output, **options)
         yield ui, keys, screen, transcript, size
 
 
@@ -924,3 +924,204 @@ def test_nothing_animates_while_the_chat_prepares():
             await asyncio.wait_for(running, 5)
 
     asyncio.run(scenario())
+
+
+# --------------------------------------------------------------------------- #
+# The command menu and the input history
+# --------------------------------------------------------------------------- #
+
+MENU_DATA = CompletionData(
+    notebooks=("analysis.py", "q2-review.py", "returns.py"), active_notebook="analysis.py",
+    skills=(("example-skill", "How this team writes period reports"),), prompts=("first-look",),
+    model="gpt-5.5", providers=("internal", "openai"),
+)
+MENU_HINTS = "↑↓ choose · tab complete · enter run · esc close"
+
+
+def hints(ui):
+    return "".join(text for _style, text in ui._hints()).strip()
+
+
+def test_slash_opens_the_command_menu_under_the_frame_and_keys_choose_and_close_it():
+    async def scenario():
+        submissions = []
+
+        async def submit(text):
+            submissions.append(text)
+
+        with terminal(submit, completions=lambda: MENU_DATA) as (ui, keys, screen, _transcript, _size):
+            windows = list(ui.application.layout.find_all_windows())
+            menu = next(index for index, window in enumerate(windows) if getattr(window.content, "text", None) == ui._menu_rows)
+            assert windows[menu - 1].content.text == ui._bottom_border and windows[menu + 1].content.text == ui._footer_row
+            running = await start(ui)
+            keys.send_text("/")
+            await until(ui._menu_open)
+            await until(lambda: "Commands and keys" in screen.getvalue())
+            assert hints(ui) == MENU_HINTS
+            assert ui.composer.window.render_info is not None
+            await until(lambda: (ui.application.ttimeoutlen, ui.application.timeoutlen) == (0.1, 0.3))  # Esc acts at once
+            for key, text in [("\t", "/help"), ("\t", "/status"), ("\x1b[Z", "/help"), ("\x1b[B", "/status"), ("\x1b[A", "/help")]:
+                keys.send_text(key)
+                await until(lambda text=text: ui.buffer.text == text)
+            keys.send_text("\x1b")
+            await until(lambda: not ui._menu_open())
+            assert ui.buffer.text == "/" and ui.application.is_running and not submissions
+            await until(lambda: (ui.application.ttimeoutlen, ui.application.timeoutlen) == (0.5, 1.0))
+            assert hints(ui) == "enter send · alt+enter new line"
+            ui.exit()
+            await asyncio.wait_for(running, 5)
+
+    asyncio.run(scenario())
+
+
+def test_enter_in_the_menu_runs_a_command_without_arguments_and_completes_the_others():
+    async def scenario():
+        submissions = []
+
+        async def submit(text):
+            submissions.append(text)
+
+        with terminal(submit, completions=lambda: MENU_DATA) as (ui, keys, _screen, _transcript, _size):
+            running = await start(ui)
+            keys.send_text("/he")
+            await until(ui._menu_open)
+            keys.send_text("\r")
+            await until(lambda: submissions == ["/help"] and not ui.busy)
+            keys.send_text("/no")
+            await until(ui._menu_open)
+            keys.send_text("\r")  # /notebook takes arguments: Enter completes it and its menu follows
+            await until(lambda: ui.buffer.text == "/notebook " and ui._menu_open())
+            assert [item.display_text for item in ui.buffer.complete_state.completions] == ["list", "new", "open", "close"]
+            keys.send_text("\r")  # the first, list, takes none: it runs
+            await until(lambda: submissions == ["/help", "/notebook list"] and not ui.busy)
+            keys.send_text("/notebook open q")
+            await until(ui._menu_open)
+            keys.send_text("\r")
+            await until(lambda: ui.buffer.text == "/notebook open q2-review.py")
+            await asyncio.sleep(0.2)
+            assert len(submissions) == 2 and not ui._menu_open(), "a name is sent by its own Enter"
+            keys.send_text("\r")
+            await until(lambda: submissions[-1] == "/notebook open q2-review.py" and not ui.busy)
+            keys.send_text("/model")  # typed in full: no menu, so Enter sends it as typed
+            await asyncio.sleep(0.3)
+            assert not ui._menu_open()
+            keys.send_text("\r")
+            await until(lambda: submissions[-1] == "/model")
+            ui.exit()
+            await asyncio.wait_for(running, 5)
+
+    asyncio.run(scenario())
+
+
+def test_esc_closes_the_menu_during_a_turn_and_only_then_cancels_it():
+    async def scenario():
+        submissions, cleaned = [], asyncio.Event()
+
+        async def submit(text):
+            submissions.append(text)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleaned.set()
+
+        with terminal(submit, completions=lambda: MENU_DATA) as (ui, keys, _screen, transcript, _size):
+            running = await start(ui)
+            keys.send_text("slow\r")
+            await until(lambda: ui.busy)
+            keys.send_text("/he")
+            await until(ui._menu_open)
+            assert hints(ui) == MENU_HINTS
+            keys.send_text("\r")  # runs /help, but a turn is running: the draft is kept, nothing queued
+            await until(lambda: "draft is kept" in ui.flash_text)
+            assert ui.buffer.text == "/help" and submissions == ["slow"]
+            keys.send_text("\x7f\x7f")
+            await until(lambda: ui.buffer.text == "/he")
+            keys.send_text("l")
+            await until(ui._menu_open)
+            keys.send_text("\x1b")
+            await until(lambda: not ui._menu_open())
+            await asyncio.sleep(0.5)
+            assert ui.busy and not cleaned.is_set() and ui.buffer.text == "/hel", "Esc closed the menu only"
+            ui._flash = None
+            assert hints(ui) == "esc cancel · your draft is kept"
+            keys.send_text("\x1b")
+            await asyncio.wait_for(cleaned.wait(), 2)
+            await until(lambda: not ui.busy)
+            assert transcript.getvalue().count("Cancelled.") == 1 and ui.buffer.text == "/hel"
+            ui.exit()
+            await asyncio.wait_for(running, 5)
+
+    asyncio.run(scenario())
+
+
+def test_history_persists_across_composers_and_its_suggestion_is_offered(tmp_path):
+    path = tmp_path / ".hailer" / "input_history"
+
+    async def submit(_text):
+        pass
+
+    async def first():
+        with terminal(submit, history_file=path) as (ui, keys, _screen, _transcript, _size):
+            running = await start(ui)
+            keys.send_text("Which region grew fastest?\r")
+            await until(lambda: not ui.busy and ui.buffer.text == "" and path.exists())
+            keys.send_text("\x1b[200~line one\nline two\x1b[201~\r")
+            await until(lambda: "line two" in path.read_text(encoding="utf-8") and not ui.busy)
+            ui.exit()
+            await asyncio.wait_for(running, 5)
+
+    async def second():
+        with terminal(submit, history_file=path) as (ui, keys, screen, _transcript, _size):
+            running = await start(ui)
+            await until(lambda: len(ui.buffer.history.get_strings()) == 2)
+            keys.send_text("\x1b[A")
+            await until(lambda: ui.buffer.text == "line one\nline two")
+            keys.send_text("\x1b[B")
+            await until(lambda: ui.buffer.text == "")
+            keys.send_text("Wh")
+            await until(ui._suggesting)
+            assert ui.buffer.suggestion.text == "ich region grew fastest?"
+            assert hints(ui) == "→ accept · enter send · alt+enter new line"
+            await until(lambda: "ich region grew fastest?" in screen.getvalue())
+            keys.send_text("\x1b[C")
+            await until(lambda: ui.buffer.text == "Which region grew fastest?")
+            ui.exit()
+            await asyncio.wait_for(running, 5)
+
+    asyncio.run(first())
+    asyncio.run(second())
+
+
+def test_a_slow_history_file_never_delays_the_first_render(tmp_path, monkeypatch):
+    from hailer.input_history import InputHistory
+
+    path = tmp_path / "input_history"
+    InputHistory(path).store_string("from last time")
+    release, readers = threading.Event(), []
+    original = InputHistory.load_history_strings
+
+    def slow(self):
+        readers.append(threading.current_thread())
+        release.wait(5)
+        return original(self)
+
+    monkeypatch.setattr(InputHistory, "load_history_strings", slow)
+
+    async def scenario():
+        async def submit(_text):
+            pass
+
+        with terminal(submit, history_file=path) as (ui, keys, _screen, _transcript, _size):
+            running = await start(ui)  # rendered while the file is still being read
+            keys.send_text("typing works")
+            await until(lambda: ui.buffer.text == "typing works" and readers)
+            assert readers[0] is not threading.current_thread(), "read on a worker thread"
+            release.set()
+            await until(lambda: ui.buffer.history.get_strings() == ["from last time"])
+            ui.exit()
+            await asyncio.wait_for(running, 5)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()

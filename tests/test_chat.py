@@ -781,3 +781,77 @@ def test_terminal_selection_keeps_pipes_plain_and_honours_override(monkeypatch, 
     monkeypatch.setattr(common, "_stdio_is_terminal", lambda: tty)
     monkeypatch.setenv("TERM", term)
     assert cli_chat._use_composer(common.CliOptions(plain=plain)) is expected
+
+
+# --------------------------------------------------------------------------- #
+# The command menu's data and the input history file
+# --------------------------------------------------------------------------- #
+
+
+def test_the_menus_notebook_names_are_listed_off_the_ui_loop_and_never_by_the_completer(harness, tmp_path):
+    from prompt_toolkit.completion import CompleteEvent
+    from prompt_toolkit.document import Document
+
+    from hailer.completion import SlashCompleter
+
+    harness.agent = AsyncFakeAgent()
+    harness.bundle = ContextBundle(
+        skills=[SkillInfo("example-skill", "How this team writes reports", tmp_path)], prompts={"first-look": tmp_path / "p.md"},
+    )
+    write_notebook(harness.config, "other")
+    sandbox = harness.sandbox
+    listed_on: list[threading.Thread] = []
+    list_notebooks = sandbox.list_notebooks
+
+    def listing() -> Any:
+        listed_on.append(threading.current_thread())
+        return list_notebooks()
+
+    sandbox.list_notebooks = listing  # type: ignore[method-assign]
+
+    async def scenario(controller: Any, ui: StubUI) -> None:
+        data = controller.completions()
+        assert "other.py" in data.notebooks and data.active_notebook == controller.notebook, "listed at startup"
+        assert data.skills == (("example-skill", "How this team writes reports"),) and data.prompts == ("first-look",)
+        assert data.model == "gpt-5.5" and "openai" in data.providers
+        listings = len(listed_on)
+        completer = SlashCompleter(controller.completions)
+        for text in ("/notebook open ", "/notebook close o", "/model ", "/skill ", "/prompt "):
+            assert list(completer.get_completions(Document(text), CompleteEvent()))
+        assert len(listed_on) == listings, "the completer reads the cached names"
+        write_notebook(harness.config, "made-by-hand")
+        await ui.submit("/notebook")
+        assert "made-by-hand.py" in controller.completions().notebooks, "refreshed after a /notebook command"
+        write_notebook(harness.config, "made-by-a-tool")
+        await ui.submit("a question")
+        assert "made-by-a-tool.py" in controller.completions().notebooks, "refreshed after a turn"
+
+    run_session(harness, scenario, sandbox=sandbox)
+    assert listed_on and threading.main_thread() not in listed_on, "never on the UI loop's thread"
+
+
+@pytest.mark.parametrize("on", [True, False], ids=["history-on", "history-off"])
+def test_the_composer_and_the_plain_prompt_keep_history_in_the_file_while_the_setting_is_on(harness, monkeypatch, on):
+    from dataclasses import replace
+
+    import hailer.chat_ui as chat_ui
+
+    harness.agent = AsyncFakeAgent()
+    harness.config = replace(harness.config, input_history=on)
+    options: dict[str, Any] = {}
+
+    class Composer(StubUI):
+        def __init__(self, console: Console, submit: Any, footer: Any, **kwargs: Any) -> None:
+            options.update(kwargs)
+
+            async def scenario(ui: StubUI) -> None:
+                await ui.submit("/exit")
+
+            super().__init__(console, submit, footer, scenario)
+
+    monkeypatch.setattr(chat_ui, "ChatUI", Composer)
+    controller = cli_chat.ChatLoop(Console(file=io.StringIO()), harness.config, common.CliOptions())
+    expected = harness.config.workspace / ".hailer" / "input_history" if on else None
+    assert controller.reader.history_file == expected
+    asyncio.run(controller.run_interactive())
+    assert options == {"completions": controller.completions, "history_file": expected}
