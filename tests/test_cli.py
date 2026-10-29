@@ -112,12 +112,14 @@ class FakeAgent:
             raise self.fail_with  # for Ctrl+C the real agent has cancelled the turn before re-raising
         final = f"Answer to: {text}"
         if on_event:
-            on_event(AgentEvent("tool_call", "marimo_execute"))
+            # The real agent's pair: a call with its id, then the result with the same id.
+            on_event(AgentEvent("tool_call", "marimo_execute", {"arguments": "{'code': 'df.head()'}", "args": {"code": "df.head()"}, "id": "call_1"}))
+            on_event(AgentEvent("tool_result", "marimo_execute", {"id": "call_1", "ok": True, "summary": "5 rows", "seconds": 0.2}))
             if self.stream:
                 # a model can stream interim commentary and then the final answer
                 for chunk in ("Checking the ", "notebook...", "Answer ", "to: ", text):
                     on_event(AgentEvent("message_delta", chunk))
-        return TurnSummary(final_response=final, thread_id=self.thread_id, input_tokens=10, output_tokens=5)
+        return TurnSummary(final_response=final, thread_id=self.thread_id, input_tokens=10, output_tokens=5, steps=1)
 
     def new_thread(self):
         self.new_threads += 1
@@ -461,6 +463,17 @@ def test_notebook_preparation_cancel_stops_real_session_poll(harness, monkeypatc
     asyncio.run(scenario())
     assert harness.opened == [harness.url]
     assert "No kernel session yet" not in output.getvalue(), "cancellation is not a timeout"
+
+
+@pytest.mark.parametrize(("waited", "expected"), [("default", True), (None, False)], ids=["opened", "timed-out"])
+def test_notebook_preparation_reports_whether_a_session_came(harness, waited, expected):
+    """The composer's footer shows the notebook as open or not open from this result."""
+    harness.client = FakeClient(session=None)  # not open yet: the wait decides
+    harness.waited_session = waited
+    output = io.StringIO()
+    opened = asyncio.run(cli_chat._prepare_notebook(Console(file=output), harness.sandbox, "analysis.py", open_browser=True))
+    assert opened is expected
+    assert ("No kernel session yet" in output.getvalue()) is not expected
 
 
 def test_turn_prints_answer_and_persists_session(harness):
@@ -1357,13 +1370,41 @@ def test_commentary_deltas_are_not_printed_and_answer_appears_once(harness):
     assert "Checking the notebook" not in result.output
 
 
-def test_progress_line_shows_the_tool_in_use(harness):
-    console = Console(force_terminal=False, width=100, highlight=False, color_system=None)
+def test_plain_turn_prints_a_row_per_result_by_id_then_the_answer_once_unwrapped():
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=False, width=60, highlight=False, color_system=None, soft_wrap=True)
     display = common._TurnDisplay(console)
-    display(common.AgentEvent("tool_call", "marimo_execute", {"arguments": "{'code': 'df.head()'}"}))
-    assert display.last_activity == "marimo_execute"
-    display(common.AgentEvent("tool_call", "notebook_open\nq2"))
-    assert display.last_activity == "notebook_open q2"  # one line, whatever the event carries
+    display.start()
+    display(AgentEvent("tool_call", "notebook_cells", {"args": {}, "id": "a"}))
+    display(AgentEvent("tool_call", "notebook_open", {"args": {"notebook": "q2\x1b[2J\nnext.py"}, "id": "b"}))
+    assert output.getvalue() == ""  # nothing live: a row once its result arrives
+    display(AgentEvent("tool_result", "notebook_open", {"id": "b", "ok": False, "summary": "notebook not found", "seconds": 0.3}))
+    display(AgentEvent("tool_result", "notebook_cells", {"id": "a", "ok": True, "summary": "6 cells", "seconds": 0.4}))
+    display(AgentEvent("message_delta", "streamed commentary"))
+    answer = "A final answer that is a good deal longer than the sixty columns of this console."
+    display.finish(TurnSummary(answer, "thread", duration_ms=1500, input_tokens=3140, output_tokens=612, steps=2))
+    lines = [line.rstrip() for line in output.getvalue().splitlines()]
+    assert re.fullmatch(r"  ✗ Opened a notebook\s+q2\[2J next\.py · notebook not found\s+0\.3s", lines[0])  # one line
+    assert re.fullmatch(r"  ✓ Read the notebook\s+6 cells\s+0\.4s", lines[1])
+    assert lines[2:] == ["", "Hailer >", answer, "", "  2 steps · 1.5s · 3.1k in · 612 out", ""]
+    assert "streamed" not in output.getvalue() and "\x1b" not in output.getvalue()
+
+
+def test_plain_turn_ends_open_steps_honestly_on_ctrl_c_or_an_error(harness):
+    class StoppedAgent(FakeAgent):
+        def run_turn(self, text, *, on_event=None, skill=None, preamble=None):
+            self.turns.append((text, None))
+            on_event(AgentEvent("tool_call", "marimo_execute", {"args": {"code": "x = 1\n"}, "id": "a"}))
+            raise KeyboardInterrupt if text == "cancel" else HailerError("The model endpoint failed.", hint="Try again.")
+
+    harness.agent = StoppedAgent()
+    result = chat(input_text="cancel\nfail\n/exit\n")
+    assert result.exit_code == 0, result.output
+    out = result.output
+    assert re.search(r"▲ Ran code\s+1 line · cancelled, effect unknown", out)
+    assert re.search(r"▲ Ran code\s+1 line · no result, effect unknown", out)
+    assert out.index("cancelled, effect unknown") < out.index("Interrupted.") < out.index("no result") < out.index("The model endpoint failed.")
+    assert "    Try again." in out and "Bye." in out
 
 
 # --------------------------------------------------------------------------- #

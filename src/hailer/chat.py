@@ -13,7 +13,7 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from rich.console import Console
+from rich.console import Console, RenderableType
 from rich.table import Table
 from rich.text import Text
 
@@ -21,6 +21,7 @@ from hailer import notebooks
 from hailer.errors import HailerError, MarimoUnavailableError, NoSessionError
 from hailer.models import ContextBundle, HailerConfig, MarimoSession, ProviderConfig, SessionState, SkillInfo, TurnSummary
 from hailer.session import EXIT_COMMANDS, help_text, load_session, parse_command, save_session
+from hailer.transcript import FooterData, NotebookRow, console_glyphs, detail_card, help_card, notebook_table, status_card
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
     from hailer.sandbox import MarimoSandbox
@@ -28,6 +29,19 @@ if TYPE_CHECKING:  # pragma: no cover - annotations only
 
 class _CommandStopped(Exception):
     """A blocking notebook operation reached a cooperative cancellation point."""
+
+
+def _when(timestamp: float) -> str:
+    """A file time in the composer's notebook list: "today 14:02", "yesterday", "12 Oct", "12 Oct 2025"."""
+    moment, today = datetime.fromtimestamp(timestamp), datetime.now()
+    days = (today.date() - moment.date()).days
+    if days == 0:
+        return f"today {moment:%H:%M}"
+    if days == 1:
+        return "yesterday"
+    if moment.year == today.year:
+        return f"{moment.day} {moment:%b}"
+    return f"{moment.day} {moment:%b %Y}"
 
 
 class ChatController:
@@ -43,6 +57,12 @@ class ChatController:
             sandbox.notice = lambda text: self.console.print(text, style="yellow", markup=False)
         #: The active notebook's name (the state file is the truth; see _sync_active_notebook).
         self.notebook: str = notebooks.load_active_notebook(config)
+        #: Whether it has a kernel session (a browser tab), as last learned (startup, a switch,
+        #: /status, /notebook, /exec); None: not known. The composer's footer shows it.
+        self.notebook_open: bool | None = None
+        #: True while the inline composer runs (cards instead of plain lines).
+        self.interactive = False
+        self._link_cache: tuple[str | None, str] = (None, "")
         self.state: SessionState = load_session(config.workspace)
         self.bundle: ContextBundle = ContextBundle()
         self.agent: Any = None
@@ -137,15 +157,42 @@ class ChatController:
         thread_id = await self.agent.astart(resume_thread_id=resume, forget_thread_id=forget)
         self._started(thread_id, resume)
 
-    def context_line(self) -> str:
-        model = self.state.model or self.config.model.name
-        return f"Notebook: {self.notebook} | Model: {model} | Context: {len(self.bundle.context_files)} files"
+    def footer(self) -> FooterData:
+        """The composer's footer, from state this controller already holds: it is read on every
+        redraw, so it never asks marimo, the agent or the disk anything."""
+        return FooterData(
+            notebook=self.notebook,
+            notebook_open=self.notebook_open,
+            kernel=self.config.kernel.runtime,
+            model=self.state.model or self.config.model.name,
+            turns=self.state.turns,
+            tokens=self.state.input_tokens + self.state.output_tokens,
+            notebook_url=self._notebook_link(),
+        )
+
+    def _notebook_link(self) -> str:
+        """The active notebook's URL without its token (it is shown, not opened), made once per name."""
+        name, url = self._link_cache
+        if name != self.notebook:
+            url = ""
+            if self.sandbox is not None:
+                try:
+                    url = self.sandbox.notebook_url(self.notebook)
+                except Exception:  # noqa: BLE001 - an odd name only loses the link
+                    url = ""
+            self._link_cache = (self.notebook, url)
+        return url
+
+    def _note_session(self, name: str, session: MarimoSession | None, *, known: bool = True) -> None:
+        """Remember whether ``name`` has a kernel session when it is the active notebook."""
+        if notebooks.same_name(name, self.notebook):
+            self.notebook_open = (session is not None) if known else None
 
     async def run_interactive(
         self,
         ui_factory: Any = None,
         *,
-        prepare_notebook: Callable[[], Awaitable[None]] | None = None,
+        prepare_notebook: Callable[[], Awaitable[bool | None]] | None = None,
         timings: Any = None,
     ) -> None:
         if ui_factory is None:
@@ -154,8 +201,9 @@ class ChatController:
             ui_factory = ChatUI
         original_console = self.console
         self.startup_failed = False
-        self.ui = ui_factory(original_console, self.ahandle, self.context_line)
+        self.ui = ui_factory(original_console, self.ahandle, self.footer)
         self.console = self.ui.console
+        self.interactive = True
 
         async def prepare() -> bool:
             async def agent_ready() -> None:
@@ -165,7 +213,9 @@ class ChatController:
 
             async def notebook_ready() -> None:
                 if prepare_notebook is not None:
-                    await prepare_notebook()
+                    opened = await prepare_notebook()
+                    if isinstance(opened, bool):  # the CLI's wait reports whether a session came
+                        self.notebook_open = opened
                 if timings is not None:
                     timings.mark("notebook_wait_complete")
 
@@ -215,6 +265,7 @@ class ChatController:
                     await self.ui.flush()
                 finally:
                     self.console = original_console
+                    self.interactive = False
 
     async def ahandle(self, text: str) -> None:
         """Execute one accepted submission. The UI owns busy gating and user echo."""
@@ -261,7 +312,7 @@ class ChatController:
                 self._pending_preamble = None
                 raise
             self._pending_preamble = None
-            self.ui.finish(summary.final_response)
+            self.ui.finish(summary)
             self._record_turn(summary)
         finally:
             # A tool may have switched notebooks before cancellation or failure.
@@ -309,7 +360,7 @@ class ChatController:
                 summary: TurnSummary = self.agent.run_turn(text, on_event=display, skill=skill, preamble=preamble)
             except KeyboardInterrupt:  # the agent has already cancelled the turn
                 self._pending_preamble = None  # the notice went out with the interrupted turn
-                display.stop()
+                display.cancel()
                 self.console.print("\nInterrupted.")
                 return
             except BaseException:
@@ -351,9 +402,11 @@ class ChatController:
         if active == self.notebook:
             return False
         self.notebook = active
+        self.notebook_open = None
         self.console.print(Text(f"Active notebook is now {active}.", style="dim"))
         if open_browser:
             sandbox, session, _err = self._cli._marimo_state(self.sandbox, active)
+            self._note_session(active, session, known=sandbox is not None)
             if sandbox is not None and session is None:
                 url = sandbox.notebook_url(active, with_token=True)
                 self.console.print(f"Opening {url} in your browser...", markup=False)
@@ -365,7 +418,10 @@ class ChatController:
     def _command(self, command: Any) -> None:
         name, args = command.name, command.args
         if name == "help":
-            self.console.print(help_text(), markup=False)
+            if self.interactive:
+                self.console.print(help_card(self._glyphs()))
+            else:
+                self.console.print(help_text(), markup=False)
         elif name == "status":
             self._status()
         elif name == "new":
@@ -407,6 +463,10 @@ class ChatController:
     def _status(self) -> None:
         self._sync_active_notebook(open_browser=False)  # a late tool call may have switched notebooks
         sandbox, session, _err = self._cli._marimo_state(self.sandbox, self.notebook)
+        self._note_session(self.notebook, session, known=sandbox is not None)
+        if self.interactive:
+            self._status_card(sandbox, session)
+            return
         if sandbox is None:
             marimo = "not running"
         elif session is None:
@@ -431,6 +491,37 @@ class ChatController:
             style = self._cli._kernel_style(self.config) if label == "Kernel" else ""  # unsafe-local: a warning
             table.add_row(Text(label), Text(value, style=style))
         self.console.print(table)
+
+    def _status_card(self, sandbox: Any, session: MarimoSession | None) -> None:
+        """/status in the composer: the plain table's information, grouped, with a health mark on
+        what can be wrong (credentials, an unisolated kernel, marimo, the notebook's tab)."""
+        g = self._glyphs()
+        credentials = self._credentials_line()
+        missing = credentials == "unknown provider" or " missing (" in credentials
+        model = g.join(self.state.model or self.config.model.name, self._active_provider_line(), credentials)
+        unsafe = bool(self._cli._kernel_style(self.config))  # unsafe-local: a warning
+        marimo: tuple[str | None, str] = ("warn", "not running")
+        notebook: tuple[str | None, str] = (None, self.notebook)
+        if sandbox is not None:
+            marimo = ("ok", sandbox.server.url)
+            notebook = (
+                ("ok", g.join(self.notebook, f"session {session.session_id}")) if session is not None
+                else ("off", g.join(self.notebook, "not open in a browser"))
+            )
+        tokens = f"{self.state.input_tokens} in / {self.state.output_tokens} out tokens"
+        rows: list[tuple[str | None, str, str]] = [
+            ("warn" if missing else "ok", "Model", model),
+            ("warn" if unsafe else "ok", "Kernel", self._cli._kernel_line(self.config)),
+            (marimo[0], "Marimo", marimo[1]),
+            (notebook[0], "Notebook", notebook[1]),
+            (None, "Notebooks", self._cli._relative(self.config.notebooks_root, self.config.workspace)),
+            (None, "Thread", g.join(self.state.thread_id or "-", self._cli._plural(self.state.turns, "turn"), tokens)),
+            (None, "Web access", self._cli._web_line(self.config)),
+        ]
+        self.console.print(status_card(g, rows))
+
+    def _glyphs(self) -> Any:
+        return console_glyphs(self.console)
 
     def _active_provider(self) -> ProviderConfig | None:
         provider_id = self.state.provider or self.config.model.provider
@@ -501,6 +592,7 @@ class ChatController:
             self.console.print("Usage: /exec <python code>  (runs in the active notebook's kernel; the model does not see it)", markup=False)
             return
         sandbox, session, err = self._cli._marimo_state(self.sandbox, self.notebook)
+        self._note_session(self.notebook, session, known=sandbox is not None)
         if sandbox is None:
             self.console.print("Marimo is not running.", markup=False)
             return
@@ -562,6 +654,7 @@ class ChatController:
         if recent:
             out.print("Recent:    " + ", ".join(recent[:5]), markup=False)
         sandbox, session, _err = self._cli._marimo_state(self.sandbox, self.notebook)
+        self._note_session(self.notebook, session, known=sandbox is not None)
         if sandbox is None:
             out.print("Marimo:    not running", markup=False)
         else:
@@ -593,7 +686,20 @@ class ChatController:
         if not infos:
             self.console.print(f"No notebooks in {folder} yet. Create one with /notebook new <name>.", markup=False)
             return
-        _sandbox, _client, sessions = self._server_sessions()
+        sandbox, _client, sessions = self._server_sessions()
+        if sandbox is not None:
+            self._note_session(self.notebook, self._cli._session_for(sessions, self.notebook))
+        note = f"{self._cli._plural(len(infos), 'notebook')} in {folder}. /notebook open <name> switches."
+        if self.interactive:
+            rows = [
+                NotebookRow(
+                    info.name, _when(info.modified), f"{info.size / 1024:.1f} KB",
+                    active=info.name == self.notebook, open=self._cli._session_for(sessions, info.name) is not None,
+                )
+                for info in infos
+            ]
+            self.console.print(notebook_table(self._glyphs(), rows, note))
+            return
         table = Table.grid(padding=(0, 2))
         for info in infos:
             markers = []
@@ -609,7 +715,7 @@ class ChatController:
                 Text(", ".join(markers)),
             )
         self.console.print(table)
-        self.console.print(f"{self._cli._plural(len(infos), 'notebook')} in {folder}. /notebook open <name> switches.", markup=False)
+        self.console.print(note, markup=False)
 
     def _notebook_new(self, rest: str) -> None:
         tokens = rest.split()
@@ -649,6 +755,7 @@ class ChatController:
             self.console.print(f"{name} is not open (no kernel session).", markup=False)
             return
         client.shutdown_session(session.session_id)
+        self._note_session(name, None)
         self.console.print(f"Closed {name} (session {session.session_id}); its browser tab is disconnected.", markup=False)
         if notebooks.same_name(name, self.notebook):
             self.console.print(f"It stays the active notebook; /notebook open {name.removesuffix('.py')} reopens it.", markup=False)
@@ -657,6 +764,7 @@ class ChatController:
         """Make ``name`` the active notebook for this chat, the agent's tools and the next session."""
         notebooks.save_active_notebook(self.config, name)
         self.notebook = name
+        self.notebook_open = None
         self._copy_notebooks_back()
         # Queue the notice first: if the wait for the browser tab is interrupted (Ctrl+C) or marimo
         # fails, the switch has still happened and the model must hear about it.
@@ -684,6 +792,7 @@ class ChatController:
         name = self.notebook
         self._check_stopped()
         sandbox, session, _err = self._cli._marimo_state(self.sandbox, name)
+        self._note_session(name, session, known=sandbox is not None)
         self._check_stopped()
         if sandbox is None:
             self.console.print("Marimo is not running; the notebook opens once it is (uvx hailer notebook).", markup=False)
@@ -703,6 +812,7 @@ class ChatController:
                     client, name, self._cli.SWITCH_SESSION_TIMEOUT_SEC,
                     should_stop=self._stop_event.is_set,
                 )
+        self._note_session(name, session)
         self._check_stopped()
         if session is None:
             self.console.print(f"No kernel session yet. Open {url} in your browser.", style="yellow", markup=False)
@@ -724,6 +834,9 @@ class ChatController:
         return sum(1 for line in (result.stdout or "").splitlines() if line.strip())
 
     def _context(self) -> None:
+        if self.interactive:
+            self._context_card()
+            return
         bundle = self.bundle
         out = self.console
         if bundle.context_files:
@@ -749,6 +862,31 @@ class ChatController:
         out.print(f"Web access: {self._cli._web_line(self.config)}", markup=False)
         for warning in bundle.warnings:
             out.print(self._cli._labelled("warn", "yellow", f"  {warning}"))
+
+    def _context_card(self) -> None:
+        """/context in the composer: the plain lines' lists, one item per row."""
+        bundle, workspace = self.bundle, self.config.workspace
+
+        def none(folder: Any) -> list[RenderableType | str]:
+            return [Text(f"none ({self._cli._relative(folder, workspace)})", style="dim")]
+
+        files: list[RenderableType | str] = []
+        for path in bundle.context_files:
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = 0
+            files.append(Text.assemble(self._cli._relative(path, workspace), (f"  ({size} bytes)", "dim")))
+        skills: list[RenderableType | str] = [Text.assemble(skill.name, (f"  {skill.description}", "dim")) for skill in bundle.skills]
+        sections: list[tuple[str, list[RenderableType | str]]] = [
+            ("Context files", files or none(self.config.context_dir)),
+            ("Skills", skills or none(self.config.skills_dir)),
+            ("Prompts", [", ".join(sorted(bundle.prompts))] if bundle.prompts else none(self.config.prompts_dir)),
+            ("Web access", [self._cli._web_line(self.config)]),
+        ]
+        if bundle.context_files:
+            sections.insert(1, ("", [Text("sent with every session", style="dim")]))
+        self.console.print(detail_card(self._glyphs(), sections, bundle.warnings))
 
     def _skill(self, args: str) -> None:
         request = self._skill_request(args)

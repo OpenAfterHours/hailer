@@ -98,15 +98,16 @@ def _run_chat_loop(
     opts: CliOptions,
     sandbox: MarimoSandbox | None = None,
     *,
-    prepare_notebook: Callable[[Console], Awaitable[None]] | None = None,
+    prepare_notebook: Callable[[Console], Awaitable[bool | None]] | None = None,
     timings: StartupTimings | None = None,
 ) -> None:
     """Start the agent and run the REPL; exit code 1 when the agent cannot start."""
     loop = ChatLoop(console, config, opts, sandbox)
     if _use_composer(opts):
-        async def prepare() -> None:
+        async def prepare() -> bool | None:
             if prepare_notebook is not None:
-                await prepare_notebook(loop.console)
+                return await prepare_notebook(loop.console)
+            return None
 
         try:
             asyncio.run(loop.run_interactive(prepare_notebook=prepare, timings=timings))
@@ -229,8 +230,9 @@ def _wait_for_notebook(
     open_browser: bool,
     should_stop: Callable[[], bool] | None = None,
     show_status: bool = True,
-) -> None:
-    """Open ``notebook`` and poll its session, stopping between blocking operations.
+) -> bool | None:
+    """Open ``notebook`` and poll its session, stopping between blocking operations. Returns
+    whether it has a session (the composer's footer shows it); None when stopped.
 
     The live composer owns its activity display, so its background preparation
     suppresses the Rich spinner. Cancellation never leaves a later browser open
@@ -238,44 +240,45 @@ def _wait_for_notebook(
     """
     stopped = should_stop or (lambda: False)
     if stopped():
-        return
+        return None
     client = sandbox.client(notebook=notebook, token_in_links=True)
     url = sandbox.notebook_url(notebook, with_token=True)
     if stopped():
-        return
+        return None
     try:
         session = client.resolve_session(notebook)
     except HailerError:
         session = None
     if stopped():
-        return
+        return None
     if session is not None:
         console.print(f"Notebook is open (session {session.session_id}).", markup=False)
-        return
+        return True
     if open_browser:
         console.print(f"Opening {url} in your browser...", markup=False)
         common._open_browser(url)
     else:
         console.print(f"Open {url} in your browser.", markup=False)
     if stopped():
-        return
+        return None
     console.print(APP_VIEW_HINT, markup=False)
     status = console.status("Waiting for the notebook to open...") if show_status else nullcontext()
     with status:
         session = common._wait_for_session(client, notebook, SESSION_TIMEOUT_SEC, should_stop=should_stop)
     if stopped():
-        return
+        return None
     if session is None:
         console.print(
             f"No kernel session yet. Open {url} in your browser; the agent reports the notebook state when asked.",
             style="yellow",
             markup=False,
         )
-    else:
-        console.print(f"Notebook is open (session {session.session_id}).", markup=False)
+        return False
+    console.print(f"Notebook is open (session {session.session_id}).", markup=False)
+    return True
 
 
-async def _prepare_notebook(console: Console, sandbox: MarimoSandbox, notebook: str, *, open_browser: bool) -> None:
+async def _prepare_notebook(console: Console, sandbox: MarimoSandbox, notebook: str, *, open_browser: bool) -> bool | None:
     """Wait off the UI loop and settle the worker before the kernel may be stopped.
 
     Cancelling ``to_thread`` alone abandons its work. The stop flag ends polling
@@ -288,7 +291,7 @@ async def _prepare_notebook(console: Console, sandbox: MarimoSandbox, notebook: 
         open_browser=open_browser, should_stop=stop.is_set, show_status=False,
     ))
     try:
-        await asyncio.shield(task)
+        return await asyncio.shield(task)
     except asyncio.CancelledError:
         stop.set()
         while not task.done():
@@ -329,8 +332,8 @@ def _run_session(console: Console, config: HailerConfig, opts: CliOptions, *, po
         _startup_panel(console, config, notebook)
         timings.mark("panel_shown")
 
-        async def prepare_notebook(chat_console: Console) -> None:
-            await _prepare_notebook(chat_console, running, notebook, open_browser=open_browser)
+        async def prepare_notebook(chat_console: Console) -> bool | None:
+            return await _prepare_notebook(chat_console, running, notebook, open_browser=open_browser)
 
         _run_chat_loop(
             console, config, opts, running,

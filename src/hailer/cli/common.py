@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +36,8 @@ from hailer.models import (
     ProviderConfig,
     TurnSummary,
 )
+from hailer.steps import Receipt, StepTracker
+from hailer.transcript import callout, console_glyphs, plain_step_row, turn_stats
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only; the runtimes import it when a kernel starts
     from hailer.sandbox import MarimoSandbox
@@ -202,8 +205,10 @@ def _wait_for_session(
 
 
 def _print_error(console: Console, err: HailerError, *, verbose: bool = False) -> None:
-    # Error text can contain "[web]" / "[model_providers.x]" which Rich markup would swallow.
-    console.print(str(err), style="red", markup=False)
+    """The error as a callout: a red ``✗`` line, then its hint lines indented beneath (the text of
+    both unchanged). Hint lines are printed as they are, so a URL in one stays a single line."""
+    # Error text can contain "[web]" / "[model_providers.x]": Text never reads Rich markup.
+    console.print(callout(console_glyphs(console), "fail", str(err)))
     if err.hint:
         for line in str(err.hint).splitlines():
             console.print(f"    {line}", markup=False)
@@ -212,7 +217,7 @@ def _print_error(console: Console, err: HailerError, *, verbose: bool = False) -
 
 
 def _print_unexpected(console: Console, exc: BaseException, *, verbose: bool) -> None:
-    console.print(f"Unexpected error: {type(exc).__name__}: {exc}", style="red", markup=False)
+    console.print(callout(console_glyphs(console), "fail", f"Unexpected error: {type(exc).__name__}: {exc}"))
     if verbose:
         console.print(traceback.format_exc(), markup=False)
     else:
@@ -532,54 +537,61 @@ def _make_line_reader(console: Console) -> _LineReader:
     return _LineReader(console, interactive=interactive)
 
 
-@dataclass
 class _TurnDisplay:
-    """Drives the progress line for one turn and prints the final answer exactly once.
+    """Prints one plain-mode turn line by line: a row for each step as its result arrives (the
+    composer's rows as plain text), then the answer exactly once and the turn's footer. No live
+    area, spinner or cursor control (pipes, ``--plain``, ``TERM=dumb``), and nothing is cut to the
+    terminal width.
 
     Message deltas are not printed as they arrive: a model can write interim commentary next
     to its tool calls and then the final answer, and streaming both printed the answer twice.
-    The spinner shows the latest tool instead, and ``finish`` prints ``final_response``.
+    ``finish`` prints ``final_response``.
     """
 
-    console: Console
-    status: Any = None
-    last_activity: str = ""
-    deltas: int = 0
+    def __init__(self, console: Console) -> None:
+        self.console = console
+        self.glyphs = console_glyphs(console)
+        self.steps = StepTracker()
+        self.started = time.monotonic()
 
     def start(self) -> None:
-        self.status = self.console.status("Thinking...", spinner="dots")
-        self.status.start()
+        self.steps = StepTracker()
+        self.started = time.monotonic()
 
     def stop(self) -> None:
-        if self.status is not None:
-            self.status.stop()
-            self.status = None
+        """The turn ended without an answer (an error): rows for the steps that were left."""
+        self._rows(self.steps.finish())
 
-    def _update(self, text: str) -> None:
-        if self.status is not None:
-            self.status.update(Text(text))
+    def cancel(self) -> None:
+        """Ctrl+C: the running steps may still finish, so their effect is unknown."""
+        self._rows(self.steps.cancel())
+
+    def _rows(self, receipts: list[Receipt]) -> None:
+        for receipt in receipts:
+            self.console.print(plain_step_row(self.glyphs, receipt, self.console.width))
 
     def __call__(self, event: AgentEvent) -> None:
-        if event.kind == "message_delta":
-            self.deltas += 1
-            if self.deltas == 1:
-                self._update("Writing reply...")
-            return
         if event.kind == "tool_call":
-            width = max(20, self.console.width - 12)
-            text = event.text.replace("\n", " ")
-            self.last_activity = text[: width - 1] + "…" if len(text) > width else text
-            self._update(f"Using: {self.last_activity}")
-            return
-        if event.kind == "status" and event.text:
-            self._update(event.text)
+            self.steps.call(event)
+        elif event.kind == "tool_result":
+            receipt = self.steps.result(event)
+            self._rows([receipt] if receipt is not None else [])
 
     def finish(self, summary: TurnSummary) -> None:
-        self.stop()
+        self._rows(self.steps.finish())
+        elapsed = summary.duration_ms / 1000 if summary.duration_ms is not None else time.monotonic() - self.started
         final = (summary.final_response or "").strip()
+        if self.steps.count:
+            self.console.print()
         self.console.print(Text(ANSWER_HEADER, style="dim"))
         if final:
             self.console.print(final, markup=False)
         else:
             self.console.print(Text("(no reply)", style="dim"))
         self.console.print()
+        stats = turn_stats(
+            self.glyphs, steps=summary.steps, elapsed=elapsed, input_tokens=summary.input_tokens, output_tokens=summary.output_tokens,
+        )
+        if stats:
+            self.console.print(Text(f"  {stats}", style="dim"))
+            self.console.print()

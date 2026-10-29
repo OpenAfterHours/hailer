@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import re
 import threading
 import time
 from collections.abc import Awaitable, Callable
@@ -19,6 +20,7 @@ from hailer import notebooks
 from hailer.errors import HailerError
 from hailer.models import ContextBundle, SessionState, SkillInfo
 from hailer.session import load_session, save_session
+from hailer.transcript import FooterData
 from test_cli import FakeAgent, Harness, harness, runner, url_for, write_notebook  # noqa: F401 - shared offline fixture
 
 
@@ -85,6 +87,7 @@ class StubUI:
         self.context = context
         self.scenario = scenario
         self.answers: list[str] = []
+        self.summaries: list[Any] = []
         self.events: list[Any] = []
         self.activities: list[str] = []
         self.exited = False
@@ -102,9 +105,10 @@ class StubUI:
             return
         await self.scenario(self)
 
-    def finish(self, text: str) -> None:
-        self.answers.append(text)
-        self.console.print(text, markup=False)
+    def finish(self, summary: Any) -> None:
+        self.answers.append(summary.final_response)
+        self.summaries.append(summary)
+        self.console.print(summary.final_response, markup=False)
 
     def on_event(self, event: Any) -> None:
         self.events.append(event)
@@ -172,7 +176,7 @@ def test_async_model_and_new_reset_thread_once_and_persist_counters(harness):
         await ui.submit("/model gpt-new")
         assert harness.agent.new_threads == 1
         assert harness.agent.model == ("gpt-new", None)
-        assert "Model: gpt-new" in ui.context()
+        assert ui.context().model == "gpt-new"
         saved = load_session(harness.config.workspace)
         assert (saved.turns, saved.input_tokens, saved.output_tokens) == (0, 0, 0)
         assert saved.model == "gpt-new"
@@ -201,7 +205,7 @@ def test_async_prompt_skill_and_reload_share_normal_turn_accounting(harness):
         harness.bundle = ContextBundle(context_text="Updated instructions", context_files=[harness.config.context_dir / "a.md"])
         await ui.submit("/reload")
         assert harness.agent.bundle is harness.bundle
-        assert "Context: 1 files" in ui.context()
+        assert controller.bundle is harness.bundle and len(controller.bundle.context_files) == 1
         await ui.submit("next")
         saved = load_session(harness.config.workspace)
         assert (saved.turns, saved.input_tokens, saved.output_tokens) == (3, 30, 15)
@@ -212,6 +216,101 @@ def test_async_prompt_skill_and_reload_share_normal_turn_accounting(harness):
     assert all(output.count(answer) == 1 for answer in ui.answers)
     assert "Checking the notebook..." not in output  # interim deltas remain activity, never duplicate the final
     assert harness.context_loads == 2
+
+
+def test_footer_data_comes_from_held_state_and_its_link_has_no_token(harness, monkeypatch):
+    harness.agent = AsyncFakeAgent()
+
+    async def scenario(controller: Any, ui: StubUI) -> None:
+        made: list[tuple[str, dict]] = []
+        original = controller.sandbox.notebook_url
+        monkeypatch.setattr(
+            controller.sandbox, "notebook_url", lambda name, **kwargs: made.append((name, kwargs)) or original(name, **kwargs),
+        )
+        footer = ui.context()
+        assert isinstance(footer, FooterData)
+        assert (footer.notebook, footer.kernel, footer.model) == (controller.notebook, harness.config.kernel.runtime, harness.config.model.name)
+        assert footer.notebook_open is None  # nothing learned yet (the stub skips the CLI's notebook wait)
+        assert footer.notebook_url.startswith(harness.server.url) and "access_token" not in footer.notebook_url
+        for _ in range(5):
+            ui.context()
+        assert made == [(controller.notebook, {})]  # once per name, never signed: redraws ask nothing
+        await ui.submit("hello")
+        assert (ui.context().turns, ui.context().tokens) == (1, 15)
+        await ui.submit("/status")
+        assert ui.context().notebook_open is True  # /status learned the session
+        await ui.submit("/notebook close")
+        assert ui.context().notebook_open is False
+
+    run_session(harness, scenario)
+
+
+@pytest.mark.parametrize("opened", [True, False, None], ids=["open", "not-open", "stopped"])
+def test_startup_notebook_wait_sets_the_footer_notebook_state(harness, opened):
+    harness.agent = AsyncFakeAgent()
+    controller = cli_chat.ChatLoop(Console(file=io.StringIO()), harness.config, common.CliOptions())
+    seen: list[Any] = []
+
+    async def prepare_notebook() -> bool | None:
+        return opened
+
+    async def scenario(ui: StubUI) -> None:
+        seen.append(ui.context().notebook_open)
+        await ui.submit("/exit")
+
+    def factory(console: Console, submit: Any, footer: Any) -> StubUI:
+        return StubUI(console, submit, footer, scenario)
+
+    asyncio.run(controller.run_interactive(ui_factory=factory, prepare_notebook=prepare_notebook))
+    assert seen == [opened]
+
+
+def test_composer_cards_keep_every_piece_of_plain_information(harness):
+    harness.agent = AsyncFakeAgent()
+    harness.agent.key_source = "keyring"
+    workspace = harness.config.workspace
+    (workspace / "ctx.md").write_text("hello", encoding="utf-8")
+    harness.bundle = ContextBundle(
+        context_text="x",
+        context_files=[workspace / "ctx.md"],
+        skills=[SkillInfo("recon", "Reconcile months", harness.config.skills_dir / "recon")],
+        prompts={"monthly": harness.config.prompts_dir / "monthly.md"},
+        warnings=["ctx.md looks like it contains a secret"],
+    )
+    write_notebook(harness.config, "other")
+
+    async def scenario(controller: Any, ui: StubUI) -> None:
+        await ui.submit("hello")
+        for command in ("/status", "/help", "/notebook list", "/context"):
+            await ui.submit(command)
+
+    controller, ui, output = run_session(harness, scenario)
+    assert ui.summaries[0].final_response == "Answer to: hello" and ui.summaries[0].steps == 1  # the whole summary
+    config = harness.config
+    status = output[output.index("Session"):output.index("Conversation")]
+    for value in (
+        config.model.name, common._provider_line(config), "OPENAI_API_KEY from keyring", harness.server.url,
+        common._kernel_line(config), controller.notebook, "session", "thread-1", "1 turn", "10 in / 5 out tokens",
+        common._relative(config.notebooks_root, config.workspace), common._web_line(config),
+    ):
+        assert value in status, value
+    for label in ("Model", "Kernel", "Marimo", "Notebook", "Notebooks", "Thread", "Web access"):
+        assert re.search(rf"[●▲○ ] {label} ", status), label
+    for text in ("Conversation", "/model <name>", "Switch model; starts a new conversation", "/notebook [list|new|open|close]", "esc cancel"):
+        assert text in output, text
+    assert re.search(r"Notebook\s+Modified\s+Size", output)
+    assert re.search(rf"{re.escape(controller.notebook)}\s+today \d\d:\d\d\s+[\d.]+ KB\s+● open\s+active", output)
+    assert re.search(r"other\.py\s+today", output) and "notebooks in" in output
+    assert "ctx.md" in output and "(5 bytes)" in output and "Reconcile months" in output and "monthly" in output
+    assert "▲ ctx.md looks like it contains a secret" in output
+
+
+def test_help_card_lists_every_command_once():
+    from hailer.session import COMMAND_GROUPS, COMMAND_USAGE, COMMANDS
+
+    assert set(COMMAND_USAGE) == set(COMMANDS) - {"quit"}  # /quit is /exit's alias
+    grouped = [name for names in COMMAND_GROUPS.values() for name in names]
+    assert sorted(grouped) == sorted(COMMAND_USAGE)
 
 
 @pytest.mark.parametrize("cancelled", [False, True], ids=["failed", "cancelled"])
@@ -230,7 +329,7 @@ def test_async_turn_syncs_notebook_after_failure_or_cancellation_and_preserves_n
         else:
             await ui.submit("switch notebook")
         assert controller.notebook == "other.py"
-        assert "Notebook: other.py" in ui.context()
+        assert ui.context().notebook == "other.py"
         assert controller._pending_preamble == (None if cancelled else notice)
         assert not ui.answers and controller.state.turns == 0
         harness.agent.fail_with = None
@@ -252,7 +351,7 @@ def test_async_notebook_command_queues_notice_for_next_turn(harness):
     async def scenario(controller: Any, ui: StubUI) -> None:
         await ui.submit("/notebook open other")
         assert controller.notebook == "other.py"
-        assert "Notebook: other.py" in ui.context()
+        assert ui.context().notebook == "other.py"
         await ui.submit("inspect it")
         await ui.submit("another question")
 
@@ -292,7 +391,7 @@ def test_cancelled_notebook_session_wait_stops_worker_and_preserves_switch_notic
         assert stopped.is_set()
         assert controller.notebook == "other.py"
         assert notebooks.load_active_notebook(harness.config) == "other.py"
-        assert "Notebook: other.py" in ui.context()
+        assert ui.context().notebook == "other.py"
         assert controller._pending_preamble.startswith("[Hailer] The active notebook is now other.py")
         assert "not open in a browser yet" in controller._pending_preamble
         await ui.submit("inspect it")
@@ -352,7 +451,7 @@ def test_interactive_start_failure_or_cancellation_closes_agent_and_flushes(harn
     output = io.StringIO()
     console = Console(file=output)
     controller = cli_chat.ChatLoop(console, harness.config, common.CliOptions())
-    ui = StubUI(console, controller.ahandle, controller.context_line, None)
+    ui = StubUI(console, controller.ahandle, controller.footer, None)
     if isinstance(failure, asyncio.CancelledError):
         with pytest.raises(asyncio.CancelledError):
             asyncio.run(controller.run_interactive(ui_factory=lambda *_args: ui))
@@ -375,7 +474,7 @@ def test_failed_final_flush_still_restores_controller_console_and_closes_agent(h
         async def flush(self) -> None:
             raise OSError("terminal output closed")
 
-    ui = BrokenOutputUI(replacement, controller.ahandle, controller.context_line, scenario)
+    ui = BrokenOutputUI(replacement, controller.ahandle, controller.footer, scenario)
     with pytest.raises(OSError, match="terminal output closed"):
         asyncio.run(controller.run_interactive(ui_factory=lambda *_args: ui))
     assert harness.agent.closed
@@ -403,7 +502,7 @@ def test_first_message_waits_for_both_startups_while_composer_accepts_paste_and_
         harness.agent = SlowAgent()
         controller = cli_chat.ChatLoop(Console(file=io.StringIO()), harness.config, common.CliOptions())
         timings = StartupTimings()
-        with terminal(controller.ahandle, controller.context_line) as (ui, keys, screen, transcript, _size):
+        with terminal(controller.ahandle, controller.footer) as (ui, keys, screen, transcript, _size):
             running = asyncio.create_task(controller.run_interactive(
                 ui_factory=lambda *_args: ui, prepare_notebook=prepare_notebook, timings=timings,
             ))
@@ -411,11 +510,11 @@ def test_first_message_waits_for_both_startups_while_composer_accepts_paste_and_
             await asyncio.wait_for(notebook_entered.wait(), 5)
             assert ui.application.is_running and ui.application.render_counter > 0
             assert set(timings.milestones) == {"input_ready"}
-            assert ui.activity == "Preparing chat..."
+            assert ui.activity == "Starting"
             keys.send_text("\x1b[200~first line\r\nsecond line\x1b[201~\r")
             await until(lambda: ui._pending_submission is not None)
             keys.send_text("next draft\r\r")
-            await until(lambda: "draft is kept" in ui.activity)
+            await until(lambda: "draft is kept" in ui.flash_text)
             assert ui.buffer.text == "next draft"
             assert harness.agent.turns == []
             release_agent.set()
@@ -425,7 +524,7 @@ def test_first_message_waits_for_both_startups_while_composer_accepts_paste_and_
             await until(lambda: len(harness.agent.turns) == 1 and not ui.busy)
             assert harness.agent.turns == [("first line\nsecond line", None)]
             assert ui.buffer.text == "next draft"
-            assert transcript.getvalue().count("You") == 1
+            assert transcript.getvalue().count("▌ first line") == 1
             assert "\x1b[?2004l" not in screen.getvalue()
             assert timings.milestones["ready_to_answer"] >= timings.milestones["notebook_wait_complete"]
             assert timings.milestones["agent_ready"] > timings.milestones["input_ready"]
@@ -466,7 +565,7 @@ def test_startup_failure_retains_queued_message_and_new_draft_and_settles_siblin
 
         harness.agent = FailedAgent()
         controller = cli_chat.ChatLoop(Console(file=io.StringIO()), harness.config, common.CliOptions())
-        with terminal(controller.ahandle, controller.context_line) as (ui, keys, _screen, transcript, _size):
+        with terminal(controller.ahandle, controller.footer) as (ui, keys, _screen, transcript, _size):
             running = asyncio.create_task(controller.run_interactive(
                 ui_factory=lambda *_args: ui, prepare_notebook=lambda: preparation("notebook"),
             ))
@@ -523,7 +622,7 @@ def test_exit_during_startup_settles_preparation_before_closing_agent(harness, g
         harness.agent = SlowAgent()
         original = Console(file=io.StringIO())
         controller = cli_chat.ChatLoop(original, harness.config, common.CliOptions())
-        with terminal(controller.ahandle, controller.context_line) as (ui, keys, screen, transcript, _size):
+        with terminal(controller.ahandle, controller.footer) as (ui, keys, screen, transcript, _size):
             running = asyncio.create_task(controller.run_interactive(ui_factory=lambda *_args: ui))
             await asyncio.wait_for(entered.wait(), 5)
             if gesture != "interrupt":
