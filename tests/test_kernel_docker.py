@@ -596,8 +596,9 @@ def test_owner_locks_say_whether_their_hailer_still_runs(tmp_path):
     assert lock.path == tmp_path / ".hailer" / f"owner-{lock.id}.lock"
     assert kd.owner_alive(tmp_path, lock.id), "held by this process, through another handle"
     assert not kd.owner_alive(tmp_path, GONE) and not kd.owner_alive(tmp_path, "") and not kd.owner_alive(tmp_path, "../x")
-    kd.sweep_owner_locks(tmp_path, grace=0)
-    assert lock.path.exists(), "a held lock is never swept"
+    _age_past_grace(lock.path)
+    kd.sweep_owner_locks(tmp_path)
+    assert lock.path.exists(), "a held lock is never swept, however old"
     lock.release()
     assert not lock.path.exists() and not kd.owner_alive(tmp_path, lock.id)
     lock.release()  # idempotent
@@ -605,8 +606,17 @@ def test_owner_locks_say_whether_their_hailer_still_runs(tmp_path):
     fresh.write_text("", encoding="utf-8")
     kd.sweep_owner_locks(tmp_path)
     assert fresh.exists(), "too young: its owner may be about to lock it"
-    kd.sweep_owner_locks(tmp_path, grace=0)
+    _age_past_grace(fresh)
+    kd.sweep_owner_locks(tmp_path)
     assert not fresh.exists()
+
+
+def _age_past_grace(path: Path) -> None:
+    # Older than the sweep's grace without waiting for it. Not grace=0 on a file just written: on
+    # Windows / Python 3.12 its time can equal time.time()'s coarse tick or round a hair past it, so
+    # it was not yet older than 0 seconds and the sweep kept it.
+    old = path.stat().st_mtime - 2 * kd.OWNER_LOCK_GRACE_SEC
+    os.utime(path, (old, old))
 
 
 def test_a_start_waits_for_its_own_token_after_checking_its_containers(tmp_path):
