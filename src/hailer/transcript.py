@@ -337,11 +337,10 @@ def session_header(glyphs: Glyphs, version: str, workspace: str) -> Text:
 
 
 def session_ended(glyphs: Glyphs, *, turns: int, elapsed: float, tokens_used: int) -> Text:
-    """``Session ended · 4 turns · 4m 12s · 18.2k tokens``: this session's turns, time and tokens."""
-    return Text(
-        "  " + glyphs.join("Session ended", plural(turns, "turn"), seconds(elapsed), f"{tokens(tokens_used)} tokens" if tokens_used else ""),
-        style=MUTED,
-    )
+    """``Session ended · 4m 12s · this session: 2 turns, 1.1k tokens``: the time, then the turns and
+    tokens of this session (the footer and ``/status`` count the whole conversation)."""
+    counts = ", ".join([plural(turns, "turn"), *([f"{tokens(tokens_used)} tokens"] if tokens_used else [])])
+    return Text("  " + glyphs.join("Session ended", seconds(elapsed), f"this session: {counts}"), style=MUTED)
 
 
 def done_items(glyphs: Glyphs, items: Sequence[tuple[str, str]]) -> Text:
@@ -373,7 +372,7 @@ def status_card(glyphs: Glyphs, rows: Sequence[tuple[str | None, str, str]], *, 
     grid = Table.grid(padding=(0, 1))
     grid.add_column(width=1, no_wrap=True)
     grid.add_column(style=MUTED, no_wrap=True, width=max((cell_len(label) for _h, label, _v in rows), default=0) + 1)
-    grid.add_column(ratio=1)
+    grid.add_column(ratio=1, overflow="fold")  # a long path (a kernel log) wraps whole instead of being cut
     marks = {"ok": (glyphs.on, OK), "warn": (glyphs.warn, WARN), "off": (glyphs.off, MUTED)}
     for health, label, value in rows:
         mark, style = marks.get(health or "", (" ", ""))

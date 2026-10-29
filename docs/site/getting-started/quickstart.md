@@ -88,7 +88,7 @@ Chart total revenue by month, split by region.
 ```
 
 Tables and charts appear in the notebook. Type `/exit` to finish: Hailer copies the notebooks back,
-stops the kernel and says so (`Session ended · 2 turns · 3m 05s · 9.4k tokens`, then `✓ Notebooks copied back
+stops the kernel and says so (`Session ended · 3m 05s · this session: 2 turns, 9.4k tokens`, then `✓ Notebooks copied back
 to notebooks/   ✓ Kernel stopped`). To continue later, open a terminal in `my-analysis` and run
 `uvx hailer` again; it resumes your conversation (`↺ Resumed  2 earlier turns · /new starts fresh`) and
 active notebook. Use `/new` for a fresh conversation, or `/help` to see the chat commands.

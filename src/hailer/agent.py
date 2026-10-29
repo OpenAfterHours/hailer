@@ -601,7 +601,13 @@ class _TurnEvents:
         )
         self.steps += 1
         seconds = round(time.monotonic() - step.started, 3)
-        self.emit(AgentEvent("tool_result", step.name, {"id": step.event_id, "ok": ok, "summary": summary, "seconds": seconds}))
+        detail: dict[str, Any] = {"id": step.event_id, "ok": ok, "summary": summary, "seconds": seconds}
+        artifact = getattr(message, "artifact", None)
+        if isinstance(artifact, Mapping) and isinstance(artifact.get("notebook"), str):
+            # A notebook tool: which notebook it left active (or closed) and whether it has a
+            # session, so the chat's footer follows at once without asking marimo.
+            detail["notebook"] = {key: artifact.get(key) for key in ("notebook", "active", "session")}
+        self.emit(AgentEvent("tool_result", step.name, detail))
 
 
 class HailerAgent:
@@ -617,11 +623,15 @@ class HailerAgent:
         env: Mapping[str, str] | None = None,
         threads_path: Path | None = None,
         sandbox: MarimoSandbox | None = None,
+        open_url: Callable[[str], bool] | None = None,
     ) -> None:
         self.config = config
         self._bundle = bundle
         #: The sandbox (kernel) this process started; the tools use it (``None``: no kernel).
         self._sandbox = sandbox
+        #: What the notebook tools open a notebook's URL with (``None``: the browser); the chat passes
+        #: one that opens nothing with --no-browser.
+        self._open_url = open_url
         self._environ: Mapping[str, str] = env if env is not None else os.environ
         self._model_factory = model_factory
         self._tools = tools
@@ -746,7 +756,7 @@ class HailerAgent:
         if self._tools is None:
             from hailer.tools import hailer_tools
 
-            self._tools = hailer_tools(self.config, sandbox=self._sandbox)
+            self._tools = hailer_tools(self.config, sandbox=self._sandbox, open_url=self._open_url)
         middleware: list[Any] = []
         after = self.config.model.summarize_after_tokens
         if after > 0:

@@ -83,8 +83,12 @@ class ChatController:
         self.notebook_open: bool | None = None
         #: True while the inline composer runs (cards instead of plain lines).
         self.interactive = False
-        #: False with --no-browser: a switch prints the notebook's signed-in link instead of opening it.
+        #: False with --no-browser: nothing opens a browser (a switch, the notebook tools); the
+        #: notebook's signed-in link is printed instead.
         self.open_browser = True
+        #: The notebook a notebook_open/notebook_create call of this turn brought up (it opened the
+        #: browser and waited), so the switch's report after the turn does not open it again.
+        self._brought_up: str | None = None
         self._link_cache: tuple[str | None, str] = (None, "")
         #: The notebook before a switch a turn's tools made, until _sync_active_notebook reports it.
         self._switched_from: str | None = None
@@ -119,7 +123,7 @@ class ChatController:
         began = time.monotonic()
         self.bundle = self._cli._load_context(self.config)
         self._print_context_warnings()
-        self.agent = self._cli._make_agent(self.config, self.bundle, self.sandbox)
+        self.agent = self._cli._make_agent(self.config, self.bundle, self.sandbox, open_url=self._tool_opener)
         resume = None if self.opts.new_thread else self.state.thread_id
         forget = self.state.thread_id if self.opts.new_thread else None  # --new: drop the stored conversation
         thread_id = self.agent.start(resume_thread_id=resume, forget_thread_id=forget)
@@ -159,6 +163,38 @@ class ChatController:
         g = self._glyphs()
         status = "warn" if source == "missing" else "ok"
         return session_row(g, status, "Agent", g.join(single_line(self.state.model or ""), single_line(self.state.provider or ""), key), took)
+
+    def _tool_opener(self, url: str) -> bool:
+        """How the notebook tools open a notebook: in the browser, unless --no-browser, when nothing
+        opens (the tool then asks the model to have the user open it, and the chat prints the link)."""
+        if not self.open_browser:
+            return False
+        return self._cli._open_browser(url) is not False
+
+    def _follow_notebook_tool(self, event: Any) -> None:
+        """A notebook tool's result names the notebook it left active (or closed) and whether it has
+        a session (``detail["notebook"]``): the footer follows at once. Nothing is asked of marimo
+        or the disk here (it runs on the composer's loop); the switch's row comes after the turn."""
+        info = event.detail.get("notebook") if getattr(event, "kind", "") == "tool_result" else None
+        if not isinstance(info, dict) or not isinstance(info.get("notebook"), str):
+            return
+        name, session = info["notebook"], info.get("session")
+        if info.get("active"):
+            if not notebooks.same_name(name, self.notebook):
+                self._switched_from = self._switched_from or self.notebook
+                self.notebook = name
+            self.notebook_open = session if isinstance(session, bool) else None
+            if event.text in ("notebook_open", "notebook_create"):
+                self._brought_up = name
+
+    def _turn_events(self, forward: Callable[[Any], None]) -> Callable[[Any], None]:
+        """The agent's events for a turn: followed here (a notebook switch), then shown by ``forward``."""
+
+        def on_event(event: Any) -> None:
+            self._follow_notebook_tool(event)
+            forward(event)
+
+        return on_event
 
     @contextmanager
     def progress(self, label: str, detail: str = "") -> Iterator[None]:
@@ -224,7 +260,7 @@ class ChatController:
         began = time.monotonic()
         self.bundle = await self._blocking(self._cli._load_context, self.config)
         self._print_context_warnings()
-        self.agent = self._cli._make_agent(self.config, self.bundle, self.sandbox)
+        self.agent = self._cli._make_agent(self.config, self.bundle, self.sandbox, open_url=self._tool_opener)
         resume = None if self.opts.new_thread else self.state.thread_id
         forget = self.state.thread_id if self.opts.new_thread else None
         thread_id = await self.agent.astart(resume_thread_id=resume, forget_thread_id=forget)
@@ -436,12 +472,14 @@ class ChatController:
 
     async def _aturn(self, text: str, *, skill: SkillInfo | None = None) -> None:
         self.ui.set_activity("Thinking...")
+        cancelled = False
         try:
             try:
                 summary = await self.agent.arun_turn(
-                    text, on_event=self.ui.on_event, skill=skill, preamble=self._pending_preamble
+                    text, on_event=self._turn_events(self.ui.on_event), skill=skill, preamble=self._pending_preamble
                 )
             except asyncio.CancelledError:
+                cancelled = True
                 self._pending_preamble = None
                 raise
             except Exception:
@@ -453,9 +491,18 @@ class ChatController:
             self._record_turn(summary)
         finally:
             # A tool may have switched notebooks before cancellation or failure.
-            await self._blocking(self._sync_active_notebook)
+            later: list[tuple[Any, dict[str, Any]]] | None = [] if cancelled else None
+            await self._blocking(self._sync_active_notebook, later=later)
+            if later:
+                # The composer prints its "Cancelled." callout once this raises, before it next
+                # yields; the switch's row goes after it, not between the cancelled step and it.
+                asyncio.get_running_loop().call_soon(self._print_later, later)
             self._copy_notebooks_back()
             self._refresh_names_soon()  # a tool may have created one: the menu's names, in the background
+
+    def _print_later(self, lines: list[tuple[Any, dict[str, Any]]]) -> None:
+        for renderable, kwargs in lines:
+            self.console.print(renderable, **kwargs)
 
     # -- REPL -------------------------------------------------------------- #
 
@@ -494,7 +541,7 @@ class ChatController:
         preamble = self._pending_preamble
         try:
             try:
-                summary: TurnSummary = self.agent.run_turn(text, on_event=display, skill=skill, preamble=preamble)
+                summary: TurnSummary = self.agent.run_turn(text, on_event=self._turn_events(display), skill=skill, preamble=preamble)
             except KeyboardInterrupt:  # the agent has already cancelled the turn
                 self._pending_preamble = None  # the notice went out with the interrupted turn
                 display.cancel()
@@ -540,38 +587,52 @@ class ChatController:
             self._switched_from = self._switched_from or self.notebook
             self.notebook, self.notebook_open = active, None
 
-    def _sync_active_notebook(self, *, open_browser: bool = True) -> bool:
+    def _sync_active_notebook(self, *, open_browser: bool = True, later: list[tuple[Any, dict[str, Any]]] | None = None) -> bool:
         """Pick up a switch the model made during a turn (its tools write the same state file).
 
-        Returns True when the active notebook changed (since before a :meth:`_peek_active_notebook`).
-        With ``open_browser`` the notebook's URL is opened once when it has no kernel session yet
-        (with --no-browser its signed-in link is printed instead).
+        Returns True when the active notebook changed (since before a :meth:`_peek_active_notebook`
+        or a notebook tool's result). With ``open_browser`` the switch is reported as one row: open
+        in the browser; or not open yet, with the signed-in link to open by hand when the tool's own
+        try (it opened the browser and waited) brought no session, or with --no-browser; only a
+        switch no tool reported (a call cut short) has its URL opened here. ``later`` collects the
+        lines instead of printing them (a cancelled turn prints them after its callout).
         """
         try:
             active = notebooks.load_active_notebook(self.config)
         except Exception:  # noqa: BLE001 - a bad state file must never spoil a finished turn
             return False
         before, self._switched_from = self._switched_from or self.notebook, None
+        brought_up, self._brought_up = self._brought_up, None
         if active == before:
             return False
         self.notebook = active
         self.notebook_open = None
-        state, link = "", ""
+        status, state, link = "ok", "", ""
         if open_browser:
             sandbox, session, _err = self._cli._marimo_state(self.sandbox, active)
             self._note_session(active, session, known=sandbox is not None)
-            if sandbox is not None and session is None and self.open_browser:
+            tried = brought_up is not None and notebooks.same_name(brought_up, active)
+            if session is not None:
+                state = "open in your browser"
+            elif sandbox is None:
+                status, state = "warn", "marimo is not running"
+            elif not self.open_browser:
+                status, state, link = "wait", "not open in a browser", sandbox.notebook_url(active, with_token=True)
+            elif tried:
+                status, state, link = "warn", "no kernel session yet", sandbox.notebook_url(active, with_token=True)
+            else:
                 self._cli._open_browser(sandbox.notebook_url(active, with_token=True))  # opened, never printed
                 state = "opened in your browser"
-            elif sandbox is not None and session is None:
-                state, link = "not open in a browser", sandbox.notebook_url(active, with_token=True)
-            elif session is not None:
-                state = "open in your browser"
+        lines: list[tuple[Any, dict[str, Any]]] = []
         g = self._glyphs()
-        self.console.print(session_row(g, "wait" if link else "ok", "Notebook", g.join(single_line(active), "now active", state)))
-        if link:  # --no-browser: the user opens it
-            self.console.print(session_note("Open it in your browser with this link (it signs you in):"))
-            self.console.print(session_note(link, style=""), soft_wrap=True)
+        lines.append((session_row(g, status, "Notebook", g.join(single_line(active), "now active", state)), {}))
+        if link:  # the user opens it: the link once, on a line of its own
+            lines.append((session_note("Open it in your browser with this link (it signs you in):"), {}))
+            lines.append((session_note(link, style=""), {"soft_wrap": True}))
+        if later is not None:
+            later.extend(lines)
+        else:
+            self._print_later(lines)
         return True
 
     # -- slash commands ---------------------------------------------------- #
@@ -640,8 +701,8 @@ class ChatController:
             ("Provider", self._active_provider_line()),
             ("Credentials", self._credentials_line()),
             ("Thread", self.state.thread_id or "-"),
-            ("Turns", str(self.state.turns)),
-            ("Tokens", f"{self.state.input_tokens} in / {self.state.output_tokens} out"),
+            ("Turns", f"{self.state.turns} (this conversation)"),
+            ("Tokens", f"{self.state.input_tokens} in / {self.state.output_tokens} out (this conversation)"),
             ("Marimo", marimo),
             ("Kernel", self._cli._kernel_line(self.config)),
             *([("Kernel log", log)] if (log := self._log_hint()) else []),
@@ -677,7 +738,7 @@ class ChatController:
             (marimo[0], "Marimo", marimo[1]),
             (notebook[0], "Notebook", notebook[1]),
             (None, "Notebooks", self._cli._relative(self.config.notebooks_root, self.config.workspace)),
-            (None, "Thread", g.join(self.state.thread_id or "-", plural(self.state.turns, "turn"), tokens)),
+            (None, "Thread", g.join(self.state.thread_id or "-", f"this conversation: {plural(self.state.turns, 'turn')}", tokens)),
             (None, "Web access", self._cli._web_line(self.config)),
         ]
         self.console.print(status_card(g, rows))

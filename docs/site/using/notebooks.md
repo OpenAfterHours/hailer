@@ -23,7 +23,7 @@ The terminal shows a short checklist while the session starts, and a summary whe
   ✓ Notebook   analysis.py · open in your browser                           2.2s
                Opens in app view (results only); Ctrl+. in the notebook shows the code
 ...
-  Session ended · 4 turns · 4m 12s · 18.2k tokens
+  Session ended · 4m 12s · this session: 4 turns, 18.2k tokens
   ✓ Notebooks copied back to notebooks/   ✓ Kernel stopped
 ```
 
@@ -102,7 +102,11 @@ The agent lists the folder, creates `q2_churn_review.py` in it (the name is slug
 existing file, and the browser tab appears by itself. Notebooks are named by their path inside the
 notebooks folder (`q2_churn_review.py`, `q3/review.py`). Whatever the agent switches to becomes the
 **active notebook**: the one every later cell edit, `/status` line and `/exec` call refers to. The chat
-shows `✓ Notebook  q2_churn_review.py · now active · opened in your browser` when the agent switched.
+shows `✓ Notebook  q2_churn_review.py · now active · open in your browser` after the turn in which the agent
+switched (the footer shows the new notebook as soon as the switch is made). The agent's tool opens the
+notebook in your browser and waits for it; when no tab came, the row is `▲ ... no kernel session yet` with the
+link to open by hand. With `--no-browser` the tool opens nothing and the row (`○ ... not open in a browser`)
+is followed by the link.
 
 The same from the prompt, without a model round-trip:
 

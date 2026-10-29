@@ -72,7 +72,7 @@ def rows(output: str, label: str, *parts: str, icon: str = "✓") -> list[str]:
     return re.findall(rf"(?:^|You > )(  {re.escape(icon)} {re.escape(label)} +{detail}[^\n]*)$", output, re.MULTILINE)
 
 
-SESSION_ENDED = re.compile(r"^  Session ended · \d+ turns? · [\d.]+s(?: · [\d.]+k? tokens)?$", re.MULTILINE)
+SESSION_ENDED = re.compile(r"^  Session ended · [\d.]+s · this session: \d+ turns?(?:, [\d.]+k? tokens)?$", re.MULTILINE)
 NOTEBOOK_SOURCE = "import marimo\n\napp = marimo.App()\n\n\n@app.cell\ndef _():\n    return\n"
 INTERNAL = ProviderConfig(
     id="internal",
@@ -327,7 +327,7 @@ def harness(tmp_path, monkeypatch):
     monkeypatch.setattr(common, "_delete_key", lambda provider: (h.deleted.append(provider.id) or True))
     monkeypatch.setattr(common, "_load_context", load_context)
     monkeypatch.setattr(common, "_render_prompt", lambda config, name, args: f"PROMPT[{name}]({args})")
-    monkeypatch.setattr(common, "_make_agent", lambda config, bundle, sandbox=None: (h.agent_sandboxes.append(sandbox) or h.agent))
+    monkeypatch.setattr(common, "_make_agent", lambda config, bundle, sandbox=None, open_url=None: (h.agent_sandboxes.append(sandbox) or h.agent))
     monkeypatch.setattr(common, "_start_dependency_warmup", lambda: h.warmups.append("started"))
     monkeypatch.setattr(common, "_open_browser", lambda url: h.opened.append(url))
 
@@ -1299,10 +1299,12 @@ def test_a_docker_session_that_cannot_remove_its_kernel_exits_1_with_the_error_i
 
 def test_the_exit_summary_counts_this_sessions_turns_and_tokens(harness):
     save_session(harness.config.workspace, SessionState(thread_id="old-thread", turns=4, input_tokens=900, output_tokens=100))
-    result = chat(input_text="one\ntwo\n/exit\n")
+    result = chat(input_text="one\ntwo\n/status\n/exit\n")
     assert result.exit_code == 0, result.output
+    assert re.search(r"Turns +6 \(this conversation\)", result.output), "/status counts the conversation, and says so"
+    assert re.search(r"Tokens +920 in / 110 out \(this conversation\)", result.output)
     ended = SESSION_ENDED.search(result.output)
-    assert ended and re.fullmatch(r"  Session ended · 2 turns · [\d.]+s · 30 tokens", ended.group(0)), ended
+    assert ended and re.fullmatch(r"  Session ended · [\d.]+s · this session: 2 turns, 30 tokens", ended.group(0)), ended
     assert json.loads(session_path(harness.config.workspace).read_text())["turns"] == 6, "the thread's own count goes on"
 
 
@@ -1835,6 +1837,78 @@ def test_switch_made_by_the_model_is_detected_after_the_turn(harness):
     assert "other.py" in status
 
 
+def real_agent(harness, monkeypatch, *script):
+    """The real agent and Hailer's real tools (on the harness's sandbox) behind the chat, with a
+    scripted model: what a switch the model makes really does."""
+    from test_agent import ScriptedModel
+
+    from hailer.agent import HailerAgent
+
+    model = ScriptedModel(script=list(script))
+
+    def make(config, bundle, sandbox=None, open_url=None):
+        harness.agent_sandboxes.append(sandbox)
+        return HailerAgent(
+            config, bundle, sandbox=sandbox, open_url=open_url,
+            model_factory=lambda provider, name, key: model, env={"OPENAI_API_KEY": "sk-test-key-000000"},
+        )
+
+    monkeypatch.setattr(common, "_make_agent", make)
+    return model
+
+
+@pytest.mark.parametrize("no_browser", [False, True], ids=["tab-never-came", "no-browser"])
+def test_a_switch_the_model_makes_with_the_real_tools_opens_at_most_once_and_prints_the_link(harness, monkeypatch, no_browser):
+    """notebook_open opens the browser itself (and waits); after the turn the chat does not open it
+    again. When no tab came, or with --no-browser (the tool then opens nothing), the switch's row
+    says so and the link to open by hand follows once, on a line of its own."""
+    from test_agent import call, say
+
+    from hailer import marimo_client
+
+    other = write_notebook(harness.config, "other")
+    monkeypatch.setattr(marimo_client, "wait_for_session", lambda client, notebook, timeout, **kw: None)  # the tab never comes
+    real_agent(harness, monkeypatch, call("notebook_open", {"notebook": "other"}, "o1"), say("Switched."))
+    result = chat(args=["notebook", "--no-browser"] if no_browser else [], input_text="open the other one\n/exit\n")
+    assert result.exit_code == 0, result.output
+    out, lines = result.output, result.output.splitlines()
+    assert active_state(harness.config) == "other.py"
+    assert harness.opened == ([] if no_browser else [url_for(other)]), "opened once, by the tool"
+    if no_browser:
+        assert rows(out, "Notebook", "other.py", "now active", "not open in a browser", icon="○")
+    else:
+        assert rows(out, "Notebook", "other.py", "now active", "no kernel session yet", icon="▲")
+    assert lines.count(f"{' ' * 15}{url_for(other)}") == 1, "the link to open by hand, once"
+    assert out.index("Switched.") < out.index(url_for(other))
+
+
+def test_a_notebook_tools_result_carries_the_notebook_it_left_active(harness, monkeypatch):
+    """The tool_result event names the notebook (and whether it has a session), so the footer can
+    follow during the turn; the text the model reads is the tool's own."""
+    from test_agent import call, say
+
+    write_notebook(harness.config, "other")
+    harness.client = FakeClient(other_sessions=[MarimoSession("s2", "other.py", "/x/other.py", name="other.py")])
+    model = real_agent(harness, monkeypatch, call("notebook_open", {"notebook": "other"}, "o1"), say("Switched."))
+    seen: list = []
+    real_follow = cli_chat.ChatLoop._follow_notebook_tool
+
+    def follow(self, event):
+        real_follow(self, event)
+        if event.kind == "tool_result":
+            seen.append((dict(event.detail), self.notebook, self.notebook_open))
+
+    monkeypatch.setattr(cli_chat.ChatLoop, "_follow_notebook_tool", follow)
+    result = chat(input_text="open the other one\n/exit\n")
+    assert result.exit_code == 0, result.output
+    (detail, notebook, notebook_open), = seen
+    assert detail["notebook"] == {"notebook": "other.py", "active": True, "session": True}
+    assert (notebook, notebook_open) == ("other.py", True), "followed as the result arrived"
+    tool_text = next(m for m in model.seen[-1] if getattr(m, "tool_call_id", None) == "o1").content
+    assert tool_text.startswith("other.py is now the active notebook.") and "session" in tool_text and "active=" not in tool_text
+    assert harness.opened == []
+
+
 def test_switch_made_by_the_model_with_session_does_not_open_browser(harness):
     other = write_notebook(harness.config, "other")
     harness.client = FakeClient(other_sessions=[MarimoSession("s2", "other.py", str(other))])
@@ -2141,7 +2215,7 @@ def test_the_prompt_never_carries_the_servers_token(harness, nb, monkeypatch):
     from hailer.agent import system_prompt
 
     captured: list = []
-    monkeypatch.setattr(common, "_make_agent", lambda config, bundle, sandbox=None: (captured.append((config, sandbox.server)) or harness.agent))
+    monkeypatch.setattr(common, "_make_agent", lambda config, bundle, sandbox=None, open_url=None: (captured.append((config, sandbox.server)) or harness.agent))
     result = notebook_cmd()
     assert result.exit_code == 0, result.output
     config, server = captured[0]
@@ -2194,7 +2268,7 @@ def test_notebook_kernel_docker_runs_the_chat_against_a_container(harness, nb, d
 
     agent_configs: list = []
     labels: list = []
-    monkeypatch.setattr(common, "_make_agent", lambda config, bundle, sandbox=None: (agent_configs.append((config, sandbox)) or harness.agent))
+    monkeypatch.setattr(common, "_make_agent", lambda config, bundle, sandbox=None, open_url=None: (agent_configs.append((config, sandbox)) or harness.agent))
     harness.agent.on_turn = lambda: labels.extend(owner_alive(harness.config.workspace, c.labels[LABEL_OWNER]) for c in docker.containers.values())
     harness.client = FakeClient(session=None)  # nobody has the tab open yet
     result = notebook_cmd(["--kernel", "docker", "--port", "2731"], input_text="hi\n/status\n/exit\n")

@@ -359,6 +359,57 @@ def test_async_turn_syncs_notebook_after_failure_or_cancellation_and_preserves_n
     assert ("endpoint failed" in output) is not cancelled
 
 
+def test_the_footer_follows_a_tool_switch_at_once_and_a_cancelled_turn_reports_it_after_its_callout(harness):
+    """A notebook tool's result names the notebook it left active: the footer shows it while the
+    turn still runs (no marimo request on the UI loop). When the turn is then cancelled, the
+    switch's row comes after the "Cancelled." callout, not between the cancelled step and it."""
+    from test_chat_ui import terminal, until
+
+    from test_cli import FakeClient
+
+    from hailer.models import MarimoSession
+
+    write_notebook(harness.config, "other")
+    harness.client = FakeClient(other_sessions=[MarimoSession("s2", "other.py", "/nb/other.py", name="other.py")])
+    running_step = asyncio.Event()
+
+    class SwitchingAgent(AsyncFakeAgent):
+        async def arun_turn(self, text: str, *, on_event: Any = None, **_kwargs: Any) -> Any:
+            self.turns.append((text, None))
+            on_event(AgentEvent("tool_call", "notebook_open", {"args": {"notebook": "other"}, "id": "a"}))
+            notebooks.save_active_notebook(harness.config, "other.py")  # what the tool does
+            on_event(AgentEvent("tool_result", "notebook_open", {
+                "id": "a", "ok": True, "summary": "", "seconds": 0.1,
+                "notebook": {"notebook": "other.py", "active": True, "session": True},
+            }))
+            on_event(AgentEvent("tool_call", "marimo_execute", {"args": {"code": "x = 1\n"}, "id": "b"}))
+            running_step.set()
+            await asyncio.Event().wait()
+
+    async def scenario():
+        harness.agent = SwitchingAgent()
+        controller = cli_chat.ChatLoop(Console(file=io.StringIO()), harness.config, common.CliOptions(), sandbox=harness.sandbox)
+        with terminal(controller.ahandle, controller.footer) as (ui, keys, _screen, transcript, _size):
+            running = asyncio.create_task(controller.run_interactive(ui_factory=lambda *_args: ui))
+            try:
+                await until(lambda: ui.application.is_running and not ui._preparing)
+                keys.send_text("switch\r")
+                await asyncio.wait_for(running_step.wait(), 5)
+                footer = controller.footer()
+                assert (footer.notebook, footer.notebook_open) == ("other.py", True), "the footer followed the tool"
+                keys.send_text("\x03")
+                await until(lambda: not ui.busy and "now active" in transcript.getvalue())
+                out = transcript.getvalue()
+                assert out.index("cancelled, effect unknown") < out.index("Cancelled.") < out.index("other.py · now active"), out
+                assert len(rows(out, "Notebook", "other.py", "now active", "open in your browser")) == 1, out
+                assert harness.opened == [], "the tool brought it up: not opened again"
+            finally:
+                ui.exit()
+                await asyncio.wait_for(running, 5)
+
+    asyncio.run(scenario())
+
+
 def test_reply_links_the_notebook_a_tool_switched_to_and_the_switch_is_reported_after_it(harness):
     harness.agent = AsyncFakeAgent()
     other = write_notebook(harness.config, "other")
