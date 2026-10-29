@@ -49,6 +49,14 @@ COMMAND_USAGE: dict[str, tuple[str, str]] = {
     "exit": ("", "Leave Hailer"),
 }
 
+# /notebook's subcommands with a short description: the command menu's second level.
+NOTEBOOK_SUBCOMMANDS: dict[str, str] = {
+    "list": "Every notebook, with its state",
+    "new": "Create one from the starter template",
+    "open": "Switch the active notebook",
+    "close": "Free a notebook's kernel session",
+}
+
 # The /help card's groups, by task, in order; every COMMAND_USAGE entry appears once.
 COMMAND_GROUPS: dict[str, tuple[str, ...]] = {
     "Conversation": ("new", "model", "skill", "prompt"),

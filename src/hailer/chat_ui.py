@@ -7,8 +7,10 @@ from a notebook worker thread); the facade queues them for that writer.
 The composer is a rounded frame whose colour says the state (cyan ready, grey busy or starting,
 red when startup failed), with key hints in its bottom border. While work runs, a live row above
 it shows the step in progress in the columns its finished row will use; a footer below it shows
-the notebook, the kernel, the model and usage. Every row but the composer's is one window that
-draws its whole line, so a redraw stays cheap (the spinner redraws often during a turn).
+the notebook, the kernel, the model and usage. ``/`` opens the command menu between the frame and
+the footer (:mod:`hailer.completion`); history can persist across sessions (:mod:`hailer.input_history`).
+Every row but the composer's is one window that draws its whole line, so a redraw stays cheap (the
+spinner redraws often during a turn).
 """
 
 from __future__ import annotations
@@ -20,13 +22,15 @@ import time
 from collections import deque
 from collections.abc import Awaitable, Callable
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, ClassVar
 
 from prompt_toolkit.application import Application, run_in_terminal
+from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text.utils import fragment_list_width
-from prompt_toolkit.history import InMemoryHistory
-from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.key_binding import KeyBindings, merge_key_bindings
+from prompt_toolkit.key_binding.bindings.auto_suggest import load_auto_suggest_bindings
 from prompt_toolkit.layout import ConditionalContainer, HSplit, Layout, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
@@ -44,8 +48,10 @@ from rich.table import Table
 from rich.text import Text
 from rich.theme import Theme
 
+from hailer.completion import RUN_ON_ENTER, SlashCompleter, menu_fragments, menu_height, menu_open
+from hailer.input_history import input_history
 from hailer.log import redact
-from hailer.models import KERNEL_RUNTIME_DOCKER, KERNEL_RUNTIME_UNSAFE_LOCAL, AgentEvent, TurnSummary
+from hailer.models import KERNEL_RUNTIME_DOCKER, KERNEL_RUNTIME_UNSAFE_LOCAL, AgentEvent, CompletionData, TurnSummary
 from hailer.session import EXIT_COMMANDS, parse_command
 from hailer.steps import Receipt, StepTracker, plural, single_line
 from hailer.transcript import (
@@ -80,9 +86,10 @@ _FRAME_SECONDS = 0.08  # spinner frame, and the redraw interval during a turn
 # them (LEARNINGS §10): nothing animates then, the live row's timer redraws once a second.
 _STARTUP_TICK_SECONDS = 1.0
 _FLASH_SECONDS = 2.5
-# During a turn Esc alone cancels, so it must act quickly: ttimeoutlen for the terminal to finish an
-# escape sequence (arrows arrive in one write), timeoutlen for an Enter that makes it Esc Enter.
-# While idle prompt_toolkit's own, longer timeouts stay, so a slow Esc, Enter is still a newline.
+# During a turn Esc alone cancels (and with the command menu open it closes the menu), so it must act
+# quickly: ttimeoutlen for the terminal to finish an escape sequence (arrows arrive in one write),
+# timeoutlen for an Enter that makes it Esc Enter. Otherwise prompt_toolkit's own, longer timeouts
+# stay, so a slow Esc, Enter is still a newline.
 _TURN_TIMEOUTS = (0.1, 0.3)
 
 _STYLE = Style.from_dict({
@@ -100,6 +107,11 @@ _STYLE = Style.from_dict({
     "hint.flash": "ansiyellow",
     "ok": "ansigreen",
     "warn": "ansiyellow",
+    # The command menu. Not "menu.*": prompt_toolkit's default style paints those grey.
+    "palette.pick": "ansicyan bold",
+    "palette.name": "",
+    "palette.name.current": "ansicyan bold",
+    "palette.meta": "ansibrightblack",
 })
 
 
@@ -392,7 +404,9 @@ class ChatUI:
     ``on_submit`` owns session work and expected error presentation. Cancellation
     propagates back here only after controller/agent cleanup, so a fresh request
     cannot overlap it. ``footer`` returns the footer's :class:`~hailer.transcript.FooterData`;
-    it is called on every redraw, so it must only read state the controller already has.
+    it is called on every redraw, so it must only read state the controller already has. So must
+    ``completions`` (the command menu's arguments; ``None``: commands only), read while a slash
+    command is typed. ``history_file``: where Up's history persists (``None``: this session only).
     """
 
     def __init__(
@@ -403,6 +417,8 @@ class ChatUI:
         *,
         pt_input: Any = None,
         pt_output: Any = None,
+        completions: Callable[[], CompletionData] | None = None,
+        history_file: Path | None = None,
     ) -> None:
         self._raw_console = console
         self.console = _QueuedConsole(self, console)
@@ -443,7 +459,10 @@ class ChatUI:
 
         self.composer = TextArea(
             multiline=True,
-            history=InMemoryHistory(),
+            history=input_history(history_file),  # a file's is read on a worker thread at the first render
+            completer=SlashCompleter(completions),
+            complete_while_typing=Condition(lambda: self.buffer.text.startswith("/")),
+            auto_suggest=AutoSuggestFromHistory(),
             height=Dimension(min=1, max=6),
             dont_extend_height=True,
             wrap_lines=True,
@@ -453,7 +472,8 @@ class ChatUI:
         self.buffer = self.composer.buffer
         self.application: Application[None] = Application(
             layout=Layout(self._container(), focused_element=self.composer),
-            key_bindings=self._key_bindings(),
+            # → (and Ctrl+E, Ctrl+F) at the end of the draft takes the grey suggestion from history.
+            key_bindings=merge_key_bindings([load_auto_suggest_bindings(), self._key_bindings()]),
             full_screen=False,
             mouse_support=False,
             erase_when_done=True,
@@ -511,6 +531,7 @@ class ChatUI:
         self.set_activity("Preparing chat...")
 
     def _after_render(self, _application: Any) -> None:
+        self._sync_timeouts()  # the menu may have opened or closed
         if self._input_ready:
             return
         self._input_ready = True
@@ -557,10 +578,34 @@ class ChatUI:
 
     def _key_bindings(self) -> KeyBindings:
         bindings = KeyBindings()
+        menu = Condition(self._menu_open)
 
-        @bindings.add("enter")
+        @bindings.add("enter", filter=~menu)
         def submit(_event: Any) -> None:
             self.submit()
+
+        # The command menu: Up/Down (auto_up/auto_down below) and Tab/Shift+Tab choose, Enter takes
+        # the chosen command (the first while none is) and runs it when it takes no arguments, Esc
+        # closes it, even during a turn (Esc then cancels only once the menu is closed).
+        @bindings.add("enter", filter=menu)
+        def accept(_event: Any) -> None:
+            self._accept_completion()
+
+        @bindings.add("tab", filter=menu)
+        def next_item(event: Any) -> None:
+            event.current_buffer.complete_next()
+
+        @bindings.add("s-tab", filter=menu)
+        def previous_item(event: Any) -> None:
+            event.current_buffer.complete_previous()
+
+        @bindings.add("tab", filter=~menu)
+        def open_menu(event: Any) -> None:
+            event.current_buffer.start_completion(select_first=False)
+
+        @bindings.add("escape", filter=menu)
+        def close_menu(event: Any) -> None:
+            event.current_buffer.cancel_completion()
 
         @bindings.add("escape", "enter")
         def newline(event: Any) -> None:
@@ -571,7 +616,7 @@ class ChatUI:
             # A newline key that never involves Esc (terminals without Option as Meta).
             event.current_buffer.insert_text("\n")
 
-        @bindings.add("escape", filter=Condition(lambda: self.busy))
+        @bindings.add("escape", filter=~menu & Condition(lambda: self.busy))
         def escape(_event: Any) -> None:
             # The same path as Ctrl+C during work; while idle Esc does nothing.
             self.cancel()
@@ -606,6 +651,24 @@ class ChatUI:
             event.current_buffer.insert_text("\x1a")
 
         return bindings
+
+    def _menu_open(self) -> bool:
+        return menu_open(self.buffer)
+
+    def _accept_completion(self) -> None:
+        state = self.buffer.complete_state
+        if state is None or not state.completions:
+            self.submit()
+            return
+        self.buffer.apply_completion(state.current_completion or state.completions[0])
+        if self.buffer.text.strip() in RUN_ON_ENTER:
+            self.submit()
+
+    def _sync_timeouts(self) -> None:
+        """Short key timeouts while a lone Esc acts (a turn runs, or the menu is open), so it acts at
+        once; prompt_toolkit's own otherwise, so a slow Esc, Enter is still a newline."""
+        quick = self._executing or self._menu_open()
+        self.application.ttimeoutlen, self.application.timeoutlen = _TURN_TIMEOUTS if quick else self._idle_timeouts
 
     # -- submissions ----------------------------------------------------------- #
 
@@ -651,7 +714,7 @@ class ChatUI:
         self._steps = StepTracker()
         self._steps_cancelled = False
         self._submitted_at = time.monotonic()
-        self.application.ttimeoutlen, self.application.timeoutlen = _TURN_TIMEOUTS
+        self._sync_timeouts()
         self.set_activity("Thinking..." if not text.startswith("/") else "Working...")
         self._active_task = asyncio.create_task(self._submit(text))
         self._animate()
@@ -681,7 +744,7 @@ class ChatUI:
             await self.flush()
             self._cancelling = False
             self._flash = None  # "Still working" is over
-            self.application.ttimeoutlen, self.application.timeoutlen = self._idle_timeouts
+            self._sync_timeouts()
             self.set_activity("Ready")
             if self._exit_requested:
                 self._exit_application()
@@ -883,7 +946,15 @@ class ChatUI:
         live = ConditionalContainer(
             row(self._live_line), filter=Condition(lambda: (self.busy or self._preparing) and bool(self.activity)),
         )
-        return HSplit([live, row(self._top_border), self.composer, row(self._bottom_border), row(self._footer_row)])
+        # The command menu sits under the frame, above the footer, while it has completions.
+        menu = ConditionalContainer(
+            Window(FormattedTextControl(self._menu_rows), height=lambda: menu_height(self.buffer)),
+            filter=Condition(self._menu_open),
+        )
+        return HSplit([live, row(self._top_border), self.composer, row(self._bottom_border), menu, row(self._footer_row)])
+
+    def _menu_rows(self) -> list[tuple[str, str]]:
+        return menu_fragments(self.buffer, self.glyphs, self._columns())
 
     def _border_style(self) -> str:
         return f"class:frame.{self._state()}"
@@ -957,7 +1028,9 @@ class ChatUI:
             style, text = "class:hint.flash", flash
         else:
             style = "class:hint"
-            if self._cancelling:
+            if self._menu_open():
+                text = g.join(f"{'up/down' if g.ascii else '↑↓'} choose", "tab complete", "enter run", "esc close")
+            elif self._cancelling:
                 text = "cancelling"
             elif self.busy and self._executing:
                 text = g.join("esc cancel", "your draft is kept")
@@ -965,6 +1038,8 @@ class ChatUI:
                 text = g.join("starting", "your message is queued" if self._pending_submission is not None else "you can type now")
             elif self._startup_failed:
                 text = g.join("startup failed", "/exit to leave")
+            elif self._suggesting():
+                text = g.join(f"{'right' if g.ascii else '→'} accept", "enter send", "alt+enter new line")
             elif self.buffer.text:
                 text = g.join("enter send", "alt+enter new line")
             else:
@@ -973,6 +1048,11 @@ class ChatUI:
         if get_cwidth(text) > room:
             text = _clip(text, room - get_cwidth(g.ellipsis)).rstrip() + g.ellipsis
         return [(style, f" {text} ")] if text else []
+
+    def _suggesting(self) -> bool:
+        """Whether the grey suggestion from history shows (→ takes it): at the end of the draft."""
+        suggestion = self.buffer.suggestion
+        return suggestion is not None and bool(suggestion.text) and self.buffer.document.is_cursor_at_the_end
 
     def _footer_data(self) -> FooterData:
         try:

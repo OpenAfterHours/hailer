@@ -61,6 +61,7 @@ _KNOWN_HAILER = {
     "max_tool_output_chars",
     "max_context_bytes",
     "log_level",
+    "input_history",
 }
 _KNOWN_MODEL = {"name", "provider", "reasoning_effort", "summarize_after_tokens"}
 _KNOWN_PROVIDER = {
@@ -106,6 +107,7 @@ data_dir = "data"                    # the data files to analyse (CSV, Parquet, 
 # max_tool_output_chars = 12000        # cap on any single tool result sent to the model
 # max_context_bytes = 24000            # cap on the concatenated context files
 # log_level = "WARNING"                # or set HAILER_LOG_LEVEL / --verbose
+# input_history = true                 # Up recalls messages from past sessions (.hailer/input_history); false: memory only
 
 [model]
 name = "gpt-5.5"
@@ -379,6 +381,7 @@ def load_config(
     log_level = (env.get("HAILER_LOG_LEVEL") or _str(hailer_tbl, "log_level", "hailer", path, DEFAULT_LOG_LEVEL) or DEFAULT_LOG_LEVEL).upper()
     max_tool_output_chars = _int(hailer_tbl, "max_tool_output_chars", "hailer", path, 12_000)
     max_context_bytes = _int(hailer_tbl, "max_context_bytes", "hailer", path, 24_000)
+    input_history = _bool(hailer_tbl, "input_history", "hailer", path, True)
 
     model_name = env.get("HAILER_MODEL") or _str(model_tbl, "name", "model", path, ModelConfig().name) or ModelConfig().name
     model_provider = env.get("HAILER_MODEL_PROVIDER") or _str(model_tbl, "provider", "model", path, ModelConfig().provider) or ModelConfig().provider
@@ -454,6 +457,7 @@ def load_config(
         config_path=path,
         max_tool_output_chars=max_tool_output_chars,
         max_context_bytes=max_context_bytes,
+        input_history=input_history,
     )
 
 

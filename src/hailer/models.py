@@ -186,6 +186,8 @@ class HailerConfig:
     max_tool_output_chars: int = 12_000
     max_context_bytes: int = 24_000
     notebooks_dir: Path | None = None  # load_config always fills it; None only in hand-built test configs
+    #: Keep what the user types in ``.hailer/input_history`` (Up recalls it in later sessions).
+    input_history: bool = True
 
     @property
     def notebooks_root(self) -> Path:
@@ -275,6 +277,23 @@ class Command:
 
     name: str
     args: str = ""
+
+
+@dataclass(frozen=True)
+class CompletionData:
+    """What the composer's command menu offers after a command name. The controller builds it from
+    state it already holds: it is read while a slash command is typed, so nothing asks marimo or the
+    disk for it."""
+
+    #: The notebooks the sandbox listed last (after startup, a ``/notebook`` command or a turn).
+    notebooks: tuple[str, ...] = ()
+    active_notebook: str = ""
+    #: (name, description) of each loaded skill.
+    skills: tuple[tuple[str, str], ...] = ()
+    prompts: tuple[str, ...] = ()
+    model: str = ""
+    #: The providers ``/model <provider>:<name>`` accepts.
+    providers: tuple[str, ...] = ()
 
 
 @dataclass
