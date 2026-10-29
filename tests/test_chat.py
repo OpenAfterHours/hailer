@@ -16,12 +16,12 @@ from rich.console import Console
 import hailer.cli as cli
 from hailer.cli import chat as cli_chat
 from hailer.cli import common
-from hailer import notebooks
+from hailer import __version__, notebooks
 from hailer.errors import HailerError
 from hailer.models import AgentEvent, ContextBundle, SessionState, SkillInfo
 from hailer.session import load_session, save_session
 from hailer.transcript import FooterData
-from test_cli import FakeAgent, Harness, harness, runner, url_for, write_notebook  # noqa: F401 - shared offline fixture
+from test_cli import SESSION_ENDED, FakeAgent, Harness, harness, rows, runner, url_for, write_notebook  # noqa: F401 - shared offline fixture
 
 
 class AsyncFakeAgent(FakeAgent):
@@ -91,6 +91,8 @@ class StubUI:
         self.links: list[Any] = []
         self.events: list[Any] = []
         self.activities: list[str] = []
+        self.tasks: list[tuple[str, str]] = []  # what the live row was asked to show (label, detail)
+        self.open_tasks: set[object] = set()
         self.exited = False
         self.flushed = False
         self.prepare: Any = None
@@ -120,6 +122,13 @@ class StubUI:
 
     def set_activity(self, text: str) -> None:
         self.activities.append(text)
+
+    def begin_task(self, key: object, label: str, detail: str = "") -> None:
+        self.tasks.append((label, detail))
+        self.open_tasks.add(key)
+
+    def end_task(self, key: object) -> None:
+        self.open_tasks.discard(key)
 
     def exit(self) -> None:
         self.exited = True
@@ -168,8 +177,9 @@ def test_async_start_persists_resumed_or_new_session(harness, new_thread):
     _controller, ui, output = run_session(harness, scenario, new_thread=new_thread)
     assert harness.agent.started == ([None] if new_thread else ["old-thread"])
     assert harness.agent.forgotten == (["old-thread"] if new_thread else [None])
-    assert ui.exited and "Bye." in output
-    assert ("Resumed conversation (3 turns so far)" in output) is not new_thread
+    assert ui.exited and "Bye." not in output  # the CLI's exit summary follows
+    assert bool(rows(output, "Resumed", "3 earlier turns", "/new starts fresh", icon="↺")) is not new_thread
+    assert len(rows(output, "Agent", "gpt-5.5", "openai")) == 1
 
 
 def test_async_model_and_new_reset_thread_once_and_persist_counters(harness):
@@ -343,7 +353,7 @@ def test_async_turn_syncs_notebook_after_failure_or_cancellation_and_preserves_n
         assert controller._pending_preamble is None and controller.state.turns == 1
 
     _controller, ui, output = run_session(harness, scenario)
-    assert output.count("Active notebook is now other.py.") == 1
+    assert len(rows(output, "Notebook", "other.py", "now active", "opened in your browser")) == 1
     assert harness.opened == [url_for(other)]
     assert ui.answers == ["Answer to: continue"]
     assert ("endpoint failed" in output) is not cancelled
@@ -361,8 +371,9 @@ def test_reply_links_the_notebook_a_tool_switched_to_and_the_switch_is_reported_
     _controller, ui, output = run_session(harness, scenario)
     assert ui.links == [harness.sandbox.notebook_url("other.py")]  # not the notebook from before the turn
     assert "access_token" not in ui.links[0]
-    assert output.count("Active notebook is now other.py.") == 1
-    assert output.index("Answer to: make another notebook") < output.index("Active notebook is now other.py.")
+    switched = rows(output, "Notebook", "other.py", "now active", "opened in your browser")
+    assert len(switched) == 1
+    assert output.index("Answer to: make another notebook") < output.index(switched[0])
     assert harness.opened == [url_for(other)]  # still opened once, after the answer
 
 
@@ -434,7 +445,7 @@ def test_async_notebook_command_queues_notice_for_next_turn(harness):
     _controller, ui, output = run_session(harness, scenario)
     assert harness.agent.preambles[0].startswith("[Hailer] The active notebook is now other.py")
     assert harness.agent.preambles[1] is None
-    assert "Active notebook: other.py." in output
+    assert rows(output, "Notebook", "other.py", "active", "open in your browser")
     assert len(ui.answers) == 2
 
 
@@ -476,7 +487,7 @@ def test_cancelled_notebook_session_wait_stops_worker_and_preserves_switch_notic
 
     _controller, ui, output = run_session(harness, scenario)
     assert harness.opened == [url_for(other)]
-    assert "Active notebook: other.py." in output
+    assert rows(output, "Notebook", "other.py", "active", "not open in a browser yet", icon="▲"), "the switch happened"
     assert ui.answers == ["Answer to: inspect it"]
 
 
@@ -586,7 +597,9 @@ def test_first_message_waits_for_both_startups_while_composer_accepts_paste_and_
             await asyncio.wait_for(notebook_entered.wait(), 5)
             assert ui.application.is_running and ui.application.render_counter > 0
             assert set(timings.milestones) == {"input_ready"}
-            assert ui.activity == "Starting"
+            assert ui.activity == "Agent"  # the live row shows the pending session work in its own columns
+            live = "".join(text for _style, text in ui._live_line())
+            assert re.search(r"Agent {6}starting gpt-5\.5", live), live  # the session rows' label column
             keys.send_text("\x1b[200~first line\r\nsecond line\x1b[201~\r")
             await until(lambda: ui._pending_submission is not None)
             keys.send_text("next draft\r\r")
@@ -607,6 +620,59 @@ def test_first_message_waits_for_both_startups_while_composer_accepts_paste_and_
             ui.exit()
             await asyncio.wait_for(running, 5)
             assert harness.agent.closed
+
+    asyncio.run(scenario())
+
+
+def test_composer_startup_commits_the_checklist_rows_as_each_part_gets_ready(harness, monkeypatch):
+    """Inside the composer the CLI's notebook wait shows on the live row (``Notebook  opening
+    analysis.py in your browser``), then commits its row and the app-view tip; the agent commits
+    ``✓ Agent`` and ``↺ Resumed``; a blank line ends the startup rows. The signed-in link is not
+    printed (the browser opened it)."""
+    from test_chat_ui import terminal, until
+    from test_cli import DOCKER_SERVER, TOKEN, FakeClient
+
+    save_session(harness.config.workspace, SessionState(thread_id="old-thread", turns=2))
+    harness.server = DOCKER_SERVER
+    harness.client = FakeClient(session=None)
+    harness.agent = AsyncFakeAgent()
+    harness.agent.key_source = "keyring"
+    waiting, release = threading.Event(), threading.Event()
+
+    def wait_session(client: Any, notebook: str, timeout: float, *, should_stop: Any = None) -> Any:
+        waiting.set()
+        assert release.wait(5)
+        return client.grant(notebook)
+
+    monkeypatch.setattr(common, "_wait_for_session", wait_session)
+
+    async def scenario():
+        controller = cli_chat.ChatLoop(Console(file=io.StringIO()), harness.config, common.CliOptions(), sandbox=harness.sandbox)
+
+        async def prepare_notebook():
+            return await cli_chat._prepare_notebook(
+                controller.console, controller.sandbox, "analysis.py", open_browser=True, progress=controller.progress,
+            )
+
+        with terminal(controller.ahandle, controller.footer) as (ui, _keys, _screen, transcript, _size):
+            running = asyncio.create_task(controller.run_interactive(ui_factory=lambda *_args: ui, prepare_notebook=prepare_notebook))
+            await until(lambda: waiting.is_set() and ui.activity == "Notebook")
+            live = "".join(text for _style, text in ui._live_line())
+            assert re.match(r"  . Notebook   opening analysis\.py in your browser", live), live
+            await ui.flush()
+            assert rows(transcript.getvalue(), "Agent", "gpt-5.5", "openai", "OPENAI_API_KEY from keyring")
+            assert rows(transcript.getvalue(), "Resumed", "2 earlier turns", "/new starts fresh", icon="↺")
+            release.set()
+            await until(lambda: not ui._preparing)
+            await ui.flush()
+            out = transcript.getvalue()
+            assert rows(out, "Notebook", "analysis.py", "open in your browser")
+            assert f"{' ' * 15}{cli_chat.APP_VIEW_TIP}" in out.splitlines()
+            assert out.endswith(f"{cli_chat.APP_VIEW_TIP}\n\n"), "a blank line ends the startup rows"
+            assert TOKEN not in out and harness.opened[0].endswith(f"access_token={TOKEN}")
+            assert controller.notebook_open is True
+            ui.exit()
+            await asyncio.wait_for(running, 5)
 
     asyncio.run(scenario())
 
@@ -768,8 +834,17 @@ def test_plain_terminal_session_emits_no_cursor_controls(harness, monkeypatch, a
     assert harness.agent.turns == [("hello", None)]
     assert harness.agent.closed
     rendered = output.getvalue()
-    assert "Answer to: hello" in rendered and "Bye." in rendered
+    assert "Answer to: hello" in rendered and SESSION_ENDED.search(rendered) and "Bye." not in rendered
     assert "\x1b" not in rendered
+    # the same checklist as the composer's, one plain line per row, in order
+    assert rendered.startswith(f"◆ Hailer {__version__}   ·   ")
+    checklist = [
+        rows(rendered, "Kernel", "unsafe-local", "runs as you, not isolated", icon="▲")[0],
+        rows(rendered, "Notebook", "analysis.py", "already open")[0],
+        rows(rendered, "Agent", "gpt-5.5", "openai")[0],
+    ]
+    assert [rendered.index(row) for row in checklist] == sorted(rendered.index(row) for row in checklist)
+    assert rendered.rstrip().endswith("✓ Kernel stopped")
 
 
 @pytest.mark.parametrize(

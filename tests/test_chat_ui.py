@@ -217,7 +217,7 @@ def test_idle_keyboard_exits(exit_keys):
             running = await start(ui)
             keys.send_text(exit_keys)
             await asyncio.wait_for(running, 5)
-            assert "Bye." in transcript.getvalue()
+            assert transcript.getvalue() == "", "no farewell of its own: the CLI's exit summary follows"
             assert PASTE_OFF in screen.getvalue()
 
     asyncio.run(scenario())
@@ -486,6 +486,7 @@ def test_idle_exit_write_failure_has_no_unowned_task(monkeypatch):
                 raise OSError("terminal closed during exit")
 
             monkeypatch.setattr(ui._raw_console, "print", failed_write)
+            ui.console.print("Last words before the exit.")  # e.g. a notebook copy's warning
             keys.send_text("\x03")
             with pytest.raises(OSError, match="terminal closed during exit"):
                 await asyncio.wait_for(running, 5)
@@ -920,6 +921,51 @@ def test_nothing_animates_while_the_chat_prepares():
             ready.set()
             await until(lambda: not ui._preparing)
             await until(lambda: ui._ticker is None)
+            ui.exit()
+            await asyncio.wait_for(running, 5)
+
+    asyncio.run(scenario())
+
+
+def test_session_tasks_show_on_the_live_row_in_the_session_rows_columns():
+    """Startup's agent and notebook (and a notebook switch) show on the live row as ``Notebook
+    opening analysis.py in your browser``, lined up with the session rows (a ten-cell label); the
+    latest begun one shows, a running step goes first, and the row ends with the tasks. Labels
+    from outside cannot add rows or controls; begin_task and end_task work from any thread."""
+
+    async def scenario():
+        ready = asyncio.Event()
+
+        async def prepare():
+            await ready.wait()
+            return True
+
+        def live():
+            return "".join(text for _style, text in ui._live_line())
+
+        with terminal(lambda _text: asyncio.sleep(0)) as (ui, _keys, _screen, _transcript, _size):
+            ui.configure_startup(prepare)
+            running = await start(ui)
+            assert ui.activity == "Starting"
+            agent, notebook = object(), object()
+            ui.begin_task(agent, "Agent", "starting gpt-5.5")
+            await asyncio.to_thread(ui.begin_task, notebook, "Notebook", "opening q2\x1b[2J\nreview.py in your browser")
+            await until(lambda: ui.activity == "Notebook")
+            assert re.match(r"  . Notebook   opening q2\[2J review\.py in your browser", live()), live()
+            ui.begin_task(agent, "Agent", "still starting")  # an update keeps its place: the notebook still shows
+            await until(lambda: ui._tasks[agent][1] == "still starting")
+            assert ui.activity == "Notebook"
+            await asyncio.to_thread(ui.end_task, notebook)
+            await until(lambda: ui.activity == "Agent")
+            assert re.match(r"  . Agent {6}still starting", live()), live()
+            ui._steps.call(call("marimo_execute", "a", code="x = 1\n"))
+            assert ui.activity == "Running code"
+            assert re.match(rf"  . Running code {{{20 - len('Running code') + 1}}}1 line", live()), live()
+            ui._steps = type(ui._steps)()
+            ui.end_task(agent)
+            await until(lambda: ui.activity == "Starting")
+            ready.set()
+            await until(lambda: not ui._preparing)
             ui.exit()
             await asyncio.wait_for(running, 5)
 

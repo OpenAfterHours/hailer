@@ -1,19 +1,28 @@
 """``uvx hailer`` and ``uvx hailer notebook``: start this session's own kernel, open the notebook,
-chat, and stop the kernel on every way out (``--foreground``: marimo without the chat)."""
+chat, and stop the kernel on every way out (``--foreground``: marimo without the chat).
+
+A session reads as a checklist: a header line, a row per thing that got ready (``✓ Kernel``,
+``✓ Notebook``, ``✓ Agent``; the last two inside the composer as they finish), and an exit summary.
+The notebook's signed-in URL (it carries the access token) is printed only when the user must open
+it by hand: ``--no-browser``, or no session came in time.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import os
 import threading
-from contextlib import nullcontext
+import time
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import replace
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 import typer
 from rich.console import Console
+from rich.text import Text
 
-from hailer import notebooks
+from hailer import __version__, notebooks
 from hailer.chat import ChatController
 from hailer.cli import common
 from hailer.cli.common import (
@@ -26,23 +35,27 @@ from hailer.cli.common import (
     _print_checks,
     _print_error,
     _print_unexpected,
-    _startup_panel,
+    _relative,
     kernel_checks,
     local_checks,
 )
 from hailer.errors import HailerError
-from hailer.models import KERNEL_RUNTIME_DOCKER, HailerConfig
+from hailer.models import KERNEL_RUNTIME_DOCKER, KERNEL_RUNTIME_UNSAFE_LOCAL, Check, HailerConfig
 from hailer.startup import StartupTimings
+from hailer.steps import single_line
+from hailer.transcript import MUTED, callout, console_glyphs, done_items, session_ended, session_header, session_note, session_row
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
     from hailer.sandbox import MarimoSandbox
 
 DEFAULT_MARIMO_PORT = 2718
 SESSION_TIMEOUT_SEC = 90.0
-APP_VIEW_HINT = (
-    "The notebook opens in app view (results only). "
-    "Press Ctrl+. in it, or use Toggle app view, to see and edit the code."
-)
+#: The muted line under ``✓ Notebook`` when this start had it opened in a browser.
+APP_VIEW_TIP = "Opens in app view (results only); Ctrl+. in the notebook shows the code"
+#: The startup checklist's label for a preflight check that did not pass (``check.name``).
+CHECK_LABELS = {"config": "Config", "notebook": "Notebook", "credentials": "API key", "kernel": "Kernel", "docker": "Docker", "image": "Image", "data": "Data"}
+#: ``progress(label, detail)``: what the composer's live row shows while a block runs.
+Progress = Callable[[str, str], AbstractContextManager[Any]]
 
 
 def _chat_console(opts: CliOptions) -> Console:
@@ -98,15 +111,17 @@ def _run_chat_loop(
     opts: CliOptions,
     sandbox: MarimoSandbox | None = None,
     *,
-    prepare_notebook: Callable[[Console], Awaitable[bool | None]] | None = None,
+    prepare_notebook: Callable[[Console, Progress], Awaitable[bool | None]] | None = None,
     timings: StartupTimings | None = None,
 ) -> None:
-    """Start the agent and run the REPL; exit code 1 when the agent cannot start."""
+    """Start the agent and run the REPL, then say the session ended; exit code 1 when the agent
+    cannot start."""
     loop = ChatLoop(console, config, opts, sandbox)
+    started = timings.started_at if timings is not None else time.perf_counter()
     if _use_composer(opts):
         async def prepare() -> bool | None:
             if prepare_notebook is not None:
-                return await prepare_notebook(loop.console)
+                return await prepare_notebook(loop.console, loop.progress)
             return None
 
         try:
@@ -115,10 +130,11 @@ def _run_chat_loop(
             _print_error(console, err, verbose=opts.verbose)
             raise typer.Exit(code=1)
         except KeyboardInterrupt:
-            console.print("Bye.")
+            pass
         except Exception as exc:  # startup/terminal failures still restore the terminal
             _print_unexpected(console, exc, verbose=opts.verbose)
             raise typer.Exit(code=1)
+        _session_ended(console, loop, started)
         if loop.startup_failed:
             # The composer keeps the draft available until the user exits, but
             # a preparation error remains a failed CLI invocation.
@@ -138,10 +154,22 @@ def _run_chat_loop(
         _print_unexpected(console, exc, verbose=opts.verbose)
         loop.close()
         raise typer.Exit(code=1)
+    console.print()
+    console.print(Text("Type /help for commands.", style=MUTED))
     try:
         loop.run()
     finally:
         loop.close()
+    console.print()
+    _session_ended(console, loop, started)
+
+
+def _session_ended(console: Console, loop: ChatController, started: float) -> None:
+    """``Session ended · 4 turns · 4m 12s · 18.2k tokens``: this session's turns, time (since the
+    command started) and tokens. The kernel's line follows once it has stopped."""
+    console.print(session_ended(
+        console_glyphs(console), turns=loop.session_turns, elapsed=time.perf_counter() - started, tokens_used=loop.session_tokens,
+    ))
 
 
 def _free_port_url(console: Console, port: int) -> tuple[int, str]:
@@ -162,16 +190,22 @@ def _where(runtime: Any) -> str:
 
 
 def _start_kernel(console: Console, runtime: Any, port: int, *, verbose: bool) -> Any:
-    """Start marimo through ``runtime`` and wait until it answers with its token; exit 1 when it
-    does not. Ctrl+C after the runtime started it still stops it (the caller owns it only once
-    this returns)."""
+    """Start marimo through ``runtime`` and wait until it answers with its token, then its row
+    (:func:`_kernel_row`, a busy port and, with ``--verbose``, the URL and log under it); exit 1 when
+    it does not start. Ctrl+C after the runtime started it still stops it (the caller owns it only
+    once this returns)."""
     running: Any = None
     try:
         _prepare_runtime(console, runtime)
-        chosen, url = _free_port_url(console, port)
-        with console.status(f"Starting marimo{_where(runtime)} on {url} ..."):
+        chosen = common._find_free_port(port)
+        began = time.monotonic()
+        with console.status(f"Starting marimo{_where(runtime)} on http://127.0.0.1:{chosen} ..."):
             running = runtime.start(chosen)
-        console.print(f"Marimo is running at {running.server.url}  (log: {running.log_hint})", markup=False)
+        _kernel_row(console, running, time.monotonic() - began)
+        if chosen != port:
+            console.print(session_note(f"Port {port} is busy; using {chosen}."))
+        if verbose:
+            console.print(session_note(f"Marimo is running at {running.server.url}  (log: {running.log_hint})"))
     except HailerError as err:  # the runtime has cleaned up; the hint carries the log tail
         _print_error(console, err, verbose=verbose)
         raise typer.Exit(code=1)
@@ -180,6 +214,51 @@ def _start_kernel(console: Console, runtime: Any, port: int, *, verbose: bool) -
             running.stop()
         raise
     return running
+
+
+def _kernel_row(console: Console, sandbox: MarimoSandbox, took: float | None) -> None:
+    """``✓ Kernel  docker · isolated · no network · data read-only  1.9s``; the unsafe-local kernel
+    is a warning row (it runs as the user). The image and the log are in ``/status``."""
+    g = console_glyphs(console)
+    server = sandbox.server
+    if server.runtime == KERNEL_RUNTIME_UNSAFE_LOCAL:
+        console.print(session_row(g, "warn", "Kernel", g.join("unsafe-local", "runs as you, not isolated"), took))
+        return
+    if server.runtime == KERNEL_RUNTIME_DOCKER:
+        network = ("network on",) if server.network_access else ("isolated", "no network")
+        console.print(session_row(g, "ok", "Kernel", g.join("docker", *network, "data read-only"), took))
+        return
+    console.print(session_row(g, "ok", "Kernel", single_line(server.runtime), took))
+
+
+def _stop_kernel(console: Console, config: HailerConfig, running: MarimoSandbox) -> None:
+    """Stop the session's kernel (a docker kernel copies its notebooks back first, which can take
+    a while: a spinner says so on a terminal) and say how it went on one line:
+    ``✓ Notebooks copied back to notebooks/   ✓ Kernel stopped``. A warning from the last copy
+    (printed as it comes) turns the first item into a warning; a stop error stays red and exits 1."""
+    g = console_glyphs(console)
+    docker = running.server.runtime == KERNEL_RUNTIME_DOCKER
+    warned: list[str] = []
+
+    def notice(text: str) -> None:
+        warned.append(text)
+        console.print(callout(g, "warn", text))
+
+    running.notice = notice
+    with console.status("Copying the notebooks back and stopping the kernel ..." if docker else "Stopping the kernel ..."):
+        running.stop()  # a docker kernel copies its notebooks back first, on every way out
+    error = getattr(running, "stop_error", "")
+    items: list[tuple[str, str]] = []
+    if docker:
+        folder = _relative(config.notebooks_root, config.workspace)
+        items.append(("warn", "Notebooks: see the warning above") if warned else ("ok", f"Notebooks copied back to {folder}{os.sep}"))
+    if not error:
+        items.append(("ok", "Kernel stopped"))
+    if items:
+        console.print(done_items(g, items))
+    if error:
+        console.print(callout(g, "fail", error))
+        raise typer.Exit(code=1)
 
 
 def _run_foreground(console: Console, config: HailerConfig, runtime: Any, port: int, *, open_browser: bool, verbose: bool) -> int:
@@ -230,17 +309,24 @@ def _wait_for_notebook(
     open_browser: bool,
     should_stop: Callable[[], bool] | None = None,
     show_status: bool = True,
+    progress: Progress | None = None,
 ) -> bool | None:
-    """Open ``notebook`` and poll its session, stopping between blocking operations. Returns
-    whether it has a session (the composer's footer shows it); None when stopped.
+    """Open ``notebook`` and poll its session, stopping between blocking operations, then its row:
+    ``✓ Notebook  analysis.py · open in your browser  2.2s`` and the app-view tip, ``already open``,
+    or a warning with the signed-in link when no session came. Returns whether it has a session
+    (the composer's footer shows it); None when stopped.
 
-    The live composer owns its activity display, so its background preparation
-    suppresses the Rich spinner. Cancellation never leaves a later browser open
-    or session message racing the next session or kernel shutdown.
+    The signed-in URL is printed only when the user must open it by hand (``--no-browser``, or no
+    session in time), never as a hyperlink. ``progress`` shows the wait on the composer's live row;
+    without it a Rich spinner does (``show_status``). Cancellation never leaves a later browser
+    open or session message racing the next session or kernel shutdown.
     """
     stopped = should_stop or (lambda: False)
     if stopped():
         return None
+    g = console_glyphs(console)
+    name = single_line(notebook)
+    began = time.monotonic()
     client = sandbox.client(notebook=notebook, token_in_links=True)
     url = sandbox.notebook_url(notebook, with_token=True)
     if stopped():
@@ -252,33 +338,40 @@ def _wait_for_notebook(
     if stopped():
         return None
     if session is not None:
-        console.print(f"Notebook is open (session {session.session_id}).", markup=False)
+        console.print(session_row(g, "ok", "Notebook", g.join(name, "already open"), time.monotonic() - began))
         return True
-    if open_browser:
-        console.print(f"Opening {url} in your browser...", markup=False)
-        common._open_browser(url)
+    if not open_browser:
+        console.print(session_row(g, "link", "Notebook", f"open {name} in your browser with this link (it signs you in):"))
+        console.print(session_note(url, style=""), soft_wrap=True)
+    if progress is not None:
+        waiting = progress("Notebook", f"opening {name} in your browser" if open_browser else f"waiting for {name} to open")
     else:
-        console.print(f"Open {url} in your browser.", markup=False)
-    if stopped():
-        return None
-    console.print(APP_VIEW_HINT, markup=False)
-    status = console.status("Waiting for the notebook to open...") if show_status else nullcontext()
-    with status:
+        waiting = console.status("Waiting for the notebook to open...") if show_status else nullcontext()
+    with waiting:
+        if open_browser:
+            common._open_browser(url)
+        if stopped():
+            return None
         session = common._wait_for_session(client, notebook, SESSION_TIMEOUT_SEC, should_stop=should_stop)
     if stopped():
         return None
+    took = time.monotonic() - began
     if session is None:
-        console.print(
-            f"No kernel session yet. Open {url} in your browser; the agent reports the notebook state when asked.",
-            style="yellow",
-            markup=False,
-        )
+        console.print(session_row(g, "warn", "Notebook", g.join(name, "no kernel session yet"), took))
+        if open_browser:
+            console.print(session_note("Open it in your browser with this link; the agent reports the notebook state when asked:"))
+            console.print(session_note(url, style=""), soft_wrap=True)
+        else:
+            console.print(session_note("Open it with the link above; the agent reports the notebook state when asked."))
         return False
-    console.print(f"Notebook is open (session {session.session_id}).", markup=False)
+    console.print(session_row(g, "ok", "Notebook", g.join(name, "open in your browser"), took))
+    console.print(session_note(APP_VIEW_TIP))
     return True
 
 
-async def _prepare_notebook(console: Console, sandbox: MarimoSandbox, notebook: str, *, open_browser: bool) -> bool | None:
+async def _prepare_notebook(
+    console: Console, sandbox: MarimoSandbox, notebook: str, *, open_browser: bool, progress: Progress | None = None,
+) -> bool | None:
     """Wait off the UI loop and settle the worker before the kernel may be stopped.
 
     Cancelling ``to_thread`` alone abandons its work. The stop flag ends polling
@@ -288,7 +381,7 @@ async def _prepare_notebook(console: Console, sandbox: MarimoSandbox, notebook: 
     stop = threading.Event()
     task = asyncio.create_task(asyncio.to_thread(
         _wait_for_notebook, console, sandbox, notebook,
-        open_browser=open_browser, should_stop=stop.is_set, show_status=False,
+        open_browser=open_browser, should_stop=stop.is_set, show_status=False, progress=progress,
     ))
     try:
         return await asyncio.shield(task)
@@ -306,11 +399,35 @@ async def _prepare_notebook(console: Console, sandbox: MarimoSandbox, notebook: 
         raise
 
 
+def _home_relative(path: Path) -> str:
+    """``path`` with ``~`` for the home folder (the header line)."""
+    try:
+        inside = Path(path).relative_to(Path.home())
+    except (ValueError, RuntimeError):  # elsewhere, or no home folder
+        return str(path)
+    return "~" if inside == Path() else str(Path("~") / inside)
+
+
+def _check_rows(console: Console, checks: list[Check]) -> None:
+    """The preflight checks that did not pass, as rows of the startup checklist: a warning
+    (yellow) or a failure (red), each with its hint lines under it, their text unchanged."""
+    g = console_glyphs(console)
+    for check in checks:
+        if check.ok:
+            continue
+        console.print(session_row(g, "fail" if check.fatal else "warn", CHECK_LABELS.get(check.name, check.name.capitalize()), check.summary))
+        for line in (check.hint or "").splitlines():
+            console.print(session_note(line, style=""))
+
+
 def _run_session(console: Console, config: HailerConfig, opts: CliOptions, *, port: int, open_browser: bool) -> None:
-    """Start this session's own kernel, chat with it, and stop it when the chat ends."""
+    """Start this session's own kernel, chat with it, and stop it when the chat ends: the header,
+    the checklist's rows, the chat, the exit summary."""
     timings = StartupTimings()
+    console.print(session_header(console_glyphs(console), __version__, _home_relative(config.workspace)))
+    console.print()
     checks = local_checks(config) + kernel_checks(config, starting=True)
-    _print_checks(console, checks, only_failures=True)
+    _check_rows(console, checks)
     if any(not c.ok and c.fatal for c in checks):
         raise typer.Exit(code=1)
     timings.mark("checks_complete")
@@ -328,12 +445,10 @@ def _run_session(console: Console, config: HailerConfig, opts: CliOptions, *, po
         if not interactive:
             _wait_for_notebook(console, running, notebook, open_browser=open_browser)
             timings.mark("notebook_wait_complete")
-        console.print()
-        _startup_panel(console, config, notebook)
-        timings.mark("panel_shown")
+        timings.mark("checklist_shown")
 
-        async def prepare_notebook(chat_console: Console) -> bool | None:
-            return await _prepare_notebook(chat_console, running, notebook, open_browser=open_browser)
+        async def prepare_notebook(chat_console: Console, progress: Progress) -> bool | None:
+            return await _prepare_notebook(chat_console, running, notebook, open_browser=open_browser, progress=progress)
 
         _run_chat_loop(
             console, config, opts, running,
@@ -341,12 +456,7 @@ def _run_session(console: Console, config: HailerConfig, opts: CliOptions, *, po
         )
     finally:
         if running is not None:
-            running.stop()  # a docker kernel copies its notebooks back first, on every way out
-            if not getattr(running, "stop_error", ""):
-                console.print("Stopped marimo.", markup=False)
-            if getattr(running, "stop_error", ""):
-                console.print(running.stop_error, style="red", markup=False)
-                raise typer.Exit(code=1)
+            _stop_kernel(console, config, running)
 
 
 def notebook(

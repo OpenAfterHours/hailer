@@ -55,6 +55,8 @@ class Glyphs:
     up: str
     ellipsis: str
     ascii: bool = False
+    brand: str = "◆"  # the startup header's mark
+    resume: str = "↺"  # a resumed or new conversation
 
     def join(self, *parts: str) -> str:
         """The non-empty ``parts`` with the separator between them."""
@@ -74,7 +76,7 @@ UNICODE = Glyphs(
 ASCII = Glyphs(
     user="|", reply="*", ok="+", fail="x", warn="!", on="*", off="o", sep="-", link="->", prompt=">",
     rule="-", bar="|", corners="++++", spinner="|/-\\", up="up", ellipsis="...",
-    ascii=True,
+    ascii=True, brand="#", resume="~",
 )
 
 
@@ -248,6 +250,96 @@ def turn_footer(glyphs: Glyphs, stats: str, notebook: str = "", url: str = "") -
     link = Text(f"{glyphs.link} {notebook}", style=Style(dim=True, link=url)) if notebook and url else Text("")
     grid.add_row(Text(f"  {stats}", style=MUTED), link)
     return grid
+
+
+# --------------------------------------------------------------------------- #
+# Session rows: the startup checklist, notebook switches and the exit summary
+# --------------------------------------------------------------------------- #
+
+#: The session rows' label column (Kernel, Notebook, Agent, Resumed): narrower than a step's.
+SESSION_LABEL_WIDTH = 10
+#: Where a session row's detail starts: the notes under a row (a tip, a link) line up with it.
+SESSION_DETAIL_COLUMN = ICON_WIDTH + 1 + SESSION_LABEL_WIDTH + 1
+#: A session row's status: its icon and the style of its icon, label and detail.
+SESSION_STYLES = {"ok": (OK, "", MUTED), "warn": (WARN, WARN, WARN), "fail": (FAIL, FAIL, FAIL), "resume": (MUTED, "", MUTED), "link": (ACCENT, "", MUTED)}
+
+
+def _session_icon(glyphs: Glyphs, status: str) -> str:
+    return {"ok": glyphs.ok, "fail": glyphs.fail, "resume": glyphs.resume, "link": glyphs.link}.get(status, glyphs.warn)
+
+
+class SessionRow:
+    """One line of what the session did: ``✓ Kernel  docker · isolated  1.9s``. ``status`` is "ok",
+    "warn", "fail", "resume" (a resumed or new conversation) or "link" (something to open by hand).
+
+    On a terminal its columns line up with each other and with the composer's live row (seconds at
+    the right edge); a row that worked keeps to one line (its detail cut with ``…``), a warning's
+    or failure's detail wraps in its column. Elsewhere (plain mode, pipes) it is one line of text
+    that is never cut, so nothing depends on the width or on redraws."""
+
+    def __init__(self, glyphs: Glyphs, status: str, label: str, detail: str = "", took: float | None = None) -> None:
+        self.glyphs, self.status, self.label, self.detail, self.took = glyphs, status, label, detail, took
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        icon_style, label_style, detail_style = SESSION_STYLES.get(self.status, SESSION_STYLES["warn"])
+        took = seconds(self.took) if self.took is not None else ""
+        if not console.is_terminal:
+            line = Text.assemble(
+                (f"  {_session_icon(self.glyphs, self.status)} ", icon_style),
+                (self.label.ljust(SESSION_LABEL_WIDTH), label_style),
+                (f" {self.detail}" if self.detail else "", detail_style),
+            )
+            line.rstrip()
+            if took:
+                room = options.max_width - line.cell_len
+                line.append(took.rjust(room) if room >= len(took) + 2 else f"  {took}", style=MUTED)
+            yield line
+            return
+        worked = self.status in ("ok", "resume", "link")
+        grid = Table.grid(expand=True, padding=(0, 1))
+        grid.add_column(width=ICON_WIDTH, no_wrap=True)
+        grid.add_column(width=SESSION_LABEL_WIDTH, no_wrap=True)
+        grid.add_column(ratio=1, no_wrap=worked, overflow="ellipsis" if worked else "fold")
+        grid.add_column(width=SECONDS_WIDTH, justify="right", no_wrap=True)
+        grid.add_row(
+            Text(f"  {_session_icon(self.glyphs, self.status)}", style=icon_style), Text(self.label, style=label_style),
+            Text(self.detail, style=detail_style), Text(took, style=MUTED),
+        )
+        yield grid
+
+
+def session_row(glyphs: Glyphs, status: str, label: str, detail: str = "", took: float | None = None) -> SessionRow:
+    """A :class:`SessionRow`."""
+    return SessionRow(glyphs, status, label, detail, took)
+
+
+def session_note(text: str, style: str = MUTED) -> RenderableType:
+    """A line under a session row's detail (a tip, a hint, a link to open by hand). A URL in it is
+    written whole and never becomes a hyperlink: the terminal wraps it, so it copies as one."""
+    return Gutter(Text(text, style=style), " " * SESSION_DETAIL_COLUMN)
+
+
+def session_header(glyphs: Glyphs, version: str, workspace: str) -> Text:
+    """``◆ Hailer 0.3.0 · ~/work/sales``: the first line of a session."""
+    return Text.assemble((f"{glyphs.brand} ", ACCENT), ("Hailer", "bold"), (f" {version}", MUTED), (f"   {glyphs.sep}   {workspace}", MUTED))
+
+
+def session_ended(glyphs: Glyphs, *, turns: int, elapsed: float, tokens_used: int) -> Text:
+    """``Session ended · 4 turns · 4m 12s · 18.2k tokens``: this session's turns, time and tokens."""
+    return Text(
+        "  " + glyphs.join("Session ended", plural(turns, "turn"), seconds(elapsed), f"{tokens(tokens_used)} tokens" if tokens_used else ""),
+        style=MUTED,
+    )
+
+
+def done_items(glyphs: Glyphs, items: Sequence[tuple[str, str]]) -> Text:
+    """``✓ Notebooks copied back to notebooks/   ✓ Kernel stopped``: (status, text) on one line."""
+    line = Text("  ")
+    for index, (status, text) in enumerate(items):
+        icon_style = SESSION_STYLES.get(status, SESSION_STYLES["warn"])[0]
+        line.append(("   " if index else "") + f"{_session_icon(glyphs, status)} ", style=icon_style)
+        line.append(text, style=MUTED if status == "ok" else icon_style)
+    return line
 
 
 # --------------------------------------------------------------------------- #
