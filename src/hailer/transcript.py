@@ -7,7 +7,6 @@ lives with the composer). Colours are ANSI names, so the terminal's own theme de
 
 from __future__ import annotations
 
-import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -23,7 +22,8 @@ from rich.table import Table
 from rich.text import Text
 
 from hailer.session import COMMAND_GROUPS, COMMAND_USAGE
-from hailer.steps import Receipt, plural, single_line
+from hailer.steps import Receipt
+from hailer.text import plural, printable, single_line
 
 ACCENT, MUTED, OK, WARN, FAIL = "cyan", "dim", "green", "yellow", "red"
 STATUS_STYLES = {"ok": OK, "failed": FAIL, "cancelled": WARN, "unknown": WARN}
@@ -55,6 +55,8 @@ class Glyphs:
     corners: str  # top-left, top-right, bottom-left, bottom-right
     spinner: str  # one character per frame
     up: str
+    up_down: str  # the command menu's choose keys
+    right: str  # the key that takes the grey suggestion from history
     ellipsis: str
     bullet: str
     ascii: bool = False
@@ -76,11 +78,11 @@ class Glyphs:
 
 UNICODE = Glyphs(
     user="▌", reply="●", ok="✓", fail="✗", warn="▲", on="●", off="○", sep="·", link="↗", prompt="›",
-    rule="─", bar="│", corners="╭╮╰╯", spinner="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏", up="↑", ellipsis="…", bullet="•",
+    rule="─", bar="│", corners="╭╮╰╯", spinner="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏", up="↑", up_down="↑↓", right="→", ellipsis="…", bullet="•",
 )
 ASCII = Glyphs(
     user="|", reply="*", ok="+", fail="x", warn="!", on="*", off="o", sep="-", link="->", prompt=">",
-    rule="-", bar="|", corners="++++", spinner="|/-\\", up="up", ellipsis="...", bullet="-",
+    rule="-", bar="|", corners="++++", spinner="|/-\\", up="up", up_down="up/down", right="right", ellipsis="...", bullet="-",
     ascii=True, brand="#", resume="~",
 )
 
@@ -116,24 +118,6 @@ def seconds(value: float) -> str:
 
 def tokens(value: int) -> str:
     return f"{value / 1000:.1f}k" if value >= 1000 else str(value)
-
-
-# --------------------------------------------------------------------------- #
-# The model's text
-# --------------------------------------------------------------------------- #
-
-# A whole escape sequence (CSI, OSC up to its terminator), then any other C0 or C1 control character
-# but the newline and the tab: Rich's Text and markup=False keep ESC, so a reply could recolour,
-# move or retitle the terminal.
-_ESCAPE_SEQUENCE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x9b[0-?]*[ -/]*[@-~]")
-_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
-
-
-def clean_reply(text: str) -> str:
-    """The model's reply as the terminal may print it: escape sequences and control characters
-    removed (newlines kept), tabs as spaces (every 4 columns, which also keeps Markdown's indents)."""
-    text = _ESCAPE_SEQUENCE.sub("", (text or "").replace("\r\n", "\n"))
-    return _CONTROL.sub("", text).expandtabs(4)
 
 
 # --------------------------------------------------------------------------- #
@@ -340,11 +324,6 @@ SESSION_DETAIL_COLUMN = ICON_WIDTH + 1 + SESSION_LABEL_WIDTH + 1
 SESSION_STYLES = {"ok": (OK, "", MUTED), "warn": (WARN, WARN, WARN), "fail": (FAIL, FAIL, FAIL), "resume": (MUTED, "", MUTED), "wait": (MUTED, "", MUTED)}
 
 
-def _printable(text: str) -> str:
-    """``text`` without control characters (an escape sequence, a newline), its spaces kept."""
-    return "".join(char if char.isprintable() else " " if char.isspace() else "" for char in text)
-
-
 class SessionRow:
     """One line of what the session did: ``✓ Kernel  docker · isolated  1.9s``. ``status`` is "ok",
     "warn", "fail", "resume" (a resumed conversation) or "wait" (not there yet: a notebook to open).
@@ -375,7 +354,7 @@ def session_note(text: str, style: str = MUTED) -> RenderableType:
     """A line under a session row's detail (a tip, a hint, a link to open by hand), without
     control characters. A URL in it is written whole and never becomes a hyperlink: printed with
     ``soft_wrap=True`` the terminal wraps it, so it copies as one."""
-    return Gutter(Text(_printable(text), style=style), " " * SESSION_DETAIL_COLUMN)
+    return Gutter(Text(printable(text), style=style), " " * SESSION_DETAIL_COLUMN)
 
 
 def session_header(glyphs: Glyphs, version: str, workspace: str) -> Text:

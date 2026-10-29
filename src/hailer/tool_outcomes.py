@@ -26,10 +26,11 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Mapping
+from functools import partial
 from typing import Any, NamedTuple
-from urllib.parse import urlsplit
 
 from hailer.log import get_logger
+from hailer.text import fit, plural, single_line, url_host
 
 log = get_logger("hailer.tool_outcomes")
 
@@ -110,18 +111,12 @@ def _framework_error(text: str) -> str:
 _EXCEPTION_RE = re.compile(r"^(?:[A-Za-z_]\w*\.)*([A-Z]\w*(?:Error|Exception|Interrupt|Exit|Warning))(?::|$)")
 
 
-def _one_line(text: str) -> str:
-    """``text`` without terminal controls or other non-printable characters (U+202E ...), on one line."""
-    return " ".join("".join(c for c in text if c.isprintable() or c.isspace()).split())
-
-
 def _clip(text: str, limit: int = SUMMARY_LIMIT) -> str:
-    flat = _one_line(text)
-    return flat if len(flat) <= limit else flat[: limit - 3].rstrip() + "..."
+    return fit(single_line(text), limit, "...")
 
 
-def _plural(count: int, noun: str, plural: str | None = None) -> str:
-    return f"{count:,} {noun if count == 1 else (plural or noun + 's')}"
+#: Counts in summaries group thousands: "12,345 rows".
+_plural = partial(plural, grouped=True)
 
 
 def _names(names: list[str]) -> str:
@@ -131,16 +126,6 @@ def _names(names: list[str]) -> str:
 
 def _join(*parts: str) -> str:
     return ", ".join(part for part in parts if part)
-
-
-def _host(url: str) -> str:
-    """``host`` or ``host:port`` of ``url``: no user, path or query."""
-    try:
-        parts = urlsplit(url.strip())
-        host, port = parts.hostname or "", parts.port
-    except ValueError:
-        return ""
-    return f"{host}:{port}" if host and port else host
 
 
 def _same_notebook(given: Any, name: str) -> bool:
@@ -514,8 +499,8 @@ def _fetch_page(args: Mapping[str, Any], text: str, status: Mapping[str, Any]) -
     source = _SOURCE_RE.match(head)
     if source is None:
         return ""
-    host = _host(source.group("url"))
-    elsewhere = f"redirected to {host}" if host and host != _host(str(args.get("url") or "")) else ""
+    host = url_host(source.group("url"))
+    elsewhere = f"redirected to {host}" if host and host != url_host(str(args.get("url") or "")) else ""
     not_text = _NOT_TEXT_RE.fullmatch(rest)  # the whole reply, never a sentence inside a page
     if not_text:
         return _join(f"not text ({not_text.group('type')})", elsewhere)

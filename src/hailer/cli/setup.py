@@ -18,7 +18,7 @@ from hailer.cli.common import (
     _labelled,
     _opts,
     _print_error,
-    _startup_panel,
+    _settings_panel,
     kernel_checks,
     local_checks,
 )
@@ -47,7 +47,7 @@ def status(ctx: typer.Context) -> None:
     opts = _opts(ctx)
     console = common.console_factory()
     config = _config_or_exit(console, opts)
-    _startup_panel(console, config)
+    _settings_panel(console, config)
     try:
         provider = config.provider
         _value, source = common._resolve_key(provider)

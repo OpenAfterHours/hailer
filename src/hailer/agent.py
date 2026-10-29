@@ -44,6 +44,7 @@ from hailer.models import (
     TurnSummary,
 )
 from hailer.statedir import ensure_state_dir, state_dir
+from hailer.text import single_line
 from hailer.tool_outcomes import tool_outcome
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only; the tools import it lazily
@@ -585,6 +586,8 @@ class _TurnEvents:
         args = _call_args(call.get("args"))
         self._waiting.setdefault(call_id, []).append(_Step(event_id, call["name"], args, time.monotonic()))
         detail = {"arguments": _preview(call.get("args")), "args": dict(args), "id": event_id}
+        # The name and the id only: arguments can hold data and stay in the conversation.
+        log.debug("tool call %s (%s)", single_line(str(call["name"])), single_line(event_id))
         self.emit(AgentEvent("tool_call", call["name"], detail))
 
     def _finished(self, message: Any) -> None:

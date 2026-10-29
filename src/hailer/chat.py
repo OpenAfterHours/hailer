@@ -25,10 +25,20 @@ from rich.text import Text
 from hailer import notebooks
 from hailer.errors import HailerError, MarimoUnavailableError, NoSessionError
 from hailer.marimo_client import request_deadline
-from hailer.models import CompletionData, ContextBundle, HailerConfig, MarimoSession, ProviderConfig, SessionState, SkillInfo, TurnSummary
+from hailer.models import (
+    KERNEL_RUNTIME_UNSAFE_LOCAL,
+    CompletionData,
+    ContextBundle,
+    HailerConfig,
+    MarimoSession,
+    ProviderConfig,
+    SessionState,
+    SkillInfo,
+    TurnSummary,
+)
 from hailer.session import EXIT_COMMANDS, help_text, load_session, parse_command, save_session
 from hailer.statedir import input_history_path
-from hailer.steps import plural, single_line
+from hailer.text import plural, single_line
 from hailer.transcript import FooterData, NotebookRow, console_glyphs, detail_card, help_card, notebook_table, status_card
 from hailer.transcript import session_note, session_row
 
@@ -750,7 +760,7 @@ class ChatController:
         g = self._glyphs()
         credentials, have_key = self._credentials()
         model = g.join(self.state.model or self.config.model.name, self._active_provider_line(), credentials)
-        unsafe = bool(self._cli._kernel_style(self.config))  # unsafe-local: a warning
+        unsafe = self.config.kernel.runtime == KERNEL_RUNTIME_UNSAFE_LOCAL  # not isolated: a warning
         marimo: tuple[str | None, str] = ("warn", "not running")
         notebook: tuple[str | None, str] = (None, self.notebook)
         if sandbox is not None:

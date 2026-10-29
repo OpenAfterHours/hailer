@@ -37,7 +37,8 @@ from hailer.models import (
     TurnSummary,
 )
 from hailer.steps import Receipt, StepTracker
-from hailer.transcript import callout, clean_reply, console_glyphs, plain_step_row, turn_stats
+from hailer.text import clean_reply
+from hailer.transcript import callout, console_glyphs, plain_step_row, turn_stats
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only; the runtimes import it when a kernel starts
     from hailer.sandbox import MarimoSandbox
@@ -123,7 +124,7 @@ def _kernel_line(config: HailerConfig) -> str:
 
 def _kernel_style(config: HailerConfig) -> str:
     """A warning style (yellow) for the ``Kernel:`` line of the unsafe-local runtime, whose notebook
-    code is not isolated (the startup panel, ``hailer status``, ``/status``, ``--foreground``)."""
+    code is not isolated (``hailer status``'s settings panel, the plain ``/status`` table, ``--foreground``)."""
     return "yellow" if config.kernel.runtime == KERNEL_RUNTIME_UNSAFE_LOCAL else ""
 
 
@@ -279,9 +280,9 @@ def _session_for(sessions: list[MarimoSession], notebook: str) -> MarimoSession 
     return match_session(sessions, notebook)
 
 
-def _startup_panel(console: Console, config: HailerConfig, notebook: str | None = None) -> None:
-    """The panel with the settings; ``notebook``: the active notebook (default: the state file's).
-    An unsafe-local ``Kernel:`` line is shown in a warning style (:func:`_kernel_style`)."""
+def _settings_panel(console: Console, config: HailerConfig, notebook: str | None = None) -> None:
+    """``hailer status``'s panel with the settings; ``notebook``: the active notebook (default: the
+    state file's). An unsafe-local ``Kernel:`` line is shown in a warning style (:func:`_kernel_style`)."""
     body = Text("\n").join(
         [
             Text(f"Model:      {config.model.name}"),
@@ -294,7 +295,6 @@ def _startup_panel(console: Console, config: HailerConfig, notebook: str | None 
         ]
     )
     console.print(Panel(body, title="Hailer", expand=False))
-    console.print("Type /help for commands.\n", markup=False)
 
 
 # --------------------------------------------------------------------------- #

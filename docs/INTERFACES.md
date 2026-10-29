@@ -890,6 +890,19 @@ was already created / made active by then, so `notebook_create` / `notebook_open
 `... is now the active notebook.` and never read as a failed call. Both hooks are keywords of `HailerTools`
 and `hailer_tools` so tests never launch a browser.
 
+## `text.py`  (chat terminal, 2026-10-29)
+
+Plain-text helpers that the agent side and the terminal share, standard library only (no Rich, no
+prompt_toolkit), so `tool_outcomes` imports them as freely as `steps`, `transcript`, `completion` and
+`chat_ui`: `single_line(text)` (control and formatting characters dropped, whitespace runs one space: labels,
+names, summaries), `printable(text)` (the same characters dropped, each whitespace character a space, spacing
+kept), `clean_reply(text)` (multi-line: CSI/OSC escape sequences and other C0/C1 controls removed, newlines kept,
+tabs expanded to every 4 columns), `plural(count, noun, plural_noun=None, *, grouped=False)` (`grouped`:
+`12,345 rows`, as tool summaries count), `url_host(url, *, port=True)` (`host` or `host:port`, never user,
+path or query; steps show the host alone) and `fit(text, cells, ellipsis="", *, width=len)` (shortened at the
+end to `cells` columns as `width` measures them, `get_cwidth` in the terminal; with an ellipsis the cut text
+loses trailing spaces first).
+
 ## `tool_outcomes.py`  (chat terminal, 2026-10-28)
 
 ```python
@@ -906,7 +919,9 @@ class, never its message (which may quote a URL with a token, a path or data): `
 open`, `MarimoUnavailableError` → `marimo not running`, `MarimoExecutionError` → `kernel request failed`,
 `NotebookNotFoundError` → `notebook not found`, `NotebookExistsError` → `notebook already exists`,
 `NotebookPathError` → `not in the notebooks folder` (`not a usable notebook name` for `notebook_create`),
-`WebAccessDenied` → `host not allowed`, `cells_unreadable` → `could not read the cells`, `unknown_template` →
+`KernelRuntimeError` → `kernel not available`, `WebAccessDenied` → `host not allowed`, `MalformedParquetError` →
+`unreadable data file`, `ConfigError` → `configuration problem`, `cells_unreadable` → `could not read the cells`,
+`unknown_template` →
 `unknown template`, an unexpected exception → `unexpected <Type>`, a plain `HailerError` by tool (`could not
 fetch the page`, `skill not found`, `could not read the file`, `could not read the data folder`, else
 `failed`). `marimo_execute` code that failed names the exception from its traceback (else `failed`), and a
@@ -935,7 +950,7 @@ block, so a SKILL.md quoting it changes nothing); `read_skill_file` `N lines` / 
 `12.3 KB` (the size of the text the model got; `, truncated` when the status says the reply was cut or the
 `Source:` line says `(first N bytes only)`; `, redirected to <host[:port]>` when the page came from another host) or `not text
 (<type>)` when the whole reply is fetch_page's not-text notice. A summary is one line of at most
-`SUMMARY_LIMIT` printable characters (`...` when cut; `str.isprintable`, as `steps.single_line`), counts and
+`SUMMARY_LIMIT` printable characters (`...` when cut, `text.fit`; `str.isprintable`, `text.single_line`), counts and
 names only. An unknown tool or reply format gives `""`.
 
 ## `code_checks.py`  (owner: code checks, 2026-09-22)
@@ -1207,7 +1222,7 @@ Interactive mode shows the editable composer after the kernel's row and before a
 browser-session waiting run concurrently. Plain/piped mode retains the notebook wait before its prompt.
 
 Startup output is a checklist (`transcript.SessionRow`: icon, a ten-cell label, detail, seconds, the same
-columns as a step row; label and detail pass `steps.single_line`, so names, warnings and check texts cannot
+columns as a step row; label and detail pass `text.single_line`, so names, warnings and check texts cannot
 add rows or terminal controls; on a terminal the columns line up with the composer's live row and a row that
 worked keeps to one line, elsewhere each is one plain line that is never cut; `session_note` lines under a
 row lose control characters too, and on the CLI's own console a terminal wraps them under the detail column
@@ -1220,7 +1235,7 @@ before any kernel starts); the runtime's own progress (docker's image download) 
 data read-only  1.9s` (`docker · network on · data read-only` with `[kernel] network`), or for unsafe-local a
 yellow `▲ Kernel  unsafe-local · runs as you, not isolated`; under it, as muted notes, `Port N is busy; using
 M.` and, with `--verbose`, `Marimo is running at <url>  (log: <log hint>)`. The settings panel
-(`common._startup_panel`) is `hailer status`'s only: `/status` has every setting, plus a `Kernel log` row (the
+(`common._settings_panel`) is `hailer status`'s only (no `Type /help` line: status has no chat): `/status` has every setting, plus a `Kernel log` row (the
 sandbox's `log_hint`). The notebook's row comes from `_wait_for_notebook`: `✓ Notebook  <name> · already
 open`, or (the browser opened, a session came) `✓ Notebook  <name> · open in your browser  2.2s` and the muted
 `APP_VIEW_TIP`, or a warning `▲ Notebook  <name> · no kernel session yet` (the agent reports the notebook state
@@ -1324,7 +1339,8 @@ True/False/None, kernel runtime, model, turns, tokens, the notebook's token-free
 redraw, so `ChatController.footer` only reads state it holds (the URL is made once per notebook name;
 `notebook_open` is what startup, a switch, `/status`, `/notebook` or `/exec` last learned). The footer shows
 `● name` (open), `○ name` (not open) or `name` (unknown), `docker · isolated` or a yellow
-`▲ unsafe-local · not isolated`, the model and `N turns · Xk tokens` (`working 3.1s` during a turn); when narrow
+`▲ unsafe-local · not isolated`, the model and `N turns · Xk tokens`, the conversation's totals (`SessionState`: the
+thread's turns and tokens, which `/new` and `/model` reset; `working 3.1s` during a turn); when narrow
 it drops tokens, turns, the model and a docker kernel, then shortens the notebook, never the unsafe-local
 warning. Widths are terminal cells. Every row but the composer is one window that draws its whole line at the
 terminal's width (the frame's sides are margins of the composer's window): rows of `VSplit`s doubled the cost
@@ -1409,7 +1425,7 @@ indented plain line (an error's hints) keeps its indent, except a string contain
 soft-wrapped, and a line of a gutter's text that holds a URL (`✗ Could not fetch <url>`), written whole: a
 URL is never cut. Everything from outside (names, errors, warnings, model output) reaches Rich as `Text`
 or with `markup=False`, never as markup: a notebook called `q[/].py` prints as itself. The reply passes
-`transcript.clean_reply` in both modes first: escape sequences (CSI, OSC) and other C0/C1 control characters
+`text.clean_reply` in both modes first: escape sequences (CSI, OSC) and other C0/C1 control characters
 are removed, newlines kept, tabs expanded to every 4 columns (Rich's `Text` and `markup=False` keep ESC). Glyphs: `transcript.glyphs_for(console.encoding)` is the Unicode set, or `ASCII` (`| * + x ! >`, `+-|`
 frame) when the encoding cannot write it (a cp1252 console); there is no setting for it. Nothing relies on
 Rich's own `…`, which an ASCII console prints as `?`: one-line cells are `transcript.Clip`s, shortened with the
@@ -1519,7 +1535,8 @@ Wording: `steps.describe_call(name, args) -> Step(live, done, target)` (`steps.V
 code", "Reading the notebook"/"Read the notebook", "Scanning the data"/"Scanned the data", ...;
 `marimo_execute` is `<n> lines`, or "Adding a cell", "Editing 2 cells", "Changing cells" for a code-mode
 script; the target comes from the arguments: notebook, data name, skill, `skill/path`, the URL's host, the
-cells pattern; an unknown tool shows its name). Labels pass `steps.single_line`. `hailer/transcript.py` holds
+cells pattern; an unknown tool shows its name). Labels pass `text.single_line`. Each `tool_call` the agent
+emits is debug-logged (`--verbose`) by tool name and event id only; the arguments, which can hold data, are not. `hailer/transcript.py` holds
 what both presentations print, Rich only: the glyph sets, `Gutter`, `user_message`, `callout`,
 `step_row`/`plain_step_row`, `turn_stats`/`turn_footer`, the cards and `FooterData`. In the composer
 (`ChatController.interactive`) slash commands print cards; plain mode keeps its lines and tables. `/status`:

@@ -2,8 +2,9 @@
 
 The chat shows each call as one row: a present-tense verb while it runs ("Running code"), then a
 past-tense verb with what it acted on and how it went ("Ran code  12 lines · 4 rows  1.5s"). The
-raw tool name and arguments stay with ``--verbose`` and the log. Pure logic, no terminal: the
-composer (:mod:`hailer.chat_ui`) and the plain display (``cli.common._TurnDisplay``) both use it.
+raw tool name is in the debug log (``--verbose``) with the call's id, the arguments nowhere outside
+the conversation (they can hold data). Pure logic, no terminal: the composer (:mod:`hailer.chat_ui`)
+and the plain display (``cli.common._TurnDisplay``) both use it.
 """
 
 from __future__ import annotations
@@ -12,14 +13,9 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
-from urllib.parse import urlparse
 
 from hailer.models import AgentEvent
-
-
-def single_line(text: str) -> str:
-    """Keep externally supplied labels from adding terminal controls or rows."""
-    return " ".join("".join(c for c in text if c.isprintable() or c.isspace()).split())
+from hailer.text import plural, single_line, url_host
 
 
 @dataclass(frozen=True)
@@ -56,11 +52,6 @@ _CELL_CALLS = {
 }
 
 
-def plural(count: int, noun: str) -> str:
-    """``1 cell``, ``2 cells``: the one count-and-noun helper of the chat's wording."""
-    return f"{count} {noun}" + ("" if count == 1 else "s")
-
-
 def _describe_code(code: str) -> Step:
     calls = {verbs: code.count(call) for call, verbs in _CELL_CALLS.items() if call in code}
     if len(calls) > 1:
@@ -93,18 +84,11 @@ def describe_call(name: str, args: Mapping[str, Any] | None = None) -> Step:
         "list_periods": lambda: arg("name"),
         "load_skill": lambda: arg("name"),
         "read_skill_file": lambda: "/".join(part for part in (arg("name"), arg("path")) if part),
-        "fetch_page": lambda: _hostname(arg("url")),
+        "fetch_page": lambda: url_host(arg("url"), port=False),
     }
     live, done = VERBS.get(name, (name, name))
     target = targets[name]() if name in targets else ""
     return Step(live, done, single_line(target))
-
-
-def _hostname(url: str) -> str:
-    try:
-        return urlparse(url).hostname or ""
-    except ValueError:
-        return ""
 
 
 StepStatus = Literal["ok", "failed", "cancelled", "unknown"]

@@ -55,7 +55,8 @@ from hailer.input_history import input_history
 from hailer.log import redact
 from hailer.models import KERNEL_RUNTIME_DOCKER, KERNEL_RUNTIME_UNSAFE_LOCAL, AgentEvent, CompletionData, TurnSummary
 from hailer.session import EXIT_COMMANDS, parse_command
-from hailer.steps import Receipt, StepTracker, plural, single_line
+from hailer.steps import Receipt, StepTracker
+from hailer.text import clean_reply, fit, plural, single_line
 from hailer.transcript import (
     ACCENT,
     LABEL_WIDTH,
@@ -66,7 +67,6 @@ from hailer.transcript import (
     Glyphs,
     Gutter,
     callout,
-    clean_reply,
     console_glyphs,
     seconds,
     simple_head,
@@ -117,17 +117,6 @@ _STYLE = Style.from_dict({
     "palette.name.current": "ansicyan bold",
     "palette.meta": "ansibrightblack",
 })
-
-
-def _clip(text: str, cells: int) -> str:
-    """The longest start of ``text`` that fits in ``cells`` terminal cells."""
-    out, used = "", 0
-    for char in text:
-        used += get_cwidth(char)
-        if used > cells:
-            break
-        out += char
-    return out
 
 
 def _hanging(text: str) -> RenderableType | str:
@@ -461,7 +450,7 @@ class _Placeholder(Processor):
             return Transformation(ti.fragments)
         text, room = self.text(), ti.width - 3  # the prompt takes two cells, and a full line would wrap
         if get_cwidth(text) > room:
-            text = _clip(text, room - get_cwidth(self.ellipsis)).rstrip() + self.ellipsis if room > 4 else ""
+            text = fit(text, room, self.ellipsis, width=get_cwidth) if room > 4 else ""
         return Transformation([*ti.fragments, ("class:placeholder", text)])
 
 
@@ -1130,9 +1119,9 @@ class ChatUI:
         label = label.ljust(width)
         detail = f" {detail}" if detail else ""
         if get_cwidth(label) > room:
-            label, detail = _clip(label, max(0, room)), ""
+            label, detail = fit(label, max(0, room), width=get_cwidth), ""
         elif get_cwidth(label + detail) > room:
-            detail = _clip(detail, room - get_cwidth(label) - get_cwidth(self.glyphs.ellipsis)) + self.glyphs.ellipsis
+            detail = fit(detail, room - get_cwidth(label), self.glyphs.ellipsis, width=get_cwidth)
         gap = max(0, room - get_cwidth(label + detail)) + (1 if timer else 0)
         return [
             ("class:spinner", head), ("class:activity", label), ("class:muted", detail),
@@ -1153,8 +1142,7 @@ class ChatUI:
         else:
             style = "class:hint"
             if self._menu_open():
-                arrows = "up/down" if g.ascii else "↑↓"
-                text = g.join(f"{arrows} choose", "tab complete", f"enter {enter_action(self.buffer)}", "esc close")
+                text = g.join(f"{g.up_down} choose", "tab complete", f"enter {enter_action(self.buffer)}", "esc close")
             elif self._cancelling:
                 text = "cancelling"
             elif self.busy and self._executing:
@@ -1164,14 +1152,14 @@ class ChatUI:
             elif self._startup_failed:
                 text = g.join("startup failed", "/exit to leave")
             elif self._suggesting():
-                text = g.join(f"{'right' if g.ascii else '→'} accept", "enter send", "alt+enter new line")
+                text = g.join(f"{g.right} accept", "enter send", "alt+enter new line")
             elif self.buffer.text:
                 text = g.join("enter send", "alt+enter new line")
             else:
                 text = g.join("/ commands", f"{g.up} history", "ctrl+c exit")
         room = max(0, self._columns() - 6)
         if get_cwidth(text) > room:
-            text = _clip(text, room - get_cwidth(g.ellipsis)).rstrip() + g.ellipsis
+            text = fit(text, room, g.ellipsis, width=get_cwidth)
         return [(style, f" {text} ")] if text else []
 
     def _suggesting(self) -> bool:
@@ -1230,7 +1218,7 @@ class ChatUI:
             elif "notebook" in groups:
                 room = width - (length(left()) - get_cwidth(notebook))
                 if room >= 4 and get_cwidth(notebook) > room:
-                    groups["notebook"] = [*dot, ("", _clip(notebook, room - get_cwidth(g.ellipsis)) + g.ellipsis)]
+                    groups["notebook"] = [*dot, ("", fit(notebook, room, g.ellipsis, width=get_cwidth))]
                     break
                 del groups["notebook"]
             else:

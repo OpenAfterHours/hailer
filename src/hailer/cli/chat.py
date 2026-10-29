@@ -48,7 +48,7 @@ from hailer.models import (
     HailerConfig,
 )
 from hailer.startup import StartupTimings
-from hailer.steps import single_line
+from hailer.text import single_line
 from hailer.transcript import (
     MUTED,
     callout,

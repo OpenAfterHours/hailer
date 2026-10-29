@@ -784,6 +784,7 @@ def test_status_subcommand(harness):
     assert "Credentials: OPENAI_API_KEY from env" in result.output
     assert "Kernels:     none running for this workspace (each uvx hailer session starts its own)" in result.output
     assert "Context:     0 file(s)" in result.output
+    assert "Type /help for commands." not in result.output, "status has no chat"
     harness.kernels = ["local marimo at http://127.0.0.1:2718 (process 7, started by Hailer process 6)", "docker hailer-kernel-x"]
     result = runner.invoke(cli.app, ["status"], catch_exceptions=False)
     assert "Kernels:     local marimo at http://127.0.0.1:2718 (process 7, started by Hailer process 6)" in result.output
@@ -2131,13 +2132,13 @@ def test_kernel_line_in_the_startup_checklist_status_and_slash_status(harness):
 
 
 def test_kernel_line_of_the_unsafe_local_runtime_is_a_warning(harness):
-    """The startup panel (so also hailer status) and /status show an unsafe-local kernel in a
-    warning style; a docker kernel's line is plain."""
+    """hailer status's settings panel shows an unsafe-local kernel in a warning style; a docker
+    kernel's line is plain."""
 
     def panel(config):
         out = io.StringIO()
         console = Console(file=out, force_terminal=True, color_system="standard", no_color=False, width=200)
-        common._startup_panel(console, config, "analysis.py")
+        common._settings_panel(console, config, "analysis.py")
         return next(line for line in out.getvalue().splitlines() if "Kernel:" in line)
 
     assert common._kernel_style(harness.config) == "yellow"

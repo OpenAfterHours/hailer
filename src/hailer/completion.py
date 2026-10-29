@@ -27,7 +27,7 @@ from prompt_toolkit.utils import get_cwidth
 
 from hailer.models import CompletionData
 from hailer.session import COMMAND_USAGE, NOTEBOOK_SUBCOMMANDS
-from hailer.steps import single_line
+from hailer.text import fit, single_line
 from hailer.transcript import Glyphs
 
 #: What Enter runs at once when the menu writes it: the commands that take no arguments.
@@ -164,13 +164,13 @@ def menu_fragments(buffer: Any, glyphs: Glyphs, columns: int) -> list[tuple[str,
     items, current, start = _window(buffer)
     shown = items[start:start + MENU_ROWS]
     chosen = 0 if current is None else current
-    names = [_fit(item.display_text, max(4, columns // 2), glyphs.ellipsis) for item in shown]
+    names = [fit(item.display_text, max(4, columns // 2), glyphs.ellipsis, width=get_cwidth) for item in shown]
     width = max((get_cwidth(name) for name in names), default=0) + 3
     room = columns - 4 - width - 1  # the mark's four cells, the name's column, one cell spare
     out: list[tuple[str, str]] = []
     for index, (item, name) in enumerate(zip(shown, names, strict=True), start):
         picked = index == chosen
-        meta = _fit(item.display_meta_text, room, glyphs.ellipsis) if room > 4 else ""
+        meta = fit(item.display_meta_text, room, glyphs.ellipsis, width=get_cwidth) if room > 4 else ""
         out += [
             ("class:palette.pick", f"  {glyphs.prompt if picked else ' '} "),
             ("class:palette.name.current" if picked else "class:palette.name", name + " " * (width - get_cwidth(name))),
@@ -182,16 +182,3 @@ def menu_fragments(buffer: Any, glyphs: Glyphs, columns: int) -> list[tuple[str,
     elif out:
         out.pop()
     return out
-
-
-def _fit(text: str, cells: int, ellipsis: str) -> str:
-    """``text`` in at most ``cells`` terminal cells, shortened with ``ellipsis``."""
-    if get_cwidth(text) <= cells:
-        return text
-    out, used, room = "", 0, cells - get_cwidth(ellipsis)
-    for char in text:
-        used += get_cwidth(char)
-        if used > room:
-            break
-        out += char
-    return out.rstrip() + ellipsis

@@ -6,6 +6,7 @@ from __future__ import annotations
 import _thread
 import asyncio
 import json
+import logging
 import signal
 import threading
 import time
@@ -1035,6 +1036,25 @@ def test_each_tool_call_is_followed_by_its_result(harness):
     answer = next(i for i, e in enumerate(events) if e.kind == "message_delta" and "All done." in e.text)
     assert events.index(started) < events.index(finished) < answer
     assert summary.steps == 1 and summary.tool_calls == ["echo"]
+
+
+def test_a_tool_call_is_debug_logged_by_name_and_id_never_with_its_arguments(harness):
+    h = harness([call("echo", {"text": "a value from the data"}, "call_echo"), say("done")])
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler(logging.DEBUG)
+    handler.emit = records.append  # type: ignore[method-assign]
+    logger = logging.getLogger("hailer.agent")
+    level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    try:
+        h.agent.run_turn("echo it", on_event=lambda _event: None)
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(level)
+    messages = [record.getMessage() for record in records]
+    assert "tool call echo (call_echo)" in messages
+    assert not any("a value from the data" in message for message in messages)
 
 
 def test_tool_call_args_are_a_json_safe_copy(harness):

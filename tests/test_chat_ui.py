@@ -1486,3 +1486,28 @@ def test_an_ascii_console_gets_ascii_ellipses_bullets_and_quote_bars():
     assert "?" not in output  # no character the console had to replace
     assert "25-01 to 2...    0.7s" in output and "a_tool_with_a_ver...  " in output and "read-only" not in output
     assert "-> a_rather_long_notebo..." in output and " - item" in output and "  | quote" in output
+
+
+@pytest.mark.parametrize(
+    ("width", "layout"),
+    [(100, "side by side"), (64, "groups above"), (40, "descriptions under")],
+)
+def test_help_card_layouts_follow_the_terminal_width(width, layout):
+    """INTERFACES: groups in their own column when wide, above their commands when narrow, the
+    descriptions under the commands when very narrow; nothing wider than the terminal."""
+    from hailer.transcript import help_card
+
+    console = Console(file=io.StringIO(), force_terminal=False, color_system=None, width=width)
+    console.print(help_card(UNICODE), soft_wrap=False)
+    lines = rows(console.file.getvalue())
+    assert all(len(line) <= width for line in lines)
+    model = next(index for index, line in enumerate(lines) if "/model <name>" in line)
+    if layout == "side by side":
+        assert re.match(r"  Conversation\s+/new\s+Start a new conversation$", lines[model - 1])
+        assert "Switch model" in lines[model]
+    elif layout == "groups above":
+        assert "  Conversation" in lines and re.match(r"  /new\s+Start a new conversation$", lines[lines.index("  Conversation") + 1])
+        assert "Switch model" in lines[model]
+    else:
+        assert lines[model] == "  /model <name>" and lines[model + 1].startswith("    Switch model")
+    assert any("alt+enter or ctrl+j new line" in line for line in lines) or any("ctrl+j" in line for line in lines)
