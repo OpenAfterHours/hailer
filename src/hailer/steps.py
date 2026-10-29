@@ -56,7 +56,8 @@ _CELL_CALLS = {
 }
 
 
-def _plural(count: int, noun: str) -> str:
+def plural(count: int, noun: str) -> str:
+    """``1 cell``, ``2 cells``: the one count-and-noun helper of the chat's wording."""
     return f"{count} {noun}" + ("" if count == 1 else "s")
 
 
@@ -70,7 +71,7 @@ def _describe_code(code: str) -> Step:
         return Step(f"{live} {cells}", f"{done} {cells}")
     lines = sum(1 for line in code.splitlines() if line.strip())
     live, done = VERBS["marimo_execute"]
-    return Step(live, done, _plural(lines, "line") if lines else "")
+    return Step(live, done, plural(lines, "line") if lines else "")
 
 
 def describe_call(name: str, args: Mapping[str, Any] | None = None) -> Step:

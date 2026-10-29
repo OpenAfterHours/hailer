@@ -113,6 +113,9 @@ class StubUI:
     def on_event(self, event: Any) -> None:
         self.events.append(event)
 
+    def settle_steps(self) -> None:
+        self.console.print("[steps settled]", markup=False)
+
     def set_activity(self, text: str) -> None:
         self.activities.append(text)
 

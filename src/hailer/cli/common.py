@@ -275,10 +275,6 @@ def _session_for(sessions: list[MarimoSession], notebook: str) -> MarimoSession 
     return match_session(sessions, notebook)
 
 
-def _plural(count: int, noun: str) -> str:
-    return f"{count} {noun}" + ("" if count == 1 else "s")
-
-
 def _startup_panel(console: Console, config: HailerConfig, notebook: str | None = None) -> None:
     """The panel with the settings; ``notebook``: the active notebook (default: the state file's).
     An unsafe-local ``Kernel:`` line is shown in a warning style (:func:`_kernel_style`)."""

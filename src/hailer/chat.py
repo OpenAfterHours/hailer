@@ -21,6 +21,7 @@ from hailer import notebooks
 from hailer.errors import HailerError, MarimoUnavailableError, NoSessionError
 from hailer.models import ContextBundle, HailerConfig, MarimoSession, ProviderConfig, SessionState, SkillInfo, TurnSummary
 from hailer.session import EXIT_COMMANDS, help_text, load_session, parse_command, save_session
+from hailer.steps import plural
 from hailer.transcript import FooterData, NotebookRow, console_glyphs, detail_card, help_card, notebook_table, status_card
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
@@ -63,6 +64,8 @@ class ChatController:
         #: True while the inline composer runs (cards instead of plain lines).
         self.interactive = False
         self._link_cache: tuple[str | None, str] = (None, "")
+        #: The notebook before a switch a turn's tools made, until _sync_active_notebook reports it.
+        self._switched_from: str | None = None
         self.state: SessionState = load_session(config.workspace)
         self.bundle: ContextBundle = ContextBundle()
         self.agent: Any = None
@@ -311,7 +314,11 @@ class ChatController:
             except asyncio.CancelledError:
                 self._pending_preamble = None
                 raise
+            except Exception:
+                self.ui.settle_steps()  # the rows of steps left open come before the error ahandle prints
+                raise
             self._pending_preamble = None
+            self._peek_active_notebook()
             self.ui.finish(summary)
             self._record_turn(summary)
         finally:
@@ -389,17 +396,30 @@ class ChatController:
             self.state.thread_id = summary.thread_id
         save_session(self.config.workspace, self.state)
 
+    def _peek_active_notebook(self) -> None:
+        """Before a turn's answer prints: take the notebook a tool switched to from the state file
+        (a local read), so the footer and the answer's link name it. Nothing asks marimo or opens
+        a browser here; :meth:`_sync_active_notebook` still reports the switch after the answer."""
+        try:
+            active = notebooks.load_active_notebook(self.config)
+        except Exception:  # noqa: BLE001 - the sync after the answer handles a bad state file
+            return
+        if active != self.notebook:
+            self._switched_from = self._switched_from or self.notebook
+            self.notebook, self.notebook_open = active, None
+
     def _sync_active_notebook(self, *, open_browser: bool = True) -> bool:
         """Pick up a switch the model made during a turn (its tools write the same state file).
 
-        Returns True when the active notebook changed. With ``open_browser`` the notebook's URL is
-        opened once when it has no kernel session yet.
+        Returns True when the active notebook changed (since before a :meth:`_peek_active_notebook`).
+        With ``open_browser`` the notebook's URL is opened once when it has no kernel session yet.
         """
         try:
             active = notebooks.load_active_notebook(self.config)
         except Exception:  # noqa: BLE001 - a bad state file must never spoil a finished turn
             return False
-        if active == self.notebook:
+        before, self._switched_from = self._switched_from or self.notebook, None
+        if active == before:
             return False
         self.notebook = active
         self.notebook_open = None
@@ -496,8 +516,7 @@ class ChatController:
         """/status in the composer: the plain table's information, grouped, with a health mark on
         what can be wrong (credentials, an unisolated kernel, marimo, the notebook's tab)."""
         g = self._glyphs()
-        credentials = self._credentials_line()
-        missing = credentials == "unknown provider" or " missing (" in credentials
+        credentials, have_key = self._credentials()
         model = g.join(self.state.model or self.config.model.name, self._active_provider_line(), credentials)
         unsafe = bool(self._cli._kernel_style(self.config))  # unsafe-local: a warning
         marimo: tuple[str | None, str] = ("warn", "not running")
@@ -510,12 +529,12 @@ class ChatController:
             )
         tokens = f"{self.state.input_tokens} in / {self.state.output_tokens} out tokens"
         rows: list[tuple[str | None, str, str]] = [
-            ("warn" if missing else "ok", "Model", model),
+            ("ok" if have_key else "warn", "Model", model),
             ("warn" if unsafe else "ok", "Kernel", self._cli._kernel_line(self.config)),
             (marimo[0], "Marimo", marimo[1]),
             (notebook[0], "Notebook", notebook[1]),
             (None, "Notebooks", self._cli._relative(self.config.notebooks_root, self.config.workspace)),
-            (None, "Thread", g.join(self.state.thread_id or "-", self._cli._plural(self.state.turns, "turn"), tokens)),
+            (None, "Thread", g.join(self.state.thread_id or "-", plural(self.state.turns, "turn"), tokens)),
             (None, "Web access", self._cli._web_line(self.config)),
         ]
         self.console.print(status_card(g, rows))
@@ -541,9 +560,13 @@ class ChatController:
         return self._cli._describe_provider(provider)
 
     def _credentials_line(self) -> str:
+        return self._credentials()[0]
+
+    def _credentials(self) -> tuple[str, bool]:
+        """The ``Credentials`` line, and whether the active provider has a key."""
         provider = self._active_provider()
         if provider is None:
-            return "unknown provider"
+            return "unknown provider", False
         source = getattr(self.agent, "key_source", None)
         if not isinstance(source, str) or not source:
             try:
@@ -551,8 +574,8 @@ class ChatController:
             except HailerError:
                 source = "missing"
         if source == "missing":
-            return f"{provider.env_key or 'API key'} missing (run: uvx hailer login {provider.id})"
-        return f"{provider.env_key or 'API key'} from {source}"
+            return f"{provider.env_key or 'API key'} missing (run: uvx hailer login {provider.id})", False
+        return f"{provider.env_key or 'API key'} from {source}", True
 
     def _model(self, args: str) -> None:
         reason = self._select_model(args)
@@ -561,7 +584,10 @@ class ChatController:
 
     def _select_model(self, args: str) -> str | None:
         if not args:
-            self.console.print(f"Model: {self.state.model or self.config.model.name}  Provider: {self.state.provider or self.config.model.provider}")
+            self.console.print(
+                f"Model: {self.state.model or self.config.model.name}  Provider: {self.state.provider or self.config.model.provider}",
+                markup=False,  # a model name is the user's text
+            )
             self.console.print("Usage: /model <name>  or  /model <provider>:<name>")
             return
         provider: str | None = None
@@ -649,7 +675,7 @@ class ChatController:
         folder = self._cli._relative(cfg.notebooks_root, cfg.workspace)
         names = self._names()
         if self.sandbox is not None:
-            out.print(f"Notebooks: {folder} ({self._cli._plural(len(names), 'notebook')}; /notebook list)", markup=False)
+            out.print(f"Notebooks: {folder} ({plural(len(names), 'notebook')}; /notebook list)", markup=False)
         recent = [name for name in notebooks.load_recent(cfg) if name != self.notebook and name in names]
         if recent:
             out.print("Recent:    " + ", ".join(recent[:5]), markup=False)
@@ -689,7 +715,7 @@ class ChatController:
         sandbox, _client, sessions = self._server_sessions()
         if sandbox is not None:
             self._note_session(self.notebook, self._cli._session_for(sessions, self.notebook))
-        note = f"{self._cli._plural(len(infos), 'notebook')} in {folder}. /notebook open <name> switches."
+        note = f"{plural(len(infos), 'notebook')} in {folder}. /notebook open <name> switches."
         if self.interactive:
             rows = [
                 NotebookRow(
@@ -776,7 +802,7 @@ class ChatController:
             if session is not None:
                 count = self._cell_count(client)
                 if count is not None:
-                    detail += f", {self._cli._plural(count, 'cell')}"
+                    detail += f", {plural(count, 'cell')}"
             else:
                 detail += ", not open in a browser yet"
             self._pending_preamble = self._switch_notice(name, detail)

@@ -7,7 +7,8 @@ from a notebook worker thread); the facade queues them for that writer.
 The composer is a rounded frame whose colour says the state (cyan ready, grey busy or starting,
 red when startup failed), with key hints in its bottom border. While work runs, a live row above
 it shows the step in progress in the columns its finished row will use; a footer below it shows
-the notebook, the kernel, the model and usage.
+the notebook, the kernel, the model and usage. Every row but the composer's is one window that
+draws its whole line, so a redraw stays cheap (the spinner redraws often during a turn).
 """
 
 from __future__ import annotations
@@ -26,9 +27,10 @@ from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text.utils import fragment_list_width
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import ConditionalContainer, HSplit, Layout, VSplit, Window, WindowAlign
+from prompt_toolkit.layout import ConditionalContainer, HSplit, Layout, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.layout.margins import Margin
 from prompt_toolkit.layout.processors import Processor, Transformation, TransformationInput
 from prompt_toolkit.output import create_output
 from prompt_toolkit.styles import Style
@@ -45,7 +47,7 @@ from rich.theme import Theme
 from hailer.log import redact
 from hailer.models import KERNEL_RUNTIME_DOCKER, KERNEL_RUNTIME_UNSAFE_LOCAL, AgentEvent, TurnSummary
 from hailer.session import EXIT_COMMANDS, parse_command
-from hailer.steps import Receipt, StepTracker, single_line
+from hailer.steps import Receipt, StepTracker, plural, single_line
 from hailer.transcript import (
     ACCENT,
     LABEL_WIDTH,
@@ -56,7 +58,6 @@ from hailer.transcript import (
     Gutter,
     callout,
     console_glyphs,
-    plural,
     seconds,
     simple_head,
     step_row,
@@ -66,8 +67,6 @@ from hailer.transcript import (
     user_message,
 )
 
-_single_line = single_line  # the name earlier code and tests use
-
 # ChatUI's own activity strings (and the controller's) in the live row's words; "" hides the row.
 _LABELS = {
     "Ready": "",
@@ -76,12 +75,15 @@ _LABELS = {
     "Preparing chat...": "Starting",
     "Cancelling...": "Cancelling",
 }
-_FRAME_SECONDS = 0.08  # spinner frame, and the redraw interval while something moves
+_FRAME_SECONDS = 0.08  # spinner frame, and the redraw interval during a turn
 # While the chat prepares, agent imports run on a worker thread and every redraw takes the GIL from
-# them: redraw less often then, so the spinner does not delay ready_to_answer.
-_STARTUP_FRAME_SECONDS = 0.25
+# them (LEARNINGS §10): nothing animates then, the live row's timer redraws once a second.
+_STARTUP_TICK_SECONDS = 1.0
 _FLASH_SECONDS = 2.5
-_ESCAPE_SECONDS, _SEQUENCE_SECONDS = 0.1, 0.3  # prompt_toolkit's defaults (0.5, 1.0) make Esc slow
+# During a turn Esc alone cancels, so it must act quickly: ttimeoutlen for the terminal to finish an
+# escape sequence (arrows arrive in one write), timeoutlen for an Enter that makes it Esc Enter.
+# While idle prompt_toolkit's own, longer timeouts stay, so a slow Esc, Enter is still a newline.
+_TURN_TIMEOUTS = (0.1, 0.3)
 
 _STYLE = Style.from_dict({
     "frame.idle": "ansicyan",
@@ -345,15 +347,38 @@ class _LogStream:
 
 
 class _Placeholder(Processor):
-    """Grey text in the empty composer that says what Enter would do now."""
+    """Grey text in the empty composer that says what Enter would do now, on one line."""
 
-    def __init__(self, text: Callable[[], str]) -> None:
+    def __init__(self, text: Callable[[], str], ellipsis: str) -> None:
         self.text = text
+        self.ellipsis = ellipsis
 
     def apply_transformation(self, ti: TransformationInput) -> Transformation:
         if ti.document.text or ti.lineno != 0:
             return Transformation(ti.fragments)
-        return Transformation([*ti.fragments, ("class:placeholder", self.text())])
+        text, room = self.text(), ti.width - 3  # the prompt takes two cells, and a full line would wrap
+        if get_cwidth(text) > room:
+            text = _clip(text, room - get_cwidth(self.ellipsis)).rstrip() + self.ellipsis if room > 4 else ""
+        return Transformation([*ti.fragments, ("class:placeholder", text)])
+
+
+class _FrameSide(Margin):
+    """A side of the composer's frame (``"│ "`` or ``" │"``) beside every line, in the frame's colour."""
+
+    def __init__(self, ui: ChatUI, text: str) -> None:
+        self.ui = ui
+        self.text = text
+
+    def get_width(self, get_ui_content: Callable[[], Any]) -> int:
+        return get_cwidth(self.text)
+
+    def create_margin(self, window_render_info: Any, width: int, height: int) -> list[tuple[str, str]]:
+        style = self.ui._border_style()
+        fragments: list[tuple[str, str]] = []
+        for row in range(height):
+            fragments += [("", "\n")] if row else []
+            fragments.append((style, self.text))
+        return fragments
 
 
 # --------------------------------------------------------------------------- #
@@ -411,6 +436,7 @@ class ChatUI:
         self._steps_cancelled = False
         self._submitted_at = time.monotonic()
         self._flash: tuple[str, float] | None = None
+        self._wake = asyncio.Event()  # the ticker's sleep, cut short when a turn starts
         # What the transcript ends with ("blank", "row" or "text"), tracked by the writer itself.
         self._tail = "blank"
         self._output = _PersistentPasteOutput(pt_output or create_output())
@@ -422,7 +448,7 @@ class ChatUI:
             dont_extend_height=True,
             wrap_lines=True,
             get_line_prefix=self._line_prefix,
-            input_processors=[_Placeholder(self._placeholder)],
+            input_processors=[_Placeholder(self._placeholder, self.glyphs.ellipsis)],
         )
         self.buffer = self.composer.buffer
         self.application: Application[None] = Application(
@@ -436,11 +462,7 @@ class ChatUI:
             after_render=self._after_render,
             style=_STYLE,
         )
-        # Esc alone cancels a turn after these short pauses: ttimeoutlen for the terminal to finish an
-        # escape sequence (arrows arrive in one write), timeoutlen for a key that would complete
-        # Esc Enter. Alt+Enter arrives as one sequence and is never split.
-        self.application.ttimeoutlen = _ESCAPE_SECONDS
-        self.application.timeoutlen = _SEQUENCE_SECONDS
+        self._idle_timeouts = (self.application.ttimeoutlen, self.application.timeoutlen)
 
     # -- state --------------------------------------------------------------- #
 
@@ -470,7 +492,7 @@ class ChatUI:
         return "busy" if self.busy or self._preparing else "idle"
 
     def _moving(self) -> bool:
-        return self.busy or self._preparing or bool(self.flash_text)
+        return self.busy or self._preparing
 
     def configure_startup(
         self,
@@ -542,6 +564,11 @@ class ChatUI:
 
         @bindings.add("escape", "enter")
         def newline(event: Any) -> None:
+            event.current_buffer.insert_text("\n")
+
+        @bindings.add("c-j")
+        def ctrl_j(event: Any) -> None:
+            # A newline key that never involves Esc (terminals without Option as Meta).
             event.current_buffer.insert_text("\n")
 
         @bindings.add("escape", filter=Condition(lambda: self.busy))
@@ -624,9 +651,11 @@ class ChatUI:
         self._steps = StepTracker()
         self._steps_cancelled = False
         self._submitted_at = time.monotonic()
+        self.application.ttimeoutlen, self.application.timeoutlen = _TURN_TIMEOUTS
         self.set_activity("Thinking..." if not text.startswith("/") else "Working...")
         self._active_task = asyncio.create_task(self._submit(text))
         self._animate()
+        self._wake.set()  # a ticker left from startup redraws at the turn's pace now
 
     async def _submit(self, text: str) -> None:
         try:
@@ -652,6 +681,7 @@ class ChatUI:
             await self.flush()
             self._cancelling = False
             self._flash = None  # "Still working" is over
+            self.application.ttimeoutlen, self.application.timeoutlen = self._idle_timeouts
             self.set_activity("Ready")
             if self._exit_requested:
                 self._exit_application()
@@ -716,10 +746,15 @@ class ChatUI:
 
         def update() -> None:
             self._flash = (single_line(text), time.monotonic() + seconds)
-            self._animate()
             self.application.invalidate()
+            if self._loop is not None:
+                self._loop.call_later(seconds + 0.05, self._redraw)  # one redraw takes it away
 
         self._on_ui_thread(update)
+
+    def _redraw(self) -> None:
+        if self.application.is_running:
+            self.application.invalidate()
 
     def on_event(self, event: AgentEvent) -> None:
         """A step starts on ``tool_call`` (keyed by its id) and is committed as one row on its
@@ -727,6 +762,8 @@ class ChatUI:
         self._on_ui_thread(lambda: self._event(event))
 
     def _event(self, event: AgentEvent) -> None:
+        if self._cancelling:
+            return  # the open steps are already shown as cancelled and the row says "Cancelling"
         if event.kind == "tool_call":
             self._steps.call(event)
         elif event.kind == "tool_result":
@@ -749,6 +786,11 @@ class ChatUI:
 
     def _commit(self, receipt: Receipt) -> None:
         self._write((step_row(self.glyphs, receipt),), {}, kind="row")
+
+    def settle_steps(self) -> None:
+        """End the steps still open as "no result, effect unknown": the controller calls it when a
+        turn fails, before it prints the error, so the rows come first."""
+        self._on_ui_thread(self._settle_steps)
 
     def _settle_steps(self) -> None:
         for receipt in self._steps.finish():
@@ -811,7 +853,9 @@ class ChatUI:
             self._raw_console.print()
         if "soft_wrap" not in kwargs:
             url = any(isinstance(item, str) and "://" in item for item in objects)
-            kwargs = {**kwargs, "soft_wrap": url}
+            # crop=False: Rich lays renderables out inside the width anyway, and a line a Gutter
+            # writes whole (a URL) must reach the terminal whole.
+            kwargs = {"crop": False, **kwargs, "soft_wrap": url}
             if not url and kwargs.get("markup") is False:
                 objects = tuple(_hanging(item) if isinstance(item, str) else item for item in objects)
         self._raw_console.print(*objects, **kwargs)
@@ -824,40 +868,37 @@ class ChatUI:
     # -- layout ---------------------------------------------------------------- #
 
     def _container(self) -> HSplit:
-        tl, tr, bl, br = self.glyphs.corners
-        rule, bar = self.glyphs.rule, self.glyphs.bar
-        border = self._border_style
-        top = VSplit([
-            Window(width=1, height=1, char=tl, style=border),
-            Window(height=1, char=rule, style=border),
-            Window(width=1, height=1, char=tr, style=border),
-        ])
-        middle = VSplit([
-            Window(width=1, char=bar, style=border), Window(width=1),
-            self.composer,
-            Window(width=1), Window(width=1, char=bar, style=border),
-        ])
-        bottom = VSplit([
-            Window(width=1, height=1, char=bl, style=border),
-            Window(width=1, height=1, char=rule, style=border),
-            Window(FormattedTextControl(self._hints), height=1, dont_extend_width=True),
-            Window(height=1, char=rule, style=border),
-            Window(width=1, height=1, char=br, style=border),
-        ])
+        # One window per row, each drawing its whole line at the terminal's width: a row of
+        # VSplits costs a width negotiation on every redraw. The frame's sides are margins of the
+        # composer's own window.
+        bar = self.glyphs.bar
+        self.composer.window.left_margins = [_FrameSide(self, f"{bar} ")]
+        self.composer.window.right_margins = [_FrameSide(self, f" {bar}")]
+
+        def row(text: Callable[[], list[tuple[str, str]]]) -> Window:
+            return Window(FormattedTextControl(text), height=1)
+
         # The live row lines up with the step rows above it, so a running step turns into its
         # finished row in place. It takes no space while idle.
         live = ConditionalContainer(
-            VSplit([
-                Window(FormattedTextControl(self._live_row), height=1),
-                Window(FormattedTextControl(self._live_elapsed), height=1, width=8, align=WindowAlign.RIGHT),
-            ]),
-            filter=Condition(lambda: (self.busy or self._preparing) and bool(self.activity)),
+            row(self._live_line), filter=Condition(lambda: (self.busy or self._preparing) and bool(self.activity)),
         )
-        footer = Window(FormattedTextControl(self._footer_row), height=1)
-        return HSplit([live, top, middle, bottom, footer])
+        return HSplit([live, row(self._top_border), self.composer, row(self._bottom_border), row(self._footer_row)])
 
     def _border_style(self) -> str:
         return f"class:frame.{self._state()}"
+
+    def _top_border(self) -> list[tuple[str, str]]:
+        tl, tr, _bl, _br = self.glyphs.corners
+        return [(self._border_style(), tl + self.glyphs.rule * max(0, self._columns() - 2) + tr)]
+
+    def _bottom_border(self) -> list[tuple[str, str]]:
+        """The frame's bottom edge with the key hints (or a flash) set into it."""
+        _tl, _tr, bl, br = self.glyphs.corners
+        style, rule = self._border_style(), self.glyphs.rule
+        hints = self._hints()
+        rest = max(0, self._columns() - 3 - fragment_list_width(hints))
+        return [(style, bl + rule), *hints, (style, rule * rest + br)]
 
     def _line_prefix(self, line: int, wrap: int) -> list[tuple[str, str]]:
         if line == 0 and wrap == 0:
@@ -881,18 +922,27 @@ class ChatUI:
         step, started, others = current
         return step.live, self.glyphs.join(step.target, f"+{others} more" if others else ""), started
 
-    def _live_row(self) -> list[tuple[str, str]]:
-        label, detail, _since = self._live()
+    def _live_line(self) -> list[tuple[str, str]]:
+        """Spinner, activity and detail in the step rows' columns; the timer at the right edge."""
+        label, detail, since = self._live()
+        now = time.monotonic()
         frames = self.glyphs.spinner
-        frame = frames[int(time.monotonic() / _FRAME_SECONDS) % len(frames)]
-        out = [("class:spinner", f"  {frame} "), ("class:activity", label.ljust(LABEL_WIDTH))]
-        if detail:
-            out.append(("class:muted", f" {detail}"))
-        return out
-
-    def _live_elapsed(self) -> list[tuple[str, str]]:
-        elapsed = time.monotonic() - self._live()[2]
-        return [("class:muted", seconds(elapsed))] if elapsed >= 1 else []
+        # While starting nothing animates: the spinner moves with the timer, once a second.
+        tick = now / _FRAME_SECONDS if self._executing else now - since
+        head = f"  {frames[int(tick) % len(frames)]} "
+        timer = seconds(now - since) if now - since >= 1 else ""
+        room = self._columns() - get_cwidth(head) - (get_cwidth(timer) + 1 if timer else 0)
+        label = label.ljust(LABEL_WIDTH)
+        detail = f" {detail}" if detail else ""
+        if get_cwidth(label) > room:
+            label, detail = _clip(label, max(0, room)), ""
+        elif get_cwidth(label + detail) > room:
+            detail = _clip(detail, room - get_cwidth(label) - get_cwidth(self.glyphs.ellipsis)) + self.glyphs.ellipsis
+        gap = max(0, room - get_cwidth(label + detail)) + (1 if timer else 0)
+        return [
+            ("class:spinner", head), ("class:activity", label), ("class:muted", detail),
+            ("", " " * gap if timer else ""), ("class:muted", timer),
+        ]
 
     def _columns(self) -> int:
         try:
@@ -915,8 +965,6 @@ class ChatUI:
                 text = g.join("starting", "your message is queued" if self._pending_submission is not None else "you can type now")
             elif self._startup_failed:
                 text = g.join("startup failed", "/exit to leave")
-            elif self.buffer.suggestion is not None and self.buffer.suggestion.text:
-                text = g.join(f"{g.right} accept", "enter send", "alt+enter new line")
             elif self.buffer.text:
                 text = g.join("enter send", "alt+enter new line")
             else:
@@ -989,7 +1037,8 @@ class ChatUI:
     # -- the redraw ticker --------------------------------------------------------- #
 
     def _animate(self) -> None:
-        """Redraw while something moves (spinner, timers, a flash); nothing ticks while idle."""
+        """Redraw while work runs: every spinner frame during a turn, once a second while the chat
+        prepares; nothing ticks while idle (a flash schedules its own redraw)."""
         if self._ticker is not None or self._loop is None or not self._moving():
             return
         try:
@@ -1003,8 +1052,11 @@ class ChatUI:
             while self._moving():
                 if self.application.is_running:
                     self.application.invalidate()
-                starting = self._preparing and not self._executing and not self.flash_text
-                await asyncio.sleep(_STARTUP_FRAME_SECONDS if starting else _FRAME_SECONDS)
+                self._wake.clear()
+                try:
+                    await asyncio.wait_for(self._wake.wait(), _FRAME_SECONDS if self._executing else _STARTUP_TICK_SECONDS)
+                except TimeoutError:
+                    pass
             if self.application.is_running:
                 self.application.invalidate()  # the frame, hints and live row settle
         finally:

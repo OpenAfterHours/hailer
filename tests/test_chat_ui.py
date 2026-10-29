@@ -567,18 +567,26 @@ def test_escape_cancels_a_turn_like_ctrl_c_and_is_harmless_while_idle():
         with terminal(submit) as (ui, keys, _screen, transcript, _size):
             running = await start(ui)
             keys.send_text("draft\x1b")
-            await asyncio.sleep(0.6)  # past both key timeouts: a lone Esc has been handled
-            assert ui.application.is_running and ui.buffer.text == "draft" and not submissions
+            await asyncio.sleep(0.7)  # a slow Esc, Enter while idle is still Esc Enter: a newline
+            keys.send_text("\r")
+            await until(lambda: ui.buffer.text == "draft\n")
+            keys.send_text("\x1b")
+            await asyncio.sleep(1.7)  # past prompt_toolkit's idle timeouts: a lone Esc did nothing
+            assert ui.application.is_running and ui.buffer.text == "draft\n" and not submissions
+            ui.buffer.text = "draft"
             keys.send_text("\r")
             await until(lambda: ui.activity == "Running code")
             keys.send_text("next\x1b\r")  # Alt+Enter (Esc Enter) still inserts a newline while busy
             await until(lambda: ui.buffer.text == "next\n")
-            await asyncio.sleep(0.4)
+            keys.send_text("\n")  # Ctrl+J: a newline key that never involves Esc
+            await until(lambda: ui.buffer.text == "next\n\n")
+            await asyncio.sleep(0.5)
             assert ui.busy and not cleaned.is_set()
             keys.send_text("\x1b")
-            await asyncio.wait_for(cleaned.wait(), 5)
+            await asyncio.wait_for(cleaned.wait(), 1)  # the turn's short timeouts: Esc acts at once
             await until(lambda: not ui.busy)
-            assert ui.buffer.text == "next\n" and submissions == ["draft"]
+            assert ui.buffer.text == "next\n\n" and submissions == ["draft"]
+            assert (ui.application.ttimeoutlen, ui.application.timeoutlen) == (0.5, 1.0)  # idle again
             lines = rows(transcript.getvalue())
             done = next(i for i, line in enumerate(lines) if "Fetched a page" in line)
             assert re.fullmatch(r"  ✓ Fetched a page\s+docs\.pola\.rs · 12 KB of text\s+0\.3s", lines[done])
@@ -772,6 +780,146 @@ def test_composer_lets_rich_wrap_with_indents_but_keeps_urls_whole():
             hint = [line for line in lines if "hint" in line or "transcript" in line]
             assert len(hint) == 2 and all(line.startswith("    ") and len(line) <= 40 for line in hint)
             assert any(url in line for line in lines)  # one line: the terminal wraps it, nothing is cut
+            ui.exit()
+            await asyncio.wait_for(running, 5)
+
+    asyncio.run(scenario())
+
+
+def test_bracketed_names_print_as_text_never_as_markup():
+    """Notebook, skill and file names, errors and warnings come from outside: "q[/].py" would be a
+    Rich markup error in the writer and end the app."""
+    from hailer.transcript import NotebookRow, callout, detail_card, notebook_table, status_card
+
+    names = ["q[/].py", "[bold]x.py", "[red]warn[/red]"]
+
+    async def scenario():
+        async def submit(_text):
+            g = ui.glyphs
+            ui.console.print(notebook_table(g, [NotebookRow(name, "[today]", "[1 KB]", active=True) for name in names], "[/] note"))
+            ui.console.print(detail_card(g, [("[Skills]", [names[1]])], ["[/]warning"]))
+            ui.console.print(status_card(g, [("ok", "[Model]", names[2])], title="[/]"))
+            ui.console.print(callout(g, "fail", "Unknown notebook q[/].py", ["[bold]hint[/bold]"]))
+
+        with terminal(submit) as (ui, keys, _screen, transcript, _size):
+            running = await start(ui)
+            keys.send_text("/notebook list\r")
+            await until(lambda: "hint" in transcript.getvalue() and not ui.busy)
+            output = transcript.getvalue()
+            for text in [*names, "[today]", "[1 KB]", "[/] note", "[Skills]", "[/]warning", "[Model]", "[/]", "Unknown notebook q[/].py", "[bold]hint[/bold]"]:
+                assert text in output, text
+            assert ui.application.is_running and not running.done()
+            ui.exit()
+            await asyncio.wait_for(running, 5)
+
+    asyncio.run(scenario())
+
+
+def test_a_url_in_a_callout_stays_on_one_line_while_the_rest_wraps_in_the_gutter():
+    async def scenario():
+        url = "https://docs.example.com/api/python/stable/reference/a/very/long/path.html?query=1"
+
+        async def submit(_text):
+            ui.console.print(callout(ui.glyphs, "fail", f"Could not fetch {url}", ["A hint that is long enough to wrap inside forty columns."]))
+
+        console = Console(file=io.StringIO(), force_terminal=False, color_system=None, width=40)
+        with terminal(submit, console=console) as (ui, keys, _screen, _transcript, _size):
+            running = await start(ui)
+            keys.send_text("go\r")
+            await until(lambda: "columns." in console.file.getvalue() and not ui.busy)
+            lines = rows(console.file.getvalue())
+            assert f"  ✗ Could not fetch {url}" in lines  # whole: the terminal wraps it, nothing cuts the URL
+            hint = [line for line in lines if "hint" in line or "columns." in line]
+            assert len(hint) == 2 and all(line.startswith("    ") and len(line) <= 40 for line in hint)
+            ui.exit()
+            await asyncio.wait_for(running, 5)
+
+    from hailer.transcript import callout
+
+    asyncio.run(scenario())
+
+
+def test_turn_footer_keeps_its_stats_and_shortens_the_link_when_narrow():
+    from hailer.transcript import turn_footer
+
+    stats = "4 steps · 6.5s · 3.1k in · 612 out"
+    for width, link in ((100, "↗ analysis.py"), (46, "↗ analy…")):
+        console = Console(file=io.StringIO(), force_terminal=False, color_system=None, width=width)
+        console.print(turn_footer(UNICODE, stats, "analysis.py", "http://127.0.0.1:2718/?file=analysis.py"))
+        line = console.file.getvalue().rstrip()
+        assert line.startswith(f"  {stats}  ") and line.endswith(link) and len(line) <= width
+
+
+def test_placeholder_stays_on_one_line_in_a_narrow_terminal():
+    async def scenario():
+        async def submit(_text):
+            pass
+
+        with terminal(submit) as (ui, _keys, _screen, _transcript, size):
+            running = await start(ui)
+            size[0] = Size(rows=24, columns=30)
+            ui.application.invalidate()
+            await until(lambda: ui.composer.window.render_info is not None and ui.composer.window.render_info.window_width < 30)
+            assert ui.composer.window.render_info.window_height == 1
+            ui.exit()
+            await asyncio.wait_for(running, 5)
+
+    asyncio.run(scenario())
+
+
+def test_events_after_a_cancel_leave_the_row_saying_cancelling():
+    async def scenario():
+        cleanup, release = asyncio.Event(), asyncio.Event()
+
+        async def submit(_text):
+            ui.on_event(call("marimo_execute", "a", code="slow()\n"))
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cleanup.set()
+                await release.wait()
+                raise
+
+        with terminal(submit) as (ui, keys, _screen, transcript, _size):
+            running = await start(ui)
+            keys.send_text("slow\r")
+            await until(lambda: ui.activity == "Running code")
+            keys.send_text("\x03")
+            await asyncio.wait_for(cleanup.wait(), 5)
+            for event in (AgentEvent("message_delta", "late words"), AgentEvent("status", "Thinking"), call("load_skill", "b", name="x")):
+                ui.on_event(event)
+            assert ui.activity == "Cancelling"
+            release.set()
+            await until(lambda: not ui.busy)
+            assert "Loaded a skill" not in transcript.getvalue()
+            ui.exit()
+            await asyncio.wait_for(running, 5)
+
+    asyncio.run(scenario())
+
+
+def test_nothing_animates_while_the_chat_prepares():
+    async def scenario():
+        ready = asyncio.Event()
+
+        async def prepare():
+            await ready.wait()
+            return True
+
+        async def submit(_text):
+            pass
+
+        with terminal(submit) as (ui, _keys, _screen, _transcript, _size):
+            ui.configure_startup(prepare)
+            running = await start(ui)
+            await asyncio.sleep(0.2)
+            before = ui.application.render_counter
+            await asyncio.sleep(2.1)
+            assert ui.application.render_counter - before <= 3  # the timer, once a second
+            assert "".join(text for _style, text in ui._live_line()).rstrip().endswith("s")  # e.g. "2.3s"
+            ready.set()
+            await until(lambda: not ui._preparing)
+            await until(lambda: ui._ticker is None)
             ui.exit()
             await asyncio.wait_for(running, 5)
 

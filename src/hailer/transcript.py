@@ -21,7 +21,7 @@ from rich.table import Table
 from rich.text import Text
 
 from hailer.session import COMMAND_GROUPS, COMMAND_USAGE
-from hailer.steps import Receipt
+from hailer.steps import Receipt, plural
 
 ACCENT, MUTED, OK, WARN, FAIL = "cyan", "dim", "green", "yellow", "red"
 STATUS_STYLES = {"ok": OK, "failed": FAIL, "cancelled": WARN, "unknown": WARN}
@@ -53,7 +53,6 @@ class Glyphs:
     corners: str  # top-left, top-right, bottom-left, bottom-right
     spinner: str  # one character per frame
     up: str
-    right: str
     ellipsis: str
     ascii: bool = False
 
@@ -70,12 +69,11 @@ class Glyphs:
 
 UNICODE = Glyphs(
     user="▌", reply="●", ok="✓", fail="✗", warn="▲", on="●", off="○", sep="·", link="↗", prompt="›",
-    rule="─", bar="│", corners="╭╮╰╯", spinner="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏", up="↑", right="→",
-    ellipsis="…",
+    rule="─", bar="│", corners="╭╮╰╯", spinner="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏", up="↑", ellipsis="…",
 )
 ASCII = Glyphs(
     user="|", reply="*", ok="+", fail="x", warn="!", on="*", off="o", sep="-", link="->", prompt=">",
-    rule="-", bar="|", corners="++++", spinner="|/-\\", up="up", right="right", ellipsis="...",
+    rule="-", bar="|", corners="++++", spinner="|/-\\", up="up", ellipsis="...",
     ascii=True,
 )
 
@@ -113,10 +111,6 @@ def tokens(value: int) -> str:
     return f"{value / 1000:.1f}k" if value >= 1000 else str(value)
 
 
-def plural(count: int, noun: str) -> str:
-    return f"{count} {noun}" + ("" if count == 1 else "s")
-
-
 # --------------------------------------------------------------------------- #
 # Layout pieces
 # --------------------------------------------------------------------------- #
@@ -137,6 +131,8 @@ class Gutter:
     def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
         if options.no_wrap:
             lines = list(Segment.split_lines(console.render(self.body, options)))
+        elif isinstance(self.body, Text) and "://" in self.body.plain:
+            lines = self._url_lines(console, options)
         else:
             width = max(10, options.max_width - cell_len(self.first))
             lines = console.render_lines(self.body, options.update(width=width, no_wrap=False), pad=False)
@@ -147,6 +143,20 @@ class Gutter:
             yield Segment(prefix if line else prefix.rstrip(), style)
             yield from line
             yield Segment.line()
+
+    def _url_lines(self, console: Console, options: ConsoleOptions) -> list[list[Segment]]:
+        """A text's lines, wrapped inside the gutter except those with a URL: Rich would cut a URL
+        into lines that no longer open or copy as one, so such a line is written whole and the
+        terminal wraps it."""
+        assert isinstance(self.body, Text)
+        width = max(10, options.max_width - cell_len(self.first))
+        lines: list[list[Segment]] = []
+        for part in self.body.split("\n"):
+            if "://" in part.plain:
+                lines += Segment.split_lines(console.render(part, options.update(no_wrap=True, overflow="ignore")))
+            else:
+                lines += console.render_lines(part, options.update(width=width, no_wrap=False), pad=False)
+        return lines
 
 
 def _rstrip(line: list[Segment]) -> list[Segment]:
@@ -229,10 +239,11 @@ def turn_stats(glyphs: Glyphs, *, steps: int, elapsed: float | None, input_token
 
 
 def turn_footer(glyphs: Glyphs, stats: str, notebook: str = "", url: str = "") -> Table:
-    """The muted line under a reply, with a terminal hyperlink to the notebook on the right."""
+    """The muted line under a reply, with a terminal hyperlink to the notebook on the right. The
+    stats keep their room; a narrow terminal shortens the link."""
     grid = Table.grid(expand=True)
-    grid.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
-    grid.add_column(justify="right", no_wrap=True)
+    grid.add_column(no_wrap=True, width=cell_len(stats) + 4)  # "  " before the stats, two spaces after
+    grid.add_column(ratio=1, justify="right", no_wrap=True, overflow="ellipsis")
     # A Style, not a style string: a URL is never parsed as style words.
     link = Text(f"{glyphs.link} {notebook}", style=Style(dim=True, link=url)) if notebook and url else Text("")
     grid.add_row(Text(f"  {stats}", style=MUTED), link)
@@ -288,7 +299,9 @@ class _HelpCard:
         }
         group_width = max(cell_len(group) for group in [*COMMAND_GROUPS, "Keys"])
         command_width = max(command.cell_len for command in commands.values())
-        keys = self.glyphs.join("enter send", "alt+enter new line", "esc cancel", f"{self.glyphs.up} history", "ctrl+c exit")
+        keys = self.glyphs.join(
+            "enter send", "alt+enter or ctrl+j new line", "esc cancel", f"{self.glyphs.up} history", "ctrl+c exit",
+        )
         side_by_side = options.max_width - group_width - command_width - 4 >= self.MIN_DESCRIPTION
         beside = side_by_side or options.max_width - command_width - 2 >= self.MIN_BESIDE
         grid = Table.grid(padding=(0, 2))
@@ -299,20 +312,20 @@ class _HelpCard:
             grid.add_column(ratio=1)
         for group, names in COMMAND_GROUPS.items():
             if not side_by_side:
-                grid.add_row(*([Text(group, style=MUTED)] + [""] * (len(grid.columns) - 1)))
+                grid.add_row(Text(group, style=MUTED), *[Text("")] * (len(grid.columns) - 1))
             for index, name in enumerate(names):
                 summary = COMMAND_USAGE[name][1]
                 if side_by_side:
-                    grid.add_row(group if index == 0 else "", commands[name], summary)
+                    grid.add_row(Text(group if index == 0 else ""), commands[name], Text(summary))
                 elif beside:
-                    grid.add_row(commands[name], summary)
+                    grid.add_row(commands[name], Text(summary))
                 else:
                     grid.add_row(Group(commands[name], Gutter(Text(summary), "  ")))
-            grid.add_row(*([""] * len(grid.columns)))
+            grid.add_row(*[Text("")] * len(grid.columns))
         footer = Table.grid(padding=(0, 2))
         footer.add_column(width=group_width, style=MUTED, no_wrap=True)
         footer.add_column(ratio=1, style=MUTED)
-        footer.add_row("Keys", keys)
+        footer.add_row(Text("Keys"), Text(keys))
         yield Group(grid, footer)
 
 
@@ -345,7 +358,7 @@ def notebook_table(glyphs: Glyphs, rows: Sequence[NotebookRow], note: str = "") 
             state.append(f"{glyphs.off} not open", style=MUTED)
         if row.active:
             state.append("  active", style=ACCENT)
-        table.add_row(row.name, row.modified, row.size, state)
+        table.add_row(Text(row.name), Text(row.modified), Text(row.size), state)  # Text: a name is never markup
     parts: list[RenderableType] = [table]
     if note:
         parts += [Text(""), Text(note, style=MUTED)]
@@ -359,7 +372,7 @@ def detail_card(glyphs: Glyphs, sections: Sequence[tuple[str, Sequence[Renderabl
     grid.add_column(ratio=1)
     for label, values in sections:
         for index, value in enumerate(values or [""]):
-            grid.add_row(label if index == 0 else "", Text(value) if isinstance(value, str) else value)
+            grid.add_row(Text(label if index == 0 else ""), Text(value) if isinstance(value, str) else value)
     parts: list[RenderableType] = [grid]
     for warning in warnings:
         parts.append(Text.assemble((f"{glyphs.warn} ", WARN), (warning, WARN)))
