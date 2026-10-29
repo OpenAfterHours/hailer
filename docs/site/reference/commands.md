@@ -19,10 +19,26 @@ Interactive chat keeps a framed input box below the conversation. Your submitted
 replies and command results appear above it. The context line shows the active notebook, model and
 number of loaded context files; the activity line shows what Hailer is doing.
 
-Enter sends; Alt+Enter inserts a newline. Pasting several lines keeps them in one editable message.
-Up and Down move through multiline input and recall earlier messages at its boundaries (history stays
-in memory for this session). You can draft your next message while Hailer works; Enter preserves that
-draft until the current operation finishes or is cancelled. Requests are not queued.
+Enter sends; Alt+Enter (or Ctrl+J) inserts a newline. Pasting several lines keeps them in one editable
+message. You can draft your next message while Hailer works; Enter preserves that draft until the current
+operation finishes or is cancelled. Requests are not queued.
+
+**Command menu.** Typing `/` at the start of a message opens a menu of the commands under the input box,
+each with a short description. Keep typing to narrow it; Up and Down (or Tab and Shift+Tab) choose; Enter
+takes the chosen command, or the first one. A command without arguments (`/help`, `/status`, `/new`,
+`/context`, `/reload`, `/clear`, `/exit`, `/notebook list`) runs at once; a command that takes arguments is
+completed with a space and the menu then offers them: the `/notebook` subcommands, notebook names after
+`/notebook open` or `/notebook close`, skill names after `/skill`, saved prompts after `/prompt`, and after
+`/model` the current model and each provider as `<provider>:`. Esc closes the menu (while a turn runs, the
+first Esc closes the menu and the next one cancels the turn). A command typed in full is sent as typed.
+Tab also opens the menu for the word being typed.
+
+**History.** Up and Down move through multiline input and recall earlier messages at its boundaries,
+including messages from earlier sessions in this workspace. As you type, the rest of the latest earlier
+message that starts the same way appears in grey; → (Right) accepts it. History is kept in
+`.hailer/input_history` (the last 1,000 messages; a message that looks like it contains an API key or token
+is never written there). To keep history for the current session only, set `input_history = false` under
+`[hailer]` in `hailer.toml`.
 
 The interface uses normal terminal scrollback and text selection. It does not capture the mouse or
 switch to an alternate screen. Use `uvx hailer --plain` or `uvx hailer notebook --plain` for the line-oriented

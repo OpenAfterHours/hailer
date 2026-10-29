@@ -179,7 +179,9 @@ Folders and the notebook come from the file alone (`HAILER_NOTEBOOK`, `HAILER_NO
 `wire_api`), `env_key` (a declared `[model_providers.openai]` without one gets `OPENAI_API_KEY`), `name`,
 `http_headers`, `env_http_headers`, `query_params`. `[web]` maps to `WebConfig` (`allowed_domains` list,
 `max_page_bytes`). `[hailer]` keys: `notebook`, `notebooks_dir`, `data_dir`, `context_dir`,
-`skills_dir`, `prompts_dir`, `max_tool_output_chars`, `max_context_bytes`, `log_level` (the removed
+`skills_dir`, `prompts_dir`, `max_tool_output_chars`, `max_context_bytes`, `log_level`, `input_history`
+(bool, default `true`: the chat's input history persists in `.hailer/input_history`; `false` keeps it in
+memory for the session; `HailerConfig.input_history`; the template shows it commented out) (the removed
 `marimo_url` and `marimo_token` are reported as unknown keys; their values are never quoted); `[model]` keys: `name`,
 `provider`, `reasoning_effort` (`""` = send none), `summarize_after_tokens` (`ModelConfig`, default 100000,
 0 = off). `notebooks_dir` (relative to the workspace) is the folder notebooks are listed from, created in and
@@ -1108,10 +1110,36 @@ def state_dir(workspace: Path) -> Path          # <workspace>/.hailer (path only
 def ensure_state_dir(workspace: Path) -> Path   # mkdir -p, then write .hailer/.gitignore unless one exists (never overwritten; a failed write is ignored)
 SANDBOX_MARK_NAME = "sandbox-wrote-notebooks"   # a sandbox copied notebooks here since the user last agreed to run them unsafe-local
 def mark_sandbox_wrote(workspace) -> None; def sandbox_wrote_notebooks(workspace) -> bool; def clear_sandbox_mark(workspace) -> None
+INPUT_HISTORY_NAME = "input_history"; def input_history_path(workspace) -> Path   # .hailer/input_history (hailer.input_history)
 ```
 The only place `.hailer/` is created: `session.save_session`, `notebooks.save_active_notebook`,
-`HailerAgent` (the default `threads.sqlite`) and the kernel runtimes' record, log and token folders all go through `ensure_state_dir`, so the
+`HailerAgent` (the default `threads.sqlite`), `input_history.InputHistory` and the kernel runtimes' record, log and token folders all go through `ensure_state_dir`, so the
 folder ignores itself in any git repository. The user's own `.gitignore` is never touched.
+
+## `input_history.py`
+
+```python
+MAX_ENTRIES = 1000; MAX_READ_BYTES = 2 MiB; LOCK_WAIT_SECONDS = 0.25
+def input_history(path: Path | None) -> History   # ThreadedHistory(InputHistory(path)), or InMemoryHistory() for None (the setting off)
+def storable(text: str) -> bool                    # not blank and hailer.log.redact(text) == text
+class InputHistory(History):                       # prompt_toolkit History kept in path (FileHistory's format)
+    def load_history_strings(self) -> Iterable[str]   # newest first; never raises ([] on any failure)
+    def store_string(self, string: str) -> None       # appends; never raises
+```
+The composer (`ChatUI(history_file=...)`) and plain mode's prompt (`_LineReader.history_file`) use it while
+`[hailer].input_history` is on; the controller passes `statedir.input_history_path(workspace)`. The file is
+prompt_toolkit's `FileHistory` format (`# <time>` line, then each line of the entry behind `+`), so multi-line
+entries round-trip. prompt_toolkit's `ThreadedHistory` reads it on a worker thread when the first render
+creates the buffer's content: nothing waits for it, and Up recalls entries as they load. Reading keeps the last
+`MAX_ENTRIES` (and at most the file's last `MAX_READ_BYTES`, dropping the entry the cut lands in) and rewrites a
+longer file through `input_history.tmp` and `os.replace`. An entry `storable` refuses (a bearer token, an
+`sk-` key, the value of a `*_KEY`/`*_TOKEN`/`*_SECRET`/`*_PASSWORD` variable: what `redact` masks) stays in
+the session's memory only. Appends (one `os.write` of the whole entry, `O_APPEND`), reads and the rewrite hold
+an exclusive lock on `input_history.lock` (`fcntl.flock`; `msvcrt.locking` on Windows), waiting at most
+`LOCK_WAIT_SECONDS` and otherwise skipping the write: two chats in one workspace interleave whole entries
+and lose none to a rewrite. A file system without locks is used unlocked. The files are created `0o600`.
+Any `OSError` (read-only workspace, permissions, a folder in the way) or corrupt bytes (decoded with
+`errors="replace"`; lines without `+` end an entry) only means less history; it is logged at debug level.
 
 ## `session.py`  (owner: wave 2 / E)
 
@@ -1121,6 +1149,7 @@ COMMANDS: dict[str, str]     # name -> one-line help, for /help
 EXIT_COMMANDS = ("exit", "quit")
 COMMAND_USAGE: dict[str, tuple[str, str]]   # name -> (argument signature, short description): the composer's /help card; every COMMANDS name but the alias quit
 COMMAND_GROUPS: dict[str, tuple[str, ...]]  # the card's groups (Conversation, Notebook, Session), each COMMAND_USAGE name once
+NOTEBOOK_SUBCOMMANDS: dict[str, str]         # list/new/open/close -> short description: the command menu's second level
 def parse_command(line: str) -> Command | None      # "/model gpt-5.5" -> Command("model", "gpt-5.5"); "/exit" ; non-slash -> None; unknown slash -> Command(name, args) (CLI reports unknown); the name ends at the first whitespace, so "/exec\n<code>" keeps its lines
 def session_path(workspace: Path) -> Path
 def load_session(workspace: Path) -> SessionState   # .hailer/session.json, tolerant of missing/corrupt
@@ -1203,7 +1232,7 @@ in yellow (`common._kernel_style`) for unsafe-local, as the startup panel and `-
 unsupported terminals use `Console.input` without starting prompt_toolkit; their Rich console also
 disables live status/cursor controls, including during startup and notebook waits.
 
-`chat_ui.py:ChatUI(console, on_submit, footer, *, pt_input=None, pt_output=None)` owns one inline prompt_toolkit
+`chat_ui.py:ChatUI(console, on_submit, footer, *, pt_input=None, pt_output=None, completions=None, history_file=None)` owns one inline prompt_toolkit
 application (no alternate screen, mouse capture or CPR) and a serialized output queue. Top to bottom: the live
 row (only while busy or starting), a bounded multiline composer in a rounded frame coloured by state (ANSI cyan
 ready, bright black busy or starting, red once startup failed) with a `›` prompt, a two-space continuation
@@ -1224,13 +1253,46 @@ redraw that ends it.
 Rich transcript output goes through `run_in_terminal`; log handlers are temporarily routed through the same
 queue, retaining redaction. Bracketed paste stays enabled throughout the live composer and is restored on exit.
 Enter submits once; Alt+Enter (Esc Enter) and Ctrl+J insert a newline (Ctrl+J never involves Esc, for
-terminals that do not send Alt as Meta); history is in memory. A busy submission leaves the draft intact, does
+terminals that do not send Alt as Meta). Up/Down move through a multiline draft and recall history at its
+edges: `history_file` (the controller passes `.hailer/input_history` while `[hailer].input_history` is on;
+see `input_history.py`) or, for `None`, this session's only. History is read on a worker thread after the
+first render, never before it. As you type, `AutoSuggestFromHistory` shows the rest of the latest matching
+history line in grey (`auto-suggestion`, bright black); → (or Ctrl+E, Ctrl+F) at the end of the draft takes
+it (`load_auto_suggest_bindings`), and the border says `→ accept · enter send · alt+enter new line`
+(`right accept` in ASCII). A busy submission leaves the draft intact, does
 not enqueue a request and flashes `Still working · esc cancels · your draft is kept` in the border for 2.5 s
 instead of replacing the activity (a flash ends with the turn or with startup). Esc cancels a running turn
-through the same path as Ctrl+C: only during a turn are the key timeouts short (`ttimeoutlen` 0.1 s,
-`timeoutlen` 0.3 s) so a lone Esc acts at once; while idle prompt_toolkit's own (0.5 s, 1.0 s) stay, Esc alone
-does nothing and Esc then Enter within about 1.5 s is still a newline. Events that arrive after a cancel do
-not replace `Cancelling`. Ctrl+C cancels active work and awaits cleanup, or exits while idle; Ctrl+D exits only
+through the same path as Ctrl+C: only during a turn, or while the command menu is open, are the key timeouts
+short (`ttimeoutlen` 0.1 s, `timeoutlen` 0.3 s; `_sync_timeouts` after every render) so a lone Esc acts at
+once; otherwise prompt_toolkit's own (0.5 s, 1.0 s) stay, Esc alone does nothing and Esc then Enter within
+about 1.5 s is still a newline. Events that arrive after a cancel do
+not replace `Cancelling`.
+
+The command menu (`completion.py`): a draft that starts with `/` and has no line break completes while
+typing (`SlashCompleter`); the completions show in a window under the frame, above the footer, while there
+are any: `  › /help       Commands and keys` (the mark on the chosen item, the first while none is), names in
+one column, descriptions (`COMMAND_USAGE`'s short forms) shortened with the glyph set's ellipsis to the
+width, at most `MENU_ROWS` = 6 rows scrolled to the chosen one and a muted `N more` line. Styles
+`palette.pick`, `palette.name`, `palette.name.current` (ANSI cyan bold), `palette.meta` (bright black):
+never `menu.*`, which prompt_toolkit's default style paints grey. The border says
+`↑↓ choose · tab complete · enter run · esc close` (`up/down` in ASCII) while it is open, also during a turn.
+Up/Down and Tab/Shift+Tab choose (Tab without a menu opens it); Enter takes the chosen item (or the first)
+and, when the draft is then one of `completion.RUN_ON_ENTER` (`/help /status /new /context /reload /clear
+/exit /notebook list`: no arguments), submits it at once; otherwise the draft keeps the completion (a
+command that takes arguments gets its trailing space, so its own menu follows) for its own Enter. Esc closes
+the menu and restores the typed text; it does not cancel a running turn while the menu is open (the next
+Esc does). A command or subcommand typed in full gets no completion that only adds a space, so its menu
+steps aside and Enter sends it as typed (`/model` prints the model and usage). Arguments: `/notebook`
+`list|new|open|close` (`session.NOTEBOOK_SUBCOMMANDS`); after `open`/`close` the notebook names
+(`active` marks the active one); `/skill` and `/prompt` names (the skill's description, `saved prompt`);
+`/model` the current model (`current`) and `<provider>:` for `openai` and each declared provider. Matching is
+a case-insensitive prefix; names pass `single_line`. `completions()` returns `models.CompletionData`
+(`notebooks`, `active_notebook`, `skills`, `prompts`, `model`, `providers`) and, like `footer`, must only
+read state the controller holds: `ChatController.completions` takes the notebook names from
+`_notebook_names`, which `_refresh_notebook_names` fills on a worker (`_blocking`): after the notebook wait
+in startup preparation, after every `/notebook` command (on its worker, unless it was stopped) and in
+`_sync_after_turn` at the end of every composer turn. The completer never lists notebooks itself; a failing
+`completions` callable leaves the command names. Every submission still goes through `parse_command`. Ctrl+C cancels active work and awaits cleanup, or exits while idle; Ctrl+D exits only
 empty and idle; Ctrl+Z then Enter exits while idle. `/exit` and `/quit` also exit.
 
 The transcript: a submission is echoed behind `▌`. `settle_steps()` ends the steps still open as `no result,
@@ -1392,6 +1454,13 @@ package-install rule) are appended by `agent.system_prompt`. Loaded with
   one request per 4xx, and the gateway's call ids in the tool events
 - `test_session.py`, `test_cli.py` (Typer `CliRunner`; slash commands; preflight messages with fakes; a
   `FakeAgent` with the `HailerAgent` surface the CLI uses): E
+- `test_completion.py`: the command menu's completions from `CompletionData` only (commands, a command typed
+  in full, each command's arguments, nothing outside a one-line slash draft, a failing data source, names that
+  cannot add rows) and its rows (mark, scroll, `N more`, ellipsis per glyph set, no `menu.*` style).
+  `test_input_history.py`: the history file's format and round trip, the cap and tail read, secret
+  filtering, corrupt files, failures that never raise, owner-only files, a held lock, two processes appending
+  while one trims, and the off switch. The composer's keys for both are in `test_chat_ui.py`; the controller's
+  cached names (listed on a worker, never by the completer) and the history file it hands out in `test_chat.py`
 - Kernel runtimes (docker kernel, 2026-09-19), none of which start anything: `test_kernel.py` (the withheld
   variables, with no way through, the unsafe-local sandbox's folders and URLs, prompt notes, `LocalRuntime` with
   `LocalProcesses` faked, and a start that never adopts another server on its port), `test_kernel_docker.py`
