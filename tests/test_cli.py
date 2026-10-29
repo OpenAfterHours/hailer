@@ -1639,6 +1639,22 @@ def test_plain_turn_prints_a_row_per_result_by_id_then_the_answer_once_unwrapped
     assert "streamed" not in output.getvalue() and "\x1b" not in output.getvalue()
 
 
+def test_plain_turn_cleans_the_reply_and_starts_cancelled_rows_on_a_new_line():
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=False, width=60, highlight=False, color_system=None, soft_wrap=True)
+    display = common._TurnDisplay(console)
+    display.start()
+    assert display.cancel() is False and output.getvalue() == ""  # nothing open: "\nInterrupted." starts the line
+    display(AgentEvent("tool_call", "marimo_execute", {"args": {"code": "slow()\n"}, "id": "a"}))
+    assert display.cancel() is True
+    assert re.fullmatch(r"\n  ▲ Ran code\s+1 line · cancelled, effect unknown\s+\d\.\ds\n", output.getvalue())  # after ^C
+    output.seek(0), output.truncate()
+    display.start()
+    display.finish(TurnSummary("\x1b[31mred\x1b[0m \x1b]0;title\x07text\x9b2J\twith a tab\r\nnext", "thread"))
+    assert "red text    with a tab\nnext" in output.getvalue()
+    assert not any(char in output.getvalue() for char in "\x1b\x07\x9b\r\t")
+
+
 def test_plain_turn_ends_open_steps_honestly_on_ctrl_c_or_an_error(harness):
     class StoppedAgent(FakeAgent):
         def run_turn(self, text, *, on_event=None, skill=None, preamble=None):

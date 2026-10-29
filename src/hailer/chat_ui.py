@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import threading
 import time
 from collections import deque
@@ -40,8 +41,9 @@ from prompt_toolkit.output import create_output
 from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
 from prompt_toolkit.widgets import TextArea
+from rich.cells import cell_len
 from rich.console import Console, ConsoleOptions, RenderableType, RenderResult
-from rich.markdown import CodeBlock, Heading, Markdown, TableElement
+from rich.markdown import BlockQuote, CodeBlock, Heading, ListItem, Markdown, Paragraph, TableElement
 from rich.segment import Segment
 from rich.syntax import Syntax
 from rich.table import Table
@@ -64,6 +66,7 @@ from hailer.transcript import (
     Glyphs,
     Gutter,
     callout,
+    clean_reply,
     console_glyphs,
     seconds,
     simple_head,
@@ -204,18 +207,105 @@ class _Table(TableElement):
         if self.header is not None and self.header.row is not None:
             for cell in self.header.row.cells:
                 justify = cell.content.justify if cell.content.justify not in (None, "default") else "left"
-                table.add_column(cell.content.copy(), justify=justify)
+                table.add_column(cell.content.copy(), justify=justify, overflow="fold")  # not Rich's "…"
         if self.body is not None:
             for row in self.body.rows:
                 table.add_row(*(cell.content for cell in row.cells))
         yield table
 
 
+_WORD = re.compile(r"\s*\S+\s*")
+
+
+class _Words:
+    """``text`` wrapped at words in the width it gets, like Rich's, except that a word longer than
+    the line (a URL) is not folded: it gets a line of its own, longer than the width, and the
+    terminal wraps that line, so the URL still opens and copies as one."""
+
+    def __init__(self, text: Text) -> None:
+        self.text = text
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        width = options.max_width
+        for paragraph in self.text.split("\n", allow_blank=True):
+            offsets, used = [], 0
+            for word in _WORD.finditer(paragraph.plain):
+                size = cell_len(word.group().rstrip())
+                if used and used + size > width:
+                    offsets.append(word.start())
+                    used = 0
+                used += cell_len(word.group())
+            for line in paragraph.divide(offsets):
+                line.rstrip()
+                yield from line.render(console)
+                yield Segment.line()
+
+
+class _Paragraph(Paragraph):
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        yield _Words(self.text)
+
+
+def _beside(console: Console, options: ConsoleOptions, elements: Any, first: Segment, rest: Segment, style: Any) -> RenderResult:
+    """``elements`` laid out narrower behind ``first`` (then ``rest``) like Rich's list items and
+    quotes, but not cropped: a word a reply keeps whole (a URL) reaches the terminal whole."""
+    width = options.max_width - cell_len(first.text)
+    rendered = console.render(elements, options.update(width=width))
+    if style:
+        rendered = Segment.apply_style(rendered, style)
+    for index, line in enumerate(Segment.split_lines(rendered)):
+        yield first if index == 0 else rest
+        yield from line
+        yield Segment.line()
+
+
+class _ListItem(ListItem):
+    """A list item behind the glyph set's bullet (Rich's ``•`` is a ``?`` on an ASCII console)."""
+
+    glyphs: Glyphs = UNICODE
+
+    @classmethod
+    def create(cls, markdown: Any, token: Any) -> _ListItem:
+        item = cls()
+        item.glyphs = getattr(markdown, "glyphs", UNICODE)
+        return item
+
+    def render_bullet(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        style = console.get_style("markdown.item.bullet", default="none")
+        bullet = f" {self.glyphs.bullet} "
+        yield from _beside(console, options, self.elements, Segment(bullet, style), Segment(" " * cell_len(bullet), style), self.style)
+
+    def render_number(self, console: Console, options: ConsoleOptions, number: int, last_number: int) -> RenderResult:
+        width = len(str(last_number)) + 2
+        style = console.get_style("markdown.item.number", default="none")
+        numeral = Segment(f"{number}".rjust(width - 1) + " ", style)
+        yield from _beside(console, options, self.elements, numeral, Segment(" " * width, style), self.style)
+
+
+class _Quote(BlockQuote):
+    """A block quote behind the glyph set's bar."""
+
+    glyphs: Glyphs = UNICODE
+
+    @classmethod
+    def create(cls, markdown: Any, token: Any) -> _Quote:
+        quote = cls()
+        quote.glyphs = getattr(markdown, "glyphs", UNICODE)
+        return quote
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        bar = Segment(f"{self.glyphs.user} ", self.style)
+        yield from _beside(console, options, self.elements, bar, bar, self.style)
+
+
 class ReplyMarkdown(Markdown):
-    """Rich Markdown with left-aligned headings, simple tables and quiet code."""
+    """Rich Markdown with left-aligned headings, simple tables, quiet code and the glyph set's
+    bullets. A word longer than the line (a URL) is never cut: it gets a line of its own, which the
+    terminal wraps, so it still opens and copies as one."""
 
     elements: ClassVar[dict[str, type[Any]]] = {
         **Markdown.elements, "heading_open": _Heading, "fence": _Code, "code_block": _Code, "table_open": _Table,
+        "paragraph_open": _Paragraph, "list_item_open": _ListItem, "blockquote_open": _Quote,
     }
 
     def __init__(self, markup: str, glyphs: Glyphs = UNICODE) -> None:
@@ -244,8 +334,8 @@ class _Plain:
 
 
 def reply(glyphs: Glyphs, markdown: str) -> RenderableType:
-    """The final answer behind the reply mark."""
-    final = (markdown or "").strip()
+    """The final answer behind the reply mark, without escape sequences or control characters."""
+    final = clean_reply(markdown).strip()
     body: RenderableType = ReplyMarkdown(final, glyphs) if final else Text("(no reply)", style=MUTED)
     return Gutter(body, f"{glyphs.reply} ", style=ACCENT)
 

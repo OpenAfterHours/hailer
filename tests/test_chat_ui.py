@@ -1375,3 +1375,65 @@ def test_a_slow_history_file_never_delays_the_first_render(tmp_path, monkeypatch
         asyncio.run(scenario())
     finally:
         release.set()
+
+
+def test_reply_control_characters_never_reach_the_terminal_and_tabs_become_spaces():
+    async def scenario():
+        async def submit(_text):
+            ui.finish(summary("\x1b[31mred\x1b[0m \x1b]0;title\x07words\x9b2J\x00\x08 and\ta tab\r\n- item"))
+
+        with terminal(submit) as (ui, keys, _screen, transcript, _size):
+            running = await start(ui)
+            keys.send_text("hi\r")
+            await until(lambda: "item" in transcript.getvalue() and not ui.busy)
+            output = transcript.getvalue()
+            assert "● red words and   a tab" in output and "• item" in output  # the tab: spaces to column 16
+            assert not any(char in output for char in "\x1b\x07\x9b\x00\x08\r\t")
+            ui.exit()
+            await asyncio.wait_for(running, 5)
+
+    asyncio.run(scenario())
+
+
+def test_urls_in_a_markdown_reply_are_never_cut_at_64_columns():
+    url = "https://example.com/a/very/long/path/that/should/not/be/cut/when/the/terminal/is/narrow?x=1"
+    listed = "https://example.com/another/long/path/that/must/stay/whole/inside/a/list/item?y=2"
+
+    async def scenario():
+        async def submit(_text):
+            ui.finish(summary(f"See {url} for more, and some words to wrap the rest of the line.\n\n- also {listed}\n\n> quoted {url}"))
+
+        console = Console(file=io.StringIO(), force_terminal=False, color_system=None, width=64)
+        with terminal(submit, console=console) as (ui, keys, _screen, _transcript, _size):
+            running = await start(ui)
+            keys.send_text("hi\r")
+            await until(lambda: "quoted" in console.file.getvalue() and not ui.busy)
+            lines = rows(console.file.getvalue())
+            assert f"  {url}" in lines  # a line of its own, longer than the terminal: the terminal wraps it
+            assert f"     {listed}" in lines and f"  ▌ {url}" in lines
+            assert all(len(line) <= 64 for line in lines if "://" not in line)  # everything else wraps inside
+            ui.exit()
+            await asyncio.wait_for(running, 5)
+
+    asyncio.run(scenario())
+
+
+def test_an_ascii_console_gets_ascii_ellipses_bullets_and_quote_bars():
+    from hailer.chat_ui import reply
+    from hailer.steps import Receipt
+    from hailer.transcript import session_row, step_row, turn_footer
+
+    raw = io.BytesIO()
+    console = Console(file=io.TextIOWrapper(raw, encoding="ascii", errors="replace"), force_terminal=True, color_system=None, width=64)
+    glyphs = glyphs_for(console.encoding)
+    assert glyphs is ASCII
+    console.print(step_row(glyphs, Receipt("ok", "Scanned the data", "sales", "6 months, 25-01 to 25-06; discount from 25-04; and more", 0.7)))
+    console.print(step_row(glyphs, Receipt("ok", "a_tool_with_a_very_long_unknown_name", "", "", 0.1)))
+    console.print(session_row(glyphs, "ok", "Kernel", "docker - isolated - no network - data read-only - and so on", 0.6))
+    console.print(turn_footer(glyphs, "4 steps - 6.5s - 3.1k in - 612 out", "a_rather_long_notebook_name.py", "http://x/"))
+    console.print(reply(glyphs, "- item\n\n> quote\n\n| a | b |\n|--|--|\n| supercalifragilisticexpialidocious_long_identifier_value_more | 2 |"))
+    console.file.flush()
+    output = raw.getvalue().decode("ascii")
+    assert "?" not in output  # no character the console had to replace
+    assert "25-01 to 2...    0.7s" in output and "a_tool_with_a_ver...  " in output and "read-only" not in output
+    assert "-> a_rather_long_notebo..." in output and " - item" in output and "  | quote" in output
