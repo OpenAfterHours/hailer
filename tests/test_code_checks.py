@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 import subprocess
 import warnings
 from pathlib import Path
@@ -145,7 +146,7 @@ def test_ty_knows_the_types_other_cells_define():
         ("load", "sales = pl.read_csv('sales.csv')"),
     )
     result = cc.check(notebook, ["use"])
-    assert result.tools == ["ty", "ruff"] and not result.problems
+    assert result.tools == ["ty", "ruff", "hailer"] and not result.problems
     assert rules(result) == [("use", "unresolved-attribute", 2)]
     assert "sortt" in result.findings[0].message and result.findings[0].column == 1
 
@@ -160,7 +161,7 @@ def test_an_undefined_name_is_reported_once_with_both_tools_and_by_ruff_alone():
     notebook = snap(("a", "print(undefined_x)"))
     assert rules(cc.check(notebook)) == [("a", "unresolved-reference", 1)]
     only_ruff = cc.check(notebook, typecheck=False)
-    assert only_ruff.tools == ["ruff"] and rules(only_ruff) == [("a", "F821", 1)]
+    assert only_ruff.tools == ["ruff", "hailer"] and rules(only_ruff) == [("a", "F821", 1)]
 
 
 def test_ruff_reports_likely_bugs():
@@ -182,7 +183,7 @@ def test_what_notebook_cells_do_on_purpose_is_not_reported():
         ("f", "print(f'plain')"),
     )
     result = cc.check(notebook)
-    assert result.tools == ["ty", "ruff"] and result.findings == []
+    assert result.tools == ["ty", "ruff", "hailer"] and result.findings == []
 
 
 def test_a_cell_that_does_not_parse_is_reported_and_the_rest_still_checked():
@@ -197,7 +198,7 @@ def test_modules_next_to_the_notebook_are_found(tmp_path):
     notebook = snap(("a", "from helpers import total\nresult = total('abc')"))
     assert rules(cc.check(notebook, typecheck=True, lint=False, search_paths=[tmp_path])) == [("a", "invalid-argument-type", 2)]
     missing = cc.check(notebook, lint=False, search_paths=[tmp_path / "gone", tmp_path])
-    assert missing.tools == ["ty"] and rules(missing) == [("a", "invalid-argument-type", 2)], "a missing folder is skipped"
+    assert missing.tools == ["ty", "hailer"] and rules(missing) == [("a", "invalid-argument-type", 2)], "a missing folder is skipped"
 
 
 def test_checking_code_that_python_warns_about_prints_no_warning(capfd):
@@ -210,7 +211,7 @@ def test_checking_code_that_python_warns_about_prints_no_warning(capfd):
 
 
 def test_checks_switched_off_run_nothing():
-    result = cc.check(snap(("a", "print(undefined_x)")), lint=False, typecheck=False)
+    result = cc.check(snap(("a", "print(undefined_x)")), lint=False, typecheck=False, hardcoded=False)
     assert (result.findings, result.tools, result.problems) == ([], [], [])
 
 
@@ -224,7 +225,7 @@ def test_a_tool_that_cannot_run_becomes_a_problem_not_an_error(monkeypatch):
     monkeypatch.setattr(cc, "_binary", missing)
     notebook = snap(("a", "print(undefined_x)"))
     result = cc.check(notebook)
-    assert result.tools == ["ruff"] and result.problems == ["ty is not installed"]
+    assert result.tools == ["ruff", "hailer"] and result.problems == ["ty is not installed"]
     assert rules(result) == [("a", "F821", 1)], "ruff's copy of a finding stays when ty did not run"
     assert "(Check skipped: ty is not installed.)" in cc.report(result, notebook, ["a"])
 
@@ -235,7 +236,67 @@ def test_a_tool_that_fails_is_reported(monkeypatch):
 
     monkeypatch.setattr(cc, "_run", failing_run)
     result = cc.check(snap(("a", "x = 1")))
-    assert result.tools == [] and result.problems == ["ty failed (exit code 2): error: something broke", "ruff failed (exit code 2): error: something broke"]
+    assert result.tools == ["hailer"] and result.problems == ["ty failed (exit code 2): error: something broke", "ruff failed (exit code 2): error: something broke"]
+
+
+# --------------------------------------------------------------------------- #
+# Values typed into text
+# --------------------------------------------------------------------------- #
+
+
+def typed(code: str) -> list[tuple[int, str]]:
+    """``(line, message up to "typed")`` for each hardcoded-value finding in one cell of ``code``."""
+    return [(f.line, f.message.split(" typed into")[0]) for f in cc.hardcoded_values(Cell("a", "", code))]
+
+
+def test_values_typed_into_text_are_reported_once_per_line():
+    code = 'mo.md(\n    """\n## March 2025\n\nRevenue rose 5.6% to £41.1k; North drove 62% of it, 62% of orders.\n"""\n)'
+    assert typed(code) == [(3, '"2025", "March"'), (5, '"5.6%", "£41.1k", "62%"')]
+    finding = cc.hardcoded_values(Cell("a", "summary", code))[0]
+    assert (finding.tool, finding.rule, finding.cell_id) == ("hailer", "hardcoded-value", "a")
+    assert finding.message.endswith("typed into the text; format values from variables so the text follows the data")
+
+
+def test_text_formatted_from_variables_and_numbers_that_are_layout_are_not_reported():
+    assert typed('mo.md(f"Revenue {direction} {pct:.1%} to £{total / 1000:.1f}k; **{top}** moved most.")') == []
+    assert typed('mo.md("## 1. Overview\\n\\n1. Load\\n2) Compare\\n\\nQ2 review, COVID-19, 12px, v1.2, 3rd")') == []
+    assert typed('mo.md("<span style=\'color: #1f77b4\'>&#163;</span> May be late")') == []
+    assert typed('periods = pl.col("period") == "2025-03"\nprint("rows: 5")\nlabel = "Top 10"') == [], "only text a reader sees"
+    assert typed('mo.md("5%"') == [], "a cell that does not parse is the syntax check's"
+
+
+def test_chart_titles_and_the_literal_parts_of_text_are_checked():
+    assert typed('chart = alt.Chart(df).properties(title="Top 10 regions, 2025-03")') == [(1, '"10", "2025-03"')]
+    assert typed('chart = alt.Chart(df).properties(title=f"Top {top_n} regions, {report_period}")') == []
+    assert typed('mo.md(\n    f"Revenue rose {pct:.1%}, "\n    "up from 38.9k"\n)') == [(3, '"38.9k"')]
+    assert typed('mo.md("Revenue " + f"{pct:.1%}" + " in 25-03 sales.parquet")') == [(1, '"25-03"')]
+    assert typed('mo.callout(mo.md("Returns fell to 3 orders"), kind="warn")') == [(1, '"3"')]
+
+
+def test_a_value_is_reported_on_the_line_that_shows_it():
+    # marimo can lay a markdown cell out again: newlines written as \n inside a string over three lines.
+    relaid = 'mo.md("""\n\\n## March 2025\\n\\nRevenue rose 5.6%\\n\n""")'
+    assert typed(relaid) == [(2, '"2025", "March", "5.6%"')]
+
+
+def test_check_looks_for_typed_values_in_the_cells_asked_about():
+    notebook = snap(IMPORTS, ("old", 'mo.md("Up 5%")'), ("new", 'mo.md("Up 6%")'), ("bad", 'mo.md("Up 7%"'))
+    result = cc.check(notebook, ["new", "bad"], lint=False, typecheck=False)
+    assert result.tools == ["hailer"] and rules(result) == [("new", "hardcoded-value", 1), ("bad", "syntax-error", 1)]
+    assert rules(cc.check(notebook, ["new"], lint=False, typecheck=False, hardcoded=False)) == []
+
+
+def test_the_starter_template_and_the_agents_examples_pass():
+    from importlib.resources import files
+
+    from hailer.notebooks import STARTER_TEMPLATE
+
+    assert typed(STARTER_TEMPLATE.replace("__HAILER_TITLE__", "Sales review")) == []
+    instructions = files("hailer").joinpath("prompts/system.md").read_text(encoding="utf-8")
+    examples = re.findall(r"```python\n(.*?)```", instructions, re.DOTALL) + re.findall(r"`(mo\.md\(f\".*?\"\))`", instructions)
+    assert any("mo.cli_args()" in e for e in examples) and any(e.startswith("mo.md(f") for e in examples)
+    for example in examples:
+        assert typed(example) == [], example
 
 
 # --------------------------------------------------------------------------- #
@@ -247,12 +308,12 @@ def test_report_lists_findings_with_their_code():
     notebook = snap(IMPORTS, ("r", "revenue", "print(undefined_x)"))
     result = cc.check(notebook, ["r"])
     assert cc.report(result, notebook, ["r"]) == (
-        "Checks (ruff, ty) on the 1 changed cell: 1 finding.\n"
+        "Checks (hailer, ruff, ty) on the 1 changed cell: 1 finding.\n"
         "- cell revenue (r), line 1: ty unresolved-reference: Name `undefined_x` used when not defined\n"
         "    print(undefined_x)"
     )
     clean = cc.check(notebook, ["imp"])
-    assert cc.report(clean, notebook, ["imp", "r"], changed=False) == "Checks (ruff, ty) on the notebook's 2 cells: no findings."
+    assert cc.report(clean, notebook, ["imp", "r"], changed=False) == "Checks (hailer, ruff, ty) on the notebook's 2 cells: no findings."
 
 
 def test_report_caps_the_findings():

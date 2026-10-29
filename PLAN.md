@@ -35,8 +35,9 @@ else: no shell, no file tool, no approval step; `fetch_page` reaches only `[web]
 model writes runs in marimo's scratchpad, and durable changes go through marimo's private code-mode API
 (`marimo._code_mode`), so marimo is pinned (`==0.24.2`) and so is the kernel image's marimo. Code mode
 formats the cells the agent creates or edits with the kernel's ruff before they run, and `code_checks.py`
-checks the changed cells with ruff and ty on this machine, over a snapshot the kernel returns; the findings
-end the tool result (`[checks]` in `hailer.toml` turns each part off).
+checks the changed cells with ruff, ty and its own check for values typed into text on this machine, over a
+snapshot the kernel returns; the findings end the tool result (`[checks]` in `hailer.toml` turns each part
+off).
 
 ## The sandbox contract
 
@@ -128,7 +129,7 @@ src/hailer/
 ├── agent.py           build_model, HailerAgent (threads, streamed turns, Ctrl+C), system prompt, error mapping
 ├── tools.py           HailerTools (the 12 tools) and hailer_tools(config) -> LangChain tools
 ├── tool_outcomes.py   a tool call's one-line outcome from its reply and status (the receipts)
-├── code_checks.py     ruff and ty on the cells the agent writes (and code mode's ruff formatting)
+├── code_checks.py     ruff, ty and typed-in values on the cells the agent writes (and code mode's ruff formatting)
 ├── sandbox.py         MarimoSandbox, the sandbox contract
 ├── notebook_sync.py   the allow-listed copy between the docker kernel and the host
 ├── kernel.py          runtime_for, the unsafe-local runtime, withheld variables
@@ -152,7 +153,7 @@ completion, Esc to cancel a running turn and an input history kept in `.hailer/`
 with a summary. The signed-in notebook URL is printed only when the user must open it by hand. What reaches
 the model is byte-identical (the strict fake gateway, streamed and not, for Chat Completions; LangChain's
 Responses conversion of the same messages). The lessons and their
-regression tests are in [LEARNINGS.md](docs/LEARNINGS.md) §16.
+regression tests are in [LEARNINGS.md](docs/LEARNINGS.md) §17.
 
 Built by implement-and-challenge rounds, each part reviewed independently before it merged; the design was
 prototyped first. Verified: the offline suite on Linux, Python 3.13; `scripts/benchmark_startup.py` against

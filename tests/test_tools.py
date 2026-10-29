@@ -335,7 +335,7 @@ def test_marimo_execute_checks_the_cells_it_changed(tmp_path):
     text = checked(make_config(tmp_path), client).marimo_execute(WRITE_CELL)
     assert text == (
         "created cell\n\n"
-        "Checks (ruff, ty) on the 1 changed cell: 1 finding.\n"
+        "Checks (hailer, ruff, ty) on the 1 changed cell: 1 finding.\n"
         "- cell revenue (revenue), line 2: ty unresolved-attribute: Object of type `DataFrame` has no attribute `sortt`\n"
         "    revenue.sortt('revenue')"
     ), "the pre-existing problem in cell 'old' is not the agent's change"
@@ -347,7 +347,7 @@ def test_marimo_execute_reports_a_clean_change_and_a_failed_run(tmp_path):
     client = NotebookClient(STARTER_CELLS, {WRITE_CELL: {"n": "rows = sales.height"}}, result=ExecResult(success=False, stderr="boom"))
     text = checked(make_config(tmp_path), client).marimo_execute(WRITE_CELL)
     assert text.startswith("Execution failed.\n[stderr]\nboom")
-    assert text.endswith("\n\nChecks (ruff, ty) on the 1 changed cell: no findings.")
+    assert text.endswith("\n\nChecks (hailer, ruff, ty) on the 1 changed cell: no findings.")
 
 
 def test_marimo_execute_without_cell_writes_runs_only_the_code(tmp_path):
@@ -367,20 +367,32 @@ def test_marimo_execute_says_nothing_when_no_cell_changed(tmp_path):
 
 def test_checks_config_switches_the_parts_off(tmp_path):
     writes = {WRITE_CELL: {"n": "print(undefined_x)"}}
-    off = CodeChecksConfig(lint=False, typecheck=False, format=False)
+    off = CodeChecksConfig(lint=False, typecheck=False, hardcoded=False, format=False)
     client = NotebookClient(STARTER_CELLS, writes)
     assert checked(make_config(tmp_path, checks=off), client).marimo_execute(WRITE_CELL) == "hello"
     assert client.executed == [WRITE_CELL]
 
-    format_only = CodeChecksConfig(lint=False, typecheck=False, format=True)
+    format_only = CodeChecksConfig(lint=False, typecheck=False, hardcoded=False, format=True)
     client = NotebookClient(STARTER_CELLS, writes)
     assert checked(make_config(tmp_path, checks=format_only), client).marimo_execute(WRITE_CELL) == "hello"
     assert len(client.executed) == 2 and "format_on_save" in client.executed[0], "formatting is switched on, nothing checked"
 
-    lint_only = CodeChecksConfig(typecheck=False, format=False)
+    lint_only = CodeChecksConfig(typecheck=False, hardcoded=False, format=False)
     client = NotebookClient(STARTER_CELLS, writes)
     text = checked(make_config(tmp_path, checks=lint_only), client).marimo_execute(WRITE_CELL)
     assert "Checks (ruff) on the 1 changed cell: 1 finding." in text and "ruff F821" in text
+    assert "format_on_save" not in client.executed[0]
+
+    hardcoded_only = CodeChecksConfig(lint=False, typecheck=False, format=False)
+    client = NotebookClient(STARTER_CELLS, {WRITE_CELL: {"summary": 'mo.md("Revenue rose 5.6% in March")'}})
+    text = checked(make_config(tmp_path, checks=hardcoded_only), client).marimo_execute(WRITE_CELL)
+    assert text == (
+        "hello\n\n"
+        "Checks (hailer) on the 1 changed cell: 1 finding.\n"
+        '- cell summary (summary), line 1: hailer hardcoded-value: "5.6%", "March" typed into the text; '
+        "format values from variables so the text follows the data\n"
+        '    mo.md("Revenue rose 5.6% in March")'
+    )
     assert "format_on_save" not in client.executed[0]
 
 
@@ -409,15 +421,21 @@ def test_notebook_check_covers_the_whole_notebook(tmp_path):
     client = NotebookClient({**STARTER_CELLS, "empty": " ", "old": "print(missing_before)"})
     tools = checked(make_config(tmp_path), client)
     assert tools.notebook_check() == (
-        "Checks (ruff, ty) on the notebook's 3 cells: 1 finding.\n"
+        "Checks (hailer, ruff, ty) on the notebook's 3 cells: 1 finding.\n"
         "- cell old (old), line 1: ty unresolved-reference: Name `missing_before` used when not defined\n"
         "    print(missing_before)"
     )
     assert "format_on_save" not in client.executed[0]
 
     assert checked(make_config(tmp_path), NotebookClient({"e": ""})).notebook_check() == "The notebook has no code to check."
-    off = make_config(tmp_path, checks=CodeChecksConfig(lint=False, typecheck=False))
+    off = make_config(tmp_path, checks=CodeChecksConfig(lint=False, typecheck=False, hardcoded=False))
     assert "switched off" in checked(off, client).notebook_check()
+    typed = NotebookClient({**STARTER_CELLS, "summary": 'mo.md(f"Revenue {total:.0f} in 2025")'})
+    only_hardcoded = make_config(tmp_path, checks=CodeChecksConfig(lint=False, typecheck=False))
+    assert checked(only_hardcoded, typed).notebook_check().startswith(
+        "Checks (hailer) on the notebook's 3 cells: 1 finding.\n"
+        '- cell summary (summary), line 1: hailer hardcoded-value: "2025" typed into the text'
+    )
     unreadable = FakeClient(result=ExecResult(success=False, stderr="NameError: x"))
     assert checked(make_config(tmp_path), unreadable).notebook_check().startswith("Could not read the notebook's cells.")
     assert HailerTools(make_config(tmp_path)).notebook_check().startswith("ERROR: marimo is not running")
@@ -1030,7 +1048,7 @@ def traceback_of(fn) -> str:
 
 
 STARTER = [{"id": "imp", "code": "import marimo as mo\nimport polars as pl"}, {"id": "load", "name": "load", "code": "sales = pl.read_csv('sales.csv')"}]
-CHECKS_OFF = CodeChecksConfig(lint=False, typecheck=False, format=False)
+CHECKS_OFF = CodeChecksConfig(lint=False, typecheck=False, hardcoded=False, format=False)
 
 
 def test_tool_replies_carry_a_status_and_hand_it_to_langchain_as_the_artifact(ws):
@@ -1082,8 +1100,8 @@ def test_outcome_of_code_that_adds_a_cell(tmp_path):
     assert says == "created and ran cell 'Hbol' (growth_by_region)\n", "marimo's words"
     client = CodeModeClient(STARTER, {WRITE_CELL: [cell]}, result=ExecResult(success=True, stdout=says))
     reply = checked(make_config(tmp_path), client).marimo_execute(WRITE_CELL)
-    assert reply.endswith("Checks (ruff, ty) on the 1 changed cell: no findings.")
-    assert reply.status == {"ok": True, "findings": 0, "checked": ["ruff", "ty"], "skipped": [], "cells": ["growth_by_region"]}
+    assert reply.endswith("Checks (hailer, ruff, ty) on the 1 changed cell: no findings.")
+    assert reply.status == {"ok": True, "findings": 0, "checked": ["hailer", "ruff", "ty"], "skipped": [], "cells": ["growth_by_region"]}
     assert outcome("marimo_execute", {"code": WRITE_CELL}, reply) == (True, "growth_by_region, checks clean")
     unnamed = CodeModeClient(STARTER, {WRITE_CELL: [{"id": "Hbol", "code": "growth = sales.height"}]}, result=ExecResult(success=True))
     assert outcome("marimo_execute", {"code": WRITE_CELL}, checked(make_config(tmp_path), unnamed).marimo_execute(WRITE_CELL)) == (True, "1 cell, checks clean")
@@ -1156,9 +1174,14 @@ def test_outcome_when_a_checker_is_missing(tmp_path, monkeypatch):
     assert outcome("marimo_execute", {"code": WRITE_CELL}, reply) == (True, "growth_by_region, checks clean, ty skipped")
     monkeypatch.setattr(code_checks, "_binary", lambda name: (_ for _ in ()).throw(code_checks._Unavailable(f"{name} is not installed")))
     client = CodeModeClient(STARTER, {WRITE_CELL: [cell]}, result=ExecResult(success=True, stdout="shape: (2, 1)\n"))
-    reply = checked(make_config(tmp_path), client).marimo_execute(WRITE_CELL)
+    no_hardcoded = make_config(tmp_path, checks=CodeChecksConfig(hardcoded=False))
+    reply = checked(no_hardcoded, client).marimo_execute(WRITE_CELL)
     assert reply.startswith("shape: (2, 1)\n\n(Check skipped: ")
     assert outcome("marimo_execute", {"code": WRITE_CELL}, reply) == (True, "growth_by_region, 2 rows, checks skipped")
+    client = CodeModeClient(STARTER, {WRITE_CELL: [cell]}, result=ExecResult(success=True, stdout="shape: (2, 1)\n"))
+    reply = checked(make_config(tmp_path), client).marimo_execute(WRITE_CELL)  # Hailer's own check needs no tool
+    assert reply.startswith("shape: (2, 1)\n\nChecks (hailer) ")
+    assert outcome("marimo_execute", {"code": WRITE_CELL}, reply) == (True, "growth_by_region, 2 rows, checks clean, ruff and ty skipped")
 
 
 def test_outcome_of_code_that_failed_or_printed_frames(ws):
@@ -1262,8 +1285,10 @@ def test_outcome_of_notebook_check(tmp_path):
     assert outcome("notebook_check", {}, checked(make_config(tmp_path), CodeModeClient(cells)).notebook_check()) == (True, "1 finding")
     assert outcome("notebook_check", {}, checked(make_config(tmp_path), CodeModeClient(STARTER)).notebook_check()) == (True, "clean")
     assert outcome("notebook_check", {}, checked(make_config(tmp_path), CodeModeClient([{"id": "e", "code": " "}])).notebook_check()) == (True, "no code")
-    off = make_config(tmp_path, checks=CodeChecksConfig(lint=False, typecheck=False))
+    off = make_config(tmp_path, checks=CodeChecksConfig(lint=False, typecheck=False, hardcoded=False))
     assert outcome("notebook_check", {}, checked(off, CodeModeClient(STARTER)).notebook_check()) == (True, "checks off")
+    typed_values_only = make_config(tmp_path, checks=CodeChecksConfig(lint=False, typecheck=False))
+    assert outcome("notebook_check", {}, checked(typed_values_only, CodeModeClient(STARTER)).notebook_check()) == (True, "clean")
     lint_only = make_config(tmp_path, checks=CodeChecksConfig(typecheck=False))
     assert outcome("notebook_check", {}, checked(lint_only, CodeModeClient(cells)).notebook_check()) == (True, "1 finding")
 

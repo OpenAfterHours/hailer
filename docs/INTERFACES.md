@@ -234,10 +234,10 @@ runtime cannot start or reach marimo: the process exited, Docker is missing or d
 `KERNEL_RUNTIME_DOCKER` / `KERNEL_RUNTIME_UNSAFE_LOCAL` / `VALID_KERNEL_RUNTIMES`, `KERNEL_IMAGE_REPOSITORY`, the
 `MarimoServer` fields listed under `marimo_client.py`, and `HailerConfig.kernel`.
 
-`[checks]` maps to `CodeChecksConfig` (models.py, `HailerConfig.checks`): `lint`, `typecheck`, `format`, all
-booleans defaulting to `true` (a non-boolean is a `ConfigError`, an unknown key a warning). `lint` and
-`typecheck` choose ruff and ty for the checks `marimo_execute` and `notebook_check` run; `format` switches on
-code mode's ruff formatting in the kernel (see `code_checks.py`).
+`[checks]` maps to `CodeChecksConfig` (models.py, `HailerConfig.checks`): `lint`, `typecheck`, `hardcoded`,
+`format`, all booleans defaulting to `true` (a non-boolean is a `ConfigError`, an unknown key a warning). `lint`,
+`typecheck` and `hardcoded` choose ruff, ty and the typed-in values check for the checks `marimo_execute` and
+`notebook_check` run; `format` switches on code mode's ruff formatting in the kernel (see `code_checks.py`).
 
 ## `log.py`  (owner: wave 1 / A)
 
@@ -864,8 +864,8 @@ text, truncated to `config.max_tool_output_chars` with head/tail and a `[... tru
 
 | tool | args | behaviour |
 |---|---|---|
-| `marimo_execute` | `code: str` | run in the scratchpad against the active notebook's session; returns stdout/output/stderr (rich mimetypes such as text/html or application/json are replaced by a short placeholder, so HTML never reaches the model); a failed run starts `Execution failed.`; `MarimoUnavailableError`/`NoSessionError` become `ERROR:` text with the hint, not exceptions. Code that mentions `create_cell` or `edit_cell` (with any `[checks]` part on) is bracketed by two `code_checks.snapshot_code` runs, the first with `enable_format=config.checks.format`; when cells changed and `lint` or `typecheck` is on, the `code_checks.report` for the changed cells follows the result after a blank line, the result shortened so the report survives the output cap. A snapshot that cannot be read skips the checks, never the code |
-| `notebook_check` | none | a snapshot of the active notebook, then `code_checks.check` over every non-empty cell and the `report` (`Checks (ruff, ty) on the notebook's N cells: ...`); `[checks]` lint and typecheck both off → says so; unreadable cells → `Could not read the notebook's cells.` + the output |
+| `marimo_execute` | `code: str` | run in the scratchpad against the active notebook's session; returns stdout/output/stderr (rich mimetypes such as text/html or application/json are replaced by a short placeholder, so HTML never reaches the model); a failed run starts `Execution failed.`; `MarimoUnavailableError`/`NoSessionError` become `ERROR:` text with the hint, not exceptions. Code that mentions `create_cell` or `edit_cell` (with any `[checks]` part on) is bracketed by two `code_checks.snapshot_code` runs, the first with `enable_format=config.checks.format`; when cells changed and `lint`, `typecheck` or `hardcoded` is on, the `code_checks.report` for the changed cells follows the result after a blank line, the result shortened so the report survives the output cap. A snapshot that cannot be read skips the checks, never the code |
+| `notebook_check` | none | a snapshot of the active notebook, then `code_checks.check` over every non-empty cell and the `report` (`Checks (hailer, ruff, ty) on the notebook's N cells: ...`); `[checks]` lint, typecheck and hardcoded all off → says so; unreadable cells → `Could not read the notebook's cells.` + the output |
 | `marimo_status` | none | server url; `kernel: <sandbox.describe()>` and `kernel paths: notebooks folder <notebooks_path>, data folder <data_path>; use these in code` (`/work/...` for a docker kernel, host paths for local); `active notebook: <name> -> session <id> (ready)` or `... has NO session. Ask the user to open <url>`; every session with its notebook and a marker: `(active notebook)`, `(another notebook in the notebooks folder; notebook_open switches to it)`, `(outside the notebooks folder)`, `(unsaved)`; when marimo is down (no sandbox, or the session's kernel stopped and the first request raises `MarimoUnavailableError`) the text is `marimo: not running` / `active notebook: <name>` / error / hint, so the active notebook is always named |
 | `notebook_cells` | `pattern: str = ""` | runs `marimo_client.LIST_CELLS_CODE`, a `cm` snippet listing the active notebook's cells (id, name, status, error count, first line); optional case-insensitive substring filter |
 | `notebook_list` | none | `sandbox.list_notebooks()`: `Notebooks in <notebooks_path> (...)`, then one line per notebook `  - <name>  modified YYYY-MM-DD HH:MM  <size>  [active] [open]` (`[open]` = has a session; when marimo is unreachable for sessions a trailing line says so with the error and hint); empty folder → `No notebooks in <notebooks_path> yet. Create one with notebook_create(name).` |
@@ -955,8 +955,9 @@ names only. An unknown tool or reply format gives `""`.
 
 ## `code_checks.py`  (owner: code checks, 2026-09-22)
 
-ruff and ty for the cells the agent writes. Both are Hailer dependencies and run as subprocesses in the
-Hailer process's environment, whatever the kernel runtime; nothing raises into the agent loop.
+ruff, ty and the typed-in values check for the cells the agent writes. ruff and ty are Hailer dependencies
+and run as subprocesses in the Hailer process's environment, whatever the kernel runtime; the values check
+reads each cell's syntax tree in process. Nothing raises into the agent loop.
 
 ```python
 SNAPSHOT_MARKER = "HAILER_CELLS:"
@@ -972,7 +973,8 @@ def changed_cells(before: Snapshot, after: Snapshot) -> list[str]   # new or edi
 def dependency_order(cells) -> list[Cell]                   # marimo's compile_cell + DirectedGraph + topological_sort; unplaceable cells last
 def syntax_error(cell: Cell) -> Finding | None              # compile with PyCF_ALLOW_TOP_LEVEL_AWAIT
 def build_script(snapshot, *, skip=()) -> tuple[str, list[tuple[str, int] | None]]   # "# cell <id>" + code per cell; line -> (cell id, line)
-def check(snapshot, cell_ids=None, *, lint=True, typecheck=True, search_paths=()) -> CheckResult   # findings, tools that ran, problems
+def hardcoded_values(cell: Cell) -> list[Finding]           # ("hailer", "hardcoded-value"), one per cell line with typed-in values
+def check(snapshot, cell_ids=None, *, lint=True, typecheck=True, hardcoded=True, search_paths=()) -> CheckResult   # findings, tools that ran, problems
 def report(result, snapshot, cell_ids, *, changed=True) -> str
 ```
 
@@ -996,7 +998,15 @@ def report(result, snapshot, cell_ids, *, changed=True) -> str
   `unresolved-reference` at the same place, `invalid-syntax` on the same line) is dropped.
 - A tool that is missing, exits with an unexpected code, times out (`TIMEOUT_SEC = 30`) or prints
   unreadable output becomes `CheckResult.problems`, shown as `(Check skipped: <why>.)`.
-- Report: `Checks (ruff, ty) on the N changed cells: M findings.` (or `on the notebook's N cells`, or
+- `hardcoded_values` looks at the text a reader sees: the first argument of `mo.md(...)` (or `marimo.md`)
+  and every `title=` keyword (charts, axes), each a string, the literal parts of an f-string, or strings
+  joined with `+`. It reports numbers (`5`, `5.6%`, `£41.1k`, `1,234`), dates (`2025-03`, `25-03`) and full
+  month names other than "May", but not digits inside a word or name (`Q2`, `COVID-19`, `12px`, `v1.2`) or
+  the number of a list item or heading (`1. Load`, `## 2) Compare`). A value's line is the first line of
+  its string's source span that shows it, so a string marimo laid out again still points at the right
+  line. A cell that does not parse has no such findings (its syntax error is reported). `check` runs it on
+  the wanted cells after ruff and ty and lists `hailer` among the tools that ran.
+- Report: `Checks (hailer, ruff, ty) on the N changed cells: M findings.` (or `on the notebook's N cells`, or
   `: no findings.`), then per finding `- cell <name> (<id>), line L: <tool> <rule>: <message>` and the source
   line indented, at most `MAX_REPORTED`, then `(and K more)`.
 
@@ -1572,7 +1582,9 @@ package-install rule) are appended by `agent.system_prompt`. Loaded with
   `HailerError`s, the normalised digest) and the data folder
 - `test_web.py`, `test_context.py`: C. `test_notebooks.py`, `test_browser.py`: notebook feature
 - `test_code_checks.py`: code checks. The real ruff and ty on small notebooks (types across cells, the
-  rules left out for notebooks, syntax errors, deduplication, missing tools), the snapshot code and the report
+  rules left out for notebooks, syntax errors, deduplication, missing tools), the typed-in values check (what
+  it reports and leaves, its line numbers, the starter template and the system prompt's own examples passing
+  it), the snapshot code and the report
 - `test_tools.py`: LangChain migration. Tool methods called directly against `fake_sandbox.py`'s `FolderSandbox`
   (the contract over a tmp folder, clients faked), plus the `hailer_tools` registration: names, schemas,
   docstring descriptions, in-process `invoke`, the daemon-thread `ainvoke` path, a cancelled call that does not

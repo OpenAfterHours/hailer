@@ -296,6 +296,15 @@ def test_system_prompt_sections(tmp_path):
     assert "Marimo URL" not in system_prompt(cfg, bundle), "no kernel: no URL"
 
 
+def test_system_prompt_asks_for_notebooks_that_re_run_and_simple_code(tmp_path):
+    text = system_prompt(make_config(tmp_path), ContextBundle())
+    assert "## Notebooks people re-run" in text and "## Simple code" in text
+    assert "One cell named `settings`" in text and 'mo.cli_args().get("period") or periods[-1]' in text
+    assert "never copy a number you saw there into a cell" in text
+    assert 'ctx.set_ui_value(ctx.globals["period_picker"], ["2025-04"])' in text, "a dropdown takes a list (checked live)"
+    assert "`hailer hardcoded-value`" in text and "Checks (hailer, ruff, ty)" in text
+
+
 def test_system_prompt_no_web(tmp_path):
     text = system_prompt(make_config(tmp_path), ContextBundle())
     assert "No internet access is available" in text

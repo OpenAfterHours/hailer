@@ -502,13 +502,15 @@ def test_validate_unknown_keys_are_warnings(tmp_path: Path) -> None:
 
 def test_checks_default_to_on_and_can_be_switched_off(tmp_path: Path) -> None:
     ws = _make_workspace(tmp_path)
-    assert load_config(workspace=ws, env={}).checks == CodeChecksConfig(lint=True, typecheck=True, format=True)
+    assert load_config(workspace=ws, env={}).checks == CodeChecksConfig(lint=True, typecheck=True, hardcoded=True, format=True)
     (tmp_path / "off").mkdir()
-    ws = _make_workspace(tmp_path / "off", "[checks]\nlint = false\ntypecheck = false\nformat = false\n")
-    assert load_config(workspace=ws, env={}).checks == CodeChecksConfig(lint=False, typecheck=False, format=False)
+    ws = _make_workspace(tmp_path / "off", "[checks]\nlint = false\ntypecheck = false\nhardcoded = false\nformat = false\n")
+    assert load_config(workspace=ws, env={}).checks == CodeChecksConfig(lint=False, typecheck=False, hardcoded=False, format=False)
     (tmp_path / "some").mkdir()
     ws = _make_workspace(tmp_path / "some", "[checks]\ntypecheck = false\n")
     assert load_config(workspace=ws, env={}).checks == CodeChecksConfig(lint=True, typecheck=False, format=True)
+    for key in ("lint", "typecheck", "hardcoded", "format"):
+        assert f"\n# {key} " in DEFAULT_CONFIG_TEMPLATE, "every [checks] key is documented in the template"
 
 
 def test_checks_values_must_be_booleans_and_keys_known(tmp_path: Path) -> None:

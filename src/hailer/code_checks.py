@@ -1,4 +1,5 @@
-"""Checks for the notebook cells the agent writes: ruff (lint and format) and ty (types).
+"""Checks for the notebook cells the agent writes: ruff (lint and format), ty (types) and Hailer's
+own check for values typed into the text a reader sees.
 
 The agent writes cells through marimo's code mode inside ``marimo_execute``. Around such a call
 :class:`~hailer.tools.HailerTools` takes a :func:`snapshot_code` of the notebook's cells before and
@@ -23,6 +24,10 @@ after, and :func:`check` lints and type-checks the notebook with the cells that 
   ruff before applying them when the kernel's ``save.format_on_save`` setting is on. The snapshot
   switches that setting on in the kernel's memory (never in a configuration file), so a cell is
   formatted before it runs: formatting afterwards would change its code and make it run again.
+- **Text follows the data.** People re-run a notebook on next month's data, so a number, date or
+  month typed into ``mo.md`` text or a chart ``title=`` would go on describing the old data.
+  :func:`hardcoded_values` reports them (rule ``hardcoded-value``); the values belong in variables
+  that an f-string formats. It reads each cell's syntax tree here, with no tool to run.
 
 Both tools come with Hailer (``ruff`` and ``ty`` are dependencies) and run as subprocesses on this
 machine, whatever the kernel runtime. Nothing here raises into the agent loop: a tool that is
@@ -35,12 +40,13 @@ import ast
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import warnings
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -66,6 +72,14 @@ TIMEOUT_SEC = 30.0
 #: The most findings :func:`report` lists.
 MAX_REPORTED = 20
 _SCRIPT_NAME = "hailer_notebook.py"
+#: A value typed into text: 5, -3, 1,234, 5.6%, £41.1k, 2025, 2025-03, 25-03. Not a digit inside a
+#: word or name (Q2, x2, COVID-19, 12px, 3rd), a version (v1.2), the second half of 1/2, or an
+#: HTML entity or colour (&#163;, #1f77b4).
+_TYPED_VALUE_RE = re.compile(r"(?<![\w.#/-])[-+]?[£$€]?\d[\d,]*(?:\.\d+)?(?:-\d{2}){0,2}(?:%|k|m|bn|pp)?(?!\w)")
+#: Month names are a period typed into text too ("May" is left out: it is also a word).
+_MONTH_RE = re.compile(r"\b(?:January|February|March|April|June|July|August|September|October|November|December)\b")
+#: A numbered list item or heading ("1. Load", "## 2) Compare"): its number is layout, not data.
+_NUMBERED_RE = re.compile(r"^\s*(?:#{1,6}\s+)?\d+[.)]\s")
 
 
 def snapshot_code(*, enable_format: bool = False) -> str:
@@ -321,20 +335,74 @@ def _ty(script: str, workdir: Path, *, search_paths: Sequence[Path]) -> list[tup
         raise _Unavailable(f"ty's output could not be read ({type(err).__name__})") from None
 
 
+def _reader_text(tree: ast.AST) -> Iterator[ast.Constant]:
+    """The strings typed into text a reader sees: the argument of ``mo.md(...)`` and any ``title=``
+    (a chart's or an axis's). Of an f-string, only its literal parts; strings joined with ``+`` too."""
+
+    def typed(node: ast.expr) -> Iterator[ast.Constant]:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            yield node
+        elif isinstance(node, ast.JoinedStr):
+            yield from (part for part in node.values if isinstance(part, ast.Constant))
+        elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            yield from typed(node.left)
+            yield from typed(node.right)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "md" and isinstance(func.value, ast.Name) and func.value.id in ("mo", "marimo") and node.args:
+            yield from typed(node.args[0])
+        for keyword in node.keywords:
+            if keyword.arg == "title":
+                yield from typed(keyword.value)
+
+
+def hardcoded_values(cell: Cell) -> list[Finding]:
+    """One ``hardcoded-value`` finding per line of text in ``cell`` that has numbers, dates or month
+    names typed in (see :func:`_reader_text`); none for a cell Python cannot parse."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            tree = ast.parse(cell.code)
+    except (SyntaxError, ValueError):
+        return []
+    source = _lines(cell.code)
+    values_by_line: dict[int, list[str]] = {}
+    for text in _reader_text(tree):
+        span = range(text.lineno, (text.end_lineno or text.lineno) + 1)
+        for line in str(text.value).split("\n"):
+            for value in _TYPED_VALUE_RE.findall(_NUMBERED_RE.sub("", line)) + _MONTH_RE.findall(line):
+                # The cell line that shows the value: a string's text lines need not be its source
+                # lines ("\n" written inside it, a string marimo laid out again).
+                number = next((n for n in span if value in source[n - 1]), text.lineno)
+                seen = values_by_line.setdefault(number, [])
+                if value not in seen:
+                    seen.append(value)
+    message = " typed into the text; format values from variables so the text follows the data"
+    return [
+        Finding("hailer", "hardcoded-value", ", ".join(f'"{v}"' for v in values) + message, cell.id, line, 1)
+        for line, values in sorted(values_by_line.items())
+        if values
+    ]
+
+
 def check(
     snapshot: Snapshot,
     cell_ids: Collection[str] | None = None,
     *,
     lint: bool = True,
     typecheck: bool = True,
+    hardcoded: bool = True,
     search_paths: Sequence[Path] = (),
 ) -> CheckResult:
-    """Lint (ruff) and type-check (ty) the notebook; the findings in ``cell_ids`` (all cells when
-    ``None``). ``search_paths`` are folders notebook code imports local modules from (the notebook's
-    folder: marimo puts it on ``sys.path``)."""
+    """Lint (ruff), type-check (ty) and look for values typed into text (:func:`hardcoded_values`);
+    the findings in ``cell_ids`` (all cells when ``None``). ``search_paths`` are folders notebook
+    code imports local modules from (the notebook's folder: marimo puts it on ``sys.path``)."""
     result = CheckResult()
     wanted = set(cell_ids) if cell_ids is not None else {c.id for c in snapshot.cells}
-    if not (lint or typecheck) or not wanted:
+    if not (lint or typecheck or hardcoded) or not wanted:
         return result
     unparsable: set[str] = set()
     for cell in snapshot.cells:
@@ -343,7 +411,7 @@ def check(
             unparsable.add(cell.id)
             if cell.id in wanted:
                 result.findings.append(error)
-    script, owners = build_script(snapshot, skip=unparsable)
+    script, owners = build_script(snapshot, skip=unparsable) if lint or typecheck else ("", [])
     raw: list[tuple[str, tuple[str, str, int, int]]] = []
     with tempfile.TemporaryDirectory(prefix="hailer-checks-") as tmp:
         workdir = Path(tmp)
@@ -361,6 +429,11 @@ def check(
                 continue
             result.tools.append(tool)
             raw += [(tool, item) for item in found]
+    if hardcoded:
+        result.tools.append("hailer")
+        for cell in snapshot.cells:
+            if cell.id in wanted and cell.id not in unparsable:
+                result.findings += hardcoded_values(cell)
     seen: set[tuple[str, int, int, str]] = set()
     for tool, (rule, message, line, column) in raw:
         owner = owners[line - 1] if 0 < line <= len(owners) else None
@@ -425,6 +498,7 @@ __all__ = [
     "changed_cells",
     "check",
     "dependency_order",
+    "hardcoded_values",
     "parse_snapshot",
     "report",
     "snapshot_code",

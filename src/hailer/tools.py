@@ -27,8 +27,9 @@ browser Hailer opens itself gets the signed-in URL.
 
 A ``marimo_execute`` call that creates or edits cells is bracketed by two snapshots of the
 notebook's cells (:mod:`hailer.code_checks`): the first also switches on code mode's ruff
-formatting in the kernel, and the cells that differ afterwards are checked with ruff and ty, the
-findings appended to the result (``[checks]`` in ``hailer.toml`` turns each part off).
+formatting in the kernel, and the cells that differ afterwards are checked with ruff, ty and
+Hailer's check for values typed into text, the findings appended to the result (``[checks]`` in
+``hailer.toml`` turns each part off).
 """
 
 from __future__ import annotations
@@ -282,9 +283,9 @@ class HailerTools:
         # The cells come from the kernel; no search path is passed, because the notebooks folder the
         # kernel imports local modules from is the sandbox's, not a folder on this machine.
         checks = self.config.checks
-        result = code_checks.check(snapshot, cell_ids, lint=checks.lint, typecheck=checks.typecheck)
+        result = code_checks.check(snapshot, cell_ids, lint=checks.lint, typecheck=checks.typecheck, hardcoded=checks.hardcoded)
         ran = sorted(result.tools)
-        wanted = [tool for tool, on in (("ruff", checks.lint), ("ty", checks.typecheck)) if on]
+        wanted = [tool for tool, on in (("ruff", checks.lint), ("ty", checks.typecheck), ("hailer", checks.hardcoded)) if on]
         facts = {"findings": len(result.findings), "checked": ran, "skipped": [tool for tool in wanted if tool not in ran]}
         return code_checks.report(result, snapshot, cell_ids, changed=changed), facts
 
@@ -407,8 +408,9 @@ class HailerTools:
         use `import marimo._code_mode as cm` and `async with cm.get_context() as ctx:` with
         ctx.create_cell(...)/ctx.edit_cell(...)/ctx.run_cell(...) (top-level `async with` is
         allowed). New and edited cells are formatted with ruff, and when the call changed cells
-        the result ends with ruff and ty findings for them. Keep printed output small: schemas,
-        head(), aggregates. Never print whole datasets.
+        the result ends with ruff, ty and hailer findings for them (hailer hardcoded-value: a
+        number typed into text that should come from a variable). Keep printed output small:
+        schemas, head(), aggregates. Never print whole datasets.
         """
 
         def go() -> str:
@@ -416,13 +418,13 @@ class HailerTools:
             client = self._client(active)
             checks = self.config.checks
             before = None
-            if (checks.lint or checks.typecheck or checks.format) and _writes_cells(code):
+            if (checks.lint or checks.typecheck or checks.hardcoded or checks.format) and _writes_cells(code):
                 before = self._snapshot(client, active, enable_format=checks.format)
             result = client.execute(code, notebook=active)
             text = _result_text(result)
             status: dict[str, Any] = {} if result.success else {"ok": False, "error": "execution_failed"}
             text = text if result.success else f"Execution failed.\n{text}"
-            if before is None or not (checks.lint or checks.typecheck):
+            if before is None or not (checks.lint or checks.typecheck or checks.hardcoded):
                 return ToolReply(text, **status)
             after = self._snapshot(client, active)
             if after is None:
@@ -507,14 +509,16 @@ class HailerTools:
         return self._run(go)
 
     def notebook_check(self) -> str:
-        """Check every cell of the active notebook with ruff (lint) and ty (types) and list the
-        findings by cell and line. Cells you create or edit are checked automatically, so use
-        this for the notebook as a whole: when the user asks for a review, or before building
-        on a notebook written elsewhere."""
+        """Check every cell of the active notebook with ruff (lint), ty (types) and Hailer's check
+        for values typed into text, and list the findings by cell and line. Cells you create or
+        edit are checked automatically, so use this for the notebook as a whole: when the user
+        asks for a review, before building on a notebook written elsewhere, or to find what to
+        change when making a notebook re-runnable."""
 
         def go() -> str:
-            if not (self.config.checks.lint or self.config.checks.typecheck):
-                return "Code checks are switched off ([checks] lint and typecheck are false in hailer.toml)."
+            checks = self.config.checks
+            if not (checks.lint or checks.typecheck or checks.hardcoded):
+                return "Code checks are switched off ([checks] lint, typecheck and hardcoded are false in hailer.toml)."
             active = self._active()
             result = self._client(active).execute(code_checks.snapshot_code(), notebook=active)
             snapshot = code_checks.parse_snapshot(result.stdout) if result.success else None
