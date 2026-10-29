@@ -23,7 +23,9 @@ branch and tag atomically. The tag triggers `.github/workflows/release.yml`, whi
    or any registry error other than "not found" fails the job without overwriting anything;
 3. only when all of that succeeds, publishes to PyPI through the `pypi` environment (trusted publishing,
    no token to store) and creates the GitHub release with the files attached. The image goes first so no
-   released Hailer points at a missing image.
+   released Hailer points at a missing image. If the release was published in the web interface instead
+   (which creates the tag and so starts the workflow), the files are attached to that release and its title
+   and notes are kept.
 
 **Changing the kernel image.** The image is defined by `src/hailer/docker/Dockerfile`, the modules in
 `hailer.kernel_image.IMAGE_MODULES` (`errors.py`, `periods.py`, `_forward.py`) and the exact versions in
