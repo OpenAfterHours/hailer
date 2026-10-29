@@ -736,7 +736,6 @@ class ChatController:
             marimo = f"{sandbox.server.url} (notebook not open in a browser)"
         else:
             marimo = f"{sandbox.server.url} (session {session.session_id})"
-        table = Table.grid(padding=(0, 2))
         rows = [
             ("Model", f"{self.state.model or self.config.model.name}"),
             ("Provider", self._active_provider_line()),
@@ -751,10 +750,11 @@ class ChatController:
             ("Notebooks", self._cli._relative(self.config.notebooks_root, self.config.workspace)),
             ("Web access", self._cli._web_line(self.config)),
         ]
+        # One whole line per row: a value is never cut (a long kernel log path stays copyable in pipes).
+        width = max(len(label) for label, _value in rows) + 2
         for label, value in rows:
             style = self._cli._kernel_style(self.config) if label == "Kernel" else ""  # unsafe-local: a warning
-            table.add_row(Text(label), Text(value, style=style))
-        self.console.print(table)
+            self.console.print(Text.assemble(label.ljust(width), (value, style)), soft_wrap=True)
 
     def _status_card(self, sandbox: Any, session: MarimoSession | None) -> None:
         """/status in the composer: the plain table's information, grouped, with a health mark on
