@@ -208,7 +208,9 @@ and `HAILER_DATA_FOLDERS` for an unsafe-local kernel's notebook code, and `load_
 `wire_api`), `env_key` (a declared `[model_providers.openai]` without one gets `OPENAI_API_KEY`), `name`,
 `http_headers`, `env_http_headers`, `query_params`. `[web]` maps to `WebConfig` (`allowed_domains` list,
 `max_page_bytes`). `[hailer]` keys: `notebook`, `notebooks_dir`, `data_dir`, `context_dir`,
-`skills_dir`, `prompts_dir`, `max_tool_output_chars`, `max_context_bytes`, `log_level` (the removed
+`skills_dir`, `prompts_dir`, `max_tool_output_chars`, `max_context_bytes`, `log_level`, `input_history`
+(bool, default `true`: the chat's input history persists in `input_history` in the state folder (`statedir.input_history_path`); `false` keeps it in
+memory for the session; `HailerConfig.input_history`; the template shows it commented out) (the removed
 `marimo_url` and `marimo_token` are reported as unknown keys; their values are never quoted); `[model]` keys: `name`,
 `provider`, `reasoning_effort` (`""` = send none), `summarize_after_tokens` (`ModelConfig`, default 100000,
 0 = off). `notebooks_dir` (relative to the workspace) is the folder notebooks are listed from, created in and
@@ -486,7 +488,10 @@ class NotebookSync:                        # NotebookSync(sandbox, folder, works
         # differs: target checked (_target: folders created, never a link/junction, resolved inside the folder; NotebookPathError),
         # backup first when the file here differs from the last copy (".hailer/notebook-backups/<name>.<YYYYmmdd-HHMMSS>.py" + a
         # warning; no write when the backup fails), then _write_atomically (temp file + os.replace). Never deletes here. "Not copied
-        # back from the kernel ..." names each refused entry once (folders as "<name>/"); failures are warnings shown once; never raises
+        # back from the kernel ..." names each refused entry once (folders as "<name>/"); failures are warnings shown once; never raises.
+        # Sets complete: True when the pass got to its end with every notebook it had to copy written here (refused names aside),
+        # False otherwise (the kernel did not answer, a write failed, the deadline or budget, the session cap, Ctrl+C, a pass under way)
+    complete: bool | None                  # the latest sync_out's outcome (None before the first): what a silent repeat cannot say
     def start(self, interval: float | None = None) -> None   # daemon thread "hailer-notebook-sync": sync_out every interval or on soon()
     def soon(self) -> None
     def close(self, *, final: bool = True) -> list[str]   # stop the thread (a pass ends within SYNC_CYCLE_SEC), then (final)
@@ -552,7 +557,7 @@ class LocalRuntime:                        # runtime = "unsafe-local"; LocalRunt
                                            #   confirm=ask_yes_no)
     # (the class keeps its name: it is the runtime on this machine; "unsafe-" is the setting's warning)
     # check: one warning "kernel" row (ok=False, fatal=False): describe() + how many variables are withheld,
-    #   hint UNSAFE_LOCAL_HINT. kernel_checks(starting=True) drops it: the startup panel shows the line instead
+    #   hint UNSAFE_LOCAL_HINT. kernel_checks(starting=True) drops it: the startup's yellow "▲ Kernel" row says it instead
     # prepare: when statedir.sandbox_wrote_notebooks, a warning line, then confirm("Run them on this machine anyway? [y/N] "):
     #   True clears the mark; False → KernelRuntimeError("Not started: ... were not approved ..."); None (no terminal) →
     #   KernelRuntimeError("Not started: ... no terminal to ask ...", hint: run uvx hailer notebook --kernel unsafe-local in a
@@ -629,6 +634,7 @@ def data_path_problems(data_dir, *, windows=None, drive_type=None) -> list[str]
     def stop(self) -> None                 # sync.close(final=True) on a daemon thread, joined at most SYNC_STOP_SEC (then a warning; Ctrl+C
                                            # there: a warning), then remove (always), then
                                            # release the owner lock; stop_error explains a failure ("... Run uvx hailer kernel stop to retry.")
+    copied_back: bool | None               # after stop: sync.complete of the last copy (False when it timed out or Ctrl+C cut it; None: no sync)
     def log_tail(self, lines=15, *, container=None) -> list[str]   # docker logs --tail, token masked
     def wait(self) -> int                  # docker logs -f; then sets ended from docker inspect: removed from outside, out of memory, exit 137, "exited (code N)"
 @dataclass(frozen=True) class Labelled: id; name; state ("" for a network); role; owner
@@ -903,12 +909,36 @@ Python runs in the marimo kernel.
 TOOL_NAMES: tuple[str, ...]      # the 15 names in the table, in the order they are offered to the model
 DEFAULT_SESSION_WAIT_SEC = 30.0
 NOTEBOOK_LINK_TIP = "The user can also run /notebook in the chat to get the link."
-class HailerTools:               # one plain method per tool, each -> str; the method's docstring is the description the model sees
+class HailerTools:               # one plain method per tool, each -> str (a ToolReply); the method's docstring is the description the model sees
     def __init__(self, config: HailerConfig, sandbox: MarimoSandbox | None = None, *, open_url: UrlOpener | None = None, session_wait_sec: float = DEFAULT_SESSION_WAIT_SEC) -> None
+    # open_url: the chat's opener (HailerAgent(open_url=...)); with --no-browser it opens nothing and returns False
+class ToolReply(str):            # the reply text, equal to it, with how the call went beside it
+    status: dict[str, Any]       # {"ok": bool, ...}, see below
 def hailer_tools(config: HailerConfig, *, sandbox: MarimoSandbox | None = None, open_url: UrlOpener | None = None, session_wait_sec: float = DEFAULT_SESSION_WAIT_SEC) -> list[Any]
-    # LangChain StructuredTool.from_function(func=method, coroutine=_in_daemon_thread(method), name=name, description=inspect.getdoc(method)), in TOOL_NAMES order
+    # LangChain StructuredTool.from_function(func=call, coroutine=_in_daemon_thread(call), name=name, description=inspect.getdoc(method),
+    #   response_format="content_and_artifact"), in TOOL_NAMES order; call = _content_and_artifact(method) (functools.wraps keeps the
+    #   signature the schema is read from) returns (str(reply), reply.status)
     # UrlOpener = Callable[[str], bool]
 ```
+
+**Status beside the text.** Every reply is a `ToolReply`, which equals its text (callers comparing text are
+unaffected), and LangChain gets the text as the tool message's content (byte for byte, a plain `str`) and
+`status` as its artifact, which langchain-openai leaves out of both wire formats (`test_agent.py` checks the
+requests). `status` is decided where the tool knows, never from the text (which holds whatever the user's code
+printed or a file contained): `_run` sets `{"ok": False, "error": <HailerError subclass name>}` for a
+`HailerError`, `{"ok": False, "error": <exception type name>, "unexpected": True}` for any other exception,
+and `truncated: True` when the text was cut to `max_tool_output_chars`; `marimo_execute` sets
+`{"ok": False, "error": "execution_failed"}` from the kernel's `success` flag, and `{"ok": False, "error":
+"cell_error", "raised": [<exception class names>]}` when the code ran but a cell it created or edited raised
+(the after snapshot's `Cell.error`, from the kernel's graph; a cell that raised before and was not changed does
+not count); `notebook_open`, `notebook_create` and `notebook_close` add `notebook` (the name), `active`
+(whether it is the active notebook now) and `session` (whether it has a kernel session after the call); a
+failed cell listing or check snapshot is `error: "cells_unreadable"` and an unknown template
+`error: "unknown_template"`. A reply with code checks adds `findings` (count), `checked` and `skipped` (`ruff` /
+`ty`), and `marimo_execute` adds `cells` whenever it compared snapshots (the changed cells' names, `""` for an
+unnamed one; `[]` when none changed). `fetch_page` calls `web.fetch_page` with the output cap off and lets `_run`
+apply it (the same `truncate_text`, so the same text), so a cut page has `truncated: True`.
+`hailer.tool_outcomes` reads it.
 
 The kernel is `sandbox`, the one this session started (kept in memory; nothing is discovered). Without one
 every kernel tool answers `ERROR: marimo is not running: this session has no kernel` with `launch_hint()`.
@@ -961,6 +991,69 @@ was already created / made active by then, so `notebook_create` / `notebook_open
 `... is now the active notebook.` and never read as a failed call. Both hooks are keywords of `HailerTools`
 and `hailer_tools` so tests never launch a browser.
 
+## `text.py`  (chat terminal, 2026-10-29)
+
+Plain-text helpers that the agent side and the terminal share, standard library only (no Rich, no
+prompt_toolkit), so `tool_outcomes` imports them as freely as `steps`, `transcript`, `completion` and
+`chat_ui`: `single_line(text)` (control and formatting characters dropped, whitespace runs one space: labels,
+names, summaries), `printable(text)` (the same characters dropped, each whitespace character a space, spacing
+kept), `clean_reply(text)` (multi-line: CSI/OSC escape sequences and other C0/C1 controls removed, newlines kept,
+tabs expanded to every 4 columns), `plural(count, noun, plural_noun=None, *, grouped=False)` (`grouped`:
+`12,345 rows`, as tool summaries count), `url_host(url, *, port=True)` (`host` or `host:port`, never user,
+path or query; steps show the host alone) and `fit(text, cells, ellipsis="", *, width=len)` (shortened at the
+end to `cells` columns as `width` measures them, `get_cwidth` in the terminal; with an ellipsis the cut text
+loses trailing spaces first).
+
+## `tool_outcomes.py`  (chat terminal, 2026-10-28)
+
+```python
+SUMMARY_LIMIT = 80
+class Outcome(NamedTuple): ok: bool; summary: str = ""
+def tool_outcome(name: str, args: Mapping[str, Any] | None, content: Any, status: Any = None, *, error: bool = False) -> Outcome  # never raises
+```
+The `ok` and `summary` of the agent's `tool_result` events (standard library only). **`ok` never comes from the
+text**: `error=True` (a `status="error"` `ToolMessage`, LangChain could not run the tool) is a failure worded by
+LangGraph's template (`invalid arguments`, `unknown tool`, else the exception name or `failed`; the arguments it
+quotes never show); otherwise `ok` is `status["ok"]` (the `ToolReply` status, the message's artifact), and
+without a status (not a Hailer tool) the call is ok with an empty summary. A failure is worded by its error
+class, never its message (which may quote a URL with a token, a path or data): `NoSessionError` → `notebook not
+open`, `MarimoUnavailableError` → `marimo not running`, `MarimoExecutionError` → `kernel request failed`,
+`NotebookNotFoundError` → `notebook not found`, `NotebookExistsError` → `notebook already exists`,
+`NotebookPathError` → `not in the notebooks folder` (`not a usable notebook name` for `notebook_create`),
+`KernelRuntimeError` → `kernel not available`, `WebAccessDenied` → `host not allowed`, `MalformedParquetError` →
+`unreadable data file`, `ConfigError` → `configuration problem`, `cells_unreadable` → `could not read the cells`,
+`unknown_template` →
+`unknown template`, an unexpected exception → `unexpected <Type>`, a plain `HailerError` by tool (`could not
+fetch the page`, `skill not found`, `could not read the file`, `could not read the data folder`, else
+`failed`). `marimo_execute` code that failed names the exception from its traceback (else `failed`), and a
+call whose created or edited cell raised (`cell_error`) is a failure named by the kernel's exception classes
+after the cells: `growth, ZeroDivisionError, checks clean`. Only when no snapshots were compared (`[checks]` all
+off) does marimo's own line (`created and ran cell 'Hbol' (growth) (error)`, in code that used
+`marimo._code_mode`) fail the call, named from the traceback text (else `cell error`); a `re-ran ... (error)`
+line never does.
+
+Summaries of calls that worked are read from the parts of the text Hailer writes itself, and never repeat what
+the arguments say (the UI shows those as the step's target): `marimo_execute` the changed cells (`cells` from
+the status: `growth_by_region`, `a and b`, `4 cells`; without snapshots, and for `deleted scratch` / `installed
+altair` / `re-ran report`, marimo's own lines such as `created and ran cell 'Hbol' (name)`, read only when
+the code used `marimo._code_mode`), a frame's `4 rows` (Polars `shape: (4, 3)` at the start of a line, pandas
+`[4 rows x 3 columns]`, read from the text before the check report) and the checks from the status (`checks
+clean`, `2 findings`, `ty skipped`, `checks skipped`); `notebook_check` `clean` / `N findings` / `checks off` /
+`no code`; `notebook_cells` `6 cells, 1 with errors` / `N matching cells` / `no cells` (`N+ cells` when the
+reply was truncated); `notebook_list` `3 notebooks, 1 open`; `notebook_create` / `notebook_open` the session
+outcome (`already open`, `opened in your browser`, `no session yet`, `browser did not open`, `marimo not
+running`; open adds the cell count), led by the notebook's name only when the argument did not already name it
+(`q2_churn.py` for "Q2 Churn"); `notebook_close` `closed` / `was not open` (`<name>, closed` without an
+argument); `marimo_status` `<name> ready` / `<name> not open` / `not running`; `list_periods` `[dataset, ]6
+months, 25-01 to 25-06[; discount from 25-04]` (the dataset only without a name argument) or `no period files,
+N other files`; `load_skill` `N files` / `no files` (from the last `Files (read with read_skill_file(...)):`
+block, so a SKILL.md quoting it changes nothing); `read_skill_file` `N lines` / `truncated`; `fetch_page`
+`12.3 KB` (the size of the text the model got; `, truncated` when the status says the reply was cut or the
+`Source:` line says `(first N bytes only)`; `, redirected to <host[:port]>` when the page came from another host) or `not text
+(<type>)` when the whole reply is fetch_page's not-text notice. A summary is one line of at most
+`SUMMARY_LIMIT` printable characters (`...` when cut, `text.fit`; `str.isprintable`, `text.single_line`), counts and
+names only. An unknown tool or reply format gives `""`.
+
 ## `code_checks.py`  (owner: code checks, 2026-09-22)
 
 ruff, ty and the typed-in values check for the cells the agent writes. ruff and ty are Hailer dependencies
@@ -973,8 +1066,10 @@ RUFF_SELECT = ("F", "PLE", "B006", "B023", "E722")          # ruff runs --isolat
 RUFF_IGNORE = ("F401", "F541", "F704", "F811", "PLE1142")   # imports for later cells, private helpers, top-level await
 TY_IGNORE = ("unresolved-import",)                          # the kernel's packages are not the host's (docker)
 MAX_REPORTED = 20
-def snapshot_code(*, enable_format: bool = False) -> str    # scratchpad code printing SNAPSHOT_MARKER + {"cells": [{id, name, code}]}
-def parse_snapshot(stdout: str) -> Snapshot | None          # Snapshot(cells: tuple[Cell(id, name, code), ...]) in notebook order
+def snapshot_code(*, enable_format: bool = False) -> str    # scratchpad code printing SNAPSHOT_MARKER + {"cells": [{id, name, code, error}]}
+def parse_snapshot(stdout: str) -> Snapshot | None          # Snapshot(cells: tuple[Cell(id, name, code, error=""), ...]) in notebook order
+    # error: the class name of the exception the cell's last run raised, from ctx.graph.cells[id].exception (what code mode's own
+    # summary reads; "" when it did not raise or the graph cannot be read); tools.marimo_execute fails a call whose changed cells raised
 def changed_cells(before: Snapshot, after: Snapshot) -> list[str]   # new or edited, non-empty, notebook order
 def dependency_order(cells) -> list[Cell]                   # marimo's compile_cell + DirectedGraph + topological_sort; unplaceable cells last
 def syntax_error(cell: Cell) -> Finding | None              # compile with PyCF_ALLOW_TOP_LEVEL_AWAIT
@@ -1100,12 +1195,33 @@ class HailerAgent:
   stored conversation valid: every tool call without a result gets a `ToolMessage(INTERRUPTED_TOOL_RESULT)`,
   and when the last stored message is the user's (the turn died before the model answered) the new text is
   appended to it under the same message id, because strict chat templates refuse two user messages in a row.
-  The turn runs as `graph.astream(..., stream_mode=["updates", "messages"])` and emits `AgentEvent("tool_call",
-  <name>, {"arguments": <80-char preview>})` and `AgentEvent("message_delta", <text>)` (the `model` node only,
-  never the summariser). `AgentEventKind` also has `"status"`; the agent does not emit it today.
+  The turn runs as `graph.astream(..., stream_mode=["updates", "messages"])`. Events (`AgentEventKind =
+  "message_delta" | "tool_call" | "tool_result" | "status"`), all emitted synchronously on the owning loop:
+  - `AgentEvent("message_delta", <text>)`: a piece of the reply (the `model` node only, never the summariser).
+  - `AgentEvent("tool_call", <name>, {"arguments": <80-char preview>, "args": <dict>, "id": <str>})` for each
+    call in a `model` update. `args` is a shallow copy of the call's arguments that `json.dumps` accepts (other
+    values as `str`; `{}` when they are not a mapping). `id` is unique in the turn, so the UI matches on it
+    alone: the call's tool_call_id, or `<id>#<n>` when the turn already used that id (some gateways number
+    calls per reply) and `call#<n>` when the model sent none (`n`: the call's position in the turn).
+  - `AgentEvent("tool_result", <name>, {"id": <str>, "ok": <bool>, "summary": <str>, "seconds": <float>})` for
+    each `ToolMessage` in a `tools` update that answers a call of this turn, after that call's `tool_call` and
+    with its `id`. A result is matched by its tool_call_id and, among the turn's waiting calls sharing one, by
+    tool name, then oldest first; calls of one model message may finish in any order (LangChain runs each as
+    its own task). A `ToolMessage` for no waiting call emits nothing and is not a step. `seconds` is the wall
+    time since the `tool_call` event, rounded to ms. `ok` and `summary` come from
+    `tool_outcomes.tool_outcome(name, args, content, message.artifact, error=(message.status == "error"))`.
+    A notebook tool's result also has `"notebook": {"notebook": <name>, "active": <bool>, "session": <bool>}`
+    (from its reply status: the notebook `notebook_open`/`notebook_create` left active or `notebook_close`
+    closed, and whether it has a kernel session), so the chat's footer follows a switch at once.
+    A call the turn is cancelled in gets no `tool_result` (the UI marks it cancelled), nor does the
+    `INTERRUPTED_TOOL_RESULT` that `_settle_history` writes for it before the next turn (state updates are
+    not streamed). The bookkeeping is `_TurnEvents(emit).on_update(update)`, testable without a graph.
+  - `"status"`: the agent does not emit it today.
   `TurnSummary(final_response, thread_id, duration_ms, tool_calls, input_tokens, output_tokens,
-  status="completed")`: `final_response` is the last model message without tool calls; tokens are summed over
-  the turn's model calls, `None` when the endpoint reported none.
+  status="completed", steps)`: `final_response` is the last model message without tool calls; tokens are summed
+  over the turn's model calls, `None` when the endpoint reported none; `tool_calls` names every call the model
+  asked for and `steps` counts the turn's `tool_result` events (the calls that ran). None of this changes the
+  requests sent.
 - `map_exception`: a `HailerError` passes through. `openai.APIStatusError` is mapped on `status_code`, in this
   order: 401 → `CredentialsError` (login hint); 400/404/422 whose body names the model (`model_not_found`,
   `param == "model"`, a pydantic `loc` with `'model'`, or "model" with "not found" / "does not exist" ...) →
@@ -1138,12 +1254,53 @@ def ensure_project_gitignore(workspace) -> None # project layout only: .hailer/.
     # files a standalone layout left) unless one exists; an unedited standalone "*" one is replaced (it would hide the project's files); never raises
 SANDBOX_MARK_NAME = "sandbox-wrote-notebooks"   # a sandbox copied notebooks here since the user last agreed to run them unsafe-local
 def mark_sandbox_wrote(workspace) -> None; def sandbox_wrote_notebooks(workspace) -> bool; def clear_sandbox_mark(workspace) -> None
+INPUT_HISTORY_NAME = "input_history"; def input_history_path(workspace) -> Path   # <state_dir>/input_history (hailer.input_history)
 ```
 The only place `.hailer/` is created: `session.save_session`, `notebooks.save_active_notebook`,
-`HailerAgent` (the default `threads.sqlite`) and the kernel runtimes' record, log and token folders all go through `ensure_state_dir`, so the
+`HailerAgent` (the default `threads.sqlite`), `input_history.InputHistory` and the kernel runtimes' record, log and token folders all go through `ensure_state_dir`, so the
 folder ignores itself in any git repository. The user's own `.gitignore` is never touched. In the project layout
 `.hailer/` itself is committed (config, notebooks, context, skills, prompts) and only its `state/` ignores
 itself; `init` and `hailer data add` write `.hailer/.gitignore` for `state/`, `local.toml` and `data/`.
+
+## `input_history.py`
+
+```python
+MAX_ENTRIES = 1000; MAX_ENTRY_BYTES = 64 KiB; MAX_READ_BYTES = MAX_ENTRIES * (MAX_ENTRY_BYTES + 64)
+LOCK_WAIT_SECONDS = 2.0; EXIT_FLUSH_SECONDS = 0.5
+def input_history(path: Path | None) -> History   # ThreadedHistory(InputHistory(path)), or InMemoryHistory() for None (the setting off)
+def storable(text: str) -> bool                    # not blank, <= MAX_ENTRY_BYTES, no credential shape (below)
+class InputHistory(History):                       # prompt_toolkit History kept in path (FileHistory's format)
+    def load_history_strings(self) -> Iterable[str]   # newest first; never raises ([] on any failure)
+    def store_string(self, string: str) -> None       # queues it for the writer thread; never checks, waits or raises
+    def flush(self, timeout: float = LOCK_WAIT_SECONDS) -> bool   # waits for the queued entries
+```
+The composer (`ChatUI(history_file=...)`) and plain mode's prompt (`_LineReader.history_file`) use it while
+`[hailer].input_history` is on; the controller passes `statedir.input_history_path(workspace)`. The file is
+prompt_toolkit's `FileHistory` format (`# <time>` line, then each line of the entry behind `+`), so multi-line
+entries round-trip. prompt_toolkit's `ThreadedHistory` reads it on a worker thread when the first render
+creates the buffer's content: nothing waits for it, and Up recalls entries as they load. Saving never runs
+on the UI loop: `store_string` (called by `Buffer.reset(append_to_history=True)` on Enter) only queues the
+entry; one daemon writer thread per process (`_WRITER`) checks it (`storable`, the size first, so a pasted
+file costs nothing), waits up to `LOCK_WAIT_SECONDS` for the lock and appends it, in submission order. An
+`atexit` handler gives queued entries `EXIT_FLUSH_SECONDS`, then leaves the thread (an entry still waiting
+for another chat's lock is lost, never half written). A read first waits for this process's queued entries.
+Reading keeps the last `MAX_ENTRIES` and rewrites a longer file, or one holding an entry over
+`MAX_ENTRY_BYTES` (written by an older build), through `tempfile.mkstemp` in the same folder and
+`os.replace`; a file it could read nothing from is never rewritten. Only a file larger than any Hailer writes
+is read from its last `MAX_READ_BYTES`. Not written (kept in the session's memory): an entry over
+`MAX_ENTRY_BYTES`, and one `storable` refuses: what `hailer.log.redact` masks (a bearer token or
+`Authorization:` value, an `sk-` key, the value of a `*_KEY`/`*_TOKEN`/`*_SECRET`/`*_PASSWORD` environment
+variable of 8 characters or more), a URL with a password (`scheme://user:password@`), a GitHub token
+(`ghp_`, `gho_`, `ghs_`, `ghu_`, `ghr_`, `github_pat_`) or an AWS access key ID (`AKIA`/`ASIA` and 16
+characters). `/exec` entries are written like any other. Appends (`O_APPEND`), reads and the rewrite hold an
+exclusive lock on `input_history.lock` (`fcntl.flock`; on Windows `msvcrt.locking`, where only `EACCES` and
+`EDEADLOCK` mean "held"): two chats in one workspace interleave whole entries and lose none to a rewrite. A
+file system without locks (any other locking error) is used unlocked. Links: the history and lock files are
+opened with `O_NOFOLLOW` (where it exists) and `O_NONBLOCK`, checked with `lstat` before and `fstat` after;
+anything but a regular file (a symlink a cloned repository ships, a FIFO) switches that history to memory
+only, logged once at info level. The files are created `0o600`. Any `OSError` (read-only workspace,
+permissions, a folder in the way) or corrupt bytes (decoded with `errors="replace"`; lines without `+` end an
+entry) only means less history; it is logged at debug level.
 
 ## `session.py`  (owner: wave 2 / E)
 
@@ -1151,6 +1308,9 @@ itself; `init` and `hailer data add` write `.hailer/.gitignore` for `state/`, `l
 SESSION_FILENAME = "session.json"   # in statedir.state_dir(workspace)
 COMMANDS: dict[str, str]     # name -> one-line help, for /help
 EXIT_COMMANDS = ("exit", "quit")
+COMMAND_USAGE: dict[str, tuple[str, str]]   # name -> (argument signature, short description): the composer's /help card; every COMMANDS name but the alias quit
+COMMAND_GROUPS: dict[str, tuple[str, ...]]  # the card's groups (Conversation, Notebook, Session), each COMMAND_USAGE name once
+NOTEBOOK_SUBCOMMANDS: dict[str, str]         # list/new/open/close -> short description: the command menu's second level
 def parse_command(line: str) -> Command | None      # "/model gpt-5.5" -> Command("model", "gpt-5.5"); "/exit" ; non-slash -> None; unknown slash -> Command(name, args) (CLI reports unknown); the name ends at the first whitespace, so "/exec\n<code>" keeps its lines
 def session_path(workspace: Path) -> Path
 def load_session(workspace: Path) -> SessionState   # .hailer/session.json, tolerant of missing/corrupt
@@ -1178,10 +1338,48 @@ output helpers, the preflight checks (`local_checks`, `kernel_checks`) and the c
 there is no import cycle.
 
 Bare `hailer` and `hailer notebook` both call `_run_session`:
-load config, run local and kernel checks, begin dependency-only warmup, then prepare and start this
-session's own kernel through the chosen runtime (`_start_kernel`; nothing is looked for or reused).
-Interactive mode shows the startup panel and editable composer before agent preparation and
+load config, print the header, run local and kernel checks, begin dependency-only warmup, then prepare and
+start this session's own kernel through the chosen runtime (`_start_kernel`; nothing is looked for or reused).
+Interactive mode shows the editable composer after the kernel's row and before agent preparation and
 browser-session waiting run concurrently. Plain/piped mode retains the notebook wait before its prompt.
+
+Startup output is a checklist (`transcript.SessionRow`: icon, a ten-cell label, detail, seconds, the same
+columns as a step row; label and detail pass `text.single_line`, so names, warnings and check texts cannot
+add rows or terminal controls; on a terminal the columns line up with the composer's live row and a row that
+worked keeps to one line, elsewhere each is one plain line that is never cut; `session_note` lines under a
+row lose control characters too, and on the CLI's own console a terminal wraps them under the detail column
+while pipes and plain mode get whole lines). In order: the header `◆ Hailer <version>   ·   <workspace>` (`~`
+for the home folder, `_home_relative`) and a blank line; each preflight check that did not pass as a row
+(`_check_rows`: `▲` warning or `✗` failure, labelled `Config`, `Notebook`, `API key`, `Kernel`, `Docker`,
+`Image`, `Data`; the summary and hint lines unchanged, the hints under the detail column; a failure exits 1
+before any kernel starts); the runtime's own progress (docker's image download) and the Rich spinner
+`Starting marimo[ in Docker] on <url> ...`; then `_kernel_row`: `✓ Kernel  docker · isolated · no network ·
+data read-only  1.9s` (`docker · network on · data read-only` with `[kernel] network`), or for unsafe-local a
+yellow `▲ Kernel  unsafe-local · runs as you, not isolated`; under it, as muted notes, `Port N is busy; using
+M.` and, with `--verbose`, `Marimo is running at <url>  (log: <log hint>)`. The settings panel
+(`common._settings_panel`) is `hailer status`'s only (no `Type /help` line: status has no chat): `/status` has every setting, plus a `Kernel log` row (the
+sandbox's `log_hint`). The notebook's row comes from `_wait_for_notebook`: `✓ Notebook  <name> · already
+open`, or (the browser opened, a session came) `✓ Notebook  <name> · open in your browser  2.2s` and the muted
+`APP_VIEW_TIP`, or a warning `▲ Notebook  <name> · no kernel session yet` (the agent reports the notebook state
+when asked). Plain mode, which has no live row, starts the wait with `○ Notebook  opening <name> in your
+browser` (no link). The agent's rows come from `ChatController._started`: `✓ Agent  <model> · <provider> · <env_key>
+from <source>  0.8s` (the source the agent resolved; nothing is looked up then), `↺ Resumed  N earlier turns ·
+/new starts fresh`, or `▲ Thread  previous conversation could not be resumed; started a new one`; context
+warnings are `▲ Context` rows. In the composer, the notebook wait and the agent start show on the live row
+(`ChatController.progress(label, detail)` -> `ChatUI.begin_task`/`end_task`: `Notebook  opening analysis.py
+in your browser`, `Agent  starting gpt-5.5`, in the session rows' columns, the latest begun one first, a
+running step before both) and commit their rows above it as each finishes; the composer prints a blank line
+when preparation ends. Plain mode prints the same rows in order, then `Type /help for commands.`.
+
+The signed-in URL (`sandbox.notebook_url(name, with_token=True)`: it carries the access token) is opened
+in the browser and, in the chat, printed only when the user must open it by hand: with `--no-browser` (at
+once, before the wait: `○ Notebook  open <name> in your browser with this link (it signs you in):`) or when
+no session came in time (the warning row, then the link). It is then a note of its own under the row,
+printed with `soft_wrap=True` (written whole: the terminal wraps it and it copies as one) and never as an
+OSC 8 hyperlink. The same holds for switches: `ChatLoop(..., open_browser=False)` (`--no-browser`) sets
+`ChatController.open_browser`, and then neither `/notebook new|open` nor a switch the model made opens a
+browser; each prints its link at once instead. `--foreground` has no chat: it prints its signed-in home URL
+(below), the only way into that kernel.
 `--kernel docker|unsafe-local` overrides the runtime for `notebook` (`_kernel_choice`: any other value, `local`
 included, prints `config.runtime_problem` and exits 2). The kernel is stopped in the `finally` of
 `_run_session` (and `_run_foreground`) whatever ends the chat: `_start_kernel` is called inside that guarded
@@ -1195,7 +1393,7 @@ it. `ChatController` points `sandbox.notice` at its current console (yellow, thr
 queue), and asks for a copy back (`sandbox.sync_soon()`, `_copy_notebooks_back`) after every turn (finished,
 failed or interrupted) and on a `/notebook` switch (`_switch_notebook`). The prompt gets a token-free URL. Once the kernel answers, `_active_notebook(config, sandbox)` picks the
 active notebook (the state file's, else `default_notebook` when `sandbox.has_notebook` says it is gone: one
-request, not a listing) and saves it; the startup panel shows that
+request, not a listing) and saves it; the notebook's startup row shows that
 name. The CLI and the chat take clients from `sandbox.client(notebook=..., token_in_links=True)` and links
 from `sandbox.notebook_url(name, with_token=True)` / `sandbox.home_url(with_token=True)`: they are printed or
 opened for the user, never sent to the model. `_marimo_state(sandbox, notebook)` is the seam the chat uses.
@@ -1203,8 +1401,27 @@ opened for the user, never sent to the model. `_marimo_state(sandbox, notebook)`
 `notebook --foreground` prepares and starts the runtime, prints its signed-in home URL ("Ctrl+C stops it"),
 waits for exit or Ctrl+C, and stops it; only the browser uses that kernel. Every Docker start checks
 `docker_mount_problems`, including foreground mode. Pull/build progress runs before any startup spinner.
-Cleanup errors print the retry command (`uvx hailer kernel stop`) and exit 1; successful cleanup prints
-`Stopped marimo.`.
+
+Exit (`_run_chat_loop`, then `_stop_kernel` in `_run_session`'s `finally`): when the chat ends (`/exit`, EOF,
+Ctrl+C while idle; nothing prints `Bye.` any more) the muted `Session ended · 4m 12s · this session: 2 turns,
+1.1k tokens` (the time since the command started, then this session's turns and tokens,
+`ChatController.session_turns`/`session_tokens`; zero tokens are left out; the footer and `/status` count the
+whole conversation, `SessionState`, and say so: `/status` reads `this conversation: N turns`; turns and tokens
+count finished turns only: a cancelled or failed turn's usage is not known to the chat and adds neither; the composer ends its transcript with a blank line however it
+exits, so the line always follows one); then, under a spinner on a terminal while the kernel stops, one line:
+`✓ Notebooks copied back to notebooks/   ✓ Kernel stopped` (docker) or `✓ Kernel stopped` (unsafe-local).
+`running.stop()` runs whatever the terminal does: a spinner or line that cannot be written (a closed
+terminal) never keeps the kernel, or its last copy back, from stopping. The first item is the last copy's own
+record, `DockerKernel.copied_back` (from `NotebookSync.complete`; None without a copy), never the warnings,
+which say a repeated problem once: `▲ Notebooks not all copied back to notebooks/` when the last copy did not
+finish (a dead kernel, a file that could not be written, the deadline, Ctrl+C). Warnings during the stop
+(`sandbox.notice` is pointed at the CLI's console) print as `▲` callouts, text unchanged, e.g. `Warning:
+stopped before the notebooks were copied back; ...`. A second Ctrl+C while the kernel is removed prints
+`Interrupted while the kernel stopped: it may still be running.` with `Run uvx hailer kernel stop to remove it.`
+(docker) or how to end the marimo process (unsafe-local), and exits 1. A stop error stays red (`✗ Could not
+finish stopping the Docker kernel: ... Run uvx hailer kernel stop to retry.`) in place of `Kernel stopped`,
+and the command exits 1. A session that failed before the chat ran (a fatal check, a kernel that did not
+start, an agent that could not start in plain mode) has no `Session ended` line.
 
 Other commands: `status` shows the configuration, credentials, context and a `Kernels:` line
 (`kernel_docker.workspace_kernels`, via `_workspace_kernels`: running Docker kernels; "none running for this
@@ -1233,7 +1450,7 @@ Agent start (`ChatLoop.start`):
 a resume means the thread was gone, the CLI says so and resets the counters. Credentials: a `"missing"` key is
 a fatal preflight failure for every provider, the built-in `openai` included; `status` and `/status` show
 `<env_key> from env|keyring` or `<env_key> missing (run: uvx hailer login <id>)`; both also show the `Kernel:` line,
-in yellow (`common._kernel_style`) for unsafe-local, as the startup panel and `--foreground` do. Interactive chat is selected when stdin/stdout are terminals, unless `--plain` is set or
+in yellow (`common._kernel_style`) for unsafe-local, as `--foreground` does (the startup's `▲ Kernel` row says it there). Interactive chat is selected when stdin/stdout are terminals, unless `--plain` is set or
 `TERM` is `dumb`/`unknown`. `--plain` is a global option and also an option on `notebook`.
 
 `hailer/chat.py:ChatController` holds shared session, slash-command and notebook operations;
@@ -1241,18 +1458,116 @@ in yellow (`common._kernel_style`) for unsafe-local, as the startup panel and `-
 unsupported terminals use `Console.input` without starting prompt_toolkit; their Rich console also
 disables live status/cursor controls, including during startup and notebook waits.
 
-`chat_ui.py:ChatUI` owns one inline prompt_toolkit application (no alternate screen, mouse capture or CPR),
-a bounded multiline composer, context/activity lines, and a serialized output queue. Rich transcript
-output goes through `run_in_terminal`; log handlers are temporarily routed through the same queue,
-retaining redaction. Bracketed paste stays enabled throughout the live composer and is restored on exit.
-Enter submits once; Alt+Enter inserts a newline; history is in memory. A busy submission leaves the draft
-intact and does not enqueue a request. Ctrl+C cancels active work and awaits cleanup, or exits while idle;
-Ctrl+D exits only empty and idle; Ctrl+Z then Enter exits while idle. `/exit` and `/quit` also exit.
+`chat_ui.py:ChatUI(console, on_submit, footer, *, pt_input=None, pt_output=None, completions=None, history_file=None)` owns one inline prompt_toolkit
+application (no alternate screen, mouse capture or CPR) and a serialized output queue. Top to bottom: the live
+row (only while busy or starting), a bounded multiline composer in a rounded frame coloured by state (ANSI cyan
+ready, bright black busy or starting, red once startup failed) with a `›` prompt, a two-space continuation
+indent, a placeholder that says what Enter does now and key hints in the frame's bottom border that follow the
+state, then a one-line footer. `footer()` returns `transcript.FooterData` (notebook, `notebook_open`
+True/False/None, kernel runtime, model, turns, tokens, the notebook's token-free URL) and is called on every
+redraw, so `ChatController.footer` only reads state it holds (the URL is made once per notebook name;
+`notebook_open` is what startup, a switch, `/status`, `/notebook` or `/exec` last learned). The footer shows
+`● name` (open), `○ name` (not open) or `name` (unknown), `docker · isolated` or a yellow
+`▲ unsafe-local · not isolated`, the model and `N turns · Xk tokens`, the conversation's totals (`SessionState`: the
+thread's turns and tokens, which `/new` and `/model` reset; `working 3.1s` during a turn); when narrow
+it drops tokens, turns, the model and a docker kernel, then shortens the notebook, never the unsafe-local
+warning. Widths are terminal cells. Every row but the composer is one window that draws its whole line at the
+terminal's width (the frame's sides are margins of the composer's window): rows of `VSplit`s doubled the cost
+of a redraw. A redraw ticker runs every 80 ms during a turn; while the chat prepares nothing animates and the
+live row's timer redraws once a second (agent imports then run on a worker thread and every redraw takes the
+GIL from them: §10, `scripts/benchmark_startup.py`); while idle nothing ticks, and a flash schedules the one
+redraw that ends it.
+Rich transcript output goes through `run_in_terminal`; log handlers are temporarily routed through the same
+queue, retaining redaction. Bracketed paste stays enabled throughout the live composer and is restored on exit.
+Enter submits once; Alt+Enter (Esc Enter) and Ctrl+J insert a newline (Ctrl+J never involves Esc, for
+terminals that do not send Alt as Meta). Up/Down move through a multiline draft and recall history at its
+edges: `history_file` (the controller passes `.hailer/input_history` while `[hailer].input_history` is on;
+see `input_history.py`) or, for `None`, this session's only. History is read on a worker thread after the
+first render, never before it; entries are saved on a writer thread. As you type,
+`ThreadedAutoSuggest(AutoSuggestFromHistory())` (searched off the UI loop) shows the rest of the latest matching
+history line in grey (`auto-suggestion`, bright black); → (or Ctrl+E, Ctrl+F) at the end of the draft takes
+it (`load_auto_suggest_bindings`), and the border says `→ accept · enter send · alt+enter new line`
+(`right accept` in ASCII). A busy submission leaves the draft intact, does
+not enqueue a request and flashes `Still working · esc cancels · your draft is kept` in the border for 2.5 s
+instead of replacing the activity (a flash ends with the turn or with startup). Esc cancels a running turn
+through the same path as Ctrl+C: only during a turn, or while the command menu is open, are the key timeouts
+short (`ttimeoutlen` 0.1 s, `timeoutlen` 0.3 s; `_sync_timeouts` after every render) so a lone Esc acts at
+once; otherwise prompt_toolkit's own (0.5 s, 1.0 s) stay, Esc alone does nothing and Esc then Enter within
+about 1.5 s is still a newline. Events that arrive after a cancel do
+not replace `Cancelling`. Ctrl+C cancels active work and awaits cleanup, or exits while idle; Ctrl+D exits only
+empty and idle; Ctrl+Z then Enter exits while idle. `/exit` and `/quit` also exit.
+
+The command menu (`completion.py`): a one-line draft that starts with `/` completes while typing
+(`SlashCompleter`), only while the cursor is at its end (or only spaces follow it). The completions show in a
+window under the frame, above the footer, while there are any: `  › /help       Commands and keys` (the mark
+on the chosen item, the first while none is), names in one column, descriptions (`COMMAND_USAGE`'s short
+forms) shortened with the glyph set's ellipsis to the width, at most `MENU_ROWS` = 6 rows scrolled to the
+chosen one and a muted `N more` line. Styles `palette.pick`, `palette.name`, `palette.name.current` (ANSI cyan
+bold), `palette.meta` (bright black): never `menu.*`, which prompt_toolkit's default style paints grey. The
+border says `↑↓ choose · tab complete · enter <run|send|complete> · esc close` (`up/down` in ASCII) while it
+is open, also during a turn (`completion.enter_action`). Up/Down and Tab/Shift+Tab choose (Tab without a menu
+opens it). Enter (`ChatUI._enter`, the same with or without the menu on screen): an item the user chose
+(arrows or Tab) is written, and submitted at once when the draft is then one of `completion.RUN_ON_ENTER`
+(`/help /status /new /context /reload /clear /exit /notebook list`: no arguments); without a choice,
+`SlashCompleter.enter_pick` decides from the draft alone, computed then, so neither typing speed nor a paste
+changes it: a draft that already is a command (any case) or a command and a whole argument (exactly as typed:
+`first-look` beside `first-look-v2`, `sales.py` beside `Sales.py`), a free-text argument
+(`completion.FREE_FORM`: `/model`, whose menu only suggests; `/model gpt-5` is never made `gpt-5.5`), or that
+nothing completes (`/exec` code, a skill's message, a prompt's arguments, a new notebook's name), is submitted
+as typed; any other slash draft is completed to the first item and nothing runs (`/n` Enter gives `/new`, a
+second Enter sends it). A command that takes arguments is completed with its space, so its own menu follows,
+except one typed in full. Esc closes the menu and restores the typed text; it does not cancel a running turn
+while the menu is open (the next Esc does). Arguments: `/notebook` `list|new|open|close`
+(`session.NOTEBOOK_SUBCOMMANDS`); after `open`/`close` the notebook names (`active` marks the active one);
+`/skill` and `/prompt` names (the skill's description, `saved prompt`); `/model` the current model (`current`)
+and `<provider>:` for `openai` and each declared provider. Matching is a case-insensitive prefix, names that
+match as typed first; names pass `single_line`. `completions()` returns `models.CompletionData` (`notebooks`,
+`active_notebook`, `skills`, `prompts`, `model`, `providers`) and, like `footer`, must only read state the
+controller holds: `ChatController.completions` takes the notebook names from `_notebook_names`. A `/notebook`
+command's own listing (`_names`, `/notebook list`'s) fills it on that command's worker; otherwise
+`_refresh_names_soon` lists in the background, nothing awaiting it (after the startup notebook wait, after
+`/notebook new`, at the end of each composer turn): on a daemon thread (`hailer-notebook-names`, never the
+loop's default executor, which `asyncio.run` joins at exit: §4), all its marimo requests under one
+`request_deadline(chat.NAMES_DEADLINE_SEC)` = 10 s (a kernel can trickle `/api/files`: §13), one listing at a
+time (a request during one makes it list once more after), never through `_blocking` or its stop flag, so
+neither `ready_to_answer` nor a turn's cleanup waits for it. `run_interactive` settles it (`_settle_names`)
+before the agent closes and the CLI stops the kernel: it waits at most `NAMES_SETTLE_SEC` = 1 s, then leaves
+the thread behind, and a result that arrives after that is ignored. The completer
+never lists notebooks itself; a failing `completions` callable leaves the command names. Every submission
+still goes through `parse_command`.
+
+The transcript: a submission is echoed behind `▌`. `settle_steps()` ends the steps still open as `no result,
+effect unknown`; `ChatController._aturn` calls it when `arun_turn` raises, so those rows come before the error.
+Before `finish` the controller reads the active notebook from the state file (`_peek_active_notebook`, a local
+read: no marimo request, no browser), so the footer and the reply's link name a notebook a tool switched to;
+`_sync_active_notebook` still reports the switch, and opens it, after the answer. `finish(summary:
+TurnSummary)` prints, once, the steps still open (`no result, effect unknown`), the reply behind `●` (`chat_ui.ReplyMarkdown`: left-aligned headings,
+tables with only a header rule and their column alignment, code behind a thin bar, the glyph set's bullets and
+quote bars, ANSI colours only; paragraphs wrap at words and a longer word, a URL, gets a line of its own that
+the terminal wraps, in lists and quotes too) and a muted line `N steps · 7.7s · 3.1k in · 612 out` (`steps`, `duration_ms` and the token counts; unknown or zero
+parts left out) with `↗ <notebook>` as an OSC 8 hyperlink to the token-free URL (the stats keep their room, a
+narrow terminal shortens the link). A cancelled turn ends with a
+`▲ Cancelled.` callout, and `The conversation continues; the model is told the last step's effect is unknown.`
+when a step was still running. The console stays soft-wrapped (`console_factory`, for plain mode and pipes);
+the composer prints with `soft_wrap=False` and `crop=False`, so Rich wraps at words inside gutters and an
+indented plain line (an error's hints) keeps its indent, except a string containing `://`, printed
+soft-wrapped, and a line of a gutter's text that holds a URL (`✗ Could not fetch <url>`), written whole: a
+URL is never cut. Everything from outside (names, errors, warnings, model output) reaches Rich as `Text`
+or with `markup=False`, never as markup: a notebook called `q[/].py` prints as itself. The reply passes
+`text.clean_reply` in both modes first: escape sequences (CSI, OSC) and other C0/C1 control characters
+are removed, newlines kept, tabs expanded to every 4 columns (Rich's `Text` and `markup=False` keep ESC). Glyphs: `transcript.glyphs_for(console.encoding)` is the Unicode set, or `ASCII` (`| * + x ! >`, `+-|`
+frame) when the encoding cannot write it (a cp1252 console); there is no setting for it. Nothing relies on
+Rich's own `…`, which an ASCII console prints as `?`: one-line cells are `transcript.Clip`s, shortened with the
+set's ellipsis (`...`), and wrapping columns fold.
 
 Startup is a separate preparation gate: typing and paste work from the first render, and one early
 submission waits until both agent and notebook preparation settle. Repeated Enter cannot submit it
 twice. Startup failure retains the pending message and next draft instead of dispatching them. The UI
-settles its startup task on shutdown before the controller closes the agent. Notebook waiting uses
+settles its startup task on shutdown before the controller closes the agent; that shutdown refuses
+cancellation until it is done, so nothing in it may wait on a task that can be gone: `flush` waits for the
+transcript writer only while the writer runs, and a writer cancelled with a dying loop's tasks (an error
+escaping the coroutine that runs the composer: `asyncio.run` cancels them all) leaves its queue to be
+printed directly. Notebook waiting uses
 its own cooperative stop flag and must finish before the CLI stops a kernel it owns.
 `ChatController.startup_failed` records an actual preparation error, so leaving the retained-draft
 interface still returns exit code 1; intentional startup cancellation does not set it.
@@ -1260,7 +1575,8 @@ interface still returns exit code 1; intentional startup cancellation does not s
 `startup.StartupTimings` records idempotent monotonic milestones in seconds and debug-logs them without
 user content. `input_ready` is the first composer render; `ready_to_answer` is when the first message
 may be dispatched. `notebook_wait_complete` includes a nonfatal timeout, not proof of cell execution.
-The CLI also records `checks_complete`, `kernel_ready` and `panel_shown`; the controller records
+The CLI also records `checks_complete`, `kernel_ready` and `checklist_shown` (the rows it prints before the
+chat: the kernel's, and in plain mode the notebook's); the controller records
 `agent_ready`. `scripts/benchmark_startup.py` measures fresh processes offline, including paste latency
 and the longest input-loop pause.
 
@@ -1289,24 +1605,79 @@ not list), marimo state, URL and `NOTEBOOK_USAGE`; `/notebook list` = `sandbox.l
 `client.shutdown_session`. Without a sandbox, list/new/open say marimo is not running.
 A switch (`_switch_notebook`) writes the state file, sets `self.notebook`, queues
 `_pending_preamble` **before** waiting for the tab, then `_ensure_session` (opens the URL through
-`hailer.browser` when there is no session and waits `SWITCH_SESSION_TIMEOUT_SEC` = 30 s), then refines the
-notice; Ctrl+C or a marimo error during the wait leaves the notice queued. Exact notice:
+`hailer.browser` when there is no session and waits `SWITCH_SESSION_TIMEOUT_SEC` = 30 s, the live row saying
+`Notebook  opening <name> in your browser`, plain mode a `○` row; with `--no-browser` it opens nothing and
+prints the `○ Notebook  open <name> in your browser with this link` row and the link at once), then refines
+the notice; Ctrl+C or a
+marimo error during the wait leaves the notice queued. Whatever happened, the switch ends with one row
+(`_notebook_row`): `✓ Notebook  q2.py · active · open in your browser  0.6s` (`· already open` when it had a
+session; `· created from the starter|empty template · active ...` for `/notebook new`; `analysis.py · already
+the active notebook · ...` for `/notebook open` of the active one), or a warning `▲ Notebook  q2.py · active ·
+no kernel session yet` followed by `Open it in your browser with this link:` and the signed-in link on a line
+of its own (`Open it with the link above.` after `--no-browser` printed it), or `▲ ... · not open in a browser yet` after Ctrl+C or an
+error. `/notebook close` prints `✓ Notebook  <name> · closed · session <id> · its browser tab is disconnected`
+and, for the active one, `It stays the active notebook; /notebook open <name> reopens it.` under it. Exact notice:
 `[Hailer] The active notebook is now <name> (<detail>). Call notebook_cells before editing.` with
 `<detail>` = `created from the starter template` | `created from the empty template` | `reopened`, followed by
 `, N cell(s)` when a session exists or `, not open in a browser yet` when none. It is passed once as
 `run_turn(..., preamble=...)` with the next message and cleared (also on Ctrl+C; kept when the turn raised an
 error). `_sync_active_notebook()` runs in the `finally` of every turn (finished, failed, interrupted) and,
 without opening a browser, at the start of `/notebook` and `/status`: on a change it updates `self.notebook`,
-prints `Active notebook is now <name>.` and (turn end only) opens the URL once when the notebook has no session;
+prints `✓ Notebook  <name> · now active` and (turn end only) opens the URL once when the notebook has no
+session (`· opened in your browser`; `· open in your browser` when it has one), never printing it; with
+`--no-browser` it prints `○ Notebook  <name> · now active · not open in a browser` and the link instead.
+A notebook tool's own try counts: `notebook_open`/`notebook_create` open the browser through the opener the
+chat gives the agent (`ChatController._tool_opener`, via `common._make_agent(..., open_url=...)` and
+`HailerAgent(open_url=...)` into `hailer_tools`; with `--no-browser` it opens nothing and returns False, so the
+tool asks the model to have the user open the link) and wait; so after a turn whose tool brought the notebook
+up, the chat does not open it again: with no session it prints `▲ Notebook  <name> · now active · no kernel
+session yet` and the signed-in link once on a line of its own. Only a switch no tool reported (a call cut
+short) is opened here. The footer follows a switch when the tool's result arrives: the notebook tools' reply
+status carries `notebook`, `active` and `session` (the model's text is unchanged), the agent passes them as
+`detail["notebook"]` of the `tool_result` event, and `ChatController._follow_notebook_tool` updates
+`notebook`/`notebook_open` without any I/O. After a cancelled turn the switch's row is printed after the
+composer's `▲ Cancelled.` callout (`_aturn` collects the rows and schedules them for the loop's next turn,
+which comes after the callout is queued);
 no preamble is queued because the model made the switch itself. `COMMANDS["notebook"]` =
 `Show or switch the active notebook. Usage: /notebook [list | new <name> [--empty] | open <name> | close [name]]`.
-Progress (plain `_TurnDisplay`, interactive `ChatUI.on_event`): a single activity line updated from `AgentEvent`s: `Thinking...`, `Using: <tool>`
-on `tool_call`, `Writing reply...` at the first `message_delta`, the text of a `status` event. Deltas are
-never printed (a model can stream commentary next to its tool calls and then the answer, which printed the
-answer twice); `finish` prints `final_response` once, or `(no reply)`. Interactive answers use Rich Markdown
-under `Hailer`; plain answers retain `Hailer >`. After a turn the CLI
-adds the turn and its tokens to the session file. Errors: print message + hint; exit code 1 when startup
-fails, the REPL carries on after a failed turn; traceback only with `--verbose`.
+Progress (plain `_TurnDisplay`, interactive `ChatUI.on_event`), through `steps.StepTracker`: a `tool_call`
+starts a step keyed by `detail["id"]` (unique in a turn; a call without one gets a private key that only the
+turn's end closes); the `tool_result` with that id commits one row, `✓|✗ <done verb>  <target · summary>
+<seconds>`, with the event's `seconds` (a summary that starts with the target loses that repeat). Several steps
+may be open; rows appear in result order; a result for no open step prints nothing. On cancellation every open
+step is committed as `▲ <done verb>  <target · cancelled, effect unknown>` (§4: cancelling is not a rollback);
+a turn that ends with steps open (an error) commits them as `no result, effect unknown`. A worked step's row
+is one line (its detail cut with `…`); a failed or cancelled step's detail wraps in its column. The composer's
+live row shows a spinner, the oldest open step's live verb and target in the rows' columns (`+N more` for
+parallel ones) and, from one second, a right-aligned timer; between steps it shows the latest activity
+(`Thinking`, `Writing the answer` at a `message_delta`, a `status` event's text, the text a slash command gives
+`console.status(...)` or `set_activity`, without a trailing `...`). Deltas are never printed (a model can stream
+commentary next to its tool calls and then the answer, which printed the answer twice). Plain mode prints the
+same rows as whole lines when the results arrive (no live row, spinner, cursor control or hard wrap), then
+`Hailer >`, `final_response` once (or `(no reply)`) and `  N steps · 1.5s · 3.1k in · 612 out`; Ctrl+C prints
+the cancelled rows, from a new line (the terminal has echoed `^C` where the cursor was), then `Interrupted.`. After a turn the CLI adds the turn and its tokens to the session file.
+Errors (`common._print_error`, in both modes and the other commands): a red `✗ <message>` callout, then the hint
+lines indented four spaces, both texts unchanged; exit code 1 when startup fails, the REPL carries on after a
+failed turn; traceback only with `--verbose`.
+
+Wording: `steps.describe_call(name, args) -> Step(live, done, target)` (`steps.VERBS`: "Running code"/"Ran
+code", "Reading the notebook"/"Read the notebook", "Scanning the data"/"Scanned the data", ...;
+`marimo_execute` is `<n> lines`, or "Adding a cell", "Editing 2 cells", "Changing cells" for a code-mode
+script; the target comes from the arguments: notebook, data name, skill, `skill/path`, the URL's host, the
+cells pattern; an unknown tool shows its name). Labels pass `text.single_line`. Each `tool_call` the agent
+emits is debug-logged (`--verbose`) by tool name and event id only; the arguments, which can hold data, are not. `hailer/transcript.py` holds
+what both presentations print, Rich only: the glyph sets, `Gutter`, `user_message`, `callout`,
+`step_row`/`plain_step_row`, `turn_stats`/`turn_footer`, the cards and `FooterData`. In the composer
+(`ChatController.interactive`) slash commands print cards; plain mode keeps its lines and tables. `/status`:
+a rounded `Session` card with a mark per row (`●` fine, `▲` missing credentials, unsafe-local or marimo not
+running, `○` notebook not open in a browser) holding every row of the plain table (model, provider and
+credentials; kernel; marimo; notebook and session; notebooks folder; thread, turns and tokens; web access).
+`/help`: the commands by `COMMAND_GROUPS` with their `COMMAND_USAGE` signature and description, then the keys
+(`enter send · alt+enter or ctrl+j new line · esc cancel · ↑ history · ctrl+c exit`)
+(groups in their own column when wide, above their commands when narrow, descriptions under the commands
+when very narrow). `/notebook list`: `Notebook  Modified  Size` with `● open`, `○ not open` and `active`.
+`/context`: labelled sections, warnings as `▲` lines. `scripts/chat_ui_demo.py` drives the real composer with
+the agent's events (ids, summaries, parallel, failed and cancelled steps) and these cards.
 
 ## `datafolders.py`  (data folders, 2026-10-28)
 
@@ -1372,20 +1743,44 @@ ones not on this machine, and the kernel runtime's notes, which carry the packag
   (the contract over a tmp folder, clients faked), plus the `hailer_tools` registration: names, schemas,
   docstring descriptions, in-process `invoke`, the daemon-thread `ainvoke` path, a cancelled call that does not
   wait for a blocked tool, an end-to-end pass over a real `MarimoSandbox` and `fake_marimo.py`, and a source
-  check that `hailer.tools` touches neither folder
+  check that `hailer.tools` touches neither folder. The `tool_outcomes` tests read replies the tools wrote:
+  `CodeModeClient` runs `LIST_CELLS_CODE` and the check snapshot for real against a stand-in code-mode
+  context, and `code_mode_says` produces marimo's own change lines (its `_print_summary`), so a format change
+  in marimo or in a tool fails there. They also check that each reply's status reaches LangChain as the
+  artifact with the content unchanged, and that what the user's code prints (`ERROR: ...`, `Execution
+  failed.`, a fake code-mode or check line) or a skill file holds never decides `ok` or shows up
 - `test_secrets.py`: D. `test_agent.py`: LangChain migration. Unit tests drive `HailerAgent` through
   `model_factory=` with `ScriptedModel` (a `BaseChatModel` replaying messages, exceptions or callables) and
   two toy tools: `build_model` kwargs, tracing, system prompt, error mapping, lifecycle (resume after a
   restart, `new_thread`, `set_model`, `close`), turns (events, usage, one user message, `/reload`, failed-turn
-  merge, summarisation) and Ctrl+C during a model call and during a tool (a real SIGINT to the main thread
+  merge, summarisation), tool steps (each `tool_call` followed by the `tool_result` with its id, parallel calls
+  matched by id as they finish, empty and repeated ids made unique and matched by name, `_TurnEvents` ignoring a
+  result for no call of the turn, error results, no result for a cancelled call or for the history repair,
+  `TurnSummary.steps`; on the wire, with Hailer's own tools streamed and not, the tool messages sent are the
+  reply text exactly and carry no status) and Ctrl+C during a model call and during a tool (a real SIGINT to the main thread
   on POSIX, `_thread.interrupt_main()` on Windows; see "Runtime facts").
   Wire-level tests run the real `ChatOpenAI` against `tests/fake_gateway.py` (`FakeGateway`, a stdlib
   `ThreadingHTTPServer` on 127.0.0.1: only `POST /v1/chat/completions`, 404 elsewhere, 422 for unknown fields
   and model names, required key, `X-Client-Id` header and `api-version` query, optional refusal of `stream:
-  true`, every request recorded; `port=0` picks a free port, a fixed one serves manual end-to-end runs) and
-  assert the exact request fields, headers and query, and one request per 4xx
+  true`, every request recorded; `port=0` picks a free port, a fixed one serves manual end-to-end runs; "check
+  both" in the message gets two tool calls in one reply) and assert the exact request fields, headers and query,
+  one request per 4xx, and the gateway's call ids in the tool events
 - `test_session.py`, `test_cli.py` (Typer `CliRunner`; slash commands; preflight messages with fakes; a
   `FakeAgent` with the `HailerAgent` surface the CLI uses): E
+- `test_completion.py`: the command menu's completions from `CompletionData` only (commands, a command typed
+  in full, each command's arguments, nothing outside a one-line slash draft or before the end of it, a failing
+  data source, names that cannot add rows, as-typed names first), what Enter does without a choice
+  (`enter_pick`: whole commands and arguments sent, partial ones completed) and the hint, and the rows (mark,
+  scroll, `N more`, ellipsis per glyph set, no `menu.*` style). `test_input_history.py`: the history file's
+  format and round trip, saving on the writer thread, the cap, oversized entries, a file never rewritten when
+  nothing could be read, credential filtering, corrupt files, failures that never raise, owner-only files,
+  planted links and FIFOs, a short and a long hold of the lock (the shipped wait), Windows lock errors (a fake
+  `msvcrt`), two processes appending while one trims, exit that writes the queue but never waits long, and
+  the off switch. The composer's keys for both are in `test_chat_ui.py` (Enter runs only a chosen command,
+  typed, burst and pasted drafts, as-typed names beside longer ones, no completion mid-draft, Esc during a
+  turn, Enter never waiting for the history file, suggestions off the UI loop); the controller's cached names
+  (listed off the UI loop, never awaited by startup or turns, one at a time, settled before shutdown, never by
+  the completer) and the history file it hands out in `test_chat.py`
 - Kernel runtimes (docker kernel, 2026-09-19), none of which start anything: `test_kernel.py` (the withheld
   variables, with no way through, the unsafe-local sandbox's folders and URLs, prompt notes, `LocalRuntime` with
   `LocalProcesses` faked, and a start that never adopts another server on its port), `test_kernel_docker.py`

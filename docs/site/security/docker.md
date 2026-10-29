@@ -36,8 +36,10 @@ runtime = "docker"                   # "docker" (the default) or "unsafe-local"
 - **For one run:** `uvx hailer notebook --kernel docker` (or `--kernel unsafe-local`), or `HAILER_KERNEL` in
   the environment. The flag wins over the variable, the variable over the file. `HAILER_KERNEL_IMAGE`
   overrides `image`.
-- **Which one is in use** shows in the startup panel, `uvx hailer status`, `/status` and `uvx hailer doctor`
-  (`marimo0.24.2-64a6b78f25cf` is the kernel contract, below; the `unsafe-local` line is in a warning colour):
+- **Which one is in use** shows in the `Kernel` row when a session starts (`✓ Kernel  docker · isolated ·
+  no network · data read-only`, or a yellow `▲ Kernel  unsafe-local · runs as you, not isolated`), and in
+  `uvx hailer status`, `/status` and `uvx hailer doctor` (`marimo0.24.2-64a6b78f25cf` is the kernel
+  contract, below; the `unsafe-local` line is in a warning colour):
 
   ```text
   Kernel:     docker (hailer-kernel marimo0.24.2-64a6b78f25cf; no network; data read-only)
@@ -319,9 +321,14 @@ written there.
   container another terminal is removing at the same moment counts as removed, and a network whose
   containers are still detaching is retried for a few seconds).
 - **Notebooks at stop.** The session copies its kernel's changed notebooks back before it removes the
-  containers (see [Notebook copies](#notebook-copies)). `uvx hailer kernel stop` and the leftover cleanup
+  containers (see [Notebook copies](#notebook-copies)), and says so on its last line:
+  `✓ Notebooks copied back to notebooks/   ✓ Kernel stopped`. When that copy did not finish (the kernel
+  stopped answering, a file could not be written, the deadline, Ctrl+C) the first item is
+  `▲ Notebooks not all copied back to notebooks/`, whether or not its warning was already shown; a removal that failed is a red
+  `✗ Could not finish stopping the Docker kernel: ...` instead of `Kernel stopped`, and the command exits 1. `uvx hailer kernel stop` and the leftover cleanup
   of a later start remove containers without copying: a killed session's last changes are lost.
-- **Logs.** `docker logs hailer-kernel-<id>-<suffix>`. A failed start prints its last lines.
+- **Logs.** `docker logs hailer-kernel-<id>-<suffix>`; `/status` shows the name (`Kernel log`), and
+  `uvx hailer --verbose` prints it under the `Kernel` row at start. A failed start prints its last lines.
 
 ## Platforms
 

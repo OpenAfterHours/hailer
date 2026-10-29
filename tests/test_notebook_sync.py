@@ -375,6 +375,22 @@ def test_a_kernel_that_stopped_answering_is_one_warning_and_changes_nothing(host
     assert len(said) == 1 and said[0].startswith("Warning: could not copy the notebooks back from the kernel (")
     assert said[0].endswith(f"The files in {host} are unchanged.")
     assert (host / "sales.py").read_text(encoding="utf-8") == NB
+    assert sync.complete is False, "the second pass said nothing, but it did not copy back either"
+
+
+def test_each_copy_back_records_whether_it_finished(sync, host, tmp_path, monkeypatch, said):
+    """The end of a session reads this, not the warnings: a warning repeats only once."""
+    assert sync.complete is None
+    _write(container(tmp_path) / "sales.py", notebook("v2"))
+    assert sync.sync_out() == ["sales.py"] and sync.complete is True
+    _write(container(tmp_path) / "sales.py", notebook("v3"))
+    real = ns.NotebookSync._target
+    monkeypatch.setattr(ns.NotebookSync, "_target", lambda self, name: (_ for _ in ()).throw(OSError("read-only")))
+    assert sync.sync_out() == [] and sync.complete is False
+    sync.sync_out()
+    assert sync.complete is False and len([s for s in said if "could not copy back sales.py" in s]) == 1, "said once, recorded each time"
+    monkeypatch.setattr(ns.NotebookSync, "_target", real)
+    assert sync.sync_out() == ["sales.py"] and sync.complete is True
 
 
 def test_the_periodic_copy_runs_on_a_daemon_thread_until_closed(sync, host, tmp_path):
@@ -510,6 +526,7 @@ def test_a_docker_start_copies_in_before_it_returns_and_its_stop_copies_back_bef
         "Not copied back from the kernel (only marimo notebooks with plain names are; everything else stays in the "
         "kernel and is gone when it stops): .git/."
     ]
+    assert kernel.copied_back is True, "the session's last line may say the notebooks came back"
     kernel.stop()  # idempotent: no second copy
     assert docker.containers == {}
 
@@ -532,6 +549,7 @@ def test_ctrl_c_during_the_last_copy_still_removes_the_containers(fake, tmp_path
     kernel.stop()
     assert docker.containers == {} and docker.networks == {}
     assert said == ["Warning: stopped before the notebooks were copied back; the kernel's changes since the last copy are lost."]
+    assert kernel.copied_back is False
 
 
 def test_a_last_copy_that_never_ends_cannot_keep_the_containers(fake, tmp_path, monkeypatch):
@@ -552,6 +570,32 @@ def test_a_last_copy_that_never_ends_cannot_keep_the_containers(fake, tmp_path, 
     assert time.monotonic() - started < 5
     assert docker.containers == {} and docker.networks == {}
     assert said == ["Warning: the last copy of the notebooks back from the kernel did not finish within 0.3 s; the kernel's latest changes may be missing here."]
+    assert kernel.copied_back is False
+
+
+def test_a_last_copy_from_a_dead_kernel_is_recorded_though_its_warning_was_said_before(fake, tmp_path, monkeypatch):
+    """A kernel that died (out of memory, removed) mid-session: the background copy warned once;
+    the last copy fails silently (the same warning), and the stop records that it did not finish."""
+    from hailer.errors import MarimoUnavailableError
+
+    monkeypatch.setattr(kd, "_sleep", lambda seconds: None)
+    monkeypatch.setattr(ns, "SYNC_INTERVAL_SEC", 3600.0)
+    docker = FakeDocker()
+    _config, kernel = _docker_start(tmp_path, fake, docker)
+    said: list[str] = []
+    kernel.notice = said.append
+
+    def dead() -> list:
+        raise MarimoUnavailableError("Marimo is not running at http://127.0.0.1:2718 (connection refused).")
+
+    monkeypatch.setattr(kernel, "list_tree", dead)
+    assert kernel.sync is not None
+    kernel.sync.sync_out()  # a background pass while the session ran
+    assert len(said) == 1
+    kernel.stop()
+    assert len(said) == 1, "nothing new was said at the stop"
+    assert kernel.copied_back is False
+    assert docker.containers == {} and docker.networks == {}
 
 
 def test_a_server_that_trickles_its_page_cannot_hold_the_last_copy(host, tmp_path, monkeypatch, said):

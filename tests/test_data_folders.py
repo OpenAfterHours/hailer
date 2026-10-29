@@ -137,7 +137,7 @@ def _healthy(url, timeout, token=None, should_stop=None):
 
 class _NoSync:
     def __init__(self, *args, **kwargs):
-        pass
+        self.complete = None  # NotebookSync's record of its latest copy back
 
     def sync_in(self):
         return []

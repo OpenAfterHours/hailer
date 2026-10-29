@@ -10,7 +10,7 @@ behind the design in [docs/LEARNINGS.md](docs/LEARNINGS.md), user-facing behavio
 ## What runs where
 
 ```
-Terminal ── hailer.cli (Typer) ── hailer.chat / chat_ui (composer, slash commands)
+Terminal ── hailer.cli (Typer) ── hailer.chat / chat_ui (composer, command menu, step receipts)
                │
 agent.py       LangChain create_agent + ChatOpenAI ──HTTPS──► model endpoint (OpenAI or a custom base_url,
                │  API key and conversation stay here            Responses API or Chat Completions)
@@ -87,7 +87,8 @@ runtime works on the host folder directly and syncs nothing.
   locally.
 - Docker is the default. Without a usable Docker a start fails closed and names the two ways on: install or
   start Docker, or write `runtime = "unsafe-local"`. The retired `local` value is an error, not an alias.
-- Conversations are LangGraph checkpoints in `.hailer/threads.sqlite`; only the latest thread is resumed.
+- Conversations are LangGraph checkpoints in `.hailer/threads.sqlite`; only the latest thread is resumed. What
+  the user typed is kept in `.hailer/input_history` unless `[hailer] input_history = false`.
 
 ## What leaves the machine
 
@@ -108,7 +109,7 @@ Environment overrides: `HAILER_CONFIG`, `HAILER_WORKSPACE`, `HAILER_MODEL`, `HAI
 - **A kernel session needs a browser tab:** `marimo_status` detects a missing session; the CLI and the
   notebook tools open the URL and wait.
 - **Docker is not always available** (licensing, managed machines): those users either get Docker or accept
-  `unsafe-local`, which is labelled in the startup panel, `status`, `/status` and `doctor`. A cloud kernel
+  `unsafe-local`, which is labelled in the startup checklist, `status`, `/status` and `doctor`. A cloud kernel
   behind the same sandbox contract is the planned answer ([ARCHITECTURE_PROPOSAL.md](docs/ARCHITECTURE_PROPOSAL.md) §6).
 - **The host copy of a notebook is up to one turn (or 15 s) behind** the kernel's; files that notebook code
   writes next to the notebooks in Docker are not copied back and are gone when the kernel stops.
@@ -130,8 +131,11 @@ src/hailer/
 │                      data list|add|remove (data), init, login, logout, doctor, status (setup), shared
 │                      collaborators and checks (common)
 ├── chat.py, chat_ui.py   ChatController (slash commands, notebook switches), the persistent composer
+├── steps.py, transcript.py   tool calls in plain words; what the composer and plain mode print (rows, cards)
+├── completion.py, input_history.py   the command menu's completions; the input history file
 ├── agent.py           build_model, HailerAgent (threads, streamed turns, Ctrl+C), system prompt, error mapping
 ├── tools.py           HailerTools (the 15 tools) and hailer_tools(config) -> LangChain tools
+├── tool_outcomes.py   a tool call's one-line outcome from its reply and status (the receipts)
 ├── project.py         ProjectFiles: the project's files the project_* tools list, search and read
 ├── datafolders.py     this machine's [data_folders] in .hailer/local.toml (hailer data add|remove, /data)
 ├── code_checks.py     ruff, ty and typed-in values on the cells the agent writes (and code mode's ruff formatting)
@@ -146,33 +150,25 @@ src/hailer/
 └── periods.py         YY-MM period files and multi-period loaders, also used inside the image
 ```
 
-## 2026-10-28: Hailer inside another project
+## 2026-10-29: the refined chat terminal
 
-Hailer can live inside an existing project (a uv workspace monorepo included) as a support chat for analysts:
-it answers questions about the data and about the product it comes from.
+The chat terminal now reports the user's work instead of Hailer's plumbing. A session starts with a
+checklist (Kernel, Agent, Notebook rows that resolve in place) instead of the settings panel; each tool call
+becomes one receipt line in plain words with its outcome and time (`AgentEvent("tool_result")` from the
+graph's `tools` node, the outcome decided from a status the tool returns beside its reply, never from the
+reply's text); the answer is printed once under a footer of steps, time and tokens; the composer has a
+state-coloured frame, a footer with the notebook, kernel and model, a `/` command menu with argument
+completion, Esc to cancel a running turn and an input history kept in Hailer's state folder by default; the session ends
+with a summary. The signed-in notebook URL is printed only when the user must open it by hand. What reaches
+the model is byte-identical (the strict fake gateway, streamed and not, for Chat Completions; LangChain's
+Responses conversion of the same messages). The lessons and their
+regression tests are in [LEARNINGS.md](docs/LEARNINGS.md) §19.
 
-- **Discovery and layout.** Inside a git repository the workspace is the nearest folder with a Hailer config up
-  to the repository root, else the uv workspace root, so `uv run hailer` in a member belongs to the whole
-  repository. `.hailer/hailer.toml` marks the project layout: notebooks, context, skills and prompts in
-  `.hailer/` (committed), state in `.hailer/state/` (ignored); `init` picks it in a folder with `pyproject.toml`
-  or `.git` (`--layout`). `.hailer/local.toml` is this machine's settings, merged over the project's.
-- **Project files.** `[project]` gives the agent `project_files`, `project_search` and `project_read`: the
-  project's code, docs and configuration, read-only, on this machine (`hailer.project`); git's view of the
-  files minus Hailer's state, the data and notebooks folders and credential files; credential lines withheld
-  (LEARNINGS §17).
-- **Data folders.** `[data_folders]` (and `uvx hailer data add <name> <folder>`, `/data`) mount folders from
-  anywhere on the machine read-only at `/work/folders/<name>`, as `DATA_FOLDERS["<name>"]` in notebooks, with
-  the data folder's mount rules; paths live in each machine's `local.toml` (LEARNINGS §18).
+Built by implement-and-challenge rounds, each part reviewed independently before it merged; the design was
+prototyped first. Verified: the offline suite on Linux, Python 3.13; `scripts/benchmark_startup.py` against
+the previous composer (`input_ready`, `ready_to_answer` and paste latency within noise); recorded-terminal
+captures at 100 and 64 columns and with an ASCII console encoding.
 
-Verified:
-
-- Offline suite on Linux, Python 3.13: 1174 passed, 15 skipped (with main merged in).
-- `tests/test_docker_integration.py` with `HAILER_DOCKER_TESTS=strict`: 12 passed on Linux with Docker Engine
-  29.9.2 and an image built from this checkout (`scripts/build_kernel_image.py --load`, the pinned base image
-  digest pulled through a registry mirror), including the new data folder mount.
-- Live, with a real marimo kernel and headless Chromium, in a uv workspace in the project layout: unsafe-local and
-  docker kernels both define `DATA_FOLDERS` from a folder `hailer data add` added, `list_periods` and doctor list
-  it, and the project tools read the repository.
-
-Still owed: a live turn against a real model with the project tools; the Docker integration run on Windows and
-macOS (and a data folder on a mapped drive there); a physical Ctrl+C in a Windows console.
+Still owed: a physical check on Windows Terminal and the legacy console (cp1252 glyphs, Esc timing, file
+locking for the history), on macOS Terminal (Option not set as Meta: Ctrl+J for a newline), and a live turn
+against a paid model with parallel tool calls.

@@ -1,0 +1,186 @@
+"""The composer's command menu: slash commands, then each command's own arguments.
+
+``/`` at the start of the draft lists the commands with their short descriptions
+(:data:`hailer.session.COMMAND_USAGE`). After a command and a space it lists that command's arguments:
+``/notebook`` subcommands, then notebook names after ``open`` or ``close``; skill and prompt names;
+for ``/model`` the current model and each provider as ``<provider>:``. They come from
+:class:`~hailer.models.CompletionData`, which the controller builds from state it already holds:
+nothing here asks marimo or the disk. A submission still goes through
+:func:`~hailer.session.parse_command`; the menu only writes the draft. :func:`menu_fragments` draws
+the menu under the composer's frame.
+
+Enter runs a command at once only when the user chose it in the menu (arrows or Tab) and it takes no
+arguments (:data:`RUN_ON_ENTER`). Otherwise a draft that already is a command, or a command and a
+whole argument, or a free-text argument (a model name), is sent as typed, and any other slash draft is
+completed to the first item without running it (:meth:`SlashCompleter.enter_pick`), so ``/n`` and Enter never starts a new conversation,
+however fast it was typed or pasted.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Iterable
+from typing import Any
+
+from prompt_toolkit.completion import CompleteEvent, Completer, Completion
+from prompt_toolkit.document import Document
+from prompt_toolkit.utils import get_cwidth
+
+from hailer.models import CompletionData
+from hailer.session import COMMAND_USAGE, DATA_SUBCOMMANDS, NOTEBOOK_SUBCOMMANDS
+from hailer.text import fit, single_line
+from hailer.transcript import Glyphs
+
+#: What Enter runs at once when the menu writes it: the commands that take no arguments.
+RUN_ON_ENTER = frozenset({f"/{name}" for name, (usage, _summary) in COMMAND_USAGE.items() if not usage} | {"/notebook list"})
+#: Commands whose argument is free text: the menu suggests (the current model, ``<provider>:``), but
+#: only a choice writes one; Enter sends what is typed (``/model gpt-5`` is never made ``gpt-5.5``).
+FREE_FORM = frozenset({"model"})
+#: The menu's rows; more completions scroll, with a "N more" line under them.
+MENU_ROWS = 6
+
+
+class SlashCompleter(Completer):
+    """Completions for a draft that starts with ``/`` (never for one with a line break)."""
+
+    def __init__(self, data: Callable[[], CompletionData] | None = None) -> None:
+        self._data = data
+
+    def data(self) -> CompletionData:
+        if self._data is None:
+            return CompletionData()
+        try:
+            data = self._data()
+        except Exception:  # noqa: BLE001 - a menu must never break typing
+            return CompletionData()
+        return data if isinstance(data, CompletionData) else CompletionData()
+
+    def get_completions(self, document: Document, complete_event: CompleteEvent) -> Iterable[Completion]:
+        text = document.text_before_cursor
+        # Only at the end of a one-line slash draft: completing in the middle of a word would garble it.
+        if not text.startswith("/") or "\n" in text or document.text_after_cursor.strip():
+            return
+        head, space, rest = text[1:].partition(" ")
+        # A command or subcommand that takes arguments gets its space, so their menu follows, but
+        # never when it is typed in full: then the menu steps aside and Enter sends what is typed.
+        if not space:
+            for name, (usage, summary) in COMMAND_USAGE.items():
+                if name.startswith(head.lower()):
+                    then = " " if usage and name != head else ""
+                    yield Completion(f"/{name}{then}", -len(text), display=f"/{name}", display_meta=summary)
+            return
+        words = rest.split(" ")
+        partial = words[-1]
+        found = [option for option in self._arguments(head.lower(), words[:-1]) if option[0].casefold().startswith(partial.casefold())]
+        found.sort(key=lambda option: not option[0].startswith(partial))  # names that match as typed first
+        for value, meta, then in found:
+            then = then if value != partial else ""
+            yield Completion(value + then, -len(partial), display=single_line(value), display_meta=single_line(meta))
+
+    def enter_pick(self, document: Document) -> Completion | None:
+        """What Enter writes into the draft when no menu item was chosen: the first completion,
+        unless the draft is already a command (or a command and a whole argument) as typed, or
+        nothing completes it. ``None``: Enter sends the draft as it is. Computed here and now, so
+        the result never depends on how fast the keys came or whether the menu had shown yet."""
+        if free_form(document):
+            return None
+        completions = list(self.get_completions(document, CompleteEvent()))
+        if not completions or typed_in_full(document, completions):
+            return None
+        return completions[0]
+
+    def _arguments(self, command: str, before: list[str]) -> list[tuple[str, str, str]]:
+        """(value, description, what follows it) for the word after ``/command`` and ``before``."""
+        if command == "notebook" and not before:
+            return [(sub, summary, "" if sub == "list" else " ") for sub, summary in NOTEBOOK_SUBCOMMANDS.items()]
+        if command == "data" and not before:
+            return [(sub, summary, " ") for sub, summary in DATA_SUBCOMMANDS.items()]
+        data = self.data()
+        if command == "notebook" and len(before) == 1 and before[0].lower() in ("open", "close"):
+            return [(name, "active" if name == data.active_notebook else "", "") for name in data.notebooks]
+        if before:
+            return []
+        if command == "model":
+            current = [(data.model, "current", "")] if data.model else []
+            return current + [(f"{provider}:", "provider", "") for provider in data.providers]
+        if command == "skill":
+            return [(name, description, "") for name, description in data.skills]
+        if command == "prompt":
+            return [(name, "saved prompt", "") for name in data.prompts]
+        return []
+
+
+def typed_in_full(document: Document, completions: Iterable[Completion]) -> bool:
+    """Whether the word being completed already is one of ``completions``: a command name in any
+    case (commands ignore case), an argument exactly as typed (``first-look`` beside
+    ``first-look-v2``, ``sales.py`` beside ``Sales.py``)."""
+    text = document.text_before_cursor
+    for completion in completions:
+        typed = text[len(text) + completion.start_position:]
+        value = completion.text.rstrip(" ")
+        if typed == value or (typed.startswith("/") and typed.lower() == value):
+            return True
+    return False
+
+
+def enter_action(buffer: Any) -> str:
+    """What Enter does while the menu is open, for the border's hint: "run" (a chosen command that
+    takes no arguments), "send" (the draft as typed) or "complete" (the chosen or first item)."""
+    state = buffer.complete_state
+    if state is not None and state.complete_index is not None:
+        new_text, _cursor = state.new_text_and_position()
+        return "run" if new_text.strip() in RUN_ON_ENTER else "complete"
+    if free_form(buffer.document) or typed_in_full(buffer.document, state.completions if state is not None else []):
+        return "send"
+    return "complete"
+
+
+def free_form(document: Document) -> bool:
+    """Whether the word being typed is a free-text argument (:data:`FREE_FORM`), not a closed set."""
+    head, space, _rest = document.text_before_cursor[1:].partition(" ")
+    return document.text_before_cursor.startswith("/") and bool(space) and head.lower() in FREE_FORM
+
+
+def menu_open(buffer: Any) -> bool:
+    """Whether the buffer has completions to show (the menu is on screen)."""
+    state = buffer.complete_state
+    return bool(state is not None and state.completions)
+
+
+def _window(buffer: Any) -> tuple[list[Completion], int | None, int]:
+    """(completions, the chosen one's index, the first row shown): the chosen one stays in view."""
+    state = buffer.complete_state
+    items = list(state.completions) if state is not None else []
+    current = state.complete_index if state is not None else None
+    start = 0 if current is None else max(0, min(current - MENU_ROWS + 1, len(items) - MENU_ROWS))
+    return items, current, start
+
+
+def menu_height(buffer: Any) -> int:
+    count = len(_window(buffer)[0])
+    return min(count, MENU_ROWS) + (1 if count > MENU_ROWS else 0)
+
+
+def menu_fragments(buffer: Any, glyphs: Glyphs, columns: int) -> list[tuple[str, str]]:
+    """The menu's rows: a mark on the chosen completion (the first while none is: Enter takes it),
+    its name, and its description shortened with an ellipsis to the terminal's width."""
+    items, current, start = _window(buffer)
+    shown = items[start:start + MENU_ROWS]
+    chosen = 0 if current is None else current
+    names = [fit(item.display_text, max(4, columns // 2), glyphs.ellipsis, width=get_cwidth) for item in shown]
+    width = max((get_cwidth(name) for name in names), default=0) + 3
+    room = columns - 4 - width - 1  # the mark's four cells, the name's column, one cell spare
+    out: list[tuple[str, str]] = []
+    for index, (item, name) in enumerate(zip(shown, names, strict=True), start):
+        picked = index == chosen
+        meta = fit(item.display_meta_text, room, glyphs.ellipsis, width=get_cwidth) if room > 4 else ""
+        out += [
+            ("class:palette.pick", f"  {glyphs.prompt if picked else ' '} "),
+            ("class:palette.name.current" if picked else "class:palette.name", name + " " * (width - get_cwidth(name))),
+            ("class:palette.meta", meta),
+            ("", "\n"),
+        ]
+    if len(items) > MENU_ROWS:
+        out.append(("class:muted", f"    {len(items) - MENU_ROWS} more"))
+    elif out:
+        out.pop()
+    return out

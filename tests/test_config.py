@@ -709,6 +709,30 @@ def test_repo_example_matches_template() -> None:
     assert example.read_text(encoding="utf-8").replace("\r\n", "\n") == DEFAULT_CONFIG_TEMPLATE
 
 
+def test_input_history_is_on_by_default_and_a_bool(tmp_path: Path) -> None:
+    for name in ("on", "off", "bad"):
+        (tmp_path / name).mkdir()
+    on = _make_workspace(tmp_path / "on")
+    assert load_config(workspace=on, env={}).input_history is True
+    off = _make_workspace(tmp_path / "off", "[hailer]\ninput_history = false\n")
+    config = load_config(workspace=off, env={})
+    assert config.input_history is False
+    assert validate(config) == [], "a known key: no unknown-key warning"
+    bad = _make_workspace(tmp_path / "bad", '[hailer]\ninput_history = "no"\n')
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(workspace=bad, env={})
+    assert "[hailer].input_history in" in str(excinfo.value)
+    assert 'must be true or false, not "no" (str)' in str(excinfo.value)
+    assert excinfo.value.hint == "Write input_history = true or input_history = false (no quotes)."
+
+
+def test_template_documents_input_history_commented_out() -> None:
+    import tomllib
+
+    assert "\n# input_history = true " in DEFAULT_CONFIG_TEMPLATE and ".hailer/input_history" in DEFAULT_CONFIG_TEMPLATE
+    assert "input_history" not in tomllib.loads(DEFAULT_CONFIG_TEMPLATE)["hailer"], "on by default, so only shown"
+
+
 def test_provider_stream_switches_default_to_on(tmp_path: Path) -> None:
     ws = _make_workspace(
         tmp_path,

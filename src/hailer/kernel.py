@@ -185,7 +185,8 @@ def kernel_environment(config: HailerConfig, environ: Mapping[str, str]) -> dict
 
 
 def describe_runtime(kernel: KernelConfig) -> str:
-    """The text after ``Kernel:`` in the startup panel, ``hailer status`` and ``/status``."""
+    """How the kernel runs, in words: ``hailer status``, ``/status``, ``--foreground`` and the
+    ``marimo_status`` tool show it."""
     if kernel.runtime == KERNEL_RUNTIME_UNSAFE_LOCAL:
         return "unsafe-local (runs as you; not isolated)"
     if kernel.runtime == KERNEL_RUNTIME_DOCKER:

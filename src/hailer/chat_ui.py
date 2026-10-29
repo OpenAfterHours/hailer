@@ -3,39 +3,335 @@
 Only the writer task touches the transcript while the application is running.
 The controller can keep using synchronous ``console.print`` calls (including
 from a notebook worker thread); the facade queues them for that writer.
+
+The composer is a rounded frame whose colour says the state (cyan ready, grey busy or starting,
+red when startup failed), with key hints in its bottom border. While work runs, a live row above
+it shows the step in progress in the columns its finished row will use; a footer below it shows
+the notebook, the kernel, the model and usage. ``/`` opens the command menu between the frame and
+the footer (:mod:`hailer.completion`); history can persist across sessions (:mod:`hailer.input_history`).
+Every row but the composer's is one window that draws its whole line, so a redraw stays cheap (the
+spinner redraws often during a turn).
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import threading
+import time
 from collections import deque
 from collections.abc import Awaitable, Callable
 from contextlib import contextmanager
-from typing import Any
+from pathlib import Path
+from typing import Any, ClassVar
 
 from prompt_toolkit.application import Application, run_in_terminal
-from prompt_toolkit.history import InMemoryHistory
-from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import HSplit, Layout, Window
+from prompt_toolkit.auto_suggest import AutoSuggestFromHistory, ThreadedAutoSuggest
+from prompt_toolkit.filters import Condition
+from prompt_toolkit.formatted_text.utils import fragment_list_width
+from prompt_toolkit.key_binding import KeyBindings, merge_key_bindings
+from prompt_toolkit.key_binding.bindings.auto_suggest import load_auto_suggest_bindings
+from prompt_toolkit.layout import ConditionalContainer, HSplit, Layout, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.layout.margins import Margin
+from prompt_toolkit.layout.processors import Processor, Transformation, TransformationInput
 from prompt_toolkit.output import create_output
 from prompt_toolkit.styles import Style
-from prompt_toolkit.widgets import Frame, TextArea
-from rich.console import Console
-from rich.markdown import Markdown
+from prompt_toolkit.utils import get_cwidth
+from prompt_toolkit.widgets import TextArea
+from rich.cells import cell_len
+from rich.console import Console, ConsoleOptions, RenderableType, RenderResult
+from rich.markdown import BlockQuote, CodeBlock, Heading, ListItem, Markdown, Paragraph, TableElement
+from rich.segment import Segment
+from rich.syntax import Syntax
+from rich.table import Table
 from rich.text import Text
+from rich.theme import Theme
 
+from hailer.completion import RUN_ON_ENTER, SlashCompleter, enter_action, menu_fragments, menu_height, menu_open
+from hailer.input_history import input_history
 from hailer.log import redact
-from hailer.models import AgentEvent
+from hailer.models import KERNEL_RUNTIME_DOCKER, KERNEL_RUNTIME_UNSAFE_LOCAL, AgentEvent, CompletionData, TurnSummary
 from hailer.session import EXIT_COMMANDS, parse_command
+from hailer.steps import Receipt, StepTracker
+from hailer.text import clean_reply, fit, plural, single_line
+from hailer.transcript import (
+    ACCENT,
+    LABEL_WIDTH,
+    MUTED,
+    SESSION_LABEL_WIDTH,
+    UNICODE,
+    FooterData,
+    Glyphs,
+    Gutter,
+    callout,
+    console_glyphs,
+    seconds,
+    simple_head,
+    step_row,
+    tokens,
+    turn_footer,
+    turn_stats,
+    user_message,
+)
+
+# ChatUI's own activity strings (and the controller's) in the live row's words; "" hides the row.
+_LABELS = {
+    "Ready": "",
+    "Working...": "Working",
+    "Thinking...": "Thinking",
+    "Preparing chat...": "Starting",
+    "Cancelling...": "Cancelling",
+}
+_FRAME_SECONDS = 0.08  # spinner frame, and the redraw interval during a turn
+# While the chat prepares, agent imports run on a worker thread and every redraw takes the GIL from
+# them (LEARNINGS §10): nothing animates then, the live row's timer redraws once a second.
+_STARTUP_TICK_SECONDS = 1.0
+_FLASH_SECONDS = 2.5
+# During a turn Esc alone cancels (and with the command menu open it closes the menu), so it must act
+# quickly: ttimeoutlen for the terminal to finish an escape sequence (arrows arrive in one write),
+# timeoutlen for an Enter that makes it Esc Enter. Otherwise prompt_toolkit's own, longer timeouts
+# stay, so a slow Esc, Enter is still a newline.
+_TURN_TIMEOUTS = (0.1, 0.3)
+
+_STYLE = Style.from_dict({
+    "frame.idle": "ansicyan",
+    "frame.busy": "ansibrightblack",
+    "frame.failed": "ansired",
+    "prompt.idle": "ansicyan bold",
+    "prompt.busy": "ansibrightblack",
+    "placeholder": "ansibrightblack",
+    "auto-suggestion": "ansibrightblack",
+    "spinner": "ansicyan",
+    "activity": "",
+    "muted": "ansibrightblack",
+    "hint": "ansibrightblack",
+    "hint.flash": "ansiyellow",
+    "ok": "ansigreen",
+    "warn": "ansiyellow",
+    # The command menu. Not "menu.*": prompt_toolkit's default style paints those grey.
+    "palette.pick": "ansicyan bold",
+    "palette.name": "",
+    "palette.name.current": "ansicyan bold",
+    "palette.meta": "ansibrightblack",
+})
 
 
-def _single_line(text: str) -> str:
-    """Keep externally supplied labels from adding terminal controls or rows."""
-    return " ".join("".join(c for c in text if c.isprintable() or c.isspace()).split())
+def _hanging(text: str) -> RenderableType | str:
+    """A plain one-line string that starts with spaces, as a renderable whose wrapped lines keep
+    that indent."""
+    body = text.lstrip(" ")
+    indent = len(text) - len(body)
+    return Gutter(Text(body), " " * indent) if indent and body and "\n" not in text else text
+
+
+def _label(text: str) -> str:
+    text = single_line(text)
+    return _LABELS.get(text, text.removesuffix("...").removesuffix("…"))
+
+
+# --------------------------------------------------------------------------- #
+# The reply's typography
+# --------------------------------------------------------------------------- #
+
+# ANSI names only, so the terminal's theme (light or dark) decides the colours.
+_REPLY_THEME = Theme({
+    "markdown.h1": "bold",
+    "markdown.h2": "bold",
+    "markdown.h3": "bold",
+    "markdown.h4": "bold",
+    "markdown.code": ACCENT,
+    "markdown.link": "cyan underline",
+    "markdown.link_url": MUTED,
+    "markdown.item.bullet": MUTED,
+    "markdown.item.number": MUTED,
+    "markdown.block_quote": "italic",
+    "markdown.hr": MUTED,
+    "markdown.table.header": "bold",
+    "markdown.table.border": MUTED,
+})
+
+
+class _Heading(Heading):
+    LEVEL_ALIGN: ClassVar[dict[str, Any]] = {}  # Rich centres h1; a reply reads left to right
+
+
+class _Code(CodeBlock):
+    """A fenced block behind a thin rule, its language above it; no background."""
+
+    glyphs: Glyphs = UNICODE
+
+    @classmethod
+    def create(cls, markdown: Any, token: Any) -> _Code:
+        block = super().create(markdown, token)
+        block.glyphs = getattr(markdown, "glyphs", UNICODE)
+        return block  # type: ignore[return-value]
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        code = str(self.text).rstrip()
+        syntax = Syntax(code, self.lexer_name, theme="ansi_dark", word_wrap=True, background_color="default")
+        if self.lexer_name not in ("", "text", "default"):
+            yield Text(self.lexer_name, style=MUTED)
+        yield Gutter(syntax, f"{self.glyphs.bar} ", style=MUTED)
+
+
+class _Table(TableElement):
+    """A table with only a rule under its header, keeping each column's alignment."""
+
+    glyphs: Glyphs = UNICODE
+
+    @classmethod
+    def create(cls, markdown: Any, token: Any) -> _Table:
+        table = cls()
+        table.glyphs = getattr(markdown, "glyphs", UNICODE)
+        return table
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        table = Table(
+            box=simple_head(self.glyphs), show_edge=False, pad_edge=False,
+            border_style="markdown.table.border", header_style="markdown.table.header",
+        )
+        if self.header is not None and self.header.row is not None:
+            for cell in self.header.row.cells:
+                justify = cell.content.justify if cell.content.justify not in (None, "default") else "left"
+                table.add_column(cell.content.copy(), justify=justify, overflow="fold")  # not Rich's "…"
+        if self.body is not None:
+            for row in self.body.rows:
+                table.add_row(*(cell.content for cell in row.cells))
+        yield table
+
+
+_WORD = re.compile(r"\s*\S+\s*")
+
+
+class _Words:
+    """``text`` wrapped at words in the width it gets, like Rich's, except that a word longer than
+    the line (a URL) is not folded: it gets a line of its own, longer than the width, and the
+    terminal wraps that line, so the URL still opens and copies as one."""
+
+    def __init__(self, text: Text) -> None:
+        self.text = text
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        width = options.max_width
+        for paragraph in self.text.split("\n", allow_blank=True):
+            offsets, used = [], 0
+            for word in _WORD.finditer(paragraph.plain):
+                size = cell_len(word.group().rstrip())
+                if used and used + size > width:
+                    offsets.append(word.start())
+                    used = 0
+                used += cell_len(word.group())
+            for line in paragraph.divide(offsets):
+                line.rstrip()
+                yield from line.render(console)
+                yield Segment.line()
+
+
+class _Paragraph(Paragraph):
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        yield _Words(self.text)
+
+
+def _beside(console: Console, options: ConsoleOptions, elements: Any, first: Segment, rest: Segment, style: Any) -> RenderResult:
+    """``elements`` laid out narrower behind ``first`` (then ``rest``) like Rich's list items and
+    quotes, but not cropped: a word a reply keeps whole (a URL) reaches the terminal whole."""
+    width = options.max_width - cell_len(first.text)
+    rendered = console.render(elements, options.update(width=width))
+    if style:
+        rendered = Segment.apply_style(rendered, style)
+    for index, line in enumerate(Segment.split_lines(rendered)):
+        yield first if index == 0 else rest
+        yield from line
+        yield Segment.line()
+
+
+class _ListItem(ListItem):
+    """A list item behind the glyph set's bullet (Rich's ``•`` is a ``?`` on an ASCII console)."""
+
+    glyphs: Glyphs = UNICODE
+
+    @classmethod
+    def create(cls, markdown: Any, token: Any) -> _ListItem:
+        item = cls()
+        item.glyphs = getattr(markdown, "glyphs", UNICODE)
+        return item
+
+    def render_bullet(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        style = console.get_style("markdown.item.bullet", default="none")
+        bullet = f" {self.glyphs.bullet} "
+        yield from _beside(console, options, self.elements, Segment(bullet, style), Segment(" " * cell_len(bullet), style), self.style)
+
+    def render_number(self, console: Console, options: ConsoleOptions, number: int, last_number: int) -> RenderResult:
+        width = len(str(last_number)) + 2
+        style = console.get_style("markdown.item.number", default="none")
+        numeral = Segment(f"{number}".rjust(width - 1) + " ", style)
+        yield from _beside(console, options, self.elements, numeral, Segment(" " * width, style), self.style)
+
+
+class _Quote(BlockQuote):
+    """A block quote behind the glyph set's bar."""
+
+    glyphs: Glyphs = UNICODE
+
+    @classmethod
+    def create(cls, markdown: Any, token: Any) -> _Quote:
+        quote = cls()
+        quote.glyphs = getattr(markdown, "glyphs", UNICODE)
+        return quote
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        bar = Segment(f"{self.glyphs.user} ", self.style)
+        yield from _beside(console, options, self.elements, bar, bar, self.style)
+
+
+class ReplyMarkdown(Markdown):
+    """Rich Markdown with left-aligned headings, simple tables, quiet code and the glyph set's
+    bullets. A word longer than the line (a URL) is never cut: it gets a line of its own, which the
+    terminal wraps, so it still opens and copies as one."""
+
+    elements: ClassVar[dict[str, type[Any]]] = {
+        **Markdown.elements, "heading_open": _Heading, "fence": _Code, "code_block": _Code, "table_open": _Table,
+        "paragraph_open": _Paragraph, "list_item_open": _ListItem, "blockquote_open": _Quote,
+    }
+
+    def __init__(self, markup: str, glyphs: Glyphs = UNICODE) -> None:
+        self.glyphs = glyphs
+        super().__init__(markup)
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        # Rendered whole while the reply's theme is in place, so no other output sees it.
+        with console.use_theme(_REPLY_THEME):
+            lines = list(Segment.split_lines(console.render(_Plain(super().__rich_console__(console, options)), options)))
+        while lines and not "".join(segment.text for segment in lines[0]).strip():
+            lines.pop(0)  # Rich starts a table (and so a reply that opens with one) with a blank line
+        for line in lines:
+            yield from line
+            yield Segment.line()
+
+
+class _Plain:
+    """Render an already-made render result (a generator) as a renderable."""
+
+    def __init__(self, result: RenderResult) -> None:
+        self.result = result
+
+    def __rich_console__(self, _console: Console, _options: ConsoleOptions) -> RenderResult:
+        yield from self.result
+
+
+def reply(glyphs: Glyphs, markdown: str) -> RenderableType:
+    """The final answer behind the reply mark, without escape sequences or control characters."""
+    final = clean_reply(markdown).strip()
+    body: RenderableType = ReplyMarkdown(final, glyphs) if final else Text("(no reply)", style=MUTED)
+    return Gutter(body, f"{glyphs.reply} ", style=ACCENT)
+
+
+# --------------------------------------------------------------------------- #
+# Terminal plumbing
+# --------------------------------------------------------------------------- #
 
 
 class _PersistentPasteOutput:
@@ -81,7 +377,7 @@ class _PersistentPasteOutput:
 
 
 class _Status:
-    """The small subset of Rich Status used by existing slash commands."""
+    """The small subset of Rich Status used by existing slash commands: it drives the live row."""
 
     def __init__(self, ui: ChatUI, status: Any) -> None:
         self.ui = ui
@@ -114,10 +410,10 @@ class _QueuedConsole:
         return getattr(self._console, name)
 
     def print(self, *objects: Any, **kwargs: Any) -> None:
-        self._ui._enqueue(lambda: self._console.print(*objects, **kwargs))
+        self._ui._write(objects, kwargs)
 
     def clear(self, *args: Any, **kwargs: Any) -> None:
-        self._ui._enqueue(lambda: self._console.clear(*args, **kwargs))
+        self._ui._enqueue(lambda: self._ui._clear_now(args, kwargs))
 
     def status(self, status: Any, **_kwargs: Any) -> _Status:
         return _Status(self._ui, status)
@@ -142,27 +438,74 @@ class _LogStream:
         pass
 
 
+class _Placeholder(Processor):
+    """Grey text in the empty composer that says what Enter would do now, on one line."""
+
+    def __init__(self, text: Callable[[], str], ellipsis: str) -> None:
+        self.text = text
+        self.ellipsis = ellipsis
+
+    def apply_transformation(self, ti: TransformationInput) -> Transformation:
+        if ti.document.text or ti.lineno != 0:
+            return Transformation(ti.fragments)
+        text, room = self.text(), ti.width - 3  # the prompt takes two cells, and a full line would wrap
+        if get_cwidth(text) > room:
+            text = fit(text, room, self.ellipsis, width=get_cwidth) if room > 4 else ""
+        return Transformation([*ti.fragments, ("class:placeholder", text)])
+
+
+class _FrameSide(Margin):
+    """A side of the composer's frame (``"│ "`` or ``" │"``) beside every line, in the frame's colour."""
+
+    def __init__(self, ui: ChatUI, text: str) -> None:
+        self.ui = ui
+        self.text = text
+
+    def get_width(self, get_ui_content: Callable[[], Any]) -> int:
+        return get_cwidth(self.text)
+
+    def create_margin(self, window_render_info: Any, width: int, height: int) -> list[tuple[str, str]]:
+        style = self.ui._border_style()
+        fragments: list[tuple[str, str]] = []
+        for row in range(height):
+            fragments += [("", "\n")] if row else []
+            fragments.append((style, self.text))
+        return fragments
+
+
+# --------------------------------------------------------------------------- #
+# The composer
+# --------------------------------------------------------------------------- #
+
+
 class ChatUI:
     """One live composer and at most one asynchronous command or model turn.
 
     ``on_submit`` owns session work and expected error presentation. Cancellation
     propagates back here only after controller/agent cleanup, so a fresh request
-    cannot overlap it. ``context`` supplies a short, current context strip.
+    cannot overlap it. ``footer`` returns the footer's :class:`~hailer.transcript.FooterData`;
+    it is called on every redraw, so it must only read state the controller already has. So must
+    ``completions`` (the command menu's arguments; ``None``: commands only), read while a slash
+    command is typed. ``history_file``: where Up's history persists (``None``: this session only).
     """
 
     def __init__(
         self,
         console: Console,
         on_submit: Callable[[str], Awaitable[None]],
-        context: Callable[[], str],
+        footer: Callable[[], FooterData],
         *,
         pt_input: Any = None,
         pt_output: Any = None,
+        completions: Callable[[], CompletionData] | None = None,
+        history_file: Path | None = None,
     ) -> None:
         self._raw_console = console
         self.console = _QueuedConsole(self, console)
         self._on_submit = on_submit
-        self._context = context
+        self._footer = footer
+        #: One symbol set for the transcript and the composer (ASCII when the console cannot encode Unicode).
+        self.glyphs = console_glyphs(console)
         self._queue: asyncio.Queue[Callable[[], None] | None] = asyncio.Queue()
         self._pending: deque[Callable[[], None]] = deque()
         self._pending_lock = threading.Lock()
@@ -172,6 +515,7 @@ class ChatUI:
         self._writer_error: BaseException | None = None
         self._active_task: asyncio.Task[None] | None = None
         self._startup_task: asyncio.Task[None] | None = None
+        self._ticker: asyncio.Task[None] | None = None
         self._prepare: Callable[[], Awaitable[bool]] | None = None
         self._on_input_ready: Callable[[], None] | None = None
         self._preparing = False
@@ -181,53 +525,83 @@ class ChatUI:
         self._executing = False
         self._cancelling = False
         self._exit_requested = False
-        self.activity = "Ready"
+        # The live row: the activity label (when no step runs) and since when; the turn's steps.
+        self._label = ""
+        self._label_since = time.monotonic()
+        self._steps = StepTracker()
+        self._steps_cancelled = False
+        # Session work in progress (startup's notebook and agent, a notebook switch): (label, detail,
+        # since) in the order begun; the latest is shown, in the session rows' columns, when no step
+        # runs (at startup the agent begins first and the notebook, which the user acts on, next).
+        self._tasks: dict[object, tuple[str, str, float]] = {}
+        self._submitted_at = time.monotonic()
+        self._flash: tuple[str, float] | None = None
+        self._wake = asyncio.Event()  # the ticker's sleep, cut short when a turn starts
+        # What the transcript ends with ("blank", "row" or "text"), tracked by the writer itself.
+        self._tail = "blank"
         self._output = _PersistentPasteOutput(pt_output or create_output())
 
+        self._completer = SlashCompleter(completions)
         self.composer = TextArea(
             multiline=True,
-            history=InMemoryHistory(),
+            # A file's history is read on a worker thread at the first render and written on another.
+            history=input_history(history_file),
+            completer=self._completer,
+            complete_while_typing=Condition(lambda: self.buffer.text.startswith("/")),
+            auto_suggest=ThreadedAutoSuggest(AutoSuggestFromHistory()),  # searched off the UI loop
             height=Dimension(min=1, max=6),
             dont_extend_height=True,
             wrap_lines=True,
+            get_line_prefix=self._line_prefix,
+            input_processors=[_Placeholder(self._placeholder, self.glyphs.ellipsis)],
         )
         self.buffer = self.composer.buffer
-        context_line = Window(
-            FormattedTextControl(lambda: [("class:context", _single_line(self._context()))]),
-            height=1,
-        )
-        activity_line = Window(
-            FormattedTextControl(lambda: [("class:activity", self.activity)]), height=1,
-        )
-        help_line = Window(
-            FormattedTextControl(
-                "Enter send | Alt+Enter newline | /help commands | Ctrl+C cancel/exit"
-            ),
-            height=1,
-            style="class:help",
-        )
         self.application: Application[None] = Application(
-            layout=Layout(HSplit([context_line, activity_line, Frame(self.composer), help_line])),
-            key_bindings=self._key_bindings(),
+            layout=Layout(self._container(), focused_element=self.composer),
+            # → (and Ctrl+E, Ctrl+F) at the end of the draft takes the grey suggestion from history.
+            key_bindings=merge_key_bindings([load_auto_suggest_bindings(), self._key_bindings()]),
             full_screen=False,
             mouse_support=False,
             erase_when_done=True,
             input=pt_input,
             output=self._output,
             after_render=self._after_render,
-            style=Style.from_dict({
-                "context": "ansibrightblack",
-                "activity": "ansicyan",
-                "help": "ansibrightblack",
-                "frame.border": "ansibrightblack",
-            }),
+            style=_STYLE,
         )
+        self._idle_timeouts = (self.application.ttimeoutlen, self.application.timeoutlen)
+
+    # -- state --------------------------------------------------------------- #
 
     @property
     def busy(self) -> bool:
         return (
             self._active_task is not None and not self._active_task.done()
         ) or (self._preparing and self._pending_submission is not None)
+
+    @property
+    def activity(self) -> str:
+        """What the live row says is happening ("" while idle): the oldest running step's verb, else
+        the latest session task's label (:meth:`begin_task`), else the latest activity
+        (``set_activity`` or a ``status`` event)."""
+        current = self._steps.current()
+        if current is not None:
+            return current[0].live
+        return next(reversed(self._tasks.values()))[0] if self._tasks else self._label
+
+    @property
+    def flash_text(self) -> str:
+        """The short hint shown in the frame's border instead of the key hints, or ""."""
+        if self._flash is not None and time.monotonic() < self._flash[1]:
+            return self._flash[0]
+        return ""
+
+    def _state(self) -> str:
+        if self._startup_failed:
+            return "failed"
+        return "busy" if self.busy or self._preparing else "idle"
+
+    def _moving(self) -> bool:
+        return self.busy or self._preparing
 
     def configure_startup(
         self,
@@ -246,6 +620,7 @@ class ChatUI:
         self.set_activity("Preparing chat...")
 
     def _after_render(self, _application: Any) -> None:
+        self._sync_timeouts()  # the menu may have opened or closed
         if self._input_ready:
             return
         self._input_ready = True
@@ -253,6 +628,7 @@ class ChatUI:
             self._on_input_ready()
         if self._prepare is not None:
             self._startup_task = asyncio.create_task(self._prepare_chat())
+        self._animate()
 
     async def _prepare_chat(self) -> None:
         assert self._prepare is not None
@@ -263,20 +639,24 @@ class ChatUI:
             # A startup operation can itself be cancelled; do not leave the
             # composer waiting forever for a readiness signal that cannot come.
             if not self._exit_requested:
-                self.console.print("Chat preparation cancelled.", markup=False)
+                self.console.print(callout(self.glyphs, "warn", "Chat preparation cancelled."))
                 self.exit()
             raise
         except Exception as exc:
-            self.console.print(f"Unexpected error: {type(exc).__name__}: {exc}", style="red", markup=False)
+            self.console.print(callout(self.glyphs, "fail", f"Unexpected error: {type(exc).__name__}: {exc}"))
         finally:
             self._preparing = False
+            self._flash = None  # a "queued" hint is over either way
         if self._exit_requested:
             return
+        self.gap()  # the startup rows end with a blank line, as a turn does
         self._startup_failed = not ready
         if not ready:
-            self.set_activity("Chat preparation failed. Your draft is kept; /exit to leave.")
+            self.set_activity("Ready")
             if self._pending_submission is not None:
-                self.console.print("Your queued message was not sent and is kept in history (Up to recall).", markup=False)
+                self.console.print(
+                    Text("Your queued message was not sent and is kept in history (Up to recall).", style=MUTED)
+                )
             return
         if self._pending_submission is not None:
             text, self._pending_submission = self._pending_submission, None
@@ -284,16 +664,48 @@ class ChatUI:
         else:
             self.set_activity("Ready")
 
+    # -- keys ---------------------------------------------------------------- #
+
     def _key_bindings(self) -> KeyBindings:
         bindings = KeyBindings()
+        menu = Condition(self._menu_open)
 
         @bindings.add("enter")
-        def submit(_event: Any) -> None:
-            self.submit()
+        def enter(_event: Any) -> None:
+            self._enter()
+
+        # The command menu: Up/Down (auto_up/auto_down below) and Tab/Shift+Tab choose, Enter acts
+        # as _enter says, Esc closes it, even during a turn (Esc cancels only once it is closed).
+
+        @bindings.add("tab", filter=menu)
+        def next_item(event: Any) -> None:
+            event.current_buffer.complete_next()
+
+        @bindings.add("s-tab", filter=menu)
+        def previous_item(event: Any) -> None:
+            event.current_buffer.complete_previous()
+
+        @bindings.add("tab", filter=~menu)
+        def open_menu(event: Any) -> None:
+            event.current_buffer.start_completion(select_first=False)
+
+        @bindings.add("escape", filter=menu)
+        def close_menu(event: Any) -> None:
+            event.current_buffer.cancel_completion()
 
         @bindings.add("escape", "enter")
         def newline(event: Any) -> None:
             event.current_buffer.insert_text("\n")
+
+        @bindings.add("c-j")
+        def ctrl_j(event: Any) -> None:
+            # A newline key that never involves Esc (terminals without Option as Meta).
+            event.current_buffer.insert_text("\n")
+
+        @bindings.add("escape", filter=~menu & Condition(lambda: self.busy))
+        def escape(_event: Any) -> None:
+            # The same path as Ctrl+C during work; while idle Esc does nothing.
+            self.cancel()
 
         @bindings.add("up")
         def up(event: Any) -> None:
@@ -308,14 +720,12 @@ class ChatUI:
             if self.busy:
                 self.cancel()
             else:
-                self.console.print("Bye.", markup=False)
                 self.exit()
 
         @bindings.add("c-d")
         def eof(event: Any) -> None:
             if not event.current_buffer.text:
                 if not self.busy or self._preparing:
-                    self.console.print("Bye.", markup=False)
                     self.exit()
             else:
                 event.current_buffer.delete()
@@ -326,6 +736,33 @@ class ChatUI:
 
         return bindings
 
+    def _menu_open(self) -> bool:
+        return menu_open(self.buffer)
+
+    def _enter(self) -> None:
+        """Enter: a menu item the user chose (arrows or Tab) is written, and run when it takes no
+        arguments. Without a choice, a slash draft that is not yet a whole command is completed to
+        the first item and nothing runs; everything else is submitted as typed."""
+        state = self.buffer.complete_state
+        if state is not None and state.complete_index is not None and state.current_completion is not None:
+            self.buffer.apply_completion(state.current_completion)
+            if self.buffer.text.strip() in RUN_ON_ENTER:
+                self.submit()
+            return
+        pick = self._completer.enter_pick(self.buffer.document)
+        if pick is None:
+            self.submit()
+        else:
+            self.buffer.apply_completion(pick)
+
+    def _sync_timeouts(self) -> None:
+        """Short key timeouts while a lone Esc acts (a turn runs, or the menu is open), so it acts at
+        once; prompt_toolkit's own otherwise, so a slow Esc, Enter is still a newline."""
+        quick = self._executing or self._menu_open()
+        self.application.ttimeoutlen, self.application.timeoutlen = _TURN_TIMEOUTS if quick else self._idle_timeouts
+
+    # -- submissions ----------------------------------------------------------- #
+
     def submit(self) -> None:
         """Submit the draft once, retaining it unchanged if work is still active."""
         text = self.buffer.text.strip()
@@ -333,51 +770,70 @@ class ChatUI:
         if (self._preparing or self._startup_failed) and (
             text.startswith("\x1a") or command is not None and command.name in EXIT_COMMANDS
         ):
-            self.console.print("Bye.", markup=False)
             self.exit()
             return
+        g = self.glyphs
         if self.busy:
-            self.set_activity(
-                "Preparing chat. First message queued; your draft is kept."
-                if self._preparing else "Still working. Ctrl+C cancels; your draft is kept."
+            self.flash(
+                g.join("Starting up", "your first message is queued", "your draft is kept")
+                if self._preparing else g.join("Still working", "esc cancels", "your draft is kept")
             )
             return
         if self._startup_failed:
-            self.set_activity("Chat preparation failed. Your draft is kept; /exit to leave.")
+            self.flash(g.join("Startup failed", "your draft is kept", "/exit to leave"))
             return
         if text.startswith("\x1a"):
-            self.console.print("Bye.", markup=False)
             self.exit()
             return
         if not text:
             return
         self.buffer.reset(append_to_history=True)
-        self.console.print(Text("You", style="bold cyan"))
-        self.console.print(text, markup=False)
+        self.gap()
+        self.console.print(user_message(g, text))
         self.console.print()
         if self._preparing:
             self._pending_submission = text
-            self.set_activity("Preparing chat. First message queued; you can keep typing.")
+            self.flash(g.join("Queued", "it sends once startup finishes"))
             return
         self._launch_submission(text)
 
     def _launch_submission(self, text: str) -> None:
         self._cancelling = False
         self._executing = True
+        self._steps = StepTracker()
+        self._steps_cancelled = False
+        self._submitted_at = time.monotonic()
+        self._sync_timeouts()
         self.set_activity("Thinking..." if not text.startswith("/") else "Working...")
         self._active_task = asyncio.create_task(self._submit(text))
+        self._animate()
+        self._wake.set()  # a ticker left from startup redraws at the turn's pace now
 
     async def _submit(self, text: str) -> None:
         try:
             await self._on_submit(text)
         except asyncio.CancelledError:
-            self.console.print("Interrupted.", markup=False)
+            self._on_ui_thread(self._report_cancelled)
         except Exception as exc:  # Controller normally formats its own errors.
-            self.console.print(f"Unexpected error: {type(exc).__name__}: {exc}", style="red", markup=False)
+            message = f"Unexpected error: {type(exc).__name__}: {exc}"
+
+            def report() -> None:
+                self._settle_steps()
+                self.console.print(callout(self.glyphs, "fail", message))
+
+            self._on_ui_thread(report)
         finally:
             self._executing = False
+
+            def settle() -> None:
+                self._settle_steps()  # steps a failed turn left open: effect unknown
+                self.gap()
+
+            self._on_ui_thread(settle)
             await self.flush()
             self._cancelling = False
+            self._flash = None  # "Still working" is over
+            self._sync_timeouts()
             self.set_activity("Ready")
             if self._exit_requested:
                 self._exit_application()
@@ -387,11 +843,16 @@ class ChatUI:
             text, self._pending_submission = self._pending_submission, None
             if not self.buffer.text:
                 self.buffer.insert_text(text)
-            self.console.print("Queued message cancelled before sending; kept in history (Up to recall).", markup=False)
+            self.console.print(
+                Text("Queued message cancelled before sending; kept in history (Up to recall).", style=MUTED)
+            )
             self.set_activity("Preparing chat...")
             return
         if self.busy and self._executing and not self._cancelling:
             self._cancelling = True
+            # The running steps end here for the user: the calls may still finish (and change the
+            # notebook), so their rows say the effect is unknown.
+            self._on_ui_thread(self._cancel_steps)
             self.set_activity("Cancelling...")
             assert self._active_task is not None
             # Give a just-created task its first tick so its cancellation and
@@ -421,27 +882,380 @@ class ChatUI:
             # terminal fails while writing the farewell.
             self._enqueue(self._exit_application)
 
+    # -- what the controller and the agent report -------------------------------- #
+
     def set_activity(self, text: str) -> None:
         def update() -> None:
-            self.activity = _single_line(text)
+            self._label = _label(text)
+            self._label_since = time.monotonic()
+            self._animate()
             self.application.invalidate()
 
         self._on_ui_thread(update)
 
-    def on_event(self, event: AgentEvent) -> None:
-        if event.kind == "message_delta":
-            self.set_activity("Writing reply...")
-        elif event.kind == "tool_call":
-            self.set_activity(f"Using: {event.text}")
-        elif event.kind == "status" and event.text:
-            self.set_activity(event.text)
+    def begin_task(self, key: object, label: str, detail: str = "") -> None:
+        """Show session work (``Notebook  opening analysis.py in your browser``) on the live row, in
+        the session rows' columns, until :meth:`end_task` with the same ``key``; from any thread.
+        Begun again, it keeps its start time and place. The latest task is shown; a running step
+        goes first."""
 
-    def finish(self, final_response: str) -> None:
-        """Commit the completed answer once; event deltas only affect activity."""
-        self.console.print(Text("Hailer", style="bold"))
-        final = (final_response or "").strip()
-        self.console.print(Markdown(final) if final else Text("(no reply)", style="dim"))
+        def update() -> None:
+            since = self._tasks[key][2] if key in self._tasks else time.monotonic()
+            self._tasks[key] = (single_line(label), single_line(detail), since)
+            self._animate()
+            self.application.invalidate()
+
+        self._on_ui_thread(update)
+
+    def end_task(self, key: object) -> None:
+        def update() -> None:
+            self._tasks.pop(key, None)
+            self.application.invalidate()
+
+        self._on_ui_thread(update)
+
+    def flash(self, text: str, seconds: float = _FLASH_SECONDS) -> None:
+        """Show ``text`` in place of the key hints for a moment (the activity stays as it is)."""
+
+        def update() -> None:
+            self._flash = (single_line(text), time.monotonic() + seconds)
+            self.application.invalidate()
+            if self._loop is not None:
+                self._loop.call_later(seconds + 0.05, self._redraw)  # one redraw takes it away
+
+        self._on_ui_thread(update)
+
+    def _redraw(self) -> None:
+        if self.application.is_running:
+            self.application.invalidate()
+
+    def on_event(self, event: AgentEvent) -> None:
+        """A step starts on ``tool_call`` (keyed by its id) and is committed as one row on its
+        ``tool_result``; deltas only change the live row; the answer is printed by ``finish``."""
+        self._on_ui_thread(lambda: self._event(event))
+
+    def _event(self, event: AgentEvent) -> None:
+        if self._cancelling:
+            return  # the open steps are already shown as cancelled and the row says "Cancelling"
+        if event.kind == "tool_call":
+            self._steps.call(event)
+        elif event.kind == "tool_result":
+            receipt = self._steps.result(event)
+            if receipt is not None:
+                self._commit(receipt)
+            if not self._steps.running:
+                self._set_label("Thinking")
+        elif event.kind == "message_delta":
+            if self._label != "Writing the answer":
+                self._set_label("Writing the answer")
+        elif event.kind == "status" and event.text:
+            self._set_label(event.text)
+        self._animate()
+        self.application.invalidate()
+
+    def _set_label(self, text: str) -> None:
+        self._label = _label(text)
+        self._label_since = time.monotonic()
+
+    def _commit(self, receipt: Receipt) -> None:
+        self._write((step_row(self.glyphs, receipt),), {}, kind="row")
+
+    def settle_steps(self) -> None:
+        """End the steps still open as "no result, effect unknown": the controller calls it when a
+        turn fails, before it prints the error, so the rows come first."""
+        self._on_ui_thread(self._settle_steps)
+
+    def _settle_steps(self) -> None:
+        for receipt in self._steps.finish():
+            self._commit(receipt)
+
+    def _cancel_steps(self) -> None:
+        receipts = self._steps.cancel()
+        self._steps_cancelled = self._steps_cancelled or bool(receipts)
+        for receipt in receipts:
+            self._commit(receipt)
+
+    def _report_cancelled(self) -> None:
+        self._cancel_steps()
+        hints = ["The conversation continues; the model is told the last step's effect is unknown."] if self._steps_cancelled else []
+        self._write((callout(self.glyphs, "warn", "Cancelled.", hints),), {}, kind="attached")
+
+    def finish(self, summary: TurnSummary) -> None:
+        """Commit the completed answer once, then the turn's steps, time and tokens; event deltas
+        only affect the live row."""
+        self._on_ui_thread(lambda: self._finish(summary))
+
+    def _finish(self, summary: TurnSummary) -> None:
+        self._settle_steps()
+        g = self.glyphs
+        elapsed = summary.duration_ms / 1000 if summary.duration_ms is not None else time.monotonic() - self._submitted_at
+        stats = turn_stats(
+            g, steps=summary.steps, elapsed=elapsed, input_tokens=summary.input_tokens, output_tokens=summary.output_tokens,
+        )
+        footer = self._footer_data()
+        self.gap()
+        self.console.print(reply(g, summary.final_response))
         self.console.print()
+        self.console.print(turn_footer(g, stats, single_line(footer.notebook), footer.notebook_url))
+        self.console.print()
+
+    # -- the transcript writer ---------------------------------------------------- #
+
+    def gap(self) -> None:
+        """A blank line, unless the transcript already ends with one."""
+        self._enqueue(lambda: self._print_now((), {}, "gap"))
+
+    def _write(self, objects: tuple[Any, ...], kwargs: dict[str, Any], kind: str = "text") -> None:
+        self._enqueue(lambda: self._print_now(objects, kwargs, kind))
+
+    def _print_now(self, objects: tuple[Any, ...], kwargs: dict[str, Any], kind: str) -> None:
+        """Print on the writer, in transcript order. ``kind``: "row" (a step), "attached" (follows
+        steps directly), "gap" (a blank unless there is one) or "text" (a blank line first when it
+        follows steps).
+
+        Rich wraps what the composer prints at word boundaries inside the terminal width, so
+        gutters indent wrapped lines, and so does a plain indented line (an error's hints). The
+        console itself stays soft-wrapped for plain mode and pipes. A string with a URL is printed
+        soft-wrapped: Rich would cut the URL into lines that no longer open or copy as one."""
+        if kind == "gap":
+            if self._tail != "blank":
+                self._raw_console.print()
+                self._tail = "blank"
+            return
+        if kind == "text" and objects and self._tail == "row":
+            self._raw_console.print()
+        if "soft_wrap" not in kwargs:
+            url = any(isinstance(item, str) and "://" in item for item in objects)
+            # crop=False: Rich lays renderables out inside the width anyway, and a line a Gutter
+            # writes whole (a URL) must reach the terminal whole.
+            kwargs = {"crop": False, **kwargs, "soft_wrap": url}
+            if not url and kwargs.get("markup") is False:
+                objects = tuple(_hanging(item) if isinstance(item, str) else item for item in objects)
+        self._raw_console.print(*objects, **kwargs)
+        self._tail = "blank" if not objects else ("row" if kind == "row" else "text")
+
+    def _clear_now(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+        self._raw_console.clear(*args, **kwargs)
+        self._tail = "blank"
+
+    # -- layout ---------------------------------------------------------------- #
+
+    def _container(self) -> HSplit:
+        # One window per row, each drawing its whole line at the terminal's width: a row of
+        # VSplits costs a width negotiation on every redraw. The frame's sides are margins of the
+        # composer's own window.
+        bar = self.glyphs.bar
+        self.composer.window.left_margins = [_FrameSide(self, f"{bar} ")]
+        self.composer.window.right_margins = [_FrameSide(self, f" {bar}")]
+
+        def row(text: Callable[[], list[tuple[str, str]]]) -> Window:
+            return Window(FormattedTextControl(text), height=1)
+
+        # The live row lines up with the step rows above it, so a running step turns into its
+        # finished row in place. It takes no space while idle.
+        live = ConditionalContainer(
+            row(self._live_line), filter=Condition(lambda: (self.busy or self._preparing) and bool(self.activity)),
+        )
+        # The command menu sits under the frame, above the footer, while it has completions.
+        menu = ConditionalContainer(
+            Window(FormattedTextControl(self._menu_rows), height=lambda: menu_height(self.buffer)),
+            filter=Condition(self._menu_open),
+        )
+        return HSplit([live, row(self._top_border), self.composer, row(self._bottom_border), menu, row(self._footer_row)])
+
+    def _menu_rows(self) -> list[tuple[str, str]]:
+        return menu_fragments(self.buffer, self.glyphs, self._columns())
+
+    def _border_style(self) -> str:
+        return f"class:frame.{self._state()}"
+
+    def _top_border(self) -> list[tuple[str, str]]:
+        tl, tr, _bl, _br = self.glyphs.corners
+        return [(self._border_style(), tl + self.glyphs.rule * max(0, self._columns() - 2) + tr)]
+
+    def _bottom_border(self) -> list[tuple[str, str]]:
+        """The frame's bottom edge with the key hints (or a flash) set into it."""
+        _tl, _tr, bl, br = self.glyphs.corners
+        style, rule = self._border_style(), self.glyphs.rule
+        hints = self._hints()
+        rest = max(0, self._columns() - 3 - fragment_list_width(hints))
+        return [(style, bl + rule), *hints, (style, rule * rest + br)]
+
+    def _line_prefix(self, line: int, wrap: int) -> list[tuple[str, str]]:
+        if line == 0 and wrap == 0:
+            return [(f"class:prompt.{'idle' if self._state() == 'idle' else 'busy'}", f"{self.glyphs.prompt} ")]
+        return [("", "  ")]
+
+    def _placeholder(self) -> str:
+        if self._startup_failed:
+            return "Startup failed; /exit to leave"
+        if self._preparing and self._pending_submission is None:
+            return "Ask about your data; your first message waits for startup"
+        if self.busy:
+            return "Draft your next message"
+        return "Ask about your data, or type / for commands"
+
+    def _live(self) -> tuple[str, str, float, int]:
+        """(label, detail, since, label width) for the live row."""
+        current = self._steps.current()
+        if current is not None:
+            step, started, others = current
+            return step.live, self.glyphs.join(step.target, f"+{others} more" if others else ""), started, LABEL_WIDTH
+        if self._tasks:
+            return (*next(reversed(self._tasks.values())), SESSION_LABEL_WIDTH)
+        return self._label, "", self._label_since, LABEL_WIDTH
+
+    def _live_line(self) -> list[tuple[str, str]]:
+        """Spinner, activity and detail in the step rows' (or session rows') columns; the timer at
+        the right edge."""
+        label, detail, since, width = self._live()
+        now = time.monotonic()
+        frames = self.glyphs.spinner
+        # While starting nothing animates: the spinner moves with the timer, once a second.
+        tick = now / _FRAME_SECONDS if self._executing else now - since
+        head = f"  {frames[int(tick) % len(frames)]} "
+        timer = seconds(now - since) if now - since >= 1 else ""
+        room = self._columns() - get_cwidth(head) - (get_cwidth(timer) + 1 if timer else 0)
+        label = label.ljust(width)
+        detail = f" {detail}" if detail else ""
+        if get_cwidth(label) > room:
+            label, detail = fit(label, max(0, room), width=get_cwidth), ""
+        elif get_cwidth(label + detail) > room:
+            detail = fit(detail, room - get_cwidth(label), self.glyphs.ellipsis, width=get_cwidth)
+        gap = max(0, room - get_cwidth(label + detail)) + (1 if timer else 0)
+        return [
+            ("class:spinner", head), ("class:activity", label), ("class:muted", detail),
+            ("", " " * gap if timer else ""), ("class:muted", timer),
+        ]
+
+    def _columns(self) -> int:
+        try:
+            return self.application.output.get_size().columns
+        except Exception:  # noqa: BLE001 - a closed terminal must not break a redraw
+            return 80
+
+    def _hints(self) -> list[tuple[str, str]]:
+        g = self.glyphs
+        flash = self.flash_text
+        if flash:
+            style, text = "class:hint.flash", flash
+        else:
+            style = "class:hint"
+            if self._menu_open():
+                text = g.join(f"{g.up_down} choose", "tab complete", f"enter {enter_action(self.buffer)}", "esc close")
+            elif self._cancelling:
+                text = "cancelling"
+            elif self.busy and self._executing:
+                text = g.join("esc cancel", "your draft is kept")
+            elif self._preparing:
+                text = g.join("starting", "your message is queued" if self._pending_submission is not None else "you can type now")
+            elif self._startup_failed:
+                text = g.join("startup failed", "/exit to leave")
+            elif self._suggesting():
+                text = g.join(f"{g.right} accept", "enter send", "alt+enter new line")
+            elif self.buffer.text:
+                text = g.join("enter send", "alt+enter new line")
+            else:
+                text = g.join("/ commands", f"{g.up} history", "ctrl+c exit")
+        room = max(0, self._columns() - 6)
+        if get_cwidth(text) > room:
+            text = fit(text, room, g.ellipsis, width=get_cwidth)
+        return [(style, f" {text} ")] if text else []
+
+    def _suggesting(self) -> bool:
+        """Whether the grey suggestion from history shows (→ takes it): at the end of the draft."""
+        suggestion = self.buffer.suggestion
+        return suggestion is not None and bool(suggestion.text) and self.buffer.document.is_cursor_at_the_end
+
+    def _footer_data(self) -> FooterData:
+        try:
+            data = self._footer()
+        except Exception:  # noqa: BLE001 - the footer must never break a redraw
+            return FooterData()
+        return data if isinstance(data, FooterData) else FooterData()
+
+    def _footer_row(self) -> list[tuple[str, str]]:
+        """Notebook, kernel and model on the left, usage (or the turn's time) on the right. When
+        the terminal is narrow, usage goes first, then the model, then a docker kernel; the
+        unsafe-local warning stays."""
+        g, data = self.glyphs, self._footer_data()
+        notebook = single_line(data.notebook)
+        warning = data.kernel == KERNEL_RUNTIME_UNSAFE_LOCAL
+        if warning:
+            kernel = [("class:warn", f"{g.warn} unsafe-local {g.sep} not isolated")]
+        elif data.kernel == KERNEL_RUNTIME_DOCKER:
+            kernel = [("class:muted", f"docker {g.sep} isolated")]
+        else:
+            kernel = [("class:muted", single_line(data.kernel))] if data.kernel else []
+        dot = {True: [("class:ok", f"{g.on} ")], False: [("class:muted", f"{g.off} ")]}.get(data.notebook_open, [])
+        groups: dict[str, list[tuple[str, str]]] = {}
+        if notebook:
+            groups["notebook"] = [*dot, ("", notebook)]
+        if kernel:
+            groups["kernel"] = kernel
+        if data.model:
+            groups["model"] = [("class:muted", single_line(data.model))]
+        if self.busy and self._executing:
+            right = [f"working {seconds(time.monotonic() - self._submitted_at)}"]
+        else:
+            right = [plural(data.turns, "turn")] + ([f"{tokens(data.tokens)} tokens"] if data.tokens else [])
+        width = self._columns() - 2
+        sep = ("class:muted", f"  {g.sep}  ")
+
+        def left() -> list[tuple[str, str]]:
+            return [part for index, group in enumerate(groups.values()) for part in ([sep] if index else []) + group]
+
+        def length(fragments: list[tuple[str, str]]) -> int:
+            return fragment_list_width(fragments)  # terminal cells, so wide characters count twice
+
+        while length(left()) + get_cwidth(g.join(*right)) + (2 if right else 0) > width:
+            if right:
+                right.pop()
+            elif "model" in groups:
+                del groups["model"]
+            elif "kernel" in groups and not warning:
+                del groups["kernel"]
+            elif "notebook" in groups:
+                room = width - (length(left()) - get_cwidth(notebook))
+                if room >= 4 and get_cwidth(notebook) > room:
+                    groups["notebook"] = [*dot, ("", fit(notebook, room, g.ellipsis, width=get_cwidth))]
+                    break
+                del groups["notebook"]
+            else:
+                break
+        tail = g.join(*right)
+        gap = max(2, width - length(left()) - get_cwidth(tail))
+        return [("", " "), *left(), ("", " " * gap if tail else ""), ("class:muted", tail)]
+
+    # -- the redraw ticker --------------------------------------------------------- #
+
+    def _animate(self) -> None:
+        """Redraw while work runs: every spinner frame during a turn, once a second while the chat
+        prepares; nothing ticks while idle (a flash schedules its own redraw)."""
+        if self._ticker is not None or self._loop is None or not self._moving():
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._ticker = asyncio.ensure_future(self._tick())
+
+    async def _tick(self) -> None:
+        try:
+            while self._moving():
+                if self.application.is_running:
+                    self.application.invalidate()
+                self._wake.clear()
+                try:
+                    await asyncio.wait_for(self._wake.wait(), _FRAME_SECONDS if self._executing else _STARTUP_TICK_SECONDS)
+                except TimeoutError:
+                    pass
+            if self.application.is_running:
+                self.application.invalidate()  # the frame, hints and live row settle
+        finally:
+            self._ticker = None
+
+    # -- the UI-thread bridge ---------------------------------------------------- #
 
     def _on_ui_thread(self, callback: Callable[[], None]) -> None:
         # Commit order before scheduling the loop notification: a worker's
@@ -528,18 +1342,32 @@ class ChatUI:
         self._drain_pending()
         if self._writer_error is not None:
             raise self._writer_error
-        if self._writer is None:
-            while not self._queue.empty():
-                callback = self._queue.get_nowait()
-                try:
-                    if callback is not None:
-                        callback()
-                finally:
-                    self._queue.task_done()
-        else:
-            await self._queue.join()
+        writer = self._writer
+        if writer is not None and not writer.done():
+            # Wait for the writer, unless it ends first: cancelled with the rest of a dying loop's
+            # tasks (asyncio.run cancels them all when the coroutine fails), it would never empty the
+            # queue, and shutdown, which refuses cancellation until it is done, would wait forever.
+            joined = asyncio.ensure_future(self._queue.join())
+            try:
+                await asyncio.wait({joined, writer}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                if not joined.done():
+                    joined.cancel()
             if self._writer_error is not None:
                 raise self._writer_error
+            if joined.done() and not joined.cancelled():
+                return
+        self._write_left_over()
+
+    def _write_left_over(self) -> None:
+        """Print what the queue still holds here: before the writer starts, or after it has ended."""
+        while not self._queue.empty():
+            callback = self._queue.get_nowait()
+            try:
+                if callback is not None:
+                    self._print_transcript(callback)
+            finally:
+                self._queue.task_done()
 
     @contextmanager
     def _route_logs(self):
@@ -595,15 +1423,23 @@ class ChatUI:
                 pass
             except Exception as exc:
                 failure = exc
+        self.gap()  # what follows the composer (the CLI's exit summary) starts after a blank line
         try:
             await self.flush()
         except Exception as exc:
             failure = failure or exc
         finally:
-            if self._writer is not None:
-                if not self._writer.done():
+            writer = self._writer
+            if writer is not None:
+                if not writer.done():
                     self._queue.put_nowait(None)
-                await self._writer
+                try:
+                    await writer
+                except asyncio.CancelledError:
+                    if not writer.cancelled():
+                        raise  # this cleanup itself was cancelled
+                    # The writer was cancelled with a dying loop's tasks: print what it left here.
+                    self._write_left_over()
                 self._writer = None
         if failure is not None:
             raise failure
@@ -637,9 +1473,12 @@ class ChatUI:
                 try:
                     await self.application.run_async(pre_run=ready, set_exception_handler=False)
                 except EOFError:
-                    self.console.print("Bye.", markup=False)
+                    pass  # input closed: the CLI's exit summary follows
                 finally:
                     await self._finish_shutdown()
         finally:
             self._loop = None
+            ticker, self._ticker = self._ticker, None
+            if ticker is not None:
+                ticker.cancel()
             self._output.close()

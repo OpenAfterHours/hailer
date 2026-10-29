@@ -83,12 +83,14 @@ _NUMBERED_RE = re.compile(r"^\s*(?:#{1,6}\s+)?\d+[.)]\s")
 
 
 def snapshot_code(*, enable_format: bool = False) -> str:
-    """Scratchpad code that prints the notebook's cells (id, name, code) as one JSON line.
+    """Scratchpad code that prints the notebook's cells (id, name, code, error) as one JSON line.
 
     It reads the notebook document rather than ``ctx.cells``: reading a cell's code there counts as
     the agent having read it, which would let a later ``edit_cell`` overwrite a change the user made
-    in the browser without the agent seeing it. ``enable_format`` also switches on code mode's
-    formatting in the kernel's memory.
+    in the browser without the agent seeing it. ``error`` is the class name of the exception a cell's
+    last run raised, from the kernel's dependency graph (what code mode's own summary reads), ``""``
+    when it did not raise. ``enable_format`` also switches on code mode's formatting in the kernel's
+    memory.
     """
     lines = [
         "import json as _json",
@@ -103,7 +105,14 @@ def snapshot_code(*, enable_format: bool = False) -> str:
             "    pass",
         ]
     lines += [
-        '_cells = [{"id": str(_c.id), "name": _c.name or "", "code": _c.code or ""} for _c in _ctx._document.cells]',
+        "try:",
+        "    _ran = dict(_ctx.graph.cells)",
+        "except Exception:",
+        "    _ran = {}",
+        "def _raised(_cid):",
+        '    _exc = getattr(_ran.get(_cid), "exception", None)',
+        '    return type(_exc).__name__ if _exc is not None else ""',
+        '_cells = [{"id": str(_c.id), "name": _c.name or "", "code": _c.code or "", "error": _raised(_c.id)} for _c in _ctx._document.cells]',
         f'print({SNAPSHOT_MARKER!r} + _json.dumps({{"cells": _cells}}))',
     ]
     return "\n".join(lines)
@@ -114,6 +123,8 @@ class Cell:
     id: str
     name: str
     code: str
+    #: The class name of the exception the cell's last run raised (``""``: it did not, or unknown).
+    error: str = ""
 
     @property
     def label(self) -> str:
@@ -138,7 +149,9 @@ def parse_snapshot(stdout: str) -> Snapshot | None:
             continue
         try:
             data = json.loads(line[len(SNAPSHOT_MARKER):])
-            cells = tuple(Cell(str(c["id"]), str(c.get("name") or ""), str(c.get("code") or "")) for c in data["cells"])
+            cells = tuple(
+                Cell(str(c["id"]), str(c.get("name") or ""), str(c.get("code") or ""), str(c.get("error") or "")) for c in data["cells"]
+            )
         except (ValueError, KeyError, TypeError, AttributeError):
             return None
         return Snapshot(cells)

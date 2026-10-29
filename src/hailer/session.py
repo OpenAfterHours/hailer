@@ -34,6 +34,44 @@ COMMANDS: dict[str, str] = {
 
 EXIT_COMMANDS = ("exit", "quit")
 
+# name -> (argument signature, short description): the composer's /help card. /quit is an alias of /exit.
+COMMAND_USAGE: dict[str, tuple[str, str]] = {
+    "help": ("", "Commands and keys"),
+    "status": ("", "Model, kernel, notebook and usage"),
+    "new": ("", "Start a new conversation"),
+    "model": ("<name>", "Switch model; starts a new conversation"),
+    "notebook": ("[list|new|open|close]", "List, create, open or close notebooks"),
+    "exec": ("<code>", "Run Python in the notebook's kernel; the model does not see it"),
+    "context": ("", "Context files, skills and prompts"),
+    "data": ("[add|remove]", "Data folders; add one from anywhere on this machine"),
+    "skill": ("<name> [message]", "Run a turn with a project skill"),
+    "prompt": ("<name> [args]", "Send a saved prompt"),
+    "reload": ("", "Re-read the context, skills and prompts"),
+    "clear": ("", "Clear the screen"),
+    "exit": ("", "Leave Hailer"),
+}
+
+# /notebook's subcommands with a short description: the command menu's second level.
+NOTEBOOK_SUBCOMMANDS: dict[str, str] = {
+    "list": "Every notebook, with its state",
+    "new": "Create one from the starter template",
+    "open": "Switch the active notebook",
+    "close": "Free a notebook's kernel session",
+}
+
+# /data's subcommands with a short description: the command menu's second level.
+DATA_SUBCOMMANDS: dict[str, str] = {
+    "add": "Add a folder from anywhere on this machine, read-only in the kernel",
+    "remove": "Remove a data folder from .hailer/local.toml",
+}
+
+# The /help card's groups, by task, in order; every COMMAND_USAGE entry appears once.
+COMMAND_GROUPS: dict[str, tuple[str, ...]] = {
+    "Conversation": ("new", "model", "skill", "prompt"),
+    "Notebook": ("notebook", "data", "exec"),
+    "Session": ("status", "context", "help", "reload", "clear", "exit"),
+}
+
 
 def parse_command(line: str) -> Command | None:
     """Parse a slash command. Returns ``None`` for ordinary conversation text.

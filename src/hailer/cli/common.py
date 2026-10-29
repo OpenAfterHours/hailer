@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +36,9 @@ from hailer.models import (
     ProviderConfig,
     TurnSummary,
 )
+from hailer.steps import Receipt, StepTracker
+from hailer.text import clean_reply
+from hailer.transcript import callout, console_glyphs, plain_step_row, turn_stats
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only; the runtimes import it when a kernel starts
     from hailer.sandbox import MarimoSandbox
@@ -120,7 +124,7 @@ def _kernel_line(config: HailerConfig) -> str:
 
 def _kernel_style(config: HailerConfig) -> str:
     """A warning style (yellow) for the ``Kernel:`` line of the unsafe-local runtime, whose notebook
-    code is not isolated (the startup panel, ``hailer status``, ``/status``, ``--foreground``)."""
+    code is not isolated (``hailer status``'s settings panel, the plain ``/status`` table, ``--foreground``)."""
     return "yellow" if config.kernel.runtime == KERNEL_RUNTIME_UNSAFE_LOCAL else ""
 
 
@@ -160,11 +164,14 @@ def _render_prompt(config: HailerConfig, name: str, args: str) -> str:
     return render_prompt(config, name, args)
 
 
-def _make_agent(config: HailerConfig, bundle: ContextBundle, sandbox: MarimoSandbox | None = None) -> Any:
-    """The agent; its tools use ``sandbox``, the kernel this process started."""
+def _make_agent(
+    config: HailerConfig, bundle: ContextBundle, sandbox: MarimoSandbox | None = None, *, open_url: Callable[[str], bool] | None = None,
+) -> Any:
+    """The agent; its tools use ``sandbox``, the kernel this process started, and ``open_url`` to
+    open a notebook (``None``: the browser)."""
     from hailer.agent import HailerAgent
 
-    return HailerAgent(config, bundle, sandbox=sandbox)
+    return HailerAgent(config, bundle, sandbox=sandbox, open_url=open_url)
 
 
 def _start_dependency_warmup() -> None:
@@ -174,12 +181,13 @@ def _start_dependency_warmup() -> None:
     start_dependency_warmup()
 
 
-def _open_browser(url: str) -> None:
+def _open_browser(url: str) -> bool:
+    """Open ``url`` in the browser; whether a launcher started (the notebook tools then wait)."""
     from hailer.browser import (
         open_url,  # os.startfile first on Windows (ignores BROWSER), never raises
     )
 
-    open_url(url)
+    return open_url(url)
 
 
 def _find_free_port(preferred: int) -> int:
@@ -202,8 +210,10 @@ def _wait_for_session(
 
 
 def _print_error(console: Console, err: HailerError, *, verbose: bool = False) -> None:
-    # Error text can contain "[web]" / "[model_providers.x]" which Rich markup would swallow.
-    console.print(str(err), style="red", markup=False)
+    """The error as a callout: a red ``✗`` line, then its hint lines indented beneath (the text of
+    both unchanged). Hint lines are printed as they are, so a URL in one stays a single line."""
+    # Error text can contain "[web]" / "[model_providers.x]": Text never reads Rich markup.
+    console.print(callout(console_glyphs(console), "fail", str(err)))
     if err.hint:
         for line in str(err.hint).splitlines():
             console.print(f"    {line}", markup=False)
@@ -212,7 +222,7 @@ def _print_error(console: Console, err: HailerError, *, verbose: bool = False) -
 
 
 def _print_unexpected(console: Console, exc: BaseException, *, verbose: bool) -> None:
-    console.print(f"Unexpected error: {type(exc).__name__}: {exc}", style="red", markup=False)
+    console.print(callout(console_glyphs(console), "fail", f"Unexpected error: {type(exc).__name__}: {exc}"))
     if verbose:
         console.print(traceback.format_exc(), markup=False)
     else:
@@ -279,13 +289,9 @@ def _session_for(sessions: list[MarimoSession], notebook: str) -> MarimoSession 
     return match_session(sessions, notebook)
 
 
-def _plural(count: int, noun: str) -> str:
-    return f"{count} {noun}" + ("" if count == 1 else "s")
-
-
-def _startup_panel(console: Console, config: HailerConfig, notebook: str | None = None) -> None:
-    """The panel with the settings; ``notebook``: the active notebook (default: the state file's).
-    An unsafe-local ``Kernel:`` line is shown in a warning style (:func:`_kernel_style`)."""
+def _settings_panel(console: Console, config: HailerConfig, notebook: str | None = None) -> None:
+    """``hailer status``'s panel with the settings; ``notebook``: the active notebook (default: the
+    state file's). An unsafe-local ``Kernel:`` line is shown in a warning style (:func:`_kernel_style`)."""
     body = Text("\n").join(
         [
             Text(f"Model:      {config.model.name}"),
@@ -299,7 +305,6 @@ def _startup_panel(console: Console, config: HailerConfig, notebook: str | None 
         ]
     )
     console.print(Panel(body, title="Hailer", expand=False))
-    console.print("Type /help for commands.\n", markup=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -489,10 +494,11 @@ class _LineReader:
 
     In a terminal it is a prompt_toolkit prompt. While it waits, bracketed paste is on
     (``ESC[?2004h``), so a pasted block arrives as one message with its newlines, and it is off
-    again (``ESC[?2004l``) before the prompt returns, so before the turn runs. Up/Down recall this
-    session's messages (in memory only). No mouse capture and no alternate screen, so the
+    again (``ESC[?2004l``) before the prompt returns, so before the turn runs. Up/Down recall
+    earlier messages, from earlier sessions too when ``history_file`` is set (the controller sets
+    it while ``[hailer].input_history`` is on). No mouse capture and no alternate screen, so the
     terminal's own scrollback and selection keep working. Without a terminal (a pipe, the tests)
-    it is Rich's plain ``Console.input``, as before.
+    it is Rich's plain ``Console.input``, as before, and keeps no history.
 
     Ctrl+C at the prompt raises ``KeyboardInterrupt``; Ctrl+D on an empty line, or Ctrl+Z then
     Enter, raises ``EOFError``. ``pt_input`` / ``pt_output`` replace the terminal (tests).
@@ -504,6 +510,8 @@ class _LineReader:
         self._pt_input = pt_input
         self._pt_output = pt_output
         self._session: Any = None
+        #: ``.hailer/input_history`` (see :mod:`hailer.input_history`); read when the prompt starts.
+        self.history_file: Path | None = None
 
     def read(self) -> str:
         if self.interactive:
@@ -518,9 +526,10 @@ class _LineReader:
         if self._session is None:
             from prompt_toolkit import PromptSession
             from prompt_toolkit.formatted_text import FormattedText
-            from prompt_toolkit.history import InMemoryHistory
             from prompt_toolkit.output import create_output
             from prompt_toolkit.output.vt100 import Vt100_Output
+
+            from hailer.input_history import input_history
 
             output = self._pt_output or create_output()
             if isinstance(output, Vt100_Output):
@@ -529,7 +538,7 @@ class _LineReader:
                 output.enable_cpr = False
             self._session = PromptSession(
                 FormattedText([("bold ansicyan", PROMPT)]),
-                history=InMemoryHistory(),
+                history=input_history(self.history_file),
                 mouse_support=False,
                 input=self._pt_input,
                 output=output,
@@ -542,54 +551,66 @@ def _make_line_reader(console: Console) -> _LineReader:
     return _LineReader(console, interactive=interactive)
 
 
-@dataclass
 class _TurnDisplay:
-    """Drives the progress line for one turn and prints the final answer exactly once.
+    """Prints one plain-mode turn line by line: a row for each step as its result arrives (the
+    composer's rows as plain text), then the answer exactly once and the turn's footer. No live
+    area, spinner or cursor control (pipes, ``--plain``, ``TERM=dumb``), and nothing is cut to the
+    terminal width.
 
     Message deltas are not printed as they arrive: a model can write interim commentary next
     to its tool calls and then the final answer, and streaming both printed the answer twice.
-    The spinner shows the latest tool instead, and ``finish`` prints ``final_response``.
+    ``finish`` prints ``final_response``.
     """
 
-    console: Console
-    status: Any = None
-    last_activity: str = ""
-    deltas: int = 0
+    def __init__(self, console: Console) -> None:
+        self.console = console
+        self.glyphs = console_glyphs(console)
+        self.steps = StepTracker()
+        self.started = time.monotonic()
 
     def start(self) -> None:
-        self.status = self.console.status("Thinking...", spinner="dots")
-        self.status.start()
+        self.steps = StepTracker()
+        self.started = time.monotonic()
 
     def stop(self) -> None:
-        if self.status is not None:
-            self.status.stop()
-            self.status = None
+        """The turn ended without an answer (an error): rows for the steps that were left."""
+        self._rows(self.steps.finish())
 
-    def _update(self, text: str) -> None:
-        if self.status is not None:
-            self.status.update(Text(text))
+    def cancel(self) -> bool:
+        """Ctrl+C: the running steps may still finish, so their effect is unknown. Their rows start
+        on a new line (the terminal has echoed ``^C`` where the cursor was); True when it printed."""
+        receipts = self.steps.cancel()
+        if receipts:
+            self.console.print()
+        self._rows(receipts)
+        return bool(receipts)
+
+    def _rows(self, receipts: list[Receipt]) -> None:
+        for receipt in receipts:
+            self.console.print(plain_step_row(self.glyphs, receipt, self.console.width))
 
     def __call__(self, event: AgentEvent) -> None:
-        if event.kind == "message_delta":
-            self.deltas += 1
-            if self.deltas == 1:
-                self._update("Writing reply...")
-            return
         if event.kind == "tool_call":
-            width = max(20, self.console.width - 12)
-            text = event.text.replace("\n", " ")
-            self.last_activity = text[: width - 1] + "…" if len(text) > width else text
-            self._update(f"Using: {self.last_activity}")
-            return
-        if event.kind == "status" and event.text:
-            self._update(event.text)
+            self.steps.call(event)
+        elif event.kind == "tool_result":
+            receipt = self.steps.result(event)
+            self._rows([receipt] if receipt is not None else [])
 
     def finish(self, summary: TurnSummary) -> None:
-        self.stop()
-        final = (summary.final_response or "").strip()
+        self._rows(self.steps.finish())
+        elapsed = summary.duration_ms / 1000 if summary.duration_ms is not None else time.monotonic() - self.started
+        final = clean_reply(summary.final_response or "").strip()  # no escape sequence reaches the terminal
+        if self.steps.count:
+            self.console.print()
         self.console.print(Text(ANSWER_HEADER, style="dim"))
         if final:
             self.console.print(final, markup=False)
         else:
             self.console.print(Text("(no reply)", style="dim"))
         self.console.print()
+        stats = turn_stats(
+            self.glyphs, steps=summary.steps, elapsed=elapsed, input_tokens=summary.input_tokens, output_tokens=summary.output_tokens,
+        )
+        if stats:
+            self.console.print(Text(f"  {stats}", style="dim"))
+            self.console.print()

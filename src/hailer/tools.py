@@ -5,7 +5,11 @@ The tools run inside the Hailer process. :class:`HailerTools` holds the implemen
 tools. A method's docstring is the description the model sees.
 
 Every tool returns plain text. Hailer errors become ``ERROR: <message>\\n<hint>``
-text so the model can act on them; nothing is raised into the agent loop.
+text so the model can act on them; nothing is raised into the agent loop. Beside the text, each reply
+says how the call went (:class:`ToolReply`), decided from what happened rather than from the text
+(which holds whatever the user's code printed): LangChain keeps it as the tool message's artifact,
+which no request to the model carries, and :mod:`hailer.tool_outcomes` turns it into the step line
+the chat shows.
 
 The kernel is the :class:`~hailer.sandbox.MarimoSandbox` this Hailer process started, handed over by
 the chat and kept in memory; the tools never look for another. Everything they know about files
@@ -37,12 +41,13 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import datetime as _dt
+import functools
 import inspect
 import logging
 import threading
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Self
 
 from . import code_checks, notebooks
 from .errors import HailerError, MarimoUnavailableError, NoSessionError
@@ -93,6 +98,29 @@ UrlOpener = Callable[[str], bool]
 
 # Mimetypes whose rendered value is useful to a language model as-is.
 _TEXT_MIMETYPES = frozenset({"", "text/plain", "text/markdown", "text/csv"})
+
+
+class ToolReply(str):
+    """A tool's reply: exactly the text the model reads, with how the call went in ``status``.
+
+    ``status`` is ``{"ok": bool}`` plus, where they apply: ``error`` (the ``HailerError`` subclass or
+    unexpected exception's class name, or ``execution_failed`` / ``cell_error`` / ``cells_unreadable``
+    / ``unknown_template``), ``unexpected`` (an exception that is not a ``HailerError``), ``raised``
+    (for ``cell_error``: the exception class names the changed cells raised, from the kernel),
+    ``truncated`` (the text was cut to ``max_tool_output_chars``), the code-check facts ``cells``
+    (names of the changed cells, ``""`` for an unnamed one), ``findings``, ``checked`` and ``skipped``
+    (ruff / ty), and for the notebook tools ``notebook`` (the notebook the call left active or
+    closed), ``active`` (whether it is the active notebook now) and ``session`` (whether it has a
+    kernel session after the call), so the chat follows a switch without asking marimo.
+    It equals its text, so callers that only want the text need not know about it.
+    """
+
+    status: dict[str, Any]
+
+    def __new__(cls, text: str, **status: Any) -> Self:
+        reply = super().__new__(cls, text)
+        reply.status = {"ok": True, **status}
+        return reply
 
 
 def _result_text(result: Any) -> str:
@@ -149,6 +177,12 @@ def _default_open_url(url: str) -> bool:
     from .browser import open_url  # lazy: keeps import-time coupling low
 
     return open_url(url)
+
+
+def _cell_name(cell: code_checks.Cell | None) -> str:
+    """A cell's name, ``""`` for an unnamed one (marimo names those ``_``)."""
+    name = cell.name if cell is not None else ""
+    return "" if name in ("", "_") else name
 
 
 def _session_label(session: MarimoSession) -> str:
@@ -252,21 +286,34 @@ class HailerTools:
             log.debug("cell snapshot unreadable: %s", ((result.stderr or "").strip().splitlines() or ["no snapshot line"])[-1])
         return snapshot
 
-    def _check_report(self, snapshot: code_checks.Snapshot, cell_ids: list[str], *, changed: bool) -> str:
+    def _check_report(self, snapshot: code_checks.Snapshot, cell_ids: list[str], *, changed: bool) -> tuple[str, dict[str, Any]]:
+        """The check report for ``cell_ids`` and, for :class:`ToolReply`, how many findings it has and
+        which checkers ran or were skipped."""
         # The cells come from the kernel; no search path is passed, because the notebooks folder the
         # kernel imports local modules from is the sandbox's, not a folder on this machine.
         checks = self.config.checks
         result = code_checks.check(snapshot, cell_ids, lint=checks.lint, typecheck=checks.typecheck, hardcoded=checks.hardcoded)
-        return code_checks.report(result, snapshot, cell_ids, changed=changed)
+        ran = sorted(result.tools)
+        wanted = [tool for tool, on in (("ruff", checks.lint), ("ty", checks.typecheck), ("hailer", checks.hardcoded)) if on]
+        facts = {"findings": len(result.findings), "checked": ran, "skipped": [tool for tool in wanted if tool not in ran]}
+        return code_checks.report(result, snapshot, cell_ids, changed=changed), facts
 
-    def _run(self, fn: Callable[[], str]) -> str:
+    def _run(self, fn: Callable[[], str]) -> ToolReply:
+        """``fn()``'s reply, cut to the output cap, with its status (``ok`` unless ``fn`` says otherwise or
+        raised); exceptions become ``ERROR:`` text."""
         try:
-            return self._truncate(fn())
+            text = fn()
+            status = dict(getattr(text, "status", None) or {})
         except HailerError as err:
-            return self._truncate(_error_text(err))
+            text, status = _error_text(err), {"ok": False, "error": type(err).__name__}
         except Exception as exc:  # noqa: BLE001 - never let an exception reach the agent loop
             log.exception("tool failed")
-            return self._truncate(f"ERROR: unexpected {type(exc).__name__}: {exc}")
+            text = f"ERROR: unexpected {type(exc).__name__}: {exc}"
+            status = {"ok": False, "error": type(exc).__name__, "unexpected": True}
+        shown = self._truncate(str(text))
+        if len(shown) != len(text):
+            status["truncated"] = True
+        return ToolReply(shown, **status)
 
     def _url(self, notebook: str, *, with_token: bool = False) -> str:
         """The notebook's URL: token-free for the model (the default), signed in for the browser."""
@@ -384,14 +431,22 @@ class HailerTools:
                 before = self._snapshot(client, active, enable_format=checks.format)
             result = client.execute(code, notebook=active)
             text = _result_text(result)
+            status: dict[str, Any] = {} if result.success else {"ok": False, "error": "execution_failed"}
             text = text if result.success else f"Execution failed.\n{text}"
             if before is None or not (checks.lint or checks.typecheck or checks.hardcoded):
-                return text
+                return ToolReply(text, **status)
             after = self._snapshot(client, active)
-            changed = code_checks.changed_cells(before, after) if after is not None else []
-            if after is None or not changed:
-                return text
-            return self._with_footer(text, self._check_report(after, changed, changed=True))
+            if after is None:
+                return ToolReply(text, **status)
+            changed = code_checks.changed_cells(before, after)
+            if not changed:
+                return ToolReply(text, **status, cells=[])
+            report, facts = self._check_report(after, changed, changed=True)
+            cells = [cell for cell in (after.cell(cell_id) for cell_id in changed) if cell is not None]
+            raised = list(dict.fromkeys(cell.error for cell in cells if cell.error))
+            if raised and result.success:  # the code ran, but a cell it created or edited raised
+                status = {"ok": False, "error": "cell_error", "raised": raised}
+            return ToolReply(self._with_footer(text, report), **status, **facts, cells=[_cell_name(cell) for cell in cells])
 
         return self._run(go)
 
@@ -453,7 +508,7 @@ class HailerTools:
             result = self._client(active).execute(_list_cells_code(), notebook=active)
             text = _result_text(result)
             if not result.success:
-                return f"Could not list cells.\n{text}"
+                return ToolReply(f"Could not list cells.\n{text}", ok=False, error="cells_unreadable")
             if pattern.strip():
                 needle = pattern.strip().lower()
                 lines = [ln for ln in text.splitlines() if needle in ln.lower()]
@@ -477,11 +532,12 @@ class HailerTools:
             result = self._client(active).execute(code_checks.snapshot_code(), notebook=active)
             snapshot = code_checks.parse_snapshot(result.stdout) if result.success else None
             if snapshot is None:
-                return f"Could not read the notebook's cells.\n{_result_text(result)}"
+                return ToolReply(f"Could not read the notebook's cells.\n{_result_text(result)}", ok=False, error="cells_unreadable")
             cell_ids = [c.id for c in snapshot.cells if c.code.strip()]
             if not cell_ids:
                 return "The notebook has no code to check."
-            return self._check_report(snapshot, cell_ids, changed=False)
+            report, facts = self._check_report(snapshot, cell_ids, changed=False)
+            return ToolReply(report, **facts)
 
         return self._run(go)
 
@@ -530,12 +586,17 @@ class HailerTools:
         def go() -> str:
             kind = (template or "starter").strip().lower()
             if kind not in notebooks.TEMPLATE_KINDS:
-                return f"ERROR: unknown template {template!r}.\nUse 'starter' (imports, data helpers, welcome cell) or 'empty'."
+                return ToolReply(
+                    f"ERROR: unknown template {template!r}.\nUse 'starter' (imports, data helpers, welcome cell) or 'empty'.",
+                    ok=False,
+                    error="unknown_template",
+                )
             filename, source = notebooks.new_notebook(name, kind=kind)  # type: ignore[arg-type]
             created = self._kernel().write_notebook(filename, source, replace=False).name
             notebooks.save_active_notebook(self.config, created)
             lines = [f"Created {created} from the {kind} template; it is now the active notebook."]
-            lines.extend(self._session_lines(self._bring_up(created)))
+            outcome = self._bring_up(created)
+            lines.extend(self._session_lines(outcome))
             if kind == "starter":
                 lines.append(
                     "The starter template already defines mo, pl, duckdb, Path, WORKSPACE, DATA_DIR, data_files, "
@@ -546,7 +607,7 @@ class HailerTools:
                     "The empty template defines nothing: its first cell must import what you need "
                     "(import marimo as mo, import polars as pl, ...)."
                 )
-            return "\n".join(lines)
+            return ToolReply("\n".join(lines), notebook=created, active=True, session=outcome.session is not None)
 
         return self._run(go)
 
@@ -569,7 +630,7 @@ class HailerTools:
                     lines.append("(no cells)" if text.strip() in ("", "(no output)") else text)
                 else:
                     lines.append(f"Could not list its cells.\n{text}")
-            return "\n".join(lines)
+            return ToolReply("\n".join(lines), notebook=name, active=True, session=outcome.session is not None)
 
         return self._run(go)
 
@@ -600,7 +661,7 @@ class HailerTools:
                 )
             else:
                 lines.append(f"The active notebook is still {active}.")
-            return "\n".join(lines)
+            return ToolReply("\n".join(lines), notebook=name, active=notebooks.same_name(name, active), session=False)
 
         return self._run(go)
 
@@ -709,7 +770,10 @@ class HailerTools:
         sent to the model like any other tool result."""
         from .web import fetch_page
 
-        return self._run(lambda: fetch_page(url, self.config))
+        # The output cap is applied by _run (the same truncate_text, so the same text) rather than inside
+        # fetch_page, so the reply's status records that the page was cut.
+        uncapped = dataclasses.replace(self.config, max_tool_output_chars=0)
+        return self._run(lambda: fetch_page(url, uncapped))
 
 
 # --------------------------------------------------------------------------- #
@@ -717,7 +781,20 @@ class HailerTools:
 # --------------------------------------------------------------------------- #
 
 
-def _in_daemon_thread(fn: Callable[..., str]) -> Callable[..., Any]:
+def _content_and_artifact(method: Callable[..., str]) -> Callable[..., tuple[str, dict[str, Any]]]:
+    """``method`` as LangChain's ``content_and_artifact`` tools want it: the reply as a plain ``str`` (the
+    tool message's content, byte for byte what the method returned) and its :class:`ToolReply` status
+    (the artifact). ``functools.wraps`` keeps the signature the argument schema is read from."""
+
+    @functools.wraps(method)
+    def call(*args: Any, **kwargs: Any) -> tuple[str, dict[str, Any]]:
+        reply = method(*args, **kwargs)
+        return str(reply), dict(getattr(reply, "status", None) or {"ok": True})
+
+    return call
+
+
+def _in_daemon_thread(fn: Callable[..., Any]) -> Callable[..., Any]:
     """An async twin of a blocking tool that runs it on a daemon thread.
 
     Kernel calls can block for minutes. LangChain would otherwise run them on the event loop's
@@ -727,21 +804,21 @@ def _in_daemon_thread(fn: Callable[..., str]) -> Callable[..., Any]:
     itself finishes (or times out) in the background and its result is dropped.
     """
 
-    async def run(**kwargs: Any) -> str:
+    async def run(**kwargs: Any) -> Any:
         loop = asyncio.get_running_loop()
-        future: asyncio.Future[str] = loop.create_future()
+        future: asyncio.Future[Any] = loop.create_future()
 
-        def deliver(result: str | None, error: BaseException | None) -> None:
+        def deliver(result: Any, error: BaseException | None) -> None:
             if future.done():  # the turn was cancelled meanwhile
                 return
             if error is not None:
                 future.set_exception(error)
             else:
-                future.set_result(result or "")
+                future.set_result(result if result is not None else "")
 
         def work() -> None:
             try:
-                outcome: tuple[str | None, BaseException | None] = (fn(**kwargs), None)
+                outcome: tuple[Any, BaseException | None] = (fn(**kwargs), None)
             except BaseException as exc:  # noqa: BLE001 - handed to the awaiting turn
                 outcome = (None, exc)
             try:
@@ -763,19 +840,22 @@ def hailer_tools(
     session_wait_sec: float = DEFAULT_SESSION_WAIT_SEC,
 ) -> list[Any]:
     """Hailer's tools as LangChain tools (``TOOL_NAMES`` order), bound to ``config`` and to
-    ``sandbox``, the kernel this process started."""
+    ``sandbox``, the kernel this process started. Each returns its reply as the tool message's
+    content and the reply's :class:`ToolReply` status as its artifact."""
     from langchain_core.tools import StructuredTool  # lazy: keeps `hailer --help` and friends fast
 
     impl = HailerTools(config, sandbox, open_url=open_url, session_wait_sec=session_wait_sec)
     out: list[Any] = []
     for name in TOOL_NAMES:
         method = getattr(impl, name)
+        call = _content_and_artifact(method)
         out.append(
             StructuredTool.from_function(
-                func=method,
-                coroutine=_in_daemon_thread(method),
+                func=call,
+                coroutine=_in_daemon_thread(call),
                 name=name,
                 description=inspect.getdoc(method) or name,
+                response_format="content_and_artifact",
             )
         )
     return out

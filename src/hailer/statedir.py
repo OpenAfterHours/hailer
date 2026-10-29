@@ -3,7 +3,8 @@
 It is ``.hailer/``, or ``.hailer/state/`` in the project layout (a workspace whose config is
 ``.hailer/hailer.toml``: there ``.hailer/`` holds the project's notebooks, skills and context, which
 are committed). It holds ``session.json``, ``notebook.json``, ``threads.sqlite``,
-``notebook-backups/`` and the ``sandbox-wrote-notebooks`` mark, and, while a kernel runs, the
+``notebook-backups/``, the ``sandbox-wrote-notebooks`` mark, the chat's ``input_history`` (and its
+``.lock``) and, while a kernel runs, the
 running session's kernel files (a local kernel's record and log, a docker kernel's token folder
 while it starts). It changes on every turn. Everything that writes there creates the folder through :func:`ensure_state_dir`, which
 also puts a ``.gitignore`` containing ``*`` inside it: git then ignores the folder in any repository,
@@ -30,7 +31,7 @@ PROJECT_GITIGNORE_TEXT = (
     f"{PROJECT_STATE_DIRNAME}/\n{LOCAL_CONFIG_NAME}\ndata/\n"
     "# State a standalone workspace kept here before it moved to the project layout:\n"
     "/threads.sqlite*\n/session.json\n/notebook.json\n/notebook-backups/\n/owner-*.lock\n/kernel-token-*/\n"
-    "/marimo-*.log\n/sandbox-wrote-notebooks\n"
+    "/marimo-*.log\n/sandbox-wrote-notebooks\n/input_history*\n"
 )
 
 
@@ -74,6 +75,15 @@ def ensure_project_gitignore(workspace: Path) -> None:
             handle.write(PROJECT_GITIGNORE_TEXT)
     except OSError:
         pass
+
+
+#: ``input_history`` in the state folder: what the user typed in the chat, recalled with Up in later
+#: sessions (:mod:`hailer.input_history`; off with ``[hailer].input_history = false``).
+INPUT_HISTORY_NAME = "input_history"
+
+
+def input_history_path(workspace: Path) -> Path:
+    return state_dir(workspace) / INPUT_HISTORY_NAME
 
 
 def ensure_state_dir(workspace: Path) -> Path:

@@ -13,6 +13,7 @@ data_dir = "data"                    # the data files to analyse (CSV, Parquet, 
 # max_tool_output_chars = 12000        # cap on any single tool result sent to the model
 # max_context_bytes = 24000            # cap on the concatenated context files
 # log_level = "WARNING"                # or set HAILER_LOG_LEVEL / --verbose
+# input_history = true                 # Up recalls messages from past sessions (.hailer/input_history); false: memory only
 
 [model]
 name = "gpt-5.5"

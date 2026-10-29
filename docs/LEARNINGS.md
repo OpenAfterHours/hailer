@@ -309,7 +309,13 @@ Keep these properties; each has a test in `tests/test_notebook_sync.py` unless n
   (`test_a_server_that_trickles_its_page_cannot_hold_the_last_copy`,
   `test_a_last_copy_that_never_ends_cannot_keep_the_containers`).
 - **Failures warn, never raise**, and repeat once per message (a dead kernel does not print every 15 s). The
-  chat routes `sandbox.notice` to its own console, which the composer queues from any thread.
+  chat routes `sandbox.notice` to its own console, which the composer queues from any thread. Because a
+  repeated warning is silent, what the session's last line says about the notebooks comes from the last
+  copy's own record (`NotebookSync.complete`, `DockerKernel.copied_back`), not from the warnings: a review
+  found it claiming `✓ Notebooks copied back` after a kernel that died mid-session
+  (`test_a_last_copy_from_a_dead_kernel_is_recorded_though_its_warning_was_said_before`,
+  `test_each_copy_back_records_whether_it_finished`). The CLI stops the kernel in a `finally` no spinner or
+  line can skip (`test_a_terminal_that_cannot_be_written_never_keeps_the_kernel_from_stopping`).
 - **Ordering**: sync-in runs inside `DockerRuntime.start`, so the chat and the browser never see an empty
   folder, and a Ctrl+C there stops the kernel. This costs one list + create per notebook on loopback before
   the composer renders (LEARNINGS §10); keep it bounded rather than moving it after `_active_notebook`. Stop
@@ -350,10 +356,13 @@ therefore had the user's files and network by default. Now `docker` is the defau
   when that set it (`test_a_retired_runtime_from_the_environment_is_one_config_row_with_an_environment_fix`). `init` still writes `docker` on a machine without
   Docker and says how to install it or opt in
   (`test_init_writes_docker_and_says_how_to_get_docker_only_when_it_is_missing`).
-- **Visible every time.** The `Kernel:` line is `unsafe-local (runs as you; not isolated)` in yellow in the
-  startup panel, `status`, `/status` and `--foreground`, and a WARN row in `doctor`; a start drops that row
-  so the panel says it once (`test_kernel_line_of_the_unsafe_local_runtime_is_a_warning`,
-  `test_doctor_has_a_kernel_row`).
+- **Visible every time.** The `Kernel:` line is `unsafe-local (runs as you; not isolated)` in yellow in
+  `status`, `/status` and `--foreground`, a WARN row in `doctor`, and a session's startup checklist has the
+  yellow row `▲ Kernel  unsafe-local · runs as you, not isolated` (the composer's footer keeps
+  `▲ unsafe-local · not isolated`); a start drops the check's WARN row so the kernel's row says it once
+  (`test_kernel_line_of_the_unsafe_local_runtime_is_a_warning`,
+  `test_the_unsafe_local_kernel_row_is_a_yellow_warning_and_a_docker_one_is_not`,
+  `test_a_start_leaves_the_unsafe_local_warning_to_the_kernel_row`, `test_doctor_has_a_kernel_row`).
 - **No pass-through.** `[kernel].pass_env` is gone; an old file gets the ordinary unknown-key warning, which
   never quotes the value (`test_pass_env_is_gone_and_reported_as_an_unknown_key_without_its_value`). The
   secret-looking names stay withheld from an unsafe-local kernel.
@@ -498,3 +507,57 @@ repository: the first `pyproject.toml` used to win) and the project layout keeps
 with state in `.hailer/state/` (`statedir.state_dir` decides, so every state writer follows). Evidence:
 `test_a_command_in_a_uv_workspace_member_belongs_to_the_whole_repository`, `test_the_search_stops_at_the_repository_root`,
 `test_init_inside_a_project_puts_everything_in_dot_hailer`.
+
+## 19. The terminal reports the user's work; decide nothing from text the user's code controls
+
+The October 2026 terminal refinement (receipts, composer, command menu, input history, startup checklist)
+went through an implement-and-challenge review per part. The findings that shaped it:
+
+- **A step's ✓ or ✗ never comes from the reply's text.** The first build read `ERROR: ` at the start of a
+  tool reply as a failure, but `marimo_execute` returns the code's own stdout, so a cell printing
+  `ERROR: customer ACME owes …` showed a ✗ and put that data on screen. Tools now return a `ToolReply` whose
+  status (ok, truncated, checks, the cells that raised) is set where the tool knows it and travels as the
+  LangChain artifact; the text the model reads is byte-identical
+  (`test_tool_replies_carry_a_status_and_hand_it_to_langchain_as_the_artifact`,
+  `test_wire_tool_status_never_reaches_the_endpoint`, `test_the_status_is_left_out_of_both_wire_formats`).
+  Failure summaries use a fixed wording per error class, never the error's message. A summary does not
+  repeat the target the UI already shows from the arguments.
+- **Event ids are unique per turn** (`<id>#<n>` for a repeat, `call#<n>` when missing), so the UI matches
+  results purely by id; a result for no call of the turn emits nothing
+  (`test_receipts_follow_ids_for_parallel_and_failed_steps_and_the_reply_prints_once`).
+- **The answer is still printed once**, after the turn: deltas only move the live row (the progress contract
+  in INTERFACES.md) (`test_streamed_answer_is_not_printed_twice`, `test_commentary_deltas_are_not_printed_and_answer_appears_once`).
+- **Nothing new runs on the UI loop.** Reviews measured three regressions before they shipped: the startup
+  spinner cost ~0.2 s of `ready_to_answer` and doubled paste latency (five `VSplit` border rows made each
+  redraw ~9 ms; each border is now one window and nothing animates while the chat prepares); saving input
+  history on Enter froze the composer behind another process's file lock (saves now go to one ordered writer
+  thread, `test_saving_happens_on_the_writer_thread_not_the_callers`); and listing notebooks for the menu was
+  awaited before `ready_to_answer` and at the end of every turn (it is now a background task nothing awaits,
+  `test_the_menus_notebook_names_are_listed_off_the_ui_loop_and_never_by_the_completer`). Run
+  `scripts/benchmark_startup.py` against the base for any composer change.
+- **Names reach Rich as text.** A notebook the model may legally name `q[/].py` was rendered as Rich markup in
+  `/notebook list` and raised inside the transcript writer, which ends the application
+  (`test_bracketed_names_print_as_text_never_as_markup`, `test_composer_cards_print_bracketed_names_as_text`).
+  Every externally supplied string goes through `Text(...)` or `markup=False`, and one-line rows through
+  `steps.single_line`.
+- **The history file is a file Hailer must not trust.** `.hailer/` can arrive with a cloned folder: a planted
+  `input_history.tmp` link to `~/.bashrc` would have been overwritten by the trim. History and lock files are
+  opened without following links, must be regular files, and rewrites go through `mkstemp`
+  (`test_a_planted_temporary_link_is_never_written_through_by_the_trim`,
+  `test_a_linked_history_or_lock_file_means_memory_only_logged_once`). Entries over 64 KB and entries that
+  look like they hold a credential are kept in memory only; a file nothing could be read from is never
+  rewritten.
+- **Enter never depends on typing speed.** With `/n` typed, Enter ran `/new` if the menu had appeared and sent
+  `/n` if it had not. Now Enter runs a menu item at once only when the user chose it; otherwise an exact
+  command is sent as typed and anything else is completed first
+  (`test_enter_runs_a_command_at_once_only_when_it_was_chosen_in_the_menu`). Esc cancels only while a turn
+  runs (short key timeouts then); idle, prompt_toolkit's defaults keep Esc-then-Enter a newline, and Ctrl+J
+  always is (`test_escape_cancels_a_turn_like_ctrl_c_and_is_harmless_while_idle`,
+  `test_esc_closes_the_menu_during_a_turn_and_only_then_cancels_it`).
+- **The signed-in notebook URL is printed only when the user must open it by hand** (`--no-browser`, a tab
+  that did not open in time), whole, on its own line, never as a hyperlink
+  (`test_a_normal_start_and_switch_open_the_signed_in_link_without_printing_it`,
+  `test_no_browser_holds_for_switches_too_and_prints_each_link_at_once`,
+  `test_a_link_to_open_by_hand_is_written_whole_and_never_as_a_hyperlink`). `--foreground` still prints it:
+  it is the only way into that kernel.
+- **The kernel stops whatever the terminal does**, and the exit line reports the last copy's own record (§13).
