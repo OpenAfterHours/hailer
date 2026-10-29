@@ -963,8 +963,9 @@ def outcome(name: str, args: dict, reply: str) -> tuple[bool, str]:
 class CodeModeClient(FakeClient):
     """A FakeClient whose kernel runs Hailer's own read-only scratchpad code (the cell listing and the
     check snapshot) for real, in this process, with marimo's code-mode context replaced by one that
-    holds ``cells`` (``id``, ``code`` and optionally ``name``, ``status``, ``errors``). Any other code
-    gets ``result`` and applies ``writes`` (code -> cells it adds or replaces)."""
+    holds ``cells`` (``id``, ``code`` and optionally ``name``, ``status``, ``errors``, and ``raises``:
+    the exception its last run raised, in the kernel's graph). Any other code gets ``result`` and
+    applies ``writes`` (code -> cells it adds or replaces)."""
 
     def __init__(self, cells: list[dict], writes: dict[str, list[dict]] | None = None, **kw):
         super().__init__(**kw)
@@ -990,7 +991,8 @@ class CodeModeClient(FakeClient):
             )
             for c in self.cells
         ]
-        context = SimpleNamespace(cells=views, _document=SimpleNamespace(cells=views), _kernel=SimpleNamespace(user_config={"save": {}}))
+        graph = SimpleNamespace(cells={c["id"]: SimpleNamespace(exception=c.get("raises")) for c in self.cells})
+        context = SimpleNamespace(cells=views, _document=SimpleNamespace(cells=views), _kernel=SimpleNamespace(user_config={"save": {}}), graph=graph)
         out = io.StringIO()
         with mock.patch.object(cm, "get_context", lambda: context), contextlib.redirect_stdout(out):
             exec(compile(code, "<scratchpad>", "exec"), {})
@@ -1014,12 +1016,17 @@ def code_mode_says(ops: list, *, names: dict[str, str], ran: set[str] = frozense
     return out.getvalue()
 
 
-def traceback_of(fn) -> str:
+def raised_by(fn) -> tuple[Exception, str]:
+    """The exception ``fn`` raises and its traceback text."""
     try:
         fn()
-    except Exception:  # noqa: BLE001 - the point is the traceback text
-        return traceback.format_exc()
+    except Exception as exc:  # noqa: BLE001 - the point is the exception
+        return exc, traceback.format_exc()
     raise AssertionError("expected an exception")
+
+
+def traceback_of(fn) -> str:
+    return raised_by(fn)[1]
 
 
 STARTER = [{"id": "imp", "code": "import marimo as mo\nimport polars as pl"}, {"id": "load", "name": "load", "code": "sales = pl.read_csv('sales.csv')"}]
@@ -1080,21 +1087,31 @@ def test_outcome_of_code_that_adds_a_cell(tmp_path):
     assert outcome("marimo_execute", {"code": WRITE_CELL}, reply) == (True, "growth_by_region, checks clean")
     unnamed = CodeModeClient(STARTER, {WRITE_CELL: [{"id": "Hbol", "code": "growth = sales.height"}]}, result=ExecResult(success=True))
     assert outcome("marimo_execute", {"code": WRITE_CELL}, checked(make_config(tmp_path), unnamed).marimo_execute(WRITE_CELL)) == (True, "1 cell, checks clean")
+    # The cells were compared: a code-mode line claiming an error decides nothing.
+    fake = "created and ran cell 'Hbol' (growth_by_region) (error)\nZeroDivisionError: printed\n"
+    spoof = CodeModeClient(STARTER, {WRITE_CELL: [cell]}, result=ExecResult(success=True, stdout=fake))
+    assert outcome("marimo_execute", {"code": WRITE_CELL}, checked(make_config(tmp_path), spoof).marimo_execute(WRITE_CELL)) == (True, "growth_by_region, checks clean")
 
 
-def test_outcome_of_an_edit_with_a_finding_and_a_cell_that_raised(tmp_path):
+def test_a_cell_the_code_edited_that_raised_fails_the_call(tmp_path):
     from marimo._code_mode._plan import _UpdateOp
 
     pl = pytest.importorskip("polars")
-    edited = {"id": "load", "name": "load", "code": "sales = pl.read_csv('sales.csv')\nsales.sortt('region')"}
+    error, trace = raised_by(lambda: pl.DataFrame().sortt)
+    edited = {"id": "load", "name": "load", "code": "sales = pl.read_csv('sales.csv')\nsales.sortt('region')", "raises": error}
     says = code_mode_says([_UpdateOp("load", code=edited["code"])], names={"load": "load"}, ran={"load"}, errored={"load"})
     assert says == "\nedited code of cell 'load' (load) and ran (error)\n"
-    raised = traceback_of(lambda: pl.DataFrame().sortt)
-    client = CodeModeClient(STARTER, {WRITE_CELL: [edited]}, result=ExecResult(success=True, stdout=says, stderr=raised))
+    client = CodeModeClient(STARTER, {WRITE_CELL: [edited]}, result=ExecResult(success=True, stdout=says, stderr=trace))
     reply = checked(make_config(tmp_path), client).marimo_execute(WRITE_CELL)
-    assert "1 finding." in reply
-    # The scratchpad code ran (the kernel says so); the cell it edited raised, which the summary names.
-    assert outcome("marimo_execute", {"code": WRITE_CELL}, reply) == (True, "load, AttributeError, 1 finding")
+    assert "1 finding." in reply and not reply.startswith("Execution failed."), "the model reads what it always did"
+    assert reply.status["ok"] is False and reply.status["error"] == "cell_error" and reply.status["raised"] == ["AttributeError"]
+    assert outcome("marimo_execute", {"code": WRITE_CELL}, reply) == (False, "load, AttributeError, 1 finding")
+    # The kernel's word, not the text: the exception is named even when nothing was printed.
+    quiet = CodeModeClient(STARTER, {WRITE_CELL: [{**edited, "raises": KeyError("region")}]}, result=ExecResult(success=True))
+    assert outcome("marimo_execute", {"code": WRITE_CELL}, checked(make_config(tmp_path), quiet).marimo_execute(WRITE_CELL)) == (False, "load, KeyError, 1 finding")
+    # A cell that raised before and was not changed by this call does not fail it.
+    old = CodeModeClient([*STARTER, {"id": "old", "code": "1 / 0", "raises": ZeroDivisionError()}], {WRITE_CELL: [{"id": "n", "name": "n", "code": "n = 1"}]})
+    assert outcome("marimo_execute", {"code": WRITE_CELL}, checked(make_config(tmp_path), old).marimo_execute(WRITE_CELL)) == (True, "n, checks clean")
 
 
 def test_outcome_of_code_mode_lines_without_checks(tmp_path):
@@ -1113,10 +1130,14 @@ def test_outcome_of_code_mode_lines_without_checks(tmp_path):
     assert run(named) == (True, "n0 and n1")
     many = code_mode_says([_AddOp(f"c{i}", "1", CellConfig(), name=f"n{i}") for i in range(4)], names={f"c{i}": f"n{i}" for i in range(4)})
     assert run(many) == (True, "4 cells")
+    # With [checks] all off there are no snapshots: code mode's own line is the only word on a cell that raised.
     unnamed_error = code_mode_says([_AddOp("u1", "1/0", CellConfig())], names={"u1": ""}, ran={"u1"}, errored={"u1"})
     assert unnamed_error.strip() == "created and ran cell 'u1' (error)"
-    assert run(unnamed_error) == (True, "1 cell, cell error")
-    assert run(unnamed_error, traceback_of(lambda: 1 / 0)) == (True, "1 cell, ZeroDivisionError")
+    assert run(unnamed_error) == (False, "1 cell, cell error")
+    assert run(unnamed_error, traceback_of(lambda: 1 / 0)) == (False, "1 cell, ZeroDivisionError")
+    rerun = code_mode_says([], names={"r1": "report"}, ran={"r1"}, errored={"r1"})
+    assert rerun.strip() == "re-ran cell 'r1' (report) (error)"
+    assert run(rerun) == (True, "re-ran report"), "only a cell the code created or edited fails the call"
 
 
 def test_outcome_when_a_checker_is_missing(tmp_path, monkeypatch):
@@ -1390,6 +1411,20 @@ def test_outcome_of_fetch_page_names_a_host_only_after_a_redirect(tmp_path, monk
         assert fetch(f"http://127.0.0.1:{port}/moved") == (True, f"2.0 KB, redirected to localhost:{port}")
         ok, summary = fetch(f"http://user:pw@127.0.0.1:{port}/page")  # urllib cannot: an error that quotes the URL
         assert (ok, summary) == (False, "could not fetch the page")
+        # A page cut to the output cap says so, and the model reads what fetch_page always gave it.
+        from hailer.web import fetch_page
+
+        capped_config = make_config(tmp_path, web=WebConfig(allowed_domains=("127.0.0.1",)), max_tool_output_chars=500)
+        capped = HailerTools(capped_config).fetch_page(page)
+        assert capped == fetch_page(page, capped_config) and "truncated" in capped and len(capped) <= 500
+        assert capped.status == {"ok": True, "truncated": True}
+        ok, summary = outcome("fetch_page", {"url": page}, capped)
+        assert ok and summary.endswith(" B, truncated")
+        small = make_config(tmp_path, web=WebConfig(allowed_domains=("127.0.0.1",), max_page_bytes=100))
+        first_bytes = HailerTools(small).fetch_page(page)
+        assert "(first 100 bytes only)" in first_bytes.splitlines()[0] and "truncated" not in first_bytes.status
+        ok, summary = outcome("fetch_page", {"url": page}, first_bytes)
+        assert ok and summary.endswith(" B, truncated"), "fetch_page's own header says the page was cut"
     finally:
         server.shutdown()
         server.server_close()

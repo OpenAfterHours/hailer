@@ -823,10 +823,15 @@ requests). `status` is decided where the tool knows, never from the text (which 
 printed or a file contained): `_run` sets `{"ok": False, "error": <HailerError subclass name>}` for a
 `HailerError`, `{"ok": False, "error": <exception type name>, "unexpected": True}` for any other exception,
 and `truncated: True` when the text was cut to `max_tool_output_chars`; `marimo_execute` sets
-`{"ok": False, "error": "execution_failed"}` from the kernel's `success` flag; a failed cell listing or check
-snapshot is `error: "cells_unreadable"` and an unknown template `error: "unknown_template"`. A reply with code
-checks adds `findings` (count), `checked` and `skipped` (`ruff` / `ty`), and `marimo_execute` adds `cells`
-(the changed cells' names from the after snapshot, `""` for an unnamed one). `hailer.tool_outcomes` reads it.
+`{"ok": False, "error": "execution_failed"}` from the kernel's `success` flag, and `{"ok": False, "error":
+"cell_error", "raised": [<exception class names>]}` when the code ran but a cell it created or edited raised
+(the after snapshot's `Cell.error`, from the kernel's graph; a cell that raised before and was not changed does
+not count); a failed cell listing or check snapshot is `error: "cells_unreadable"` and an unknown template
+`error: "unknown_template"`. A reply with code checks adds `findings` (count), `checked` and `skipped` (`ruff` /
+`ty`), and `marimo_execute` adds `cells` whenever it compared snapshots (the changed cells' names, `""` for an
+unnamed one; `[]` when none changed). `fetch_page` calls `web.fetch_page` with the output cap off and lets `_run`
+apply it (the same `truncate_text`, so the same text), so a cut page has `truncated: True`.
+`hailer.tool_outcomes` reads it.
 
 The kernel is `sandbox`, the one this session started (kept in memory; nothing is discovered). Without one
 every kernel tool answers `ERROR: marimo is not running: this session has no kernel` with `launch_hint()`.
@@ -895,12 +900,17 @@ open`, `MarimoUnavailableError` → `marimo not running`, `MarimoExecutionError`
 `WebAccessDenied` → `host not allowed`, `cells_unreadable` → `could not read the cells`, `unknown_template` →
 `unknown template`, an unexpected exception → `unexpected <Type>`, a plain `HailerError` by tool (`could not
 fetch the page`, `skill not found`, `could not read the file`, `could not read the data folder`, else
-`failed`); `marimo_execute` code that failed names the exception from its traceback (else `failed`).
+`failed`). `marimo_execute` code that failed names the exception from its traceback (else `failed`), and a
+call whose created or edited cell raised (`cell_error`) is a failure named by the kernel's exception classes
+after the cells: `growth, ZeroDivisionError, checks clean`. Only when no snapshots were compared (`[checks]` all
+off) does marimo's own line (`created and ran cell 'Hbol' (growth) (error)`, in code that used
+`marimo._code_mode`) fail the call, named from the traceback text (else `cell error`); a `re-ran ... (error)`
+line never does.
 
 Summaries of calls that worked are read from the parts of the text Hailer writes itself, and never repeat what
 the arguments say (the UI shows those as the step's target): `marimo_execute` the changed cells (`cells` from
-the status: `growth_by_region`, `a and b`, `4 cells`; without checks, and for `deleted scratch` / `installed
-altair` / a cell that raised, marimo's own lines such as `created and ran cell 'Hbol' (name)`, read only when
+the status: `growth_by_region`, `a and b`, `4 cells`; without snapshots, and for `deleted scratch` / `installed
+altair` / `re-ran report`, marimo's own lines such as `created and ran cell 'Hbol' (name)`, read only when
 the code used `marimo._code_mode`), a frame's `4 rows` (Polars `shape: (4, 3)` at the start of a line, pandas
 `[4 rows x 3 columns]`, read from the text before the check report) and the checks from the status (`checks
 clean`, `2 findings`, `ty skipped`, `checks skipped`); `notebook_check` `clean` / `N findings` / `checks off` /
@@ -913,7 +923,8 @@ argument); `marimo_status` `<name> ready` / `<name> not open` / `not running`; `
 months, 25-01 to 25-06[; discount from 25-04]` (the dataset only without a name argument) or `no period files,
 N other files`; `load_skill` `N files` / `no files` (from the last `Files (read with read_skill_file(...)):`
 block, so a SKILL.md quoting it changes nothing); `read_skill_file` `N lines` / `truncated`; `fetch_page`
-`12.3 KB` (`, truncated`; `, redirected to <host[:port]>` when the page came from another host) or `not text
+`12.3 KB` (the size of the text the model got; `, truncated` when the status says the reply was cut or the
+`Source:` line says `(first N bytes only)`; `, redirected to <host[:port]>` when the page came from another host) or `not text
 (<type>)` when the whole reply is fetch_page's not-text notice. A summary is one line of at most
 `SUMMARY_LIMIT` printable characters (`...` when cut; `str.isprintable`, as `chat_ui._single_line`), counts and
 names only. An unknown tool or reply format gives `""`.
@@ -929,8 +940,10 @@ RUFF_SELECT = ("F", "PLE", "B006", "B023", "E722")          # ruff runs --isolat
 RUFF_IGNORE = ("F401", "F541", "F704", "F811", "PLE1142")   # imports for later cells, private helpers, top-level await
 TY_IGNORE = ("unresolved-import",)                          # the kernel's packages are not the host's (docker)
 MAX_REPORTED = 20
-def snapshot_code(*, enable_format: bool = False) -> str    # scratchpad code printing SNAPSHOT_MARKER + {"cells": [{id, name, code}]}
-def parse_snapshot(stdout: str) -> Snapshot | None          # Snapshot(cells: tuple[Cell(id, name, code), ...]) in notebook order
+def snapshot_code(*, enable_format: bool = False) -> str    # scratchpad code printing SNAPSHOT_MARKER + {"cells": [{id, name, code, error}]}
+def parse_snapshot(stdout: str) -> Snapshot | None          # Snapshot(cells: tuple[Cell(id, name, code, error=""), ...]) in notebook order
+    # error: the class name of the exception the cell's last run raised, from ctx.graph.cells[id].exception (what code mode's own
+    # summary reads; "" when it did not raise or the graph cannot be read); tools.marimo_execute fails a call whose changed cells raised
 def changed_cells(before: Snapshot, after: Snapshot) -> list[str]   # new or edited, non-empty, notebook order
 def dependency_order(cells) -> list[Cell]                   # marimo's compile_cell + DirectedGraph + topological_sort; unplaceable cells last
 def syntax_error(cell: Cell) -> Finding | None              # compile with PyCF_ALLOW_TOP_LEVEL_AWAIT

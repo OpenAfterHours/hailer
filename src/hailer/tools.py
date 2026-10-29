@@ -96,10 +96,12 @@ class ToolReply(str):
     """A tool's reply: exactly the text the model reads, with how the call went in ``status``.
 
     ``status`` is ``{"ok": bool}`` plus, where they apply: ``error`` (the ``HailerError`` subclass or
-    unexpected exception's class name, or ``execution_failed`` / ``cells_unreadable`` /
-    ``unknown_template``), ``unexpected`` (an exception that is not a ``HailerError``), ``truncated``
-    (the text was cut to ``max_tool_output_chars``) and the code-check facts ``cells`` (names of the
-    changed cells, ``""`` for an unnamed one), ``findings``, ``checked`` and ``skipped`` (ruff / ty).
+    unexpected exception's class name, or ``execution_failed`` / ``cell_error`` / ``cells_unreadable``
+    / ``unknown_template``), ``unexpected`` (an exception that is not a ``HailerError``), ``raised``
+    (for ``cell_error``: the exception class names the changed cells raised, from the kernel),
+    ``truncated`` (the text was cut to ``max_tool_output_chars``) and the code-check facts ``cells``
+    (names of the changed cells, ``""`` for an unnamed one), ``findings``, ``checked`` and ``skipped``
+    (ruff / ty).
     It equals its text, so callers that only want the text need not know about it.
     """
 
@@ -421,12 +423,17 @@ class HailerTools:
             if before is None or not (checks.lint or checks.typecheck):
                 return ToolReply(text, **status)
             after = self._snapshot(client, active)
-            changed = code_checks.changed_cells(before, after) if after is not None else []
-            if after is None or not changed:
+            if after is None:
                 return ToolReply(text, **status)
+            changed = code_checks.changed_cells(before, after)
+            if not changed:
+                return ToolReply(text, **status, cells=[])
             report, facts = self._check_report(after, changed, changed=True)
-            names = [_cell_name(after.cell(cell_id)) for cell_id in changed]
-            return ToolReply(self._with_footer(text, report), **status, **facts, cells=names)
+            cells = [cell for cell in (after.cell(cell_id) for cell_id in changed) if cell is not None]
+            raised = list(dict.fromkeys(cell.error for cell in cells if cell.error))
+            if raised and result.success:  # the code ran, but a cell it created or edited raised
+                status = {"ok": False, "error": "cell_error", "raised": raised}
+            return ToolReply(self._with_footer(text, report), **status, **facts, cells=[_cell_name(cell) for cell in cells])
 
         return self._run(go)
 
@@ -699,7 +706,10 @@ class HailerTools:
         sent to the model like any other tool result."""
         from .web import fetch_page
 
-        return self._run(lambda: fetch_page(url, self.config))
+        # The output cap is applied by _run (the same truncate_text, so the same text) rather than inside
+        # fetch_page, so the reply's status records that the page was cut.
+        uncapped = dataclasses.replace(self.config, max_tool_output_chars=0)
+        return self._run(lambda: fetch_page(url, uncapped))
 
 
 # --------------------------------------------------------------------------- #

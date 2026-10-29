@@ -55,6 +55,29 @@ def test_snapshot_code_can_switch_on_code_mode_formatting_in_the_kernel():
     assert code.index("format_on_save") < code.index("print("), "set before the cells are read"
 
 
+def test_snapshot_code_reports_the_exception_a_cell_raised(monkeypatch):
+    """Run in a stand-in code-mode context: the kernel's graph says which cell raised and with what."""
+    import contextlib
+    import io
+    from types import SimpleNamespace
+
+    import marimo._code_mode as cm
+
+    cells = [SimpleNamespace(id="ok", name="fine", code="x = 1"), SimpleNamespace(id="bad", name="", code="1 / 0")]
+    graph = SimpleNamespace(cells={"ok": SimpleNamespace(exception=None), "bad": SimpleNamespace(exception=ZeroDivisionError("x"))})
+    for context, errors in (
+        (SimpleNamespace(_document=SimpleNamespace(cells=cells), graph=graph), ["", "ZeroDivisionError"]),
+        (SimpleNamespace(_document=SimpleNamespace(cells=cells)), ["", ""]),  # no graph to read: nothing known
+    ):
+        monkeypatch.setattr(cm, "get_context", lambda context=context: context)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            exec(compile(cc.snapshot_code(), "<scratchpad>", "exec"), {})
+        snapshot = cc.parse_snapshot(out.getvalue())
+        assert snapshot is not None and [c.error for c in snapshot.cells] == errors
+        assert [(c.id, c.name, c.code) for c in snapshot.cells] == [("ok", "fine", "x = 1"), ("bad", "", "1 / 0")]
+
+
 def test_parse_snapshot_takes_the_marker_line():
     payload = {"cells": [{"id": "Hbol", "name": "", "code": "import marimo as mo"}, {"id": "b", "name": "load", "code": None}]}
     out = f"noise\n{cc.SNAPSHOT_MARKER}{json.dumps(payload)}\n"

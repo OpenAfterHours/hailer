@@ -67,6 +67,7 @@ _ERROR_WORDS: dict[str, str] = {
     "MalformedParquetError": "unreadable data file",
     "ConfigError": "configuration problem",
     "cells_unreadable": "could not read the cells",
+    "cell_error": "cell error",
     "unknown_template": "unknown template",
     "execution_failed": "failed",
 }
@@ -229,7 +230,7 @@ _SHAPE_RE = re.compile(r"^shape: \((?P<rows>[\d_]+),(?P<cols> [\d_]+)?\)$|^\[(?P
 
 def _cell_ops(text: str) -> tuple[list[tuple[str, str]], bool, list[str]]:
     """``[(kind, name)]`` for the cells code mode reports it changed (name ``""`` when unnamed), whether
-    one of them raised, and the packages it installed."""
+    one it created or edited raised, and the packages it installed."""
     ops: list[tuple[str, str]] = []
     errored = False
     packages: list[str] = []
@@ -248,7 +249,7 @@ def _cell_ops(text: str) -> tuple[list[tuple[str, str]], bool, list[str]]:
             name, error = "", True
         kind = verb.split()[0]  # created, edited, deleted, moved, re-ran
         ops.append(("changed" if kind in ("created", "edited") else kind, "" if name == "_" else name))
-        errored = errored or error
+        errored = errored or (error and kind in ("created", "edited"))
     return ops, errored, packages
 
 
@@ -279,24 +280,34 @@ def _rows(text: str) -> str:
     return rows
 
 
-def _marimo_execute(args: Mapping[str, Any], text: str, status: Mapping[str, Any]) -> str:
+def _marimo_execute(args: Mapping[str, Any], text: str, status: Mapping[str, Any]) -> Outcome:
+    """The cells the code changed, then what went wrong or the rows it printed, then the checks.
+
+    A cell the code created or edited that raised fails the call: the kernel says so in the status
+    (``cell_error``, with the exception classes). Only when there were no cell snapshots (``[checks]``
+    all off) does marimo's own ``... (error)`` line say it, read from code that used code mode."""
     body = text
     if "checked" in status:  # the reply ends with the check report: what the code printed comes before it
         header = "\n\nChecks (" if _strings(status.get("checked")) else "\n\n(Check skipped: "
         head, sep, _report = text.rpartition(header)
         body = head if sep else text
-    changed = _strings(status.get("cells")) if "cells" in status else None
+    snapshots = "cells" in status  # the cells were compared before and after the code ran
+    changed = _strings(status.get("cells")) if snapshots else None
     # Code mode's lines are read only from code that used it: other code may print anything.
-    ops, cell_error, packages = _cell_ops(body) if "_code_mode" in str(args.get("code") or "") else ([], False, [])
+    ops, line_error, packages = _cell_ops(body) if "_code_mode" in str(args.get("code") or "") else ([], False, [])
     installed = ""
     if packages:
         installed = "installed " + (_names(packages) if len(packages) <= MAX_NAMES else _plural(len(packages), "package"))
     cells = _join(_cell_words(changed, ops), installed)
-    if not status.get("ok", True):
-        return _join(cells, _exception_name(body) or "failed", _checks(status))
-    if cell_error:
-        return _join(cells, _exception_name(body) or "cell error", _checks(status))
-    return _join(cells, _rows(body), _checks(status))
+    error = status.get("error")
+    if status.get("ok", True) is False and error == "cell_error":
+        raised = [name for name in _strings(status.get("raised")) if _IDENTIFIER_RE.match(name)][:MAX_NAMES]
+        return Outcome(False, _join(cells, _names(raised) if raised else "cell error", _checks(status)))
+    if status.get("ok", True) is False:
+        return Outcome(False, _join(cells, _exception_name(body) or "failed", _checks(status)))
+    if line_error and not snapshots:
+        return Outcome(False, _join(cells, _exception_name(body) or "cell error", _checks(status)))
+    return Outcome(True, _join(cells, _rows(body), _checks(status)))
 
 
 def _exception_name(text: str) -> str:
@@ -513,7 +524,6 @@ def _fetch_page(args: Mapping[str, Any], text: str, status: Mapping[str, Any]) -
 
 
 _PARSERS: dict[str, Callable[[Mapping[str, Any], str, Mapping[str, Any]], str]] = {
-    "marimo_execute": _marimo_execute,
     "marimo_status": _marimo_status,
     "notebook_cells": _notebook_cells,
     "notebook_check": _notebook_check,
@@ -547,12 +557,14 @@ def tool_outcome(name: str, args: Mapping[str, Any] | None, content: Any, status
         if not isinstance(status, Mapping):
             return Outcome(True, "")
         ok = status.get("ok", True) is not False
-        failed_code = name == "marimo_execute" and status.get("error") == "execution_failed"
-        if not ok and not failed_code:  # worded by its class; code that failed is named by its exception
+        given = args if isinstance(args, Mapping) else {}
+        if name == "marimo_execute" and status.get("error") in (None, "execution_failed", "cell_error"):
+            ok, summary = _marimo_execute(given, _text(content), status)  # failed code is named by its exception
+            return Outcome(ok, _clip(summary))
+        if not ok:  # worded by its class, never its message
             return Outcome(False, _clip(_failure(name, status)))
         parser = _PARSERS.get(name)
-        given = args if isinstance(args, Mapping) else {}
-        return Outcome(ok, _clip(parser(given, _text(content), status)) if parser is not None else "")
+        return Outcome(True, _clip(parser(given, _text(content), status)) if parser is not None else "")
     except Exception as exc:  # noqa: BLE001 - a summary is never worth a failed turn
         log.debug("no outcome for %s: %s", name, type(exc).__name__)
         return Outcome(not error and not (isinstance(status, Mapping) and status.get("ok") is False), "")
