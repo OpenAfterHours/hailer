@@ -18,17 +18,18 @@ The terminal shows a short checklist while the session starts, and a summary whe
 ◆ Hailer 0.3.0   ·   ~/work/acme-analytics
 
   ✓ Kernel     docker · isolated · no network · data read-only              1.9s
-  ✓ Notebook   analysis.py · open in your browser                           2.2s
-               Opens in app view (results only); Ctrl+. in the notebook shows the code
   ✓ Agent      gpt-5.5 · openai · OPENAI_API_KEY from keyring               0.8s
   ↺ Resumed    3 earlier turns · /new starts fresh
+  ✓ Notebook   analysis.py · open in your browser                           2.2s
+               Opens in app view (results only); Ctrl+. in the notebook shows the code
 ...
   Session ended · 4 turns · 4m 12s · 18.2k tokens
   ✓ Notebooks copied back to notebooks/   ✓ Kernel stopped
 ```
 
-You can type your first question as soon as the input box appears; the notebook and agent rows arrive
-while it waits. A problem found by the startup checks is a `▲` (warning) or `✗` (the start stops) row
+You can type your first question as soon as the input box appears; the agent and notebook rows arrive
+while it waits, each when it is ready (usually the agent first). If the last copy of the notebooks back
+did not finish, the last line says `▲ Notebooks not all copied back to notebooks/`. A problem found by the startup checks is a `▲` (warning) or `✗` (the start stops) row
 under the first line. `/status` shows the full settings: model, provider, kernel image, kernel log,
 notebook and web access.
 
@@ -38,9 +39,10 @@ notebook and web access.
   re-runs the notebook in a fresh kernel.
 - **The server needs a token.** Hailer gives every server it starts a random token and keeps it in
   memory, so other programs on the machine cannot send code to the kernel. The link Hailer opens
-  carries `access_token=...`, which signs the browser in. Hailer prints that link only when you have to
-  open it yourself: with `--no-browser`, or when the notebook's tab did not open in time (then a `▲ Notebook
-  ... no kernel session yet` row with the link on a line of its own). Links the agent quotes in the chat
+  carries `access_token=...`, which signs the browser in. In the chat Hailer prints that link only when you
+  have to open it yourself: with `--no-browser` (at once, for the first notebook and for every switch), or
+  when the notebook's tab did not open in time (then a `▲ Notebook ... no kernel session yet` row with the
+  link on a line of its own). `--foreground` has no chat and always prints its signed-in link. Links the agent quotes in the chat
   leave the token out, because tool results go to the model endpoint; `/notebook` prints the signed-in link.
 - **Log.** The kernel's log is `docker logs hailer-kernel-<id>-<suffix>`; `/status` names it (`Kernel log`),
   and `--verbose` prints it under the `Kernel` row. When a start fails, its last lines are in the error
@@ -66,7 +68,8 @@ not the code behind them (the URL carries `view-as=present`). To see or edit the
 switches back. It is a normal edit session either way, so the agent works in it exactly the same.
 
 Flags: `--port N` (default 2718; a free port is chosen when it is busy, and a note under the `Kernel` row
-says so), `--no-browser` (print the signed-in URL instead of opening it), `--foreground` (just run marimo attached to this terminal, no chat, until Ctrl+C; it
+says so), `--no-browser` (print the signed-in URL instead of opening it, at startup and for every notebook
+switch), `--foreground` (just run marimo attached to this terminal, no chat, until Ctrl+C; it
 opens marimo's home page unless `--no-browser` is given), `--new` (start a fresh conversation), `--kernel docker|unsafe-local`
 (where notebook code runs for this run; the default comes from `[kernel] runtime`, which defaults to `docker`).
 

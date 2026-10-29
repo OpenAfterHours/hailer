@@ -67,9 +67,9 @@ The terminal shows what got ready, one row each:
 ◆ Hailer 0.3.0   ·   ~/my-analysis
 
   ✓ Kernel     docker · isolated · no network · data read-only              1.9s
+  ✓ Agent      gpt-5.5 · openai · OPENAI_API_KEY from keyring               0.8s
   ✓ Notebook   analysis.py · open in your browser                           2.2s
                Opens in app view (results only); Ctrl+. in the notebook shows the code
-  ✓ Agent      gpt-5.5 · openai · OPENAI_API_KEY from keyring               0.8s
 ```
 
 You can type or paste your first question while chat preparation continues. Pressing Enter keeps one

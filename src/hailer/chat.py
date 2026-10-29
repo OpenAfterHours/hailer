@@ -80,6 +80,8 @@ class ChatController:
         self.notebook_open: bool | None = None
         #: True while the inline composer runs (cards instead of plain lines).
         self.interactive = False
+        #: False with --no-browser: a switch prints the notebook's signed-in link instead of opening it.
+        self.open_browser = True
         self._link_cache: tuple[str | None, str] = (None, "")
         #: The notebook before a switch a turn's tools made, until _sync_active_notebook reports it.
         self._switched_from: str | None = None
@@ -151,9 +153,11 @@ class ChatController:
     @contextmanager
     def progress(self, label: str, detail: str = "") -> Iterator[None]:
         """Show ``label`` and ``detail`` on the composer's live row while the block runs, from any
-        thread (``Notebook  opening analysis.py in your browser``); nothing in plain mode."""
+        thread (``Notebook  opening analysis.py in your browser``); plain mode, which has no live
+        row, prints them once as a ``○`` row when the block starts."""
         ui = getattr(self, "ui", None) if self.interactive else None
         if ui is None:
+            self.console.print(session_row(self._glyphs(), "wait", label, detail))
             yield
             return
         key = object()
@@ -469,7 +473,8 @@ class ChatController:
         """Pick up a switch the model made during a turn (its tools write the same state file).
 
         Returns True when the active notebook changed (since before a :meth:`_peek_active_notebook`).
-        With ``open_browser`` the notebook's URL is opened once when it has no kernel session yet.
+        With ``open_browser`` the notebook's URL is opened once when it has no kernel session yet
+        (with --no-browser its signed-in link is printed instead).
         """
         try:
             active = notebooks.load_active_notebook(self.config)
@@ -480,17 +485,22 @@ class ChatController:
             return False
         self.notebook = active
         self.notebook_open = None
-        state = ""
+        state, link = "", ""
         if open_browser:
             sandbox, session, _err = self._cli._marimo_state(self.sandbox, active)
             self._note_session(active, session, known=sandbox is not None)
-            if sandbox is not None and session is None:
+            if sandbox is not None and session is None and self.open_browser:
                 self._cli._open_browser(sandbox.notebook_url(active, with_token=True))  # opened, never printed
                 state = "opened in your browser"
+            elif sandbox is not None and session is None:
+                state, link = "not open in a browser", sandbox.notebook_url(active, with_token=True)
             elif session is not None:
                 state = "open in your browser"
         g = self._glyphs()
-        self.console.print(session_row(g, "ok", "Notebook", g.join(single_line(active), "now active", state)))
+        self.console.print(session_row(g, "wait" if link else "ok", "Notebook", g.join(single_line(active), "now active", state)))
+        if link:  # --no-browser: the user opens it
+            self.console.print(session_note("Open it in your browser with this link (it signs you in):"))
+            self.console.print(session_note(link, style=""), soft_wrap=True)
         return True
 
     # -- slash commands ---------------------------------------------------- #
@@ -563,7 +573,7 @@ class ChatController:
             ("Tokens", f"{self.state.input_tokens} in / {self.state.output_tokens} out"),
             ("Marimo", marimo),
             ("Kernel", self._cli._kernel_line(self.config)),
-            *([("Kernel log", self._log_hint())] if self._log_hint() else []),
+            *([("Kernel log", log)] if (log := self._log_hint()) else []),
             ("Notebook", self.notebook),
             ("Notebooks", self._cli._relative(self.config.notebooks_root, self.config.workspace)),
             ("Web access", self._cli._web_line(self.config)),
@@ -592,7 +602,7 @@ class ChatController:
         rows: list[tuple[str | None, str, str]] = [
             ("ok" if have_key else "warn", "Model", model),
             ("warn" if unsafe else "ok", "Kernel", self._cli._kernel_line(self.config)),
-            *([(None, "Kernel log", self._log_hint())] if self._log_hint() else []),
+            *([(None, "Kernel log", log)] if (log := self._log_hint()) else []),
             (marimo[0], "Marimo", marimo[1]),
             (notebook[0], "Notebook", notebook[1]),
             (None, "Notebooks", self._cli._relative(self.config.notebooks_root, self.config.workspace)),
@@ -898,8 +908,14 @@ class ChatController:
         if session is not None:
             return _Opened(session, client, "already open", ok=True)
         url = sandbox.notebook_url(name, with_token=True)  # opened, and printed only when it must be opened by hand
-        with self.progress("Notebook", f"opening {single_line(name)} in your browser"):
-            self._cli._open_browser(url)
+        if not self.open_browser:  # --no-browser: the link at once, then the wait
+            g = self._glyphs()
+            self.console.print(session_row(g, "wait", "Notebook", f"open {single_line(name)} in your browser with this link (it signs you in):"))
+            self.console.print(session_note(url, style=""), soft_wrap=True)
+        doing = f"opening {single_line(name)} in your browser" if self.open_browser else f"waiting for {single_line(name)} to open"
+        with self.progress("Notebook", doing):
+            if self.open_browser:
+                self._cli._open_browser(url)
             if self._stop_event is None:
                 session = self._cli._wait_for_session(client, name, self._cli.SWITCH_SESSION_TIMEOUT_SEC)
             else:
@@ -909,6 +925,8 @@ class ChatController:
                 )
         self._note_session(name, session)
         self._check_stopped()
+        if session is None and not self.open_browser:
+            return _Opened(None, client, "no kernel session yet", note="Open it with the link above.")
         if session is None:
             return _Opened(None, client, "no kernel session yet", note="Open it in your browser with this link:", link=url)
         return _Opened(session, client, "open in your browser", ok=True)

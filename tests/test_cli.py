@@ -41,6 +41,7 @@ from hailer.models import (
     TurnSummary,
     WebConfig,
 )
+from hailer.sandbox import MarimoSandbox
 from hailer.session import save_session, session_path
 
 runner = CliRunner()
@@ -68,10 +69,10 @@ def rows(output: str, label: str, *parts: str, icon: str = "✓") -> list[str]:
     detail starts with ``parts`` (joined by `` · ``), to the end of their line. A row may follow the
     plain prompt on its line: the test runner does not echo what was typed."""
     detail = re.escape(" · ".join(parts))
-    return re.findall(rf"(?:^|You > )(  {re.escape(icon)} {re.escape(label)} +{detail}[^\n]*)$", output, re.M)
+    return re.findall(rf"(?:^|You > )(  {re.escape(icon)} {re.escape(label)} +{detail}[^\n]*)$", output, re.MULTILINE)
 
 
-SESSION_ENDED = re.compile(r"^  Session ended · \d+ turns? · [\d.]+s(?: · [\d.]+k? tokens)?$", re.M)
+SESSION_ENDED = re.compile(r"^  Session ended · \d+ turns? · [\d.]+s(?: · [\d.]+k? tokens)?$", re.MULTILINE)
 NOTEBOOK_SOURCE = "import marimo\n\napp = marimo.App()\n\n\n@app.cell\ndef _():\n    return\n"
 INTERNAL = ProviderConfig(
     id="internal",
@@ -954,7 +955,7 @@ def test_notebook_no_browser_still_waits_and_continues_without_session(harness, 
     result = notebook_cmd(["--no-browser"])
     assert result.exit_code == 0, result.output
     assert harness.opened == []
-    assert rows(result.output, "Notebook", "open analysis.py in your browser with this link", icon="↗")
+    assert rows(result.output, "Notebook", "open analysis.py in your browser with this link", icon="○")
     assert f"{' ' * 15}{signed(harness.url)}" in result.output.splitlines(), "the link on a line of its own"
     assert result.output.count(TOKEN) == 1, "printed once"
     assert rows(result.output, "Notebook", "analysis.py", "no kernel session yet", icon="▲")
@@ -1115,6 +1116,40 @@ def test_a_normal_start_and_switch_open_the_signed_in_link_without_printing_it(h
     assert rows(result.output, "Notebook", "third.py", "now active", "opened in your browser")
 
 
+def test_no_browser_holds_for_switches_too_and_prints_each_link_at_once(harness, nb):
+    """--no-browser: nothing opens a browser, not a /notebook switch nor one the model made; each
+    notebook to open gets its signed-in link at once, on a line of its own, before any wait."""
+    other = write_notebook(harness.config, "other")
+    third = write_notebook(harness.config, "third")
+    harness.client = FakeClient(session=None)
+    harness.agent.on_turn = lambda: notebooks.save_active_notebook(harness.config, "third.py")
+    result = notebook_cmd(["--no-browser"], input_text="/notebook open other\nswitch to the third one\n/exit\n")
+    assert result.exit_code == 0, result.output
+    assert harness.opened == [], "no browser"
+    out, lines = result.output, result.output.splitlines()
+    link = rows(out, "Notebook", "open other.py in your browser with this link (it signs you in):", icon="○")
+    assert link and f"{' ' * 15}{signed(url_for(other))}" in lines
+    assert out.index(link[0]) < out.index(signed(url_for(other))) < out.index(rows(out, "Notebook", "other.py", "active")[0])
+    assert rows(out, "Notebook", "third.py", "now active", "not open in a browser", icon="○")
+    assert f"{' ' * 15}{signed(url_for(third))}" in lines
+    assert out.count(TOKEN) == 3, "startup, the switch and the model's switch: each link once"
+    assert nb.session_waits == ["analysis.py", "other.py"], "a /notebook switch still waits for the tab"
+
+
+def test_plain_mode_says_what_it_waits_for(harness, nb):
+    """Without the composer's live row, a wait for a notebook's tab (up to 90 s at startup, 30 s after
+    /notebook open) starts with one ○ row; the signed-in link is not in it."""
+    write_notebook(harness.config, "other")
+    harness.client = FakeClient(session=None)
+    result = notebook_cmd(input_text="/notebook open other\n/exit\n")
+    assert result.exit_code == 0, result.output
+    out = result.output
+    for name, done in (("analysis.py", ("analysis.py", "open in your browser")), ("other.py", ("other.py", "active", "open in your browser"))):
+        waiting = rows(out, "Notebook", f"opening {name} in your browser", icon="○")
+        assert len(waiting) == 1 and out.index(waiting[0]) < out.index(rows(out, "Notebook", *done)[0])
+    assert TOKEN not in out
+
+
 def test_a_switch_whose_tab_does_not_open_in_time_prints_the_signed_in_link_once(harness, nb):
     other = write_notebook(harness.config, "other")
     harness.client = FakeClient(session=None)
@@ -1143,54 +1178,114 @@ def test_a_link_to_open_by_hand_is_written_whole_and_never_as_a_hyperlink(harnes
     assert "\x1b]8;" not in out.getvalue()
 
 
-def test_the_exit_summary_says_what_was_stopped_and_copied_back():
-    """docker: the notebooks came back and the kernel went; unsafe-local: the kernel went; a warning
-    from the last copy stays visible and marks the first item; a stop error stays red, exit 1."""
-    import typer
+@dataclass
+class StoppingKernel(MarimoSandbox):
+    """A kernel whose stop warns, records its last copy (``copied_back``), fails or is interrupted."""
 
-    from hailer.sandbox import MarimoSandbox
+    warning: str = ""
+    error: str = ""
+    copied: bool | None = None
+    interrupt: bool = False
+    stop_error: str = ""
+    copied_back: bool | None = None
+    stops: int = 0
 
-    @dataclass
-    class Kernel(MarimoSandbox):
-        warning: str = ""
-        error: str = ""
-        stop_error: str = ""
+    def stop(self) -> None:
+        self.stops += 1
+        if self.warning:
+            self.notify(self.warning)
+        self.copied_back = self.copied
+        self.stop_error = self.error
+        if self.interrupt:
+            raise KeyboardInterrupt  # a second Ctrl+C while the containers are removed
 
-        def stop(self) -> None:
-            if self.warning:
-                self.notify(self.warning)
-            self.stop_error = self.error
 
+def _stop_config() -> HailerConfig:
     workspace = Path("/w")
-    config = HailerConfig(
+    return HailerConfig(
         workspace=workspace, notebook=workspace / "notebooks" / "analysis.py", data_dir=workspace / "data",
         context_dir=workspace / "c", skills_dir=workspace / "s", prompts_dir=workspace / "p",
     )
 
-    def stop(runtime, **kernel):
-        out = io.StringIO()
-        console = Console(file=out, force_terminal=True, color_system="standard", width=150, highlight=False)
-        console.status = lambda *_args, **_kwargs: nullcontext()  # the spinner while it stops
-        running = Kernel(MarimoServer(url="http://127.0.0.1:2718", runtime=runtime), **kernel)
-        code = 0
-        try:
-            cli_chat._stop_kernel(console, config, running)
-        except typer.Exit as stopped:
-            code = stopped.exit_code
-        plain = re.sub(r"\x1b\[[0-9;]*m", "", out.getvalue())
-        return code, plain, out.getvalue()
 
-    code, text, _raw = stop("docker")
+def _stop(runtime: str, **kernel) -> tuple[int, str, str, StoppingKernel]:
+    """``_stop_kernel`` on a terminal (its spinner left out); exit code, text, raw output, kernel."""
+    import typer
+
+    out = io.StringIO()
+    console = Console(file=out, force_terminal=True, color_system="standard", width=150, highlight=False)
+    console.status = lambda *_args, **_kwargs: nullcontext()
+    running = StoppingKernel(MarimoServer(url="http://127.0.0.1:2718", runtime=runtime), **kernel)
+    code = 0
+    try:
+        cli_chat._stop_kernel(console, _stop_config(), running)
+    except typer.Exit as stopped:
+        code = stopped.exit_code
+    return code, re.sub(r"\x1b\[[0-9;]*m", "", out.getvalue()), out.getvalue(), running
+
+
+def test_the_exit_summary_says_what_was_stopped_and_copied_back():
+    """docker: the notebooks came back (the last copy's own record says so) and the kernel went;
+    unsafe-local: the kernel went; a stop error stays red, exit 1."""
+    code, text, _raw, _kernel = _stop("docker", copied=True)
     assert code == 0 and text.splitlines() == [f"  ✓ Notebooks copied back to notebooks{os.sep}   ✓ Kernel stopped"]
-    code, text, _raw = stop("unsafe-local")
+    code, text, _raw, _kernel = _stop("unsafe-local")
     assert code == 0 and text.splitlines() == ["  ✓ Kernel stopped"]
-    lost = "Warning: stopped before the notebooks were copied back; the kernel's changes since the last copy are lost."
-    code, text, _raw = stop("docker", warning=lost)
-    assert code == 0 and text.splitlines() == [f"  ▲ {lost}", "  ▲ Notebooks: see the warning above   ✓ Kernel stopped"]
     failed = "Could not finish stopping the Docker kernel: hailer-net-1: docker said: in use. Run uvx hailer kernel stop to retry."
-    code, text, raw = stop("docker", error=failed)
+    code, text, raw, _kernel = _stop("docker", copied=True, error=failed)
     assert code == 1 and text.splitlines() == [f"  ✓ Notebooks copied back to notebooks{os.sep}", f"  ✗ {failed}"]
     assert "Kernel stopped" not in text and "\x1b[31m" in raw, "red"
+
+
+@pytest.mark.parametrize("warning", ["Warning: stopped before the notebooks were copied back; the kernel's changes since the last copy are lost.", ""], ids=["said", "said-before"])
+def test_the_exit_summary_says_when_the_last_copy_did_not_finish_even_without_a_new_warning(warning):
+    """A dead kernel's warning was said once mid-session, so its last copy fails silently: the line
+    comes from the copy's record, never from the warnings."""
+    code, text, _raw, _kernel = _stop("docker", copied=False, warning=warning)
+    assert code == 0
+    assert text.splitlines() == [*([f"  ▲ {warning}"] if warning else []), f"  ▲ Notebooks not all copied back to notebooks{os.sep}   ✓ Kernel stopped"]
+    code, text, _raw, _kernel = _stop("docker", warning="Warning: other.py changed both here and in the kernel. ...", copied=True)
+    assert text.splitlines()[-1] == f"  ✓ Notebooks copied back to notebooks{os.sep}   ✓ Kernel stopped", "a warning is not a failed copy"
+
+
+@pytest.mark.parametrize(("runtime", "how"), [("docker", "Run uvx hailer kernel stop to remove it."), ("unsafe-local", "End its python -m marimo process")])
+def test_a_second_ctrl_c_while_the_kernel_is_removed_says_it_may_still_run(runtime, how):
+    code, text, _raw, kernel = _stop(runtime, interrupt=True)
+    assert code == 1 and kernel.stops == 1, "not stopped twice"
+    assert "Interrupted while the kernel stopped: it may still be running." in text and how in text
+    assert "Kernel stopped" not in text
+
+
+def test_a_terminal_that_cannot_be_written_never_keeps_the_kernel_from_stopping():
+    """The spinner and the summary write to the terminal; when it fails (closed, a broken pipe) the
+    kernel is still stopped, so its last copy back runs and nothing is left for the next start."""
+
+    class Broken(io.StringIO):
+        def write(self, text):
+            raise OSError("terminal closed")
+
+    console = Console(file=Broken(), force_terminal=True, color_system="standard", width=100)
+    running = StoppingKernel(MarimoServer(url="http://127.0.0.1:2718", runtime="docker"), copied=True)
+    with pytest.raises(OSError, match="terminal closed"):
+        cli_chat._stop_kernel(console, _stop_config(), running)
+    assert running.stops == 1
+
+
+def test_a_session_whose_terminal_fails_at_the_end_still_stops_its_kernel(harness, monkeypatch):
+    """The chat ended; the exit summary cannot be written: the kernel stops all the same."""
+    failing = {"now": False}
+
+    class Flaky(io.StringIO):
+        def write(self, text):
+            if failing["now"]:
+                raise OSError("terminal closed")
+            return super().write(text)
+
+    monkeypatch.setattr(cli_chat, "_chat_console", lambda opts: Console(file=Flaky(), force_terminal=False, width=120, soft_wrap=True))
+    harness.agent.close = lambda: failing.update(now=True)  # the chat is over
+    result = runner.invoke(cli.app, [], input="/exit\n", catch_exceptions=True)
+    assert isinstance(result.exception, OSError)
+    assert [k.stopped for k in harness.kernel_starts] == [1]
 
 
 def test_a_docker_session_that_cannot_remove_its_kernel_exits_1_with_the_error_in_red(harness, nb, docker):
@@ -2111,7 +2206,7 @@ def test_notebook_kernel_docker_runs_the_chat_against_a_container(harness, nb, d
     assert run[:8] == ["run", "-d", "--pull", "never", "--name", kernel_name, "--network", network_name]
     assert docker.commands("create")[0][5:7] == ["-p", "127.0.0.1:2731:2718"]
     assert "Marimo is running at" not in result.output, "only with --verbose"
-    assert re.search(rf"^(You > )?Kernel log +docker logs {kernel_name} *$", result.output, re.M), "/status keeps the log reachable"
+    assert re.search(rf"^(You > )?Kernel log +docker logs {kernel_name} *$", result.output, re.MULTILINE), "/status keeps the log reachable"
     assert harness.opened == [f"http://127.0.0.1:2731/?file=/work/notebooks/analysis.py&view-as=present&access_token={TOKEN}"]
     assert TOKEN not in result.output, "the browser opened it: the signed-in link is never printed"
     assert rows(result.output, "Kernel", "docker", "isolated", "no network", "data read-only")

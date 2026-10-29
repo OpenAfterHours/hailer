@@ -739,6 +739,49 @@ def test_ascii_glyphs_when_the_console_cannot_encode_unicode():
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("gesture", ["/exit\r", "\x03"], ids=["exit", "ctrl-c"])
+def test_the_transcript_ends_with_a_blank_line_even_when_the_chat_ends_during_startup(gesture):
+    """What follows the composer (the CLI's exit summary) starts after a blank line, however it ends."""
+
+    async def scenario():
+        async def prepare():
+            ui.console.print("  ✓ Agent      gpt-5.5")
+            await asyncio.Event().wait()
+            return True
+
+        with terminal(lambda _text: asyncio.sleep(0)) as (ui, keys, _screen, transcript, _size):
+            ui.configure_startup(prepare)
+            running = await start(ui)
+            await until(lambda: "Agent" in transcript.getvalue())
+            keys.send_text(gesture)
+            await asyncio.wait_for(running, 5)
+            assert transcript.getvalue().endswith("gpt-5.5\n\n")
+
+    asyncio.run(scenario())
+
+
+def test_session_rows_are_one_plain_line_whatever_their_text_and_their_icons_fit_the_column():
+    """Labels and details come from outside (context-file names, warnings, check texts): no escape
+    sequence or newline reaches the terminal. Every status mark, in both glyph sets, fits the icon
+    column the live row and the step rows share."""
+    from rich.cells import cell_len
+
+    from hailer.transcript import ICON_WIDTH, session_note, session_row
+
+    for glyphs in (UNICODE, ASCII):
+        for status in ("ok", "warn", "fail", "resume", "wait", "failed", "cancelled"):
+            assert cell_len(f"  {glyphs.icon(status)}") <= ICON_WIDTH, (glyphs.ascii, status)
+    for terminal_console in (False, True):
+        out = io.StringIO()
+        console = Console(file=out, force_terminal=terminal_console, color_system=None, width=80)
+        console.print(session_row(UNICODE, "warn", "Con\ntext", "ctx\x1b[2J.md\nlooks\tlike a secret", 0.4))
+        console.print(session_note("hint\x1b]8;;http://x\x07 with\x00 controls"))
+        lines = out.getvalue().splitlines()
+        assert "\x1b" not in out.getvalue() and "\x07" not in out.getvalue() and "\x00" not in out.getvalue()
+        assert re.match(r"  ▲ Con text {3}ctx\[2J\.md looks like a secret +0\.4s$", lines[0]), lines
+        assert lines[1].strip() == "hint]8;;http://x with controls" and len(lines) == 2
+
+
 def test_reply_footer_links_the_notebook_without_its_token():
     async def scenario():
         url = "http://127.0.0.1:2718/?file=/work/notebooks/analysis.py&view-as=present"

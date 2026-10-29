@@ -1245,6 +1245,7 @@ class ChatUI:
                 pass
             except Exception as exc:
                 failure = exc
+        self.gap()  # what follows the composer (the CLI's exit summary) starts after a blank line
         try:
             await self.flush()
         except Exception as exc:

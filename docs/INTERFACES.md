@@ -438,7 +438,10 @@ class NotebookSync:                        # NotebookSync(sandbox, folder, works
         # differs: target checked (_target: folders created, never a link/junction, resolved inside the folder; NotebookPathError),
         # backup first when the file here differs from the last copy (".hailer/notebook-backups/<name>.<YYYYmmdd-HHMMSS>.py" + a
         # warning; no write when the backup fails), then _write_atomically (temp file + os.replace). Never deletes here. "Not copied
-        # back from the kernel ..." names each refused entry once (folders as "<name>/"); failures are warnings shown once; never raises
+        # back from the kernel ..." names each refused entry once (folders as "<name>/"); failures are warnings shown once; never raises.
+        # Sets complete: True when the pass got to its end with every notebook it had to copy written here (refused names aside),
+        # False otherwise (the kernel did not answer, a write failed, the deadline or budget, the session cap, Ctrl+C, a pass under way)
+    complete: bool | None                  # the latest sync_out's outcome (None before the first): what a silent repeat cannot say
     def start(self, interval: float | None = None) -> None   # daemon thread "hailer-notebook-sync": sync_out every interval or on soon()
     def soon(self) -> None
     def close(self, *, final: bool = True) -> list[str]   # stop the thread (a pass ends within SYNC_CYCLE_SEC), then (final)
@@ -574,6 +577,7 @@ def data_path_problems(data_dir, *, windows=None, drive_type=None) -> list[str]
     def stop(self) -> None                 # sync.close(final=True) on a daemon thread, joined at most SYNC_STOP_SEC (then a warning; Ctrl+C
                                            # there: a warning), then remove (always), then
                                            # release the owner lock; stop_error explains a failure ("... Run uvx hailer kernel stop to retry.")
+    copied_back: bool | None               # after stop: sync.complete of the last copy (False when it timed out or Ctrl+C cut it; None: no sync)
     def log_tail(self, lines=15, *, container=None) -> list[str]   # docker logs --tail, token masked
     def wait(self) -> int                  # docker logs -f; then sets ended from docker inspect: removed from outside, out of memory, exit 137, "exited (code N)"
 @dataclass(frozen=True) class Labelled: id; name; state ("" for a network); role; owner
@@ -1152,9 +1156,12 @@ start this session's own kernel through the chosen runtime (`_start_kernel`; not
 Interactive mode shows the editable composer after the kernel's row and before agent preparation and
 browser-session waiting run concurrently. Plain/piped mode retains the notebook wait before its prompt.
 
-Startup output is a checklist (`transcript.SessionRow`: icon, a ten-cell label, detail, seconds; on a
-terminal the columns line up with the composer's live row and a row that worked keeps to one line, elsewhere
-each is one plain line that is never cut). In order: the header `◆ Hailer <version>   ·   <workspace>` (`~`
+Startup output is a checklist (`transcript.SessionRow`: icon, a ten-cell label, detail, seconds, the same
+columns as a step row; label and detail pass `steps.single_line`, so names, warnings and check texts cannot
+add rows or terminal controls; on a terminal the columns line up with the composer's live row and a row that
+worked keeps to one line, elsewhere each is one plain line that is never cut; `session_note` lines under a
+row lose control characters too, and on the CLI's own console a terminal wraps them under the detail column
+while pipes and plain mode get whole lines). In order: the header `◆ Hailer <version>   ·   <workspace>` (`~`
 for the home folder, `_home_relative`) and a blank line; each preflight check that did not pass as a row
 (`_check_rows`: `▲` warning or `✗` failure, labelled `Config`, `Notebook`, `API key`, `Kernel`, `Docker`,
 `Image`, `Data`; the summary and hint lines unchanged, the hints under the detail column; a failure exits 1
@@ -1167,7 +1174,8 @@ M.` and, with `--verbose`, `Marimo is running at <url>  (log: <log hint>)`. The 
 sandbox's `log_hint`). The notebook's row comes from `_wait_for_notebook`: `✓ Notebook  <name> · already
 open`, or (the browser opened, a session came) `✓ Notebook  <name> · open in your browser  2.2s` and the muted
 `APP_VIEW_TIP`, or a warning `▲ Notebook  <name> · no kernel session yet` (the agent reports the notebook state
-when asked). The agent's rows come from `ChatController._started`: `✓ Agent  <model> · <provider> · <env_key>
+when asked). Plain mode, which has no live row, starts the wait with `○ Notebook  opening <name> in your
+browser` (no link). The agent's rows come from `ChatController._started`: `✓ Agent  <model> · <provider> · <env_key>
 from <source>  0.8s` (the source the agent resolved; nothing is looked up then), `↺ Resumed  N earlier turns ·
 /new starts fresh`, or `▲ Thread  previous conversation could not be resumed; started a new one`; context
 warnings are `▲ Context` rows. In the composer, the notebook wait and the agent start show on the live row
@@ -1177,10 +1185,14 @@ running step before both) and commit their rows above it as each finishes; the c
 when preparation ends. Plain mode prints the same rows in order, then `Type /help for commands.`.
 
 The signed-in URL (`sandbox.notebook_url(name, with_token=True)`: it carries the access token) is opened
-in the browser and printed only when the user must open it by hand: with `--no-browser` (`↗ Notebook  open
-<name> in your browser with this link (it signs you in):`) or when no session came in time (the warning row,
-then the link). It is then a note of its own under the row, printed with `soft_wrap=True` (written whole: the
-terminal wraps it and it copies as one) and never as an OSC 8 hyperlink. The same holds for switches.
+in the browser and, in the chat, printed only when the user must open it by hand: with `--no-browser` (at
+once, before the wait: `○ Notebook  open <name> in your browser with this link (it signs you in):`) or when
+no session came in time (the warning row, then the link). It is then a note of its own under the row,
+printed with `soft_wrap=True` (written whole: the terminal wraps it and it copies as one) and never as an
+OSC 8 hyperlink. The same holds for switches: `ChatLoop(..., open_browser=False)` (`--no-browser`) sets
+`ChatController.open_browser`, and then neither `/notebook new|open` nor a switch the model made opens a
+browser; each prints its link at once instead. `--foreground` has no chat: it prints its signed-in home URL
+(below), the only way into that kernel.
 `--kernel docker|unsafe-local` overrides the runtime for `notebook` (`_kernel_choice`: any other value, `local`
 included, prints `config.runtime_problem` and exits 2). The kernel is stopped in the `finally` of
 `_run_session` (and `_run_foreground`) whatever ends the chat: `_start_kernel` is called inside that guarded
@@ -1206,14 +1218,21 @@ waits for exit or Ctrl+C, and stops it; only the browser uses that kernel. Every
 Exit (`_run_chat_loop`, then `_stop_kernel` in `_run_session`'s `finally`): when the chat ends (`/exit`, EOF,
 Ctrl+C while idle; nothing prints `Bye.` any more) the muted `Session ended · N turns · 4m 12s · 18.2k tokens`
 (this session's turns and tokens, `ChatController.session_turns`/`session_tokens`, and the time since the
-command started; zero tokens are left out); then, under a spinner on a terminal while the kernel stops, one
-line: `✓ Notebooks copied back to notebooks/   ✓ Kernel stopped` (docker) or `✓ Kernel stopped`
-(unsafe-local). A warning from the stop (`sandbox.notice` is pointed at the CLI's console, as a `▲` callout,
-text unchanged, e.g. `Warning: stopped before the notebooks were copied back; ...`) makes the first item
-`▲ Notebooks: see the warning above`. A stop error stays red (`✗ Could not finish stopping the Docker kernel:
-... Run uvx hailer kernel stop to retry.`) in place of `Kernel stopped`, and the command exits 1. A session
-that failed before the chat ran (a fatal check, a kernel that did not start, an agent that could not start in
-plain mode) has no `Session ended` line.
+command started; zero tokens are left out; the composer ends its transcript with a blank line however it
+exits, so the line always follows one); then, under a spinner on a terminal while the kernel stops, one line:
+`✓ Notebooks copied back to notebooks/   ✓ Kernel stopped` (docker) or `✓ Kernel stopped` (unsafe-local).
+`running.stop()` runs whatever the terminal does: a spinner or line that cannot be written (a closed
+terminal) never keeps the kernel, or its last copy back, from stopping. The first item is the last copy's own
+record, `DockerKernel.copied_back` (from `NotebookSync.complete`; None without a copy), never the warnings,
+which say a repeated problem once: `▲ Notebooks not all copied back to notebooks/` when the last copy did not
+finish (a dead kernel, a file that could not be written, the deadline, Ctrl+C). Warnings during the stop
+(`sandbox.notice` is pointed at the CLI's console) print as `▲` callouts, text unchanged, e.g. `Warning:
+stopped before the notebooks were copied back; ...`. A second Ctrl+C while the kernel is removed prints
+`Interrupted while the kernel stopped: it may still be running.` with `Run uvx hailer kernel stop to remove it.`
+(docker) or how to end the marimo process (unsafe-local), and exits 1. A stop error stays red (`✗ Could not
+finish stopping the Docker kernel: ... Run uvx hailer kernel stop to retry.`) in place of `Kernel stopped`,
+and the command exits 1. A session that failed before the chat ran (a fatal check, a kernel that did not
+start, an agent that could not start in plain mode) has no `Session ended` line.
 
 Other commands: `status` shows the configuration, credentials, context and a `Kernels:` line
 (`kernel_docker.workspace_kernels`, via `_workspace_kernels`: running Docker kernels; "none running for this
@@ -1334,13 +1353,15 @@ not list), marimo state, URL and `NOTEBOOK_USAGE`; `/notebook list` = `sandbox.l
 A switch (`_switch_notebook`) writes the state file, sets `self.notebook`, queues
 `_pending_preamble` **before** waiting for the tab, then `_ensure_session` (opens the URL through
 `hailer.browser` when there is no session and waits `SWITCH_SESSION_TIMEOUT_SEC` = 30 s, the live row saying
-`Notebook  opening <name> in your browser`; it prints nothing itself), then refines the notice; Ctrl+C or a
+`Notebook  opening <name> in your browser`, plain mode a `○` row; with `--no-browser` it opens nothing and
+prints the `○ Notebook  open <name> in your browser with this link` row and the link at once), then refines
+the notice; Ctrl+C or a
 marimo error during the wait leaves the notice queued. Whatever happened, the switch ends with one row
 (`_notebook_row`): `✓ Notebook  q2.py · active · open in your browser  0.6s` (`· already open` when it had a
 session; `· created from the starter|empty template · active ...` for `/notebook new`; `analysis.py · already
 the active notebook · ...` for `/notebook open` of the active one), or a warning `▲ Notebook  q2.py · active ·
 no kernel session yet` followed by `Open it in your browser with this link:` and the signed-in link on a line
-of its own (the only case a switch prints it), or `▲ ... · not open in a browser yet` after Ctrl+C or an
+of its own (`Open it with the link above.` after `--no-browser` printed it), or `▲ ... · not open in a browser yet` after Ctrl+C or an
 error. `/notebook close` prints `✓ Notebook  <name> · closed · session <id> · its browser tab is disconnected`
 and, for the active one, `It stays the active notebook; /notebook open <name> reopens it.` under it. Exact notice:
 `[Hailer] The active notebook is now <name> (<detail>). Call notebook_cells before editing.` with
@@ -1350,7 +1371,8 @@ and, for the active one, `It stays the active notebook; /notebook open <name> re
 error). `_sync_active_notebook()` runs in the `finally` of every turn (finished, failed, interrupted) and,
 without opening a browser, at the start of `/notebook` and `/status`: on a change it updates `self.notebook`,
 prints `✓ Notebook  <name> · now active` and (turn end only) opens the URL once when the notebook has no
-session (`· opened in your browser`; `· open in your browser` when it has one), never printing it;
+session (`· opened in your browser`; `· open in your browser` when it has one), never printing it; with
+`--no-browser` it prints `○ Notebook  <name> · now active · not open in a browser` and the link instead;
 no preamble is queued because the model made the switch itself. `COMMANDS["notebook"]` =
 `Show or switch the active notebook. Usage: /notebook [list | new <name> [--empty] | open <name> | close [name]]`.
 Progress (plain `_TurnDisplay`, interactive `ChatUI.on_event`), through `steps.StepTracker`: a `tool_call`

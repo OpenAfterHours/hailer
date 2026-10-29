@@ -318,8 +318,9 @@ written there.
   containers are still detaching is retried for a few seconds).
 - **Notebooks at stop.** The session copies its kernel's changed notebooks back before it removes the
   containers (see [Notebook copies](#notebook-copies)), and says so on its last line:
-  `✓ Notebooks copied back to notebooks/   ✓ Kernel stopped`. A warning from that copy is printed above it
-  and turns the first item into `▲ Notebooks: see the warning above`; a removal that failed is a red
+  `✓ Notebooks copied back to notebooks/   ✓ Kernel stopped`. When that copy did not finish (the kernel
+  stopped answering, a file could not be written, the deadline, Ctrl+C) the first item is
+  `▲ Notebooks not all copied back to notebooks/`, whether or not its warning was already shown; a removal that failed is a red
   `✗ Could not finish stopping the Docker kernel: ...` instead of `Kernel stopped`, and the command exits 1. `uvx hailer kernel stop` and the leftover cleanup
   of a later start remove containers without copying: a killed session's last changes are lost.
 - **Logs.** `docker logs hailer-kernel-<id>-<suffix>`; `/status` shows the name (`Kernel log`), and

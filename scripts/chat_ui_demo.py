@@ -72,6 +72,7 @@ class Demo:
         self.kernel = "unsafe-local" if unsafe_local else "docker"
         self.model = "gpt-5.5"
         self.turns, self.tokens, self.calls = 3, 14_820, 0
+        self.console = console  # the terminal before and after the composer, as the CLI's
         self.ui = ChatUI(console, self.submit, self.footer)
 
     def footer(self) -> FooterData:
@@ -276,7 +277,7 @@ class Demo:
             await asyncio.wait_for(self.ui.run(), timeout)
         except TimeoutError:
             console.print(f"Demo stopped after {timeout:g} seconds.", markup=False)
-        out = self.ui._raw_console  # the composer has gone: what the CLI prints after it
+        out = self.console  # the composer has gone: what the CLI prints after it
         out.print(session_ended(g, turns=self.turns - 3, elapsed=time.monotonic() - started, tokens_used=max(0, self.tokens - 14_820)))
         stopped = [("ok", "Kernel stopped")] if self.kernel == "unsafe-local" else [("ok", "Notebooks copied back to notebooks/"), ("ok", "Kernel stopped")]
         out.print(done_items(g, stopped))

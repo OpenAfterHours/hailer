@@ -307,7 +307,13 @@ Keep these properties; each has a test in `tests/test_notebook_sync.py` unless n
   (`test_a_server_that_trickles_its_page_cannot_hold_the_last_copy`,
   `test_a_last_copy_that_never_ends_cannot_keep_the_containers`).
 - **Failures warn, never raise**, and repeat once per message (a dead kernel does not print every 15 s). The
-  chat routes `sandbox.notice` to its own console, which the composer queues from any thread.
+  chat routes `sandbox.notice` to its own console, which the composer queues from any thread. Because a
+  repeated warning is silent, what the session's last line says about the notebooks comes from the last
+  copy's own record (`NotebookSync.complete`, `DockerKernel.copied_back`), not from the warnings: a review
+  found it claiming `✓ Notebooks copied back` after a kernel that died mid-session
+  (`test_a_last_copy_from_a_dead_kernel_is_recorded_though_its_warning_was_said_before`,
+  `test_each_copy_back_records_whether_it_finished`). The CLI stops the kernel in a `finally` no spinner or
+  line can skip (`test_a_terminal_that_cannot_be_written_never_keeps_the_kernel_from_stopping`).
 - **Ordering**: sync-in runs inside `DockerRuntime.start`, so the chat and the browser never see an empty
   folder, and a Ctrl+C there stops the kernel. This costs one list + create per notebook on loopback before
   the composer renders (LEARNINGS §10); keep it bounded rather than moving it after `_active_notebook`. Stop

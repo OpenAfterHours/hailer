@@ -21,7 +21,7 @@ from rich.table import Table
 from rich.text import Text
 
 from hailer.session import COMMAND_GROUPS, COMMAND_USAGE
-from hailer.steps import Receipt, plural
+from hailer.steps import Receipt, plural, single_line
 
 ACCENT, MUTED, OK, WARN, FAIL = "cyan", "dim", "green", "yellow", "red"
 STATUS_STYLES = {"ok": OK, "failed": FAIL, "cancelled": WARN, "unknown": WARN}
@@ -63,7 +63,9 @@ class Glyphs:
         return f" {self.sep} ".join(part for part in parts if part)
 
     def icon(self, status: str) -> str:
-        return {"ok": self.ok, "failed": self.fail}.get(status, self.warn)
+        """A step's or session row's status as its mark: "ok", "failed"/"fail", "resume" (a resumed
+        conversation), "wait" (not there yet); anything else (cancelled, unknown, warn) is a warning."""
+        return {"ok": self.ok, "failed": self.fail, "fail": self.fail, "resume": self.resume, "wait": self.off}.get(status, self.warn)
 
     def characters(self) -> str:
         return "".join(str(value) for value in vars(self).values() if isinstance(value, str))
@@ -192,42 +194,70 @@ def callout(glyphs: Glyphs, kind: str, message: str, hints: Sequence[str] = ()) 
     return Gutter(body, f"  {glyphs.fail if kind == 'fail' else glyphs.warn} ", style=style)
 
 
-def step_row(glyphs: Glyphs, receipt: Receipt) -> Table:
-    """One finished step: icon, done verb, ``target · outcome``, seconds. Every column has a fixed
-    width, so durations line up across separately printed rows and with the live row. A step that
-    worked keeps to one line; the detail of one that did not (its error, "cancelled, effect
-    unknown") wraps in its column rather than being cut."""
+@dataclass(frozen=True)
+class _Row:
+    """What a step row and a session row share: an icon, a fixed-width label, the detail and the
+    seconds, with the styles of the icon, the label and the detail."""
+
+    icon: str
+    styles: tuple[str, str, str]
+    label: str
+    label_width: int
+    detail: str = ""
+    took: float | None = None
+    #: One line, its detail cut with an ellipsis; otherwise (a failure, a warning) the detail wraps.
+    worked: bool = True
+
+    def grid(self) -> Table:
+        """Every column has a fixed width, so durations line up across separately printed rows and
+        with the composer's live row."""
+        icon_style, label_style, detail_style = self.styles
+        grid = Table.grid(expand=True, padding=(0, 1))
+        grid.add_column(width=ICON_WIDTH, no_wrap=True)
+        grid.add_column(width=self.label_width, no_wrap=True)
+        grid.add_column(ratio=1, no_wrap=self.worked, overflow="ellipsis" if self.worked else "fold")
+        grid.add_column(width=SECONDS_WIDTH, justify="right", no_wrap=True)
+        grid.add_row(
+            Text(f"  {self.icon}", style=icon_style), Text(self.label, style=label_style),
+            Text(self.detail, style=detail_style), Text(seconds(self.took) if self.took is not None else "", style=MUTED),
+        )
+        return grid
+
+    def line(self, width: int) -> Text:
+        """One line of text that is never cut; the seconds go to the right edge when they fit there."""
+        icon_style, label_style, detail_style = self.styles
+        line = Text.assemble(
+            (f"  {self.icon} ", icon_style),
+            (self.label.ljust(self.label_width), label_style),
+            (f" {self.detail}" if self.detail else "", detail_style),
+        )
+        line.rstrip()
+        if self.took is not None:
+            took = seconds(self.took)
+            room = width - line.cell_len
+            line.append(took.rjust(room) if room >= len(took) + 2 else f"  {took}", style=MUTED)
+        return line
+
+
+def _step(glyphs: Glyphs, receipt: Receipt) -> _Row:
     style = STATUS_STYLES.get(receipt.status, WARN)
-    grid = Table.grid(expand=True, padding=(0, 1))
-    grid.add_column(width=ICON_WIDTH, no_wrap=True)
-    grid.add_column(width=LABEL_WIDTH, no_wrap=True)
-    grid.add_column(ratio=1, no_wrap=receipt.status == "ok", overflow="ellipsis" if receipt.status == "ok" else "fold")
-    grid.add_column(width=SECONDS_WIDTH, justify="right", no_wrap=True)
-    grid.add_row(
-        Text(f"  {glyphs.icon(receipt.status)}", style=style),
-        Text(receipt.label, style="" if receipt.status == "ok" else style),
-        Text(glyphs.join(receipt.target, receipt.outcome), style=MUTED),
-        Text(seconds(receipt.seconds) if receipt.seconds is not None else "", style=MUTED),
+    ok = receipt.status == "ok"
+    return _Row(
+        glyphs.icon(receipt.status), (style, "" if ok else style, MUTED), receipt.label, LABEL_WIDTH,
+        glyphs.join(receipt.target, receipt.outcome), receipt.seconds, worked=ok,
     )
-    return grid
+
+
+def step_row(glyphs: Glyphs, receipt: Receipt) -> Table:
+    """One finished step: icon, done verb, ``target · outcome``, seconds. A step that worked keeps
+    to one line; the detail of one that did not (its error, "cancelled, effect unknown") wraps in
+    its column rather than being cut."""
+    return _step(glyphs, receipt).grid()
 
 
 def plain_step_row(glyphs: Glyphs, receipt: Receipt, width: int) -> Text:
-    """:func:`step_row` as one line of text that is never cut; the seconds go to the right edge
-    when they fit there."""
-    style = STATUS_STYLES.get(receipt.status, WARN)
-    detail = glyphs.join(receipt.target, receipt.outcome)
-    line = Text.assemble(
-        (f"  {glyphs.icon(receipt.status)} ", style),
-        (receipt.label.ljust(LABEL_WIDTH), "" if receipt.status == "ok" else style),
-        (f" {detail}" if detail else "", MUTED),
-    )
-    line.rstrip()
-    if receipt.seconds is not None:
-        took = seconds(receipt.seconds)
-        room = width - line.cell_len
-        line.append(took.rjust(room) if room >= len(took) + 2 else f"  {took}", style=MUTED)
-    return line
+    """:func:`step_row` as one line of text that is never cut."""
+    return _step(glyphs, receipt).line(width)
 
 
 def turn_stats(glyphs: Glyphs, *, steps: int, elapsed: float | None, input_tokens: int | None, output_tokens: int | None) -> str:
@@ -260,17 +290,19 @@ def turn_footer(glyphs: Glyphs, stats: str, notebook: str = "", url: str = "") -
 SESSION_LABEL_WIDTH = 10
 #: Where a session row's detail starts: the notes under a row (a tip, a link) line up with it.
 SESSION_DETAIL_COLUMN = ICON_WIDTH + 1 + SESSION_LABEL_WIDTH + 1
-#: A session row's status: its icon and the style of its icon, label and detail.
-SESSION_STYLES = {"ok": (OK, "", MUTED), "warn": (WARN, WARN, WARN), "fail": (FAIL, FAIL, FAIL), "resume": (MUTED, "", MUTED), "link": (ACCENT, "", MUTED)}
+#: A session row's status: the style of its icon, label and detail.
+SESSION_STYLES = {"ok": (OK, "", MUTED), "warn": (WARN, WARN, WARN), "fail": (FAIL, FAIL, FAIL), "resume": (MUTED, "", MUTED), "wait": (MUTED, "", MUTED)}
 
 
-def _session_icon(glyphs: Glyphs, status: str) -> str:
-    return {"ok": glyphs.ok, "fail": glyphs.fail, "resume": glyphs.resume, "link": glyphs.link}.get(status, glyphs.warn)
+def _printable(text: str) -> str:
+    """``text`` without control characters (an escape sequence, a newline), its spaces kept."""
+    return "".join(char if char.isprintable() else " " if char.isspace() else "" for char in text)
 
 
 class SessionRow:
     """One line of what the session did: ``✓ Kernel  docker · isolated  1.9s``. ``status`` is "ok",
-    "warn", "fail", "resume" (a resumed or new conversation) or "link" (something to open by hand).
+    "warn", "fail", "resume" (a resumed conversation) or "wait" (not there yet: a notebook to open).
+    The label and the detail are made one plain line (names and warnings come from outside).
 
     On a terminal its columns line up with each other and with the composer's live row (seconds at
     the right edge); a row that worked keeps to one line (its detail cut with ``…``), a warning's
@@ -278,34 +310,13 @@ class SessionRow:
     that is never cut, so nothing depends on the width or on redraws."""
 
     def __init__(self, glyphs: Glyphs, status: str, label: str, detail: str = "", took: float | None = None) -> None:
-        self.glyphs, self.status, self.label, self.detail, self.took = glyphs, status, label, detail, took
+        self.row = _Row(
+            glyphs.icon(status), SESSION_STYLES.get(status, SESSION_STYLES["warn"]), single_line(label),
+            SESSION_LABEL_WIDTH, single_line(detail), took, worked=status in ("ok", "resume", "wait"),
+        )
 
     def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
-        icon_style, label_style, detail_style = SESSION_STYLES.get(self.status, SESSION_STYLES["warn"])
-        took = seconds(self.took) if self.took is not None else ""
-        if not console.is_terminal:
-            line = Text.assemble(
-                (f"  {_session_icon(self.glyphs, self.status)} ", icon_style),
-                (self.label.ljust(SESSION_LABEL_WIDTH), label_style),
-                (f" {self.detail}" if self.detail else "", detail_style),
-            )
-            line.rstrip()
-            if took:
-                room = options.max_width - line.cell_len
-                line.append(took.rjust(room) if room >= len(took) + 2 else f"  {took}", style=MUTED)
-            yield line
-            return
-        worked = self.status in ("ok", "resume", "link")
-        grid = Table.grid(expand=True, padding=(0, 1))
-        grid.add_column(width=ICON_WIDTH, no_wrap=True)
-        grid.add_column(width=SESSION_LABEL_WIDTH, no_wrap=True)
-        grid.add_column(ratio=1, no_wrap=worked, overflow="ellipsis" if worked else "fold")
-        grid.add_column(width=SECONDS_WIDTH, justify="right", no_wrap=True)
-        grid.add_row(
-            Text(f"  {_session_icon(self.glyphs, self.status)}", style=icon_style), Text(self.label, style=label_style),
-            Text(self.detail, style=detail_style), Text(took, style=MUTED),
-        )
-        yield grid
+        yield self.row.grid() if console.is_terminal else self.row.line(options.max_width)
 
 
 def session_row(glyphs: Glyphs, status: str, label: str, detail: str = "", took: float | None = None) -> SessionRow:
@@ -314,9 +325,10 @@ def session_row(glyphs: Glyphs, status: str, label: str, detail: str = "", took:
 
 
 def session_note(text: str, style: str = MUTED) -> RenderableType:
-    """A line under a session row's detail (a tip, a hint, a link to open by hand). A URL in it is
-    written whole and never becomes a hyperlink: the terminal wraps it, so it copies as one."""
-    return Gutter(Text(text, style=style), " " * SESSION_DETAIL_COLUMN)
+    """A line under a session row's detail (a tip, a hint, a link to open by hand), without
+    control characters. A URL in it is written whole and never becomes a hyperlink: printed with
+    ``soft_wrap=True`` the terminal wraps it, so it copies as one."""
+    return Gutter(Text(_printable(text), style=style), " " * SESSION_DETAIL_COLUMN)
 
 
 def session_header(glyphs: Glyphs, version: str, workspace: str) -> Text:
@@ -337,7 +349,7 @@ def done_items(glyphs: Glyphs, items: Sequence[tuple[str, str]]) -> Text:
     line = Text("  ")
     for index, (status, text) in enumerate(items):
         icon_style = SESSION_STYLES.get(status, SESSION_STYLES["warn"])[0]
-        line.append(("   " if index else "") + f"{_session_icon(glyphs, status)} ", style=icon_style)
+        line.append(("   " if index else "") + f"{glyphs.icon(status)} ", style=icon_style)
         line.append(text, style=MUTED if status == "ok" else icon_style)
     return line
 
