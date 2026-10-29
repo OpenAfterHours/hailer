@@ -54,8 +54,11 @@ See [notebooks and sessions](notebooks.md) for switching, reopening and managing
 | Action | Shortcut or command |
 |---|---|
 | Send a message | Enter |
-| Insert a newline | Alt+Enter |
-| Cancel the current turn | Ctrl+C |
+| Insert a newline | Alt+Enter, or Ctrl+J (never involves Esc, so it never cancels) |
+| Cancel the current turn | Esc or Ctrl+C (Esc first closes the command menu when it is open) |
+| Open the command menu | `/` at the start of a message (or Tab); Up/Down or Tab/Shift+Tab choose, Esc closes |
+| Recall earlier messages | Up/Down, also from earlier sessions in this workspace (`[hailer] input_history = false` keeps them for this session only) |
+| Leave Hailer | `/exit`, Ctrl+C while idle, Ctrl+D on an empty line, or Ctrl+Z then Enter |
 | See chat commands | `/help` |
 | See the active model and notebook | `/status` |
 | Show the notebook link | `/notebook` |

@@ -163,11 +163,14 @@ def _render_prompt(config: HailerConfig, name: str, args: str) -> str:
     return render_prompt(config, name, args)
 
 
-def _make_agent(config: HailerConfig, bundle: ContextBundle, sandbox: MarimoSandbox | None = None) -> Any:
-    """The agent; its tools use ``sandbox``, the kernel this process started."""
+def _make_agent(
+    config: HailerConfig, bundle: ContextBundle, sandbox: MarimoSandbox | None = None, *, open_url: Callable[[str], bool] | None = None,
+) -> Any:
+    """The agent; its tools use ``sandbox``, the kernel this process started, and ``open_url`` to
+    open a notebook (``None``: the browser)."""
     from hailer.agent import HailerAgent
 
-    return HailerAgent(config, bundle, sandbox=sandbox)
+    return HailerAgent(config, bundle, sandbox=sandbox, open_url=open_url)
 
 
 def _start_dependency_warmup() -> None:
@@ -177,12 +180,13 @@ def _start_dependency_warmup() -> None:
     start_dependency_warmup()
 
 
-def _open_browser(url: str) -> None:
+def _open_browser(url: str) -> bool:
+    """Open ``url`` in the browser; whether a launcher started (the notebook tools then wait)."""
     from hailer.browser import (
         open_url,  # os.startfile first on Windows (ignores BROWSER), never raises
     )
 
-    open_url(url)
+    return open_url(url)
 
 
 def _find_free_port(preferred: int) -> int:

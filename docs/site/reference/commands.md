@@ -3,7 +3,7 @@
 | Command | What it does |
 |---|---|
 | `/help` | Show the command list. |
-| `/status` | Model, provider, credentials source, thread id, token usage, marimo state, kernel runtime, web allowlist. |
+| `/status` | Model, provider, credentials source, thread id with this conversation's turns and tokens, marimo state, kernel runtime and its log, web allowlist. |
 | `/new` | Start a new conversation thread (context files are re-read). |
 | `/model <name>` or `/model <provider>:<name>` | Switch model (and provider); starts a new thread. |
 | `/notebook`, `/notebook list`, `/notebook new <name> [--empty]`, `/notebook open <name>`, `/notebook close [name]` | Show or switch the active notebook (see *Working with several notebooks*). |
@@ -16,8 +16,14 @@
 | `/exit`, `/quit` | Exit Hailer (Ctrl+C at the prompt, Ctrl+D on an empty line, or Ctrl+Z then Enter, also exit). |
 
 Interactive chat keeps a framed input box below the conversation. Your submitted messages, Hailer's
-replies and command results appear above it. The context line shows the active notebook, model and
-number of loaded context files; the activity line shows what Hailer is doing.
+replies and command results appear above it. While Hailer works, a live line above the box shows the step
+in progress (or what startup or a notebook switch waits for) with a timer. The footer below the box shows
+the active notebook (`●` open in the browser, `○` not open), the kernel (`docker · isolated`, or a yellow
+`▲ unsafe-local · not isolated`), the model, and this conversation's turns and tokens (`working 3.1s` during
+a turn); it follows a notebook switch as soon as the tool that made it returns. When you leave, the last
+lines count this session only: `Session ended · 4m 12s · this session: 2 turns, 1.1k tokens`. Turns and
+tokens count finished turns: a cancelled or failed turn adds neither (the endpoint may still bill what it
+used).
 
 Enter sends; Alt+Enter (or Ctrl+J) inserts a newline. Pasting several lines keeps them in one editable
 message. You can draft your next message while Hailer works; Enter preserves that draft until the current
@@ -51,8 +57,9 @@ The interface uses normal terminal scrollback and text selection. It does not ca
 switch to an alternate screen. Use `uvx hailer --plain` or `uvx hailer notebook --plain` for the line-oriented
 `You >` interface. Pipes and terminals reporting `TERM=dumb` or `TERM=unknown` use plain input automatically.
 
-Ctrl+C during a turn cancels the model request and keeps the composer open. A notebook command already
-performing a blocking operation finishes its cleanup before another command can start. Cancellation does
+Esc or Ctrl+C during a turn cancels the model request and keeps the composer open (when the command
+menu is open, Esc first closes it; the next Esc cancels). A notebook command already performing a blocking
+operation finishes its cleanup before another command can start. Cancellation does
 not undo tool actions that have already happened. Ctrl+C while idle exits; Ctrl+D on empty input or
 Ctrl+Z then Enter also exits. The conversation is stored in `.hailer/threads.sqlite`, which is how
 `uvx hailer` resumes it after a restart; `/new` (or `uvx hailer --new`) discards it and starts another.

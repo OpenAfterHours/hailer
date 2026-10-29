@@ -816,6 +816,18 @@ def test_session_rows_are_one_plain_line_whatever_their_text_and_their_icons_fit
         assert lines[1].strip() == "hint]8;;http://x with controls" and len(lines) == 2
 
 
+def test_a_long_status_value_wraps_whole_instead_of_being_cut():
+    """/status's Kernel log of an unsafe-local kernel is a long path: it wraps in its column."""
+    from hailer.transcript import status_card
+
+    path = "/home/alex/" + "deep" * 20 + "/.hailer/marimo-424242.log"
+    out = io.StringIO()
+    Console(file=out, width=60, force_terminal=False).print(status_card(UNICODE, [(None, "Kernel log", path)]))
+    assert "…" not in out.getvalue()
+    inside = "".join(line.strip(" │╭╮╰╯─").removeprefix("Session").replace("Kernel log", "").strip() for line in out.getvalue().splitlines())
+    assert path in inside.replace(" ", "")
+
+
 def test_reply_footer_links_the_notebook_without_its_token():
     async def scenario():
         url = "http://127.0.0.1:2718/?file=/work/notebooks/analysis.py&view-as=present"

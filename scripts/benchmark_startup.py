@@ -77,7 +77,7 @@ async def _sample(notebook_delay: float) -> dict[str, float]:
             )},
         )
         services = SimpleNamespace(**vars(common))
-        services._make_agent = lambda config, bundle, sandbox: HailerAgent(
+        services._make_agent = lambda config, bundle, sandbox, open_url=None: HailerAgent(
             config, bundle, sandbox=sandbox, env={"HAILER_STARTUP_PROBE_KEY": "dummy-offline-probe"},
         )
         transcript, screen = io.StringIO(), io.StringIO()

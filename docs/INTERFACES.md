@@ -813,6 +813,7 @@ DEFAULT_SESSION_WAIT_SEC = 30.0
 NOTEBOOK_LINK_TIP = "The user can also run /notebook in the chat to get the link."
 class HailerTools:               # one plain method per tool, each -> str (a ToolReply); the method's docstring is the description the model sees
     def __init__(self, config: HailerConfig, sandbox: MarimoSandbox | None = None, *, open_url: UrlOpener | None = None, session_wait_sec: float = DEFAULT_SESSION_WAIT_SEC) -> None
+    # open_url: the chat's opener (HailerAgent(open_url=...)); with --no-browser it opens nothing and returns False
 class ToolReply(str):            # the reply text, equal to it, with how the call went beside it
     status: dict[str, Any]       # {"ok": bool, ...}, see below
 def hailer_tools(config: HailerConfig, *, sandbox: MarimoSandbox | None = None, open_url: UrlOpener | None = None, session_wait_sec: float = DEFAULT_SESSION_WAIT_SEC) -> list[Any]
@@ -832,7 +833,9 @@ and `truncated: True` when the text was cut to `max_tool_output_chars`; `marimo_
 `{"ok": False, "error": "execution_failed"}` from the kernel's `success` flag, and `{"ok": False, "error":
 "cell_error", "raised": [<exception class names>]}` when the code ran but a cell it created or edited raised
 (the after snapshot's `Cell.error`, from the kernel's graph; a cell that raised before and was not changed does
-not count); a failed cell listing or check snapshot is `error: "cells_unreadable"` and an unknown template
+not count); `notebook_open`, `notebook_create` and `notebook_close` add `notebook` (the name), `active`
+(whether it is the active notebook now) and `session` (whether it has a kernel session after the call); a
+failed cell listing or check snapshot is `error: "cells_unreadable"` and an unknown template
 `error: "unknown_template"`. A reply with code checks adds `findings` (count), `checked` and `skipped` (`ruff` /
 `ty`), and `marimo_execute` adds `cells` whenever it compared snapshots (the changed cells' names, `""` for an
 unnamed one; `[]` when none changed). `fetch_page` calls `web.fetch_page` with the output cap off and lets `_run`
@@ -1081,6 +1084,9 @@ class HailerAgent:
     its own task). A `ToolMessage` for no waiting call emits nothing and is not a step. `seconds` is the wall
     time since the `tool_call` event, rounded to ms. `ok` and `summary` come from
     `tool_outcomes.tool_outcome(name, args, content, message.artifact, error=(message.status == "error"))`.
+    A notebook tool's result also has `"notebook": {"notebook": <name>, "active": <bool>, "session": <bool>}`
+    (from its reply status: the notebook `notebook_open`/`notebook_create` left active or `notebook_close`
+    closed, and whether it has a kernel session), so the chat's footer follows a switch at once.
     A call the turn is cancelled in gets no `tool_result` (the UI marks it cancelled), nor does the
     `INTERRUPTED_TOOL_RESULT` that `_settle_history` writes for it before the next turn (state updates are
     not streamed). The bookkeeping is `_TurnEvents(emit).on_update(update)`, testable without a graph.
@@ -1260,9 +1266,11 @@ waits for exit or Ctrl+C, and stops it; only the browser uses that kernel. Every
 `docker_mount_problems`, including foreground mode. Pull/build progress runs before any startup spinner.
 
 Exit (`_run_chat_loop`, then `_stop_kernel` in `_run_session`'s `finally`): when the chat ends (`/exit`, EOF,
-Ctrl+C while idle; nothing prints `Bye.` any more) the muted `Session ended · N turns · 4m 12s · 18.2k tokens`
-(this session's turns and tokens, `ChatController.session_turns`/`session_tokens`, and the time since the
-command started; zero tokens are left out; the composer ends its transcript with a blank line however it
+Ctrl+C while idle; nothing prints `Bye.` any more) the muted `Session ended · 4m 12s · this session: 2 turns,
+1.1k tokens` (the time since the command started, then this session's turns and tokens,
+`ChatController.session_turns`/`session_tokens`; zero tokens are left out; the footer and `/status` count the
+whole conversation, `SessionState`, and say so: `/status` reads `this conversation: N turns`; turns and tokens
+count finished turns only: a cancelled or failed turn's usage is not known to the chat and adds neither; the composer ends its transcript with a blank line however it
 exits, so the line always follows one); then, under a spinner on a terminal while the kernel stops, one line:
 `✓ Notebooks copied back to notebooks/   ✓ Kernel stopped` (docker) or `✓ Kernel stopped` (unsafe-local).
 `running.stop()` runs whatever the terminal does: a spinner or line that cannot be written (a closed
@@ -1472,7 +1480,19 @@ error). `_sync_active_notebook()` runs in the `finally` of every turn (finished,
 without opening a browser, at the start of `/notebook` and `/status`: on a change it updates `self.notebook`,
 prints `✓ Notebook  <name> · now active` and (turn end only) opens the URL once when the notebook has no
 session (`· opened in your browser`; `· open in your browser` when it has one), never printing it; with
-`--no-browser` it prints `○ Notebook  <name> · now active · not open in a browser` and the link instead;
+`--no-browser` it prints `○ Notebook  <name> · now active · not open in a browser` and the link instead.
+A notebook tool's own try counts: `notebook_open`/`notebook_create` open the browser through the opener the
+chat gives the agent (`ChatController._tool_opener`, via `common._make_agent(..., open_url=...)` and
+`HailerAgent(open_url=...)` into `hailer_tools`; with `--no-browser` it opens nothing and returns False, so the
+tool asks the model to have the user open the link) and wait; so after a turn whose tool brought the notebook
+up, the chat does not open it again: with no session it prints `▲ Notebook  <name> · now active · no kernel
+session yet` and the signed-in link once on a line of its own. Only a switch no tool reported (a call cut
+short) is opened here. The footer follows a switch when the tool's result arrives: the notebook tools' reply
+status carries `notebook`, `active` and `session` (the model's text is unchanged), the agent passes them as
+`detail["notebook"]` of the `tool_result` event, and `ChatController._follow_notebook_tool` updates
+`notebook`/`notebook_open` without any I/O. After a cancelled turn the switch's row is printed after the
+composer's `▲ Cancelled.` callout (`_aturn` collects the rows and schedules them for the loop's next turn,
+which comes after the callout is queued);
 no preamble is queued because the model made the switch itself. `COMMANDS["notebook"]` =
 `Show or switch the active notebook. Usage: /notebook [list | new <name> [--empty] | open <name> | close [name]]`.
 Progress (plain `_TurnDisplay`, interactive `ChatUI.on_event`), through `steps.StepTracker`: a `tool_call`

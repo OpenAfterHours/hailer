@@ -99,9 +99,11 @@ class ToolReply(str):
     unexpected exception's class name, or ``execution_failed`` / ``cell_error`` / ``cells_unreadable``
     / ``unknown_template``), ``unexpected`` (an exception that is not a ``HailerError``), ``raised``
     (for ``cell_error``: the exception class names the changed cells raised, from the kernel),
-    ``truncated`` (the text was cut to ``max_tool_output_chars``) and the code-check facts ``cells``
+    ``truncated`` (the text was cut to ``max_tool_output_chars``), the code-check facts ``cells``
     (names of the changed cells, ``""`` for an unnamed one), ``findings``, ``checked`` and ``skipped``
-    (ruff / ty).
+    (ruff / ty), and for the notebook tools ``notebook`` (the notebook the call left active or
+    closed), ``active`` (whether it is the active notebook now) and ``session`` (whether it has a
+    kernel session after the call), so the chat follows a switch without asking marimo.
     It equals its text, so callers that only want the text need not know about it.
     """
 
@@ -580,7 +582,8 @@ class HailerTools:
             created = self._kernel().write_notebook(filename, source, replace=False).name
             notebooks.save_active_notebook(self.config, created)
             lines = [f"Created {created} from the {kind} template; it is now the active notebook."]
-            lines.extend(self._session_lines(self._bring_up(created)))
+            outcome = self._bring_up(created)
+            lines.extend(self._session_lines(outcome))
             if kind == "starter":
                 lines.append(
                     "The starter template already defines mo, pl, duckdb, Path, WORKSPACE, DATA_DIR, data_files, "
@@ -591,7 +594,7 @@ class HailerTools:
                     "The empty template defines nothing: its first cell must import what you need "
                     "(import marimo as mo, import polars as pl, ...)."
                 )
-            return "\n".join(lines)
+            return ToolReply("\n".join(lines), notebook=created, active=True, session=outcome.session is not None)
 
         return self._run(go)
 
@@ -614,7 +617,7 @@ class HailerTools:
                     lines.append("(no cells)" if text.strip() in ("", "(no output)") else text)
                 else:
                     lines.append(f"Could not list its cells.\n{text}")
-            return "\n".join(lines)
+            return ToolReply("\n".join(lines), notebook=name, active=True, session=outcome.session is not None)
 
         return self._run(go)
 
@@ -645,7 +648,7 @@ class HailerTools:
                 )
             else:
                 lines.append(f"The active notebook is still {active}.")
-            return "\n".join(lines)
+            return ToolReply("\n".join(lines), notebook=name, active=notebooks.same_name(name, active), session=False)
 
         return self._run(go)
 
