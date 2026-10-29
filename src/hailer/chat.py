@@ -9,7 +9,10 @@ from __future__ import annotations
 import asyncio
 import textwrap
 import threading
-from collections.abc import Awaitable, Callable
+import time
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
 from pathlib import Path
@@ -24,8 +27,9 @@ from hailer.errors import HailerError, MarimoUnavailableError, NoSessionError
 from hailer.models import CompletionData, ContextBundle, HailerConfig, MarimoSession, ProviderConfig, SessionState, SkillInfo, TurnSummary
 from hailer.session import EXIT_COMMANDS, help_text, load_session, parse_command, save_session
 from hailer.statedir import input_history_path
-from hailer.steps import plural
+from hailer.steps import plural, single_line
 from hailer.transcript import FooterData, NotebookRow, console_glyphs, detail_card, help_card, notebook_table, status_card
+from hailer.transcript import session_note, session_row
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
     from hailer.sandbox import MarimoSandbox
@@ -48,6 +52,19 @@ def _when(timestamp: float) -> str:
     return f"{moment.day} {moment:%b %Y}"
 
 
+@dataclass(frozen=True)
+class _Opened:
+    """What :meth:`ChatController._ensure_session` came to: the session and client, the notebook's
+    state in words for its row, whether that is fine, a note and the signed-in link to open by hand."""
+
+    session: MarimoSession | None = None
+    client: Any = None
+    state: str = "not open in a browser yet"
+    ok: bool = False
+    note: str = ""
+    link: str = ""
+
+
 class ChatController:
     def __init__(self, console: Console, config: HailerConfig, opts: Any, *, services: Any, sandbox: MarimoSandbox | None = None) -> None:
         self._cli = services
@@ -66,10 +83,16 @@ class ChatController:
         self.notebook_open: bool | None = None
         #: True while the inline composer runs (cards instead of plain lines).
         self.interactive = False
+        #: False with --no-browser: a switch prints the notebook's signed-in link instead of opening it.
+        self.open_browser = True
         self._link_cache: tuple[str | None, str] = (None, "")
         #: The notebook before a switch a turn's tools made, until _sync_active_notebook reports it.
         self._switched_from: str | None = None
         self.state: SessionState = load_session(config.workspace)
+        #: This session's turns and tokens (the state's counters span sessions and restart at /new):
+        #: the CLI's exit summary.
+        self.session_turns = 0
+        self.session_tokens = 0
         self.bundle: ContextBundle = ContextBundle()
         self.agent: Any = None
         self.startup_failed = False
@@ -93,20 +116,24 @@ class ChatController:
     # -- lifecycle --------------------------------------------------------- #
 
     def start(self) -> None:
+        began = time.monotonic()
         self.bundle = self._cli._load_context(self.config)
         self._print_context_warnings()
         self.agent = self._cli._make_agent(self.config, self.bundle, self.sandbox)
         resume = None if self.opts.new_thread else self.state.thread_id
         forget = self.state.thread_id if self.opts.new_thread else None  # --new: drop the stored conversation
         thread_id = self.agent.start(resume_thread_id=resume, forget_thread_id=forget)
-        self._started(thread_id, resume)
+        self._started(thread_id, resume, time.monotonic() - began)
 
-    def _started(self, thread_id: str, resume: str | None) -> None:
+    def _started(self, thread_id: str, resume: str | None, took: float | None = None) -> None:
+        """Record the thread the agent started on, then the startup rows: ``✓ Agent  model ·
+        provider · key source`` and whether the conversation was resumed."""
+        resumed: tuple[str, str, str] | None = None
         if resume and thread_id != resume:
-            self.console.print(Text("Previous conversation could not be resumed; started a new one.", style="dim"))
+            resumed = ("warn", "Thread", "previous conversation could not be resumed; started a new one")
             self.state = SessionState()
         elif resume:
-            self.console.print(Text(f"Resumed conversation ({self.state.turns} turns so far). /new starts fresh.", style="dim"))
+            resumed = ("resume", "Resumed", self._glyphs().join(plural(self.state.turns, "earlier turn"), "/new starts fresh"))
         elif self.opts.new_thread:
             self.state = SessionState()
         self.state.thread_id = thread_id
@@ -117,6 +144,38 @@ class ChatController:
         self.state.model = model if isinstance(model, str) else self.config.model.name
         self.state.provider = provider if isinstance(provider, str) else self.config.model.provider
         save_session(self.config.workspace, self.state)
+        self.console.print(self._agent_row(took))
+        if resumed is not None:
+            self.console.print(session_row(self._glyphs(), *resumed))
+
+    def _agent_row(self, took: float | None) -> RenderableType:
+        """``✓ Agent  gpt-5.5 · openai · OPENAI_API_KEY from keyring``. The key's source is the one
+        the agent resolved: nothing is looked up here (this runs on the composer's loop)."""
+        provider = self._active_provider()
+        source = getattr(self.agent, "key_source", None)
+        key = ""
+        if provider is not None and isinstance(source, str) and source:
+            key = f"{provider.env_key or 'API key'} " + ("missing" if source == "missing" else f"from {source}")
+        g = self._glyphs()
+        status = "warn" if source == "missing" else "ok"
+        return session_row(g, status, "Agent", g.join(single_line(self.state.model or ""), single_line(self.state.provider or ""), key), took)
+
+    @contextmanager
+    def progress(self, label: str, detail: str = "") -> Iterator[None]:
+        """Show ``label`` and ``detail`` on the composer's live row while the block runs, from any
+        thread (``Notebook  opening analysis.py in your browser``); plain mode, which has no live
+        row, prints them once as a ``○`` row when the block starts."""
+        ui = getattr(self, "ui", None) if self.interactive else None
+        if ui is None:
+            self.console.print(session_row(self._glyphs(), "wait", label, detail))
+            yield
+            return
+        key = object()
+        ui.begin_task(key, label, detail)
+        try:
+            yield
+        finally:
+            ui.end_task(key)
 
     def close(self) -> None:
         if self.agent is not None:
@@ -127,7 +186,7 @@ class ChatController:
 
     def _print_context_warnings(self) -> None:
         for warning in self.bundle.warnings:
-            self.console.print(self._cli._labelled("warn", "yellow", f"  {warning}"))
+            self.console.print(session_row(self._glyphs(), "warn", "Context", warning))
 
     # -- persistent interactive session ----------------------------------- #
 
@@ -162,13 +221,14 @@ class ChatController:
             raise _CommandStopped()
 
     async def astart(self) -> None:
+        began = time.monotonic()
         self.bundle = await self._blocking(self._cli._load_context, self.config)
         self._print_context_warnings()
         self.agent = self._cli._make_agent(self.config, self.bundle, self.sandbox)
         resume = None if self.opts.new_thread else self.state.thread_id
         forget = self.state.thread_id if self.opts.new_thread else None
         thread_id = await self.agent.astart(resume_thread_id=resume, forget_thread_id=forget)
-        self._started(thread_id, resume)
+        self._started(thread_id, resume, time.monotonic() - began)
 
     def footer(self) -> FooterData:
         """The composer's footer, from state this controller already holds: it is read on every
@@ -274,7 +334,8 @@ class ChatController:
 
         async def prepare() -> bool:
             async def agent_ready() -> None:
-                await self.astart()
+                with self.progress("Agent", f"starting {single_line(self.config.model.name)}"):
+                    await self.astart()
                 if timings is not None:
                     timings.mark("agent_ready")
 
@@ -343,8 +404,7 @@ class ChatController:
             if command is None:
                 await self._aturn(text)
             elif command.name in EXIT_COMMANDS:
-                self.console.print("Bye.")
-                self.ui.exit()
+                self.ui.exit()  # the CLI's exit summary follows
             elif command.name == "new":
                 self._reset_thread(await self.agent.anew_thread(), "New conversation started.")
             elif command.name == "model":
@@ -400,13 +460,13 @@ class ChatController:
     # -- REPL -------------------------------------------------------------- #
 
     def run(self) -> None:
-        # The plain prompt leaves the cursor after "You > "; prompt_toolkit has ended the line already.
-        bye = "Bye." if self.reader.interactive else "\nBye."
+        """The plain chat loop, until /exit, EOF or Ctrl+C at the prompt; the CLI's exit summary follows."""
         while True:
             try:
                 line = self.reader.read()
             except (EOFError, KeyboardInterrupt):
-                self.console.print(bye)
+                if not self.reader.interactive:
+                    self.console.print()  # the plain prompt leaves the cursor after "You > "
                 return
             text = line.strip()
             if not text:
@@ -417,7 +477,6 @@ class ChatController:
                     self._turn(text)
                     continue
                 if command.name in EXIT_COMMANDS:
-                    self.console.print("Bye.")
                     return
                 self._command(command)
             except HailerError as err:
@@ -463,6 +522,8 @@ class ChatController:
         self.state.turns += 1
         self.state.input_tokens += summary.input_tokens or 0
         self.state.output_tokens += summary.output_tokens or 0
+        self.session_turns += 1
+        self.session_tokens += (summary.input_tokens or 0) + (summary.output_tokens or 0)
         if summary.thread_id:
             self.state.thread_id = summary.thread_id
         save_session(self.config.workspace, self.state)
@@ -483,7 +544,8 @@ class ChatController:
         """Pick up a switch the model made during a turn (its tools write the same state file).
 
         Returns True when the active notebook changed (since before a :meth:`_peek_active_notebook`).
-        With ``open_browser`` the notebook's URL is opened once when it has no kernel session yet.
+        With ``open_browser`` the notebook's URL is opened once when it has no kernel session yet
+        (with --no-browser its signed-in link is printed instead).
         """
         try:
             active = notebooks.load_active_notebook(self.config)
@@ -494,14 +556,22 @@ class ChatController:
             return False
         self.notebook = active
         self.notebook_open = None
-        self.console.print(Text(f"Active notebook is now {active}.", style="dim"))
+        state, link = "", ""
         if open_browser:
             sandbox, session, _err = self._cli._marimo_state(self.sandbox, active)
             self._note_session(active, session, known=sandbox is not None)
-            if sandbox is not None and session is None:
-                url = sandbox.notebook_url(active, with_token=True)
-                self.console.print(f"Opening {url} in your browser...", markup=False)
-                self._cli._open_browser(url)
+            if sandbox is not None and session is None and self.open_browser:
+                self._cli._open_browser(sandbox.notebook_url(active, with_token=True))  # opened, never printed
+                state = "opened in your browser"
+            elif sandbox is not None and session is None:
+                state, link = "not open in a browser", sandbox.notebook_url(active, with_token=True)
+            elif session is not None:
+                state = "open in your browser"
+        g = self._glyphs()
+        self.console.print(session_row(g, "wait" if link else "ok", "Notebook", g.join(single_line(active), "now active", state)))
+        if link:  # --no-browser: the user opens it
+            self.console.print(session_note("Open it in your browser with this link (it signs you in):"))
+            self.console.print(session_note(link, style=""), soft_wrap=True)
         return True
 
     # -- slash commands ---------------------------------------------------- #
@@ -574,6 +644,7 @@ class ChatController:
             ("Tokens", f"{self.state.input_tokens} in / {self.state.output_tokens} out"),
             ("Marimo", marimo),
             ("Kernel", self._cli._kernel_line(self.config)),
+            *([("Kernel log", log)] if (log := self._log_hint()) else []),
             ("Notebook", self.notebook),
             ("Notebooks", self._cli._relative(self.config.notebooks_root, self.config.workspace)),
             ("Web access", self._cli._web_line(self.config)),
@@ -602,6 +673,7 @@ class ChatController:
         rows: list[tuple[str | None, str, str]] = [
             ("ok" if have_key else "warn", "Model", model),
             ("warn" if unsafe else "ok", "Kernel", self._cli._kernel_line(self.config)),
+            *([(None, "Kernel log", log)] if (log := self._log_hint()) else []),
             (marimo[0], "Marimo", marimo[1]),
             (notebook[0], "Notebook", notebook[1]),
             (None, "Notebooks", self._cli._relative(self.config.notebooks_root, self.config.workspace)),
@@ -612,6 +684,10 @@ class ChatController:
 
     def _glyphs(self) -> Any:
         return console_glyphs(self.console)
+
+    def _log_hint(self) -> str:
+        """Where this chat's kernel logs (``docker logs hailer-kernel-...``, a log file): /status."""
+        return single_line(str(getattr(self.sandbox, "log_hint", "") or "")) if self.sandbox is not None else ""
 
     def _active_provider(self) -> ProviderConfig | None:
         provider_id = self.state.provider or self.config.model.provider
@@ -829,7 +905,6 @@ class ChatController:
             return
         filename, source = notebooks.new_notebook(name, kind=kind)
         created = self.sandbox.write_notebook(filename, source, replace=False).name
-        self.console.print(f"Created {created} from the {kind} template.", markup=False)
         self._switch_notebook(created, how=f"created from the {kind} template")
 
     def _notebook_open(self, rest: str) -> None:
@@ -838,8 +913,9 @@ class ChatController:
             return
         name = self._resolve(rest)
         if notebooks.same_name(name, self.notebook):
-            self.console.print(f"{name} is already the active notebook.", markup=False)
-            self._ensure_session()
+            began = time.monotonic()
+            opened = self._ensure_session()
+            self._notebook_row([name, "already the active notebook"], opened, time.monotonic() - began)
             return
         self._switch_notebook(name, how="reopened")
 
@@ -856,12 +932,16 @@ class ChatController:
             return
         client.shutdown_session(session.session_id)
         self._note_session(name, None)
-        self.console.print(f"Closed {name} (session {session.session_id}); its browser tab is disconnected.", markup=False)
+        g = self._glyphs()
+        closed = g.join(single_line(name), "closed", f"session {session.session_id}", "its browser tab is disconnected")
+        self.console.print(session_row(g, "ok", "Notebook", closed))
         if notebooks.same_name(name, self.notebook):
-            self.console.print(f"It stays the active notebook; /notebook open {name.removesuffix('.py')} reopens it.", markup=False)
+            self.console.print(session_note(f"It stays the active notebook; /notebook open {name.removesuffix('.py')} reopens it."))
 
     def _switch_notebook(self, name: str, *, how: str) -> None:
-        """Make ``name`` the active notebook for this chat, the agent's tools and the next session."""
+        """Make ``name`` the active notebook for this chat, the agent's tools and the next session,
+        then one row: ``✓ Notebook  q2.py · active · open in your browser  0.6s``."""
+        began = time.monotonic()
         notebooks.save_active_notebook(self.config, name)
         self.notebook = name
         self.notebook_open = None
@@ -869,42 +949,47 @@ class ChatController:
         # Queue the notice first: if the wait for the browser tab is interrupted (Ctrl+C) or marimo
         # fails, the switch has still happened and the model must hear about it.
         self._pending_preamble = self._switch_notice(name, f"{how}, not open in a browser yet")
+        opened = _Opened()
         try:
-            session, client = self._ensure_session()
+            opened = self._ensure_session()
             self._check_stopped()
             detail = how
-            if session is not None:
-                count = self._cell_count(client)
+            if opened.session is not None:
+                count = self._cell_count(opened.client)
                 if count is not None:
                     detail += f", {plural(count, 'cell')}"
             else:
                 detail += ", not open in a browser yet"
             self._pending_preamble = self._switch_notice(name, detail)
         finally:
-            self.console.print(f"Active notebook: {name}.", markup=False)
+            self._notebook_row([name, "" if how == "reopened" else how, "active"], opened, time.monotonic() - began)
 
     @staticmethod
     def _switch_notice(name: str, detail: str) -> str:
         return f"[Hailer] The active notebook is now {name} ({detail}). Call notebook_cells before editing."
 
-    def _ensure_session(self) -> tuple[MarimoSession | None, Any]:
-        """Open the active notebook in the browser when it has no kernel session; (session, client)."""
+    def _ensure_session(self) -> _Opened:
+        """Open the active notebook in the browser when it has no kernel session and wait for one
+        (the live row says so); what came of it. Nothing is printed here: the caller's row is."""
         name = self.notebook
         self._check_stopped()
         sandbox, session, _err = self._cli._marimo_state(self.sandbox, name)
         self._note_session(name, session, known=sandbox is not None)
         self._check_stopped()
         if sandbox is None:
-            self.console.print("Marimo is not running; the notebook opens once it is (uvx hailer notebook).", markup=False)
-            return None, None
+            return _Opened(state="marimo is not running", note="Marimo is not running; the notebook opens once it is (uvx hailer notebook).")
         client = sandbox.client(notebook=name, token_in_links=True)
         if session is not None:
-            self.console.print(f"Notebook is open (session {session.session_id}).", markup=False)
-            return session, client
-        url = sandbox.notebook_url(name, with_token=True)
-        self.console.print(f"Opening {url} in your browser...", markup=False)
-        self._cli._open_browser(url)
-        with self.console.status("Waiting for the notebook to open..."):
+            return _Opened(session, client, "already open", ok=True)
+        url = sandbox.notebook_url(name, with_token=True)  # opened, and printed only when it must be opened by hand
+        if not self.open_browser:  # --no-browser: the link at once, then the wait
+            g = self._glyphs()
+            self.console.print(session_row(g, "wait", "Notebook", f"open {single_line(name)} in your browser with this link (it signs you in):"))
+            self.console.print(session_note(url, style=""), soft_wrap=True)
+        doing = f"opening {single_line(name)} in your browser" if self.open_browser else f"waiting for {single_line(name)} to open"
+        with self.progress("Notebook", doing):
+            if self.open_browser:
+                self._cli._open_browser(url)
             if self._stop_event is None:
                 session = self._cli._wait_for_session(client, name, self._cli.SWITCH_SESSION_TIMEOUT_SEC)
             else:
@@ -914,11 +999,22 @@ class ChatController:
                 )
         self._note_session(name, session)
         self._check_stopped()
+        if session is None and not self.open_browser:
+            return _Opened(None, client, "no kernel session yet", note="Open it with the link above.")
         if session is None:
-            self.console.print(f"No kernel session yet. Open {url} in your browser.", style="yellow", markup=False)
-        else:
-            self.console.print(f"Notebook is open (session {session.session_id}).", markup=False)
-        return session, client
+            return _Opened(None, client, "no kernel session yet", note="Open it in your browser with this link:", link=url)
+        return _Opened(session, client, "open in your browser", ok=True)
+
+    def _notebook_row(self, parts: list[str], opened: _Opened, took: float | None) -> None:
+        """``✓ Notebook  q2.py · active · open in your browser  0.6s``; a notebook that did not
+        open is a warning, with the signed-in link under it when it must be opened by hand."""
+        g = self._glyphs()
+        detail = g.join(*(single_line(part) for part in parts), opened.state)
+        self.console.print(session_row(g, "ok" if opened.ok else "warn", "Notebook", detail, took))
+        if opened.note:
+            self.console.print(session_note(opened.note))
+        if opened.link:
+            self.console.print(session_note(opened.link, style=""), soft_wrap=True)  # whole: it copies as one
 
     def _cell_count(self, client: Any) -> int | None:
         """Number of cells in the active notebook, or None when it cannot be determined."""

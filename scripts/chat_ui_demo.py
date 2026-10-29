@@ -28,6 +28,7 @@ from hailer.cli.common import _print_error, _reconfigure_streams
 from hailer.errors import HailerError
 from hailer.models import AgentEvent, CompletionData, TurnSummary
 from hailer.transcript import FooterData, NotebookRow, detail_card, help_card, notebook_table, status_card
+from hailer.transcript import done_items, session_ended, session_note, session_row
 
 URL = "http://127.0.0.1:2718/?file=/work/notebooks/{name}&view-as=present"
 
@@ -74,6 +75,7 @@ class Demo:
         self.kernel = "unsafe-local" if unsafe_local else "docker"
         self.model = "gpt-5.5"
         self.turns, self.tokens, self.calls = 3, 14_820, 0
+        self.console = console  # the terminal before and after the composer, as the CLI's
         self.ui = ChatUI(console, self.submit, self.footer, completions=self.completions, history_file=history)
 
     def footer(self) -> FooterData:
@@ -93,11 +95,26 @@ class Demo:
         await asyncio.sleep(seconds * self.delay)
 
     async def prepare(self) -> bool:
-        await self.pause(1.5)
-        self.ui.console.print("Notebook is open (session s_7d41b0).", markup=False)
-        self.notebook_open = True
-        await self.pause(0.6)
-        self.ui.console.print(Text("Resumed conversation (3 turns so far). /new starts fresh.", style="dim"))
+        """The startup checklist as ``uvx hailer`` prints it: the agent and the notebook in parallel
+        on the live row, each committing its row when it is ready."""
+        g, out = self.ui.glyphs, self.ui.console
+
+        async def agent() -> None:
+            self.ui.begin_task("agent", "Agent", f"starting {self.model}")
+            await self.pause(0.8)
+            self.ui.end_task("agent")
+            out.print(session_row(g, "ok", "Agent", g.join(self.model, "openai", "OPENAI_API_KEY from keyring"), 0.8 * self.delay))
+            out.print(session_row(g, "resume", "Resumed", g.join("3 earlier turns", "/new starts fresh")))
+
+        async def notebook() -> None:
+            self.ui.begin_task("notebook", "Notebook", f"opening {self.notebook} in your browser")
+            await self.pause(2.2)
+            self.ui.end_task("notebook")
+            self.notebook_open = True
+            out.print(session_row(g, "ok", "Notebook", g.join(self.notebook, "open in your browser"), 2.2 * self.delay))
+            out.print(session_note("Opens in app view (results only); Ctrl+. in the notebook shows the code"))
+
+        await asyncio.gather(agent(), notebook())
         return True
 
     # -- simulated agent events ---------------------------------------------------- #
@@ -185,8 +202,7 @@ class Demo:
         command, _, argument = text.partition(" ")
         argument = argument.strip()
         if command in {"/exit", "/quit"}:
-            out.print("Bye.", markup=False)
-            self.ui.exit()
+            self.ui.exit()  # the exit summary follows the composer (run)
         elif command == "/help":
             out.print(help_card(self.ui.glyphs))
         elif command == "/status":
@@ -196,12 +212,12 @@ class Demo:
         elif command == "/notebook" and argument.startswith("open "):
             name = argument.split(None, 1)[1].removesuffix(".py") + ".py"
             self.notebook, self.notebook_open = name, None
-            out.print(f"Opening {URL.format(name=name)}&access_token=... in your browser...", markup=False)
-            with out.status("Waiting for the notebook to open..."):
-                await self.pause(1.5)
+            self.ui.begin_task("switch", "Notebook", f"opening {name} in your browser")  # opened, never printed
+            await self.pause(1.5)
+            self.ui.end_task("switch")
             self.notebook_open = True
-            out.print("Notebook is open (session s_9a3f11).", markup=False)
-            out.print(f"Active notebook: {name}.", markup=False)
+            g = self.ui.glyphs
+            out.print(session_row(g, "ok", "Notebook", g.join(name, "active", "open in your browser"), 1.5 * self.delay))
         elif command == "/context":
             out.print(self.context())
         elif command == "/clear":
@@ -256,15 +272,25 @@ class Demo:
         return detail_card(self.ui.glyphs, sections, ["Skipped .config/hailer/context/notes.docx: not a text file"])
 
     async def run(self, timeout: float) -> None:
-        console = self.ui.console
-        console.print(Text(self.ui.glyphs.join("Hailer composer demo", "simulated work only"), style="bold"))
+        console, g = self.ui.console, self.ui.glyphs
+        started = time.monotonic()
+        console.print(Text(g.join("Hailer composer demo", "simulated work only"), style="bold"))
         console.print("Type a message or /help. Esc or Ctrl+C cancels a turn; Ctrl+C while idle exits.", markup=False)
         console.print()
+        kernel = (
+            session_row(g, "warn", "Kernel", g.join("unsafe-local", "runs as you, not isolated"), 0.9)
+            if self.kernel == "unsafe-local" else session_row(g, "ok", "Kernel", g.join("docker", "isolated", "no network", "data read-only"), 1.9)
+        )
+        console.print(kernel)
         self.ui.configure_startup(self.prepare)
         try:
             await asyncio.wait_for(self.ui.run(), timeout)
         except TimeoutError:
             console.print(f"Demo stopped after {timeout:g} seconds.", markup=False)
+        out = self.console  # the composer has gone: what the CLI prints after it
+        out.print(session_ended(g, turns=self.turns - 3, elapsed=time.monotonic() - started, tokens_used=max(0, self.tokens - 14_820)))
+        stopped = [("ok", "Kernel stopped")] if self.kernel == "unsafe-local" else [("ok", "Notebooks copied back to notebooks/"), ("ok", "Kernel stopped")]
+        out.print(done_items(g, stopped))
 
 
 if __name__ == "__main__":

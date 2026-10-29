@@ -218,7 +218,7 @@ def test_idle_keyboard_exits(exit_keys):
             running = await start(ui)
             keys.send_text(exit_keys)
             await asyncio.wait_for(running, 5)
-            assert "Bye." in transcript.getvalue()
+            assert transcript.getvalue() == "", "no farewell of its own: the CLI's exit summary follows"
             assert PASTE_OFF in screen.getvalue()
 
     asyncio.run(scenario())
@@ -487,6 +487,7 @@ def test_idle_exit_write_failure_has_no_unowned_task(monkeypatch):
                 raise OSError("terminal closed during exit")
 
             monkeypatch.setattr(ui._raw_console, "print", failed_write)
+            ui.console.print("Last words before the exit.")  # e.g. a notebook copy's warning
             keys.send_text("\x03")
             with pytest.raises(OSError, match="terminal closed during exit"):
                 await asyncio.wait_for(running, 5)
@@ -739,6 +740,49 @@ def test_ascii_glyphs_when_the_console_cannot_encode_unicode():
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("gesture", ["/exit\r", "\x03"], ids=["exit", "ctrl-c"])
+def test_the_transcript_ends_with_a_blank_line_even_when_the_chat_ends_during_startup(gesture):
+    """What follows the composer (the CLI's exit summary) starts after a blank line, however it ends."""
+
+    async def scenario():
+        async def prepare():
+            ui.console.print("  ✓ Agent      gpt-5.5")
+            await asyncio.Event().wait()
+            return True
+
+        with terminal(lambda _text: asyncio.sleep(0)) as (ui, keys, _screen, transcript, _size):
+            ui.configure_startup(prepare)
+            running = await start(ui)
+            await until(lambda: "Agent" in transcript.getvalue())
+            keys.send_text(gesture)
+            await asyncio.wait_for(running, 5)
+            assert transcript.getvalue().endswith("gpt-5.5\n\n")
+
+    asyncio.run(scenario())
+
+
+def test_session_rows_are_one_plain_line_whatever_their_text_and_their_icons_fit_the_column():
+    """Labels and details come from outside (context-file names, warnings, check texts): no escape
+    sequence or newline reaches the terminal. Every status mark, in both glyph sets, fits the icon
+    column the live row and the step rows share."""
+    from rich.cells import cell_len
+
+    from hailer.transcript import ICON_WIDTH, session_note, session_row
+
+    for glyphs in (UNICODE, ASCII):
+        for status in ("ok", "warn", "fail", "resume", "wait", "failed", "cancelled"):
+            assert cell_len(f"  {glyphs.icon(status)}") <= ICON_WIDTH, (glyphs.ascii, status)
+    for terminal_console in (False, True):
+        out = io.StringIO()
+        console = Console(file=out, force_terminal=terminal_console, color_system=None, width=80)
+        console.print(session_row(UNICODE, "warn", "Con\ntext", "ctx\x1b[2J.md\nlooks\tlike a secret", 0.4))
+        console.print(session_note("hint\x1b]8;;http://x\x07 with\x00 controls"))
+        lines = out.getvalue().splitlines()
+        assert "\x1b" not in out.getvalue() and "\x07" not in out.getvalue() and "\x00" not in out.getvalue()
+        assert re.match(r"  ▲ Con text {3}ctx\[2J\.md looks like a secret +0\.4s$", lines[0]), lines
+        assert lines[1].strip() == "hint]8;;http://x with controls" and len(lines) == 2
+
+
 def test_reply_footer_links_the_notebook_without_its_token():
     async def scenario():
         url = "http://127.0.0.1:2718/?file=/work/notebooks/analysis.py&view-as=present"
@@ -921,6 +965,51 @@ def test_nothing_animates_while_the_chat_prepares():
             ready.set()
             await until(lambda: not ui._preparing)
             await until(lambda: ui._ticker is None)
+            ui.exit()
+            await asyncio.wait_for(running, 5)
+
+    asyncio.run(scenario())
+
+
+def test_session_tasks_show_on_the_live_row_in_the_session_rows_columns():
+    """Startup's agent and notebook (and a notebook switch) show on the live row as ``Notebook
+    opening analysis.py in your browser``, lined up with the session rows (a ten-cell label); the
+    latest begun one shows, a running step goes first, and the row ends with the tasks. Labels
+    from outside cannot add rows or controls; begin_task and end_task work from any thread."""
+
+    async def scenario():
+        ready = asyncio.Event()
+
+        async def prepare():
+            await ready.wait()
+            return True
+
+        def live():
+            return "".join(text for _style, text in ui._live_line())
+
+        with terminal(lambda _text: asyncio.sleep(0)) as (ui, _keys, _screen, _transcript, _size):
+            ui.configure_startup(prepare)
+            running = await start(ui)
+            assert ui.activity == "Starting"
+            agent, notebook = object(), object()
+            ui.begin_task(agent, "Agent", "starting gpt-5.5")
+            await asyncio.to_thread(ui.begin_task, notebook, "Notebook", "opening q2\x1b[2J\nreview.py in your browser")
+            await until(lambda: ui.activity == "Notebook")
+            assert re.match(r"  . Notebook   opening q2\[2J review\.py in your browser", live()), live()
+            ui.begin_task(agent, "Agent", "still starting")  # an update keeps its place: the notebook still shows
+            await until(lambda: ui._tasks[agent][1] == "still starting")
+            assert ui.activity == "Notebook"
+            await asyncio.to_thread(ui.end_task, notebook)
+            await until(lambda: ui.activity == "Agent")
+            assert re.match(r"  . Agent {6}still starting", live()), live()
+            ui._steps.call(call("marimo_execute", "a", code="x = 1\n"))
+            assert ui.activity == "Running code"
+            assert re.match(rf"  . Running code {{{20 - len('Running code') + 1}}}1 line", live()), live()
+            ui._steps = type(ui._steps)()
+            ui.end_task(agent)
+            await until(lambda: ui.activity == "Starting")
+            ready.set()
+            await until(lambda: not ui._preparing)
             ui.exit()
             await asyncio.wait_for(running, 5)
 

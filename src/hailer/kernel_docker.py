@@ -643,6 +643,8 @@ class DockerKernel(MarimoSandbox):
     network: str | None = None
     network_id: str | None = None
     stop_error: str = ""
+    #: After :meth:`stop`: whether its last copy of the notebooks back finished (None: there was none).
+    copied_back: bool | None = None
     owner: OwnerLock | None = None
     sync: NotebookSync | None = None
 
@@ -690,6 +692,7 @@ class DockerKernel(MarimoSandbox):
         self.stop_error = ""
         sync, self.sync = self.sync, None
         if sync is not None:
+            self.copied_back = False  # until the last copy says otherwise
             last = threading.Thread(target=sync.close, name="hailer-notebook-last-copy", daemon=True)
             try:
                 last.start()
@@ -699,6 +702,8 @@ class DockerKernel(MarimoSandbox):
                         f"Warning: the last copy of the notebooks back from the kernel did not finish within "
                         f"{notebook_sync.SYNC_STOP_SEC:g} s; the kernel's latest changes may be missing here."
                     )
+                else:
+                    self.copied_back = sync.complete is True
             except KeyboardInterrupt:
                 self.notify("Warning: stopped before the notebooks were copied back; the kernel's changes since the last copy are lost.")
         try:

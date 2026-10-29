@@ -307,7 +307,13 @@ Keep these properties; each has a test in `tests/test_notebook_sync.py` unless n
   (`test_a_server_that_trickles_its_page_cannot_hold_the_last_copy`,
   `test_a_last_copy_that_never_ends_cannot_keep_the_containers`).
 - **Failures warn, never raise**, and repeat once per message (a dead kernel does not print every 15 s). The
-  chat routes `sandbox.notice` to its own console, which the composer queues from any thread.
+  chat routes `sandbox.notice` to its own console, which the composer queues from any thread. Because a
+  repeated warning is silent, what the session's last line says about the notebooks comes from the last
+  copy's own record (`NotebookSync.complete`, `DockerKernel.copied_back`), not from the warnings: a review
+  found it claiming `✓ Notebooks copied back` after a kernel that died mid-session
+  (`test_a_last_copy_from_a_dead_kernel_is_recorded_though_its_warning_was_said_before`,
+  `test_each_copy_back_records_whether_it_finished`). The CLI stops the kernel in a `finally` no spinner or
+  line can skip (`test_a_terminal_that_cannot_be_written_never_keeps_the_kernel_from_stopping`).
 - **Ordering**: sync-in runs inside `DockerRuntime.start`, so the chat and the browser never see an empty
   folder, and a Ctrl+C there stops the kernel. This costs one list + create per notebook on loopback before
   the composer renders (LEARNINGS §10); keep it bounded rather than moving it after `_active_notebook`. Stop
@@ -348,10 +354,13 @@ therefore had the user's files and network by default. Now `docker` is the defau
   when that set it (`test_a_retired_runtime_from_the_environment_is_one_config_row_with_an_environment_fix`). `init` still writes `docker` on a machine without
   Docker and says how to install it or opt in
   (`test_init_writes_docker_and_says_how_to_get_docker_only_when_it_is_missing`).
-- **Visible every time.** The `Kernel:` line is `unsafe-local (runs as you; not isolated)` in yellow in the
-  startup panel, `status`, `/status` and `--foreground`, and a WARN row in `doctor`; a start drops that row
-  so the panel says it once (`test_kernel_line_of_the_unsafe_local_runtime_is_a_warning`,
-  `test_doctor_has_a_kernel_row`).
+- **Visible every time.** The `Kernel:` line is `unsafe-local (runs as you; not isolated)` in yellow in
+  `status`, `/status` and `--foreground`, a WARN row in `doctor`, and a session's startup checklist has the
+  yellow row `▲ Kernel  unsafe-local · runs as you, not isolated` (the composer's footer keeps
+  `▲ unsafe-local · not isolated`); a start drops the check's WARN row so the kernel's row says it once
+  (`test_kernel_line_of_the_unsafe_local_runtime_is_a_warning`,
+  `test_the_unsafe_local_kernel_row_is_a_yellow_warning_and_a_docker_one_is_not`,
+  `test_a_start_leaves_the_unsafe_local_warning_to_the_kernel_row`, `test_doctor_has_a_kernel_row`).
 - **No pass-through.** `[kernel].pass_env` is gone; an old file gets the ordinary unknown-key warning, which
   never quotes the value (`test_pass_env_is_gone_and_reported_as_an_unknown_key_without_its_value`). The
   secret-looking names stay withheld from an unsafe-local kernel.

@@ -58,6 +58,7 @@ from hailer.transcript import (
     ACCENT,
     LABEL_WIDTH,
     MUTED,
+    SESSION_LABEL_WIDTH,
     UNICODE,
     FooterData,
     Glyphs,
@@ -450,6 +451,10 @@ class ChatUI:
         self._label_since = time.monotonic()
         self._steps = StepTracker()
         self._steps_cancelled = False
+        # Session work in progress (startup's notebook and agent, a notebook switch): (label, detail,
+        # since) in the order begun; the latest is shown, in the session rows' columns, when no step
+        # runs (at startup the agent begins first and the notebook, which the user acts on, next).
+        self._tasks: dict[object, tuple[str, str, float]] = {}
         self._submitted_at = time.monotonic()
         self._flash: tuple[str, float] | None = None
         self._wake = asyncio.Event()  # the ticker's sleep, cut short when a turn starts
@@ -497,9 +502,12 @@ class ChatUI:
     @property
     def activity(self) -> str:
         """What the live row says is happening ("" while idle): the oldest running step's verb, else
-        the latest activity (``set_activity`` or a ``status`` event)."""
+        the latest session task's label (:meth:`begin_task`), else the latest activity
+        (``set_activity`` or a ``status`` event)."""
         current = self._steps.current()
-        return current[0].live if current is not None else self._label
+        if current is not None:
+            return current[0].live
+        return next(reversed(self._tasks.values()))[0] if self._tasks else self._label
 
     @property
     def flash_text(self) -> str:
@@ -562,6 +570,7 @@ class ChatUI:
             self._flash = None  # a "queued" hint is over either way
         if self._exit_requested:
             return
+        self.gap()  # the startup rows end with a blank line, as a turn does
         self._startup_failed = not ready
         if not ready:
             self.set_activity("Ready")
@@ -632,14 +641,12 @@ class ChatUI:
             if self.busy:
                 self.cancel()
             else:
-                self.console.print("Bye.", markup=False)
                 self.exit()
 
         @bindings.add("c-d")
         def eof(event: Any) -> None:
             if not event.current_buffer.text:
                 if not self.busy or self._preparing:
-                    self.console.print("Bye.", markup=False)
                     self.exit()
             else:
                 event.current_buffer.delete()
@@ -684,7 +691,6 @@ class ChatUI:
         if (self._preparing or self._startup_failed) and (
             text.startswith("\x1a") or command is not None and command.name in EXIT_COMMANDS
         ):
-            self.console.print("Bye.", markup=False)
             self.exit()
             return
         g = self.glyphs
@@ -698,7 +704,6 @@ class ChatUI:
             self.flash(g.join("Startup failed", "your draft is kept", "/exit to leave"))
             return
         if text.startswith("\x1a"):
-            self.console.print("Bye.", markup=False)
             self.exit()
             return
         if not text:
@@ -805,6 +810,27 @@ class ChatUI:
             self._label = _label(text)
             self._label_since = time.monotonic()
             self._animate()
+            self.application.invalidate()
+
+        self._on_ui_thread(update)
+
+    def begin_task(self, key: object, label: str, detail: str = "") -> None:
+        """Show session work (``Notebook  opening analysis.py in your browser``) on the live row, in
+        the session rows' columns, until :meth:`end_task` with the same ``key``; from any thread.
+        Begun again, it keeps its start time and place. The latest task is shown; a running step
+        goes first."""
+
+        def update() -> None:
+            since = self._tasks[key][2] if key in self._tasks else time.monotonic()
+            self._tasks[key] = (single_line(label), single_line(detail), since)
+            self._animate()
+            self.application.invalidate()
+
+        self._on_ui_thread(update)
+
+    def end_task(self, key: object) -> None:
+        def update() -> None:
+            self._tasks.pop(key, None)
             self.application.invalidate()
 
         self._on_ui_thread(update)
@@ -990,17 +1016,20 @@ class ChatUI:
             return "Draft your next message"
         return "Ask about your data, or type / for commands"
 
-    def _live(self) -> tuple[str, str, float]:
-        """(label, detail, since) for the live row."""
+    def _live(self) -> tuple[str, str, float, int]:
+        """(label, detail, since, label width) for the live row."""
         current = self._steps.current()
-        if current is None:
-            return self._label, "", self._label_since
-        step, started, others = current
-        return step.live, self.glyphs.join(step.target, f"+{others} more" if others else ""), started
+        if current is not None:
+            step, started, others = current
+            return step.live, self.glyphs.join(step.target, f"+{others} more" if others else ""), started, LABEL_WIDTH
+        if self._tasks:
+            return (*next(reversed(self._tasks.values())), SESSION_LABEL_WIDTH)
+        return self._label, "", self._label_since, LABEL_WIDTH
 
     def _live_line(self) -> list[tuple[str, str]]:
-        """Spinner, activity and detail in the step rows' columns; the timer at the right edge."""
-        label, detail, since = self._live()
+        """Spinner, activity and detail in the step rows' (or session rows') columns; the timer at
+        the right edge."""
+        label, detail, since, width = self._live()
         now = time.monotonic()
         frames = self.glyphs.spinner
         # While starting nothing animates: the spinner moves with the timer, once a second.
@@ -1008,7 +1037,7 @@ class ChatUI:
         head = f"  {frames[int(tick) % len(frames)]} "
         timer = seconds(now - since) if now - since >= 1 else ""
         room = self._columns() - get_cwidth(head) - (get_cwidth(timer) + 1 if timer else 0)
-        label = label.ljust(LABEL_WIDTH)
+        label = label.ljust(width)
         detail = f" {detail}" if detail else ""
         if get_cwidth(label) > room:
             label, detail = _clip(label, max(0, room)), ""
@@ -1302,6 +1331,7 @@ class ChatUI:
                 pass
             except Exception as exc:
                 failure = exc
+        self.gap()  # what follows the composer (the CLI's exit summary) starts after a blank line
         try:
             await self.flush()
         except Exception as exc:
@@ -1344,7 +1374,7 @@ class ChatUI:
                 try:
                     await self.application.run_async(pre_run=ready, set_exception_handler=False)
                 except EOFError:
-                    self.console.print("Bye.", markup=False)
+                    pass  # input closed: the CLI's exit summary follows
                 finally:
                     await self._finish_shutdown()
         finally:

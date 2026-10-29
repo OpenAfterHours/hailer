@@ -233,6 +233,11 @@ class NotebookSync:
         self._new_files = 0  # notebooks this session created here
         self._written = 0  # bytes this session wrote here
         self._said: set[str] = set()  # warnings already shown (a dead kernel would repeat them every pass)
+        #: Whether the latest copy back finished with every notebook it had to copy written here
+        #: (names the allow-list refuses aside); None before the first. A warning it repeats is not
+        #: shown again, so the end of a session reads this rather than the warnings.
+        self.complete: bool | None = None
+        self._short = False  # the pass under way left a notebook behind
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._stopping = threading.Event()
@@ -324,15 +329,19 @@ class NotebookSync:
         Never raises; failures, and a copy cut short, are warning lines and leave the files here as
         they were. Waits at most :data:`SYNC_LOCK_SEC` for a copy under way."""
         if not self._lock.acquire(timeout=SYNC_LOCK_SEC):
+            self.complete = False
             self._say_once("Warning: an earlier copy of the notebooks back from the kernel did not finish; this one was skipped.")
             return []
         seconds = SYNC_CYCLE_SEC if seconds is None else seconds
         budget = SYNC_CYCLE_BYTES if budget is None else budget
+        self._short = False
+        finished = False  # the pass got to its end (Ctrl+C or an error did not cut it short)
         try:
             copied: list[str] = []
             try:
                 with request_deadline(seconds):
                     self._sync_out(copied, time.monotonic() + seconds, budget)
+                finished = True
             except (_OutOfTime, MarimoUnavailableError) as err:
                 if isinstance(err, _OutOfTime) or "out of time" in str(err):
                     self._say_once(
@@ -345,6 +354,7 @@ class NotebookSync:
                 self._say_once(f"Warning: could not copy the notebooks back from the kernel ({err}). The files in {self.folder} are unchanged.")
             return copied
         finally:
+            self.complete = finished and not self._short
             self._lock.release()
 
     def _sync_out(self, copied: list[str], end: float, budget: int) -> None:
@@ -404,6 +414,7 @@ class NotebookSync:
                     f"stays in the kernel and is gone when it stops): {_names(fresh)}."
                 )
             if failures:
+                self._short = True
                 self._say_once(f"Warning: could not copy back {', '.join(failures)}; the files in {self.folder} are unchanged.")
 
     def _target(self, name: str) -> Path:
@@ -437,6 +448,7 @@ class NotebookSync:
         target = self._target(name)
         data = text.encode("utf-8")
         if not target.exists() and (self._new_files >= SESSION_NEW_FILES or self._written + len(data) > SESSION_BYTES):
+            self._short = True
             self._say_once(
                 f"Warning: this session already copied back {self._new_files} new notebooks "
                 f"({self._written // (1024 * 1024)} MiB); new notebooks from the kernel are no longer copied back."

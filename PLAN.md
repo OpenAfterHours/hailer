@@ -104,7 +104,7 @@ Environment overrides: `HAILER_CONFIG`, `HAILER_WORKSPACE`, `HAILER_MODEL`, `HAI
 - **A kernel session needs a browser tab:** `marimo_status` detects a missing session; the CLI and the
   notebook tools open the URL and wait.
 - **Docker is not always available** (licensing, managed machines): those users either get Docker or accept
-  `unsafe-local`, which is labelled in the startup panel, `status`, `/status` and `doctor`. A cloud kernel
+  `unsafe-local`, which is labelled in the startup checklist, `status`, `/status` and `doctor`. A cloud kernel
   behind the same sandbox contract is the planned answer ([ARCHITECTURE_PROPOSAL.md](docs/ARCHITECTURE_PROPOSAL.md) §6).
 - **The host copy of a notebook is up to one turn (or 15 s) behind** the kernel's; files that notebook code
   writes next to the notebooks in Docker are not copied back and are gone when the kernel stops.

@@ -41,6 +41,7 @@ class NoSync:
 
     def __init__(self, *args, **kwargs):
         self.closed = []
+        self.complete = None  # NotebookSync's record of its latest copy back
 
     def sync_in(self):
         return []
@@ -53,6 +54,7 @@ class NoSync:
 
     def close(self, *, final=True):
         self.closed.append(final)
+        self.complete = True
         return []
 
 
