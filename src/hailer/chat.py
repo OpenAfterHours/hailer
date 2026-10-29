@@ -254,7 +254,7 @@ class ChatController:
                     timings.mark("notebook_wait_complete")
                 await self._blocking(self._refresh_notebook_names)  # the command menu's names
 
-            tasks =[asyncio.create_task(agent_ready()), asyncio.create_task(notebook_ready())]
+            tasks = [asyncio.create_task(agent_ready()), asyncio.create_task(notebook_ready())]
             try:
                 await asyncio.gather(*tasks)
                 if timings is not None:
