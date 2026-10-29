@@ -148,8 +148,9 @@ def test_two_processes_append_and_trim_without_mixing_entries(tmp_path):
     writer = textwrap.dedent(f"""
         import sys
         sys.path.insert(0, {str(SRC)!r})
-        from hailer.input_history import InputHistory
-        history = InputHistory({str(path)!r})
+        from hailer import input_history
+        input_history.LOCK_WAIT_SECONDS = 30  # a slow disk must not turn a wait into a skipped write here
+        history = input_history.InputHistory({str(path)!r})
         for index in range(150):
             history.store_string(f"{{sys.argv[1]}} {{index}} first line\\n{{sys.argv[1]}} {{index}} second line")
             if sys.argv[1] == "b" and index % 10 == 0:

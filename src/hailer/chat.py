@@ -21,8 +21,7 @@ from rich.text import Text
 
 from hailer import notebooks
 from hailer.errors import HailerError, MarimoUnavailableError, NoSessionError
-from hailer.models import ContextBundle, HailerConfig, MarimoSession, ProviderConfig, SessionState, SkillInfo, TurnSummary
-from hailer.models import CompletionData
+from hailer.models import CompletionData, ContextBundle, HailerConfig, MarimoSession, ProviderConfig, SessionState, SkillInfo, TurnSummary
 from hailer.session import EXIT_COMMANDS, help_text, load_session, parse_command, save_session
 from hailer.statedir import input_history_path
 from hailer.steps import plural
@@ -197,7 +196,7 @@ class ChatController:
         """List the sandbox's notebooks for the command menu (blocking: run it off the UI loop)."""
         try:
             self._notebook_names = tuple(self._names())
-        except Exception:  # noqa: BLE001 - the menu only keeps its last list
+        except Exception:  # noqa: BLE001 - the menu keeps its last list
             pass
 
     def _input_history_file(self) -> Path | None:
