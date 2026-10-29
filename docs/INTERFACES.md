@@ -498,7 +498,7 @@ class LocalRuntime:                        # runtime = "unsafe-local"; LocalRunt
                                            #   confirm=ask_yes_no)
     # (the class keeps its name: it is the runtime on this machine; "unsafe-" is the setting's warning)
     # check: one warning "kernel" row (ok=False, fatal=False): describe() + how many variables are withheld,
-    #   hint UNSAFE_LOCAL_HINT. kernel_checks(starting=True) drops it: the startup panel shows the line instead
+    #   hint UNSAFE_LOCAL_HINT. kernel_checks(starting=True) drops it: the startup's yellow "▲ Kernel" row says it instead
     # prepare: when statedir.sandbox_wrote_notebooks, a warning line, then confirm("Run them on this machine anyway? [y/N] "):
     #   True clears the mark; False → KernelRuntimeError("Not started: ... were not approved ..."); None (no terminal) →
     #   KernelRuntimeError("Not started: ... no terminal to ask ...", hint: run uvx hailer notebook --kernel unsafe-local in a
@@ -1147,10 +1147,40 @@ output helpers, the preflight checks (`local_checks`, `kernel_checks`) and the c
 there is no import cycle.
 
 Bare `hailer` and `hailer notebook` both call `_run_session`:
-load config, run local and kernel checks, begin dependency-only warmup, then prepare and start this
-session's own kernel through the chosen runtime (`_start_kernel`; nothing is looked for or reused).
-Interactive mode shows the startup panel and editable composer before agent preparation and
+load config, print the header, run local and kernel checks, begin dependency-only warmup, then prepare and
+start this session's own kernel through the chosen runtime (`_start_kernel`; nothing is looked for or reused).
+Interactive mode shows the editable composer after the kernel's row and before agent preparation and
 browser-session waiting run concurrently. Plain/piped mode retains the notebook wait before its prompt.
+
+Startup output is a checklist (`transcript.SessionRow`: icon, a ten-cell label, detail, seconds; on a
+terminal the columns line up with the composer's live row and a row that worked keeps to one line, elsewhere
+each is one plain line that is never cut). In order: the header `◆ Hailer <version>   ·   <workspace>` (`~`
+for the home folder, `_home_relative`) and a blank line; each preflight check that did not pass as a row
+(`_check_rows`: `▲` warning or `✗` failure, labelled `Config`, `Notebook`, `API key`, `Kernel`, `Docker`,
+`Image`, `Data`; the summary and hint lines unchanged, the hints under the detail column; a failure exits 1
+before any kernel starts); the runtime's own progress (docker's image download) and the Rich spinner
+`Starting marimo[ in Docker] on <url> ...`; then `_kernel_row`: `✓ Kernel  docker · isolated · no network ·
+data read-only  1.9s` (`docker · network on · data read-only` with `[kernel] network`), or for unsafe-local a
+yellow `▲ Kernel  unsafe-local · runs as you, not isolated`; under it, as muted notes, `Port N is busy; using
+M.` and, with `--verbose`, `Marimo is running at <url>  (log: <log hint>)`. The settings panel
+(`common._startup_panel`) is `hailer status`'s only: `/status` has every setting, plus a `Kernel log` row (the
+sandbox's `log_hint`). The notebook's row comes from `_wait_for_notebook`: `✓ Notebook  <name> · already
+open`, or (the browser opened, a session came) `✓ Notebook  <name> · open in your browser  2.2s` and the muted
+`APP_VIEW_TIP`, or a warning `▲ Notebook  <name> · no kernel session yet` (the agent reports the notebook state
+when asked). The agent's rows come from `ChatController._started`: `✓ Agent  <model> · <provider> · <env_key>
+from <source>  0.8s` (the source the agent resolved; nothing is looked up then), `↺ Resumed  N earlier turns ·
+/new starts fresh`, or `▲ Thread  previous conversation could not be resumed; started a new one`; context
+warnings are `▲ Context` rows. In the composer, the notebook wait and the agent start show on the live row
+(`ChatController.progress(label, detail)` -> `ChatUI.begin_task`/`end_task`: `Notebook  opening analysis.py
+in your browser`, `Agent  starting gpt-5.5`, in the session rows' columns, the latest begun one first, a
+running step before both) and commit their rows above it as each finishes; the composer prints a blank line
+when preparation ends. Plain mode prints the same rows in order, then `Type /help for commands.`.
+
+The signed-in URL (`sandbox.notebook_url(name, with_token=True)`: it carries the access token) is opened
+in the browser and printed only when the user must open it by hand: with `--no-browser` (`↗ Notebook  open
+<name> in your browser with this link (it signs you in):`) or when no session came in time (the warning row,
+then the link). It is then a note of its own under the row, printed with `soft_wrap=True` (written whole: the
+terminal wraps it and it copies as one) and never as an OSC 8 hyperlink. The same holds for switches.
 `--kernel docker|unsafe-local` overrides the runtime for `notebook` (`_kernel_choice`: any other value, `local`
 included, prints `config.runtime_problem` and exits 2). The kernel is stopped in the `finally` of
 `_run_session` (and `_run_foreground`) whatever ends the chat: `_start_kernel` is called inside that guarded
@@ -1164,7 +1194,7 @@ it. `ChatController` points `sandbox.notice` at its current console (yellow, thr
 queue), and asks for a copy back (`sandbox.sync_soon()`, `_copy_notebooks_back`) after every turn (finished,
 failed or interrupted) and on a `/notebook` switch (`_switch_notebook`). The prompt gets a token-free URL. Once the kernel answers, `_active_notebook(config, sandbox)` picks the
 active notebook (the state file's, else `default_notebook` when `sandbox.has_notebook` says it is gone: one
-request, not a listing) and saves it; the startup panel shows that
+request, not a listing) and saves it; the notebook's startup row shows that
 name. The CLI and the chat take clients from `sandbox.client(notebook=..., token_in_links=True)` and links
 from `sandbox.notebook_url(name, with_token=True)` / `sandbox.home_url(with_token=True)`: they are printed or
 opened for the user, never sent to the model. `_marimo_state(sandbox, notebook)` is the seam the chat uses.
@@ -1172,8 +1202,18 @@ opened for the user, never sent to the model. `_marimo_state(sandbox, notebook)`
 `notebook --foreground` prepares and starts the runtime, prints its signed-in home URL ("Ctrl+C stops it"),
 waits for exit or Ctrl+C, and stops it; only the browser uses that kernel. Every Docker start checks
 `docker_mount_problems`, including foreground mode. Pull/build progress runs before any startup spinner.
-Cleanup errors print the retry command (`uvx hailer kernel stop`) and exit 1; successful cleanup prints
-`Stopped marimo.`.
+
+Exit (`_run_chat_loop`, then `_stop_kernel` in `_run_session`'s `finally`): when the chat ends (`/exit`, EOF,
+Ctrl+C while idle; nothing prints `Bye.` any more) the muted `Session ended · N turns · 4m 12s · 18.2k tokens`
+(this session's turns and tokens, `ChatController.session_turns`/`session_tokens`, and the time since the
+command started; zero tokens are left out); then, under a spinner on a terminal while the kernel stops, one
+line: `✓ Notebooks copied back to notebooks/   ✓ Kernel stopped` (docker) or `✓ Kernel stopped`
+(unsafe-local). A warning from the stop (`sandbox.notice` is pointed at the CLI's console, as a `▲` callout,
+text unchanged, e.g. `Warning: stopped before the notebooks were copied back; ...`) makes the first item
+`▲ Notebooks: see the warning above`. A stop error stays red (`✗ Could not finish stopping the Docker kernel:
+... Run uvx hailer kernel stop to retry.`) in place of `Kernel stopped`, and the command exits 1. A session
+that failed before the chat ran (a fatal check, a kernel that did not start, an agent that could not start in
+plain mode) has no `Session ended` line.
 
 Other commands: `status` shows the configuration, credentials, context and a `Kernels:` line
 (`kernel_docker.workspace_kernels`, via `_workspace_kernels`: running Docker kernels; "none running for this
@@ -1195,7 +1235,7 @@ Agent start (`ChatLoop.start`):
 a resume means the thread was gone, the CLI says so and resets the counters. Credentials: a `"missing"` key is
 a fatal preflight failure for every provider, the built-in `openai` included; `status` and `/status` show
 `<env_key> from env|keyring` or `<env_key> missing (run: uvx hailer login <id>)`; both also show the `Kernel:` line,
-in yellow (`common._kernel_style`) for unsafe-local, as the startup panel and `--foreground` do. Interactive chat is selected when stdin/stdout are terminals, unless `--plain` is set or
+in yellow (`common._kernel_style`) for unsafe-local, as `--foreground` does (the startup's `▲ Kernel` row says it there). Interactive chat is selected when stdin/stdout are terminals, unless `--plain` is set or
 `TERM` is `dumb`/`unknown`. `--plain` is a global option and also an option on `notebook`.
 
 `hailer/chat.py:ChatController` holds shared session, slash-command and notebook operations;
@@ -1263,7 +1303,8 @@ interface still returns exit code 1; intentional startup cancellation does not s
 `startup.StartupTimings` records idempotent monotonic milestones in seconds and debug-logs them without
 user content. `input_ready` is the first composer render; `ready_to_answer` is when the first message
 may be dispatched. `notebook_wait_complete` includes a nonfatal timeout, not proof of cell execution.
-The CLI also records `checks_complete`, `kernel_ready` and `panel_shown`; the controller records
+The CLI also records `checks_complete`, `kernel_ready` and `checklist_shown` (the rows it prints before the
+chat: the kernel's, and in plain mode the notebook's); the controller records
 `agent_ready`. `scripts/benchmark_startup.py` measures fresh processes offline, including paste latency
 and the longest input-loop pause.
 
@@ -1292,15 +1333,24 @@ not list), marimo state, URL and `NOTEBOOK_USAGE`; `/notebook list` = `sandbox.l
 `client.shutdown_session`. Without a sandbox, list/new/open say marimo is not running.
 A switch (`_switch_notebook`) writes the state file, sets `self.notebook`, queues
 `_pending_preamble` **before** waiting for the tab, then `_ensure_session` (opens the URL through
-`hailer.browser` when there is no session and waits `SWITCH_SESSION_TIMEOUT_SEC` = 30 s), then refines the
-notice; Ctrl+C or a marimo error during the wait leaves the notice queued. Exact notice:
+`hailer.browser` when there is no session and waits `SWITCH_SESSION_TIMEOUT_SEC` = 30 s, the live row saying
+`Notebook  opening <name> in your browser`; it prints nothing itself), then refines the notice; Ctrl+C or a
+marimo error during the wait leaves the notice queued. Whatever happened, the switch ends with one row
+(`_notebook_row`): `✓ Notebook  q2.py · active · open in your browser  0.6s` (`· already open` when it had a
+session; `· created from the starter|empty template · active ...` for `/notebook new`; `analysis.py · already
+the active notebook · ...` for `/notebook open` of the active one), or a warning `▲ Notebook  q2.py · active ·
+no kernel session yet` followed by `Open it in your browser with this link:` and the signed-in link on a line
+of its own (the only case a switch prints it), or `▲ ... · not open in a browser yet` after Ctrl+C or an
+error. `/notebook close` prints `✓ Notebook  <name> · closed · session <id> · its browser tab is disconnected`
+and, for the active one, `It stays the active notebook; /notebook open <name> reopens it.` under it. Exact notice:
 `[Hailer] The active notebook is now <name> (<detail>). Call notebook_cells before editing.` with
 `<detail>` = `created from the starter template` | `created from the empty template` | `reopened`, followed by
 `, N cell(s)` when a session exists or `, not open in a browser yet` when none. It is passed once as
 `run_turn(..., preamble=...)` with the next message and cleared (also on Ctrl+C; kept when the turn raised an
 error). `_sync_active_notebook()` runs in the `finally` of every turn (finished, failed, interrupted) and,
 without opening a browser, at the start of `/notebook` and `/status`: on a change it updates `self.notebook`,
-prints `Active notebook is now <name>.` and (turn end only) opens the URL once when the notebook has no session;
+prints `✓ Notebook  <name> · now active` and (turn end only) opens the URL once when the notebook has no
+session (`· opened in your browser`; `· open in your browser` when it has one), never printing it;
 no preamble is queued because the model made the switch itself. `COMMANDS["notebook"]` =
 `Show or switch the active notebook. Usage: /notebook [list | new <name> [--empty] | open <name> | close [name]]`.
 Progress (plain `_TurnDisplay`, interactive `ChatUI.on_event`), through `steps.StepTracker`: a `tool_call`

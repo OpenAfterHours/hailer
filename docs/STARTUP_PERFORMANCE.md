@@ -54,8 +54,10 @@ uv run --locked pytest
 uv run --locked hailer --verbose
 ```
 
-Actual sessions log separate `checks_complete`, `kernel_ready`, `panel_shown`, `input_ready`,
-`agent_ready`, `notebook_wait_complete` and `ready_to_answer` milestones. Notebook wait completion
+Actual sessions log separate `checks_complete`, `kernel_ready`, `checklist_shown`, `input_ready`,
+`agent_ready`, `notebook_wait_complete` and `ready_to_answer` milestones. `checklist_shown` (called
+`panel_shown` until 2026-10-29, when the settings panel gave way to the startup checklist) marks the rows
+the CLI prints before the chat: the kernel's, and in plain mode the notebook's. Notebook wait completion
 may mean a nonfatal timeout; a session's existence alone does not prove its cells have initialized.
 Cancellation stops notebook polling cooperatively, but an in-flight HTTP request or browser launcher
 still has to settle before cleanup.

@@ -61,6 +61,17 @@ The first start downloads Hailer's kernel image, which takes a minute or two. Th
 in your browser and starts the chat in your terminal. **Keep the notebook tab open while you work**; it
 provides the live session that runs the analysis.
 
+The terminal shows what got ready, one row each:
+
+```text
+◆ Hailer 0.3.0   ·   ~/my-analysis
+
+  ✓ Kernel     docker · isolated · no network · data read-only              1.9s
+  ✓ Notebook   analysis.py · open in your browser                           2.2s
+               Opens in app view (results only); Ctrl+. in the notebook shows the code
+  ✓ Agent      gpt-5.5 · openai · OPENAI_API_KEY from keyring               0.8s
+```
+
 You can type or paste your first question while chat preparation continues. Pressing Enter keeps one
 message waiting and sends it when preparation finishes; you can keep editing your next draft meanwhile.
 
@@ -76,11 +87,13 @@ With the sample CSV, try:
 Chart total revenue by month, split by region.
 ```
 
-Tables and charts appear in the notebook. Type `/exit` to finish. To continue later, open a terminal
-in `my-analysis` and run `uvx hailer` again; it resumes your conversation and active notebook.
-Use `/new` for a fresh conversation, or `/help` to see the chat commands.
+Tables and charts appear in the notebook. Type `/exit` to finish: Hailer copies the notebooks back,
+stops the kernel and says so (`Session ended · 2 turns · 3m 05s · 9.4k tokens`, then `✓ Notebooks copied back
+to notebooks/   ✓ Kernel stopped`). To continue later, open a terminal in `my-analysis` and run
+`uvx hailer` again; it resumes your conversation (`↺ Resumed  2 earlier turns · /new starts fresh`) and
+active notebook. Use `/new` for a fresh conversation, or `/help` to see the chat commands.
 
-If startup fails, run `uvx hailer doctor` for checks and suggested fixes, or see
+If startup fails (a red `✗` row), run `uvx hailer doctor` for checks and suggested fixes, or see
 [Troubleshooting](../reference/troubleshooting.md#troubleshooting). `Docker is not installed.` or
 `Docker is not running.` means exactly that: install or start Docker and run `uvx hailer` again. `doctor`
 starts no kernel: every `uvx hailer` session starts its own and stops it when the chat ends.

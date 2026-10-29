@@ -47,9 +47,10 @@ runtime = "unsafe-local"
 ```
 
 or for one session, `uvx hailer notebook --kernel unsafe-local`, or at setup
-`uvx hailer init --kernel unsafe-local`. The startup panel, `/status` and `uvx hailer status` then show
-`Kernel: unsafe-local (runs as you; not isolated)` in a warning colour, and `uvx hailer doctor` shows a
-warning row. See [data handling and security](data-handling.md) for what Hailer still withholds.
+`uvx hailer init --kernel unsafe-local`. Every session then starts with the yellow row
+`▲ Kernel  unsafe-local · runs as you, not isolated`, the chat's footer keeps `▲ unsafe-local · not isolated`,
+`/status` and `uvx hailer status` show `Kernel: unsafe-local (runs as you; not isolated)` in a warning
+colour, and `uvx hailer doctor` shows a warning row. See [data handling and security](data-handling.md) for what Hailer still withholds.
 
 The runtime was called `local` before; that name is refused with a message, so that nobody keeps the
 unisolated runtime without writing `unsafe-local` themselves.

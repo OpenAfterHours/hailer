@@ -12,17 +12,40 @@ terminal. One server hosts every notebook in the folder, and marimo's own home p
 without `?file=`) lists them all. When you leave the chat (`/exit`, Ctrl+Z Enter, or Ctrl+C at the
 prompt) it stops the marimo server it started.
 
+The terminal shows a short checklist while the session starts, and a summary when it ends:
+
+```text
+◆ Hailer 0.3.0   ·   ~/work/acme-analytics
+
+  ✓ Kernel     docker · isolated · no network · data read-only              1.9s
+  ✓ Notebook   analysis.py · open in your browser                           2.2s
+               Opens in app view (results only); Ctrl+. in the notebook shows the code
+  ✓ Agent      gpt-5.5 · openai · OPENAI_API_KEY from keyring               0.8s
+  ↺ Resumed    3 earlier turns · /new starts fresh
+...
+  Session ended · 4 turns · 4m 12s · 18.2k tokens
+  ✓ Notebooks copied back to notebooks/   ✓ Kernel stopped
+```
+
+You can type your first question as soon as the input box appears; the notebook and agent rows arrive
+while it waits. A problem found by the startup checks is a `▲` (warning) or `✗` (the start stops) row
+under the first line. `/status` shows the full settings: model, provider, kernel image, kernel log,
+notebook and web access.
+
 - **One server per session.** Every `uvx hailer` or `uvx hailer notebook` starts its own server and stops
   it when the chat ends. Hailer never looks for, or attaches to, a server another session started, so
   several sessions can run side by side in one workspace (each on its own port). Restarting the chat
   re-runs the notebook in a fresh kernel.
 - **The server needs a token.** Hailer gives every server it starts a random token and keeps it in
-  memory, so other programs on the machine cannot send code to the kernel. The link Hailer opens or prints
-  carries `access_token=...`, which signs the browser in. Links the agent quotes in the chat leave the token
-  out, because tool results go to the model endpoint; `/notebook` prints the signed-in link.
-- **Log.** The kernel's log is `docker logs hailer-kernel-<id>-<suffix>`. When a start fails, its last
-  lines are in the error message; Hailer masks the token in them. With `unsafe-local`, marimo's output goes
-  to `.hailer/marimo-<pid>.log`, one per session, deleted when the kernel stops.
+  memory, so other programs on the machine cannot send code to the kernel. The link Hailer opens
+  carries `access_token=...`, which signs the browser in. Hailer prints that link only when you have to
+  open it yourself: with `--no-browser`, or when the notebook's tab did not open in time (then a `▲ Notebook
+  ... no kernel session yet` row with the link on a line of its own). Links the agent quotes in the chat
+  leave the token out, because tool results go to the model endpoint; `/notebook` prints the signed-in link.
+- **Log.** The kernel's log is `docker logs hailer-kernel-<id>-<suffix>`; `/status` names it (`Kernel log`),
+  and `--verbose` prints it under the `Kernel` row. When a start fails, its last lines are in the error
+  message; Hailer masks the token in them. With `unsafe-local`, marimo's output goes to
+  `.hailer/marimo-<pid>.log`, one per session, deleted when the kernel stops.
 - **If Hailer is killed.** Docker kernels left behind are removed by the next start or
   `uvx hailer kernel stop`. Nothing records an unsafe-local kernel: its marimo keeps running (other programs
   still need its token) until you end the `python -m marimo` process with Task Manager or `kill`.
@@ -42,8 +65,8 @@ not the code behind them (the URL carries `view-as=present`). To see or edit the
 (`Cmd+.` on macOS) in the notebook, or choose *Toggle app view* from the notebook menu; the same shortcut
 switches back. It is a normal edit session either way, so the agent works in it exactly the same.
 
-Flags: `--port N` (default 2718; a free port is chosen when it is busy), `--no-browser` (print the URL
-instead of opening it), `--foreground` (just run marimo attached to this terminal, no chat, until Ctrl+C; it
+Flags: `--port N` (default 2718; a free port is chosen when it is busy, and a note under the `Kernel` row
+says so), `--no-browser` (print the signed-in URL instead of opening it), `--foreground` (just run marimo attached to this terminal, no chat, until Ctrl+C; it
 opens marimo's home page unless `--no-browser` is given), `--new` (start a fresh conversation), `--kernel docker|unsafe-local`
 (where notebook code runs for this run; the default comes from `[kernel] runtime`, which defaults to `docker`).
 
@@ -76,7 +99,7 @@ The agent lists the folder, creates `q2_churn_review.py` in it (the name is slug
 existing file, and the browser tab appears by itself. Notebooks are named by their path inside the
 notebooks folder (`q2_churn_review.py`, `q3/review.py`). Whatever the agent switches to becomes the
 **active notebook**: the one every later cell edit, `/status` line and `/exec` call refers to. The chat
-shows `Active notebook is now q2_churn_review.py.` when the agent switched.
+shows `✓ Notebook  q2_churn_review.py · now active · opened in your browser` when the agent switched.
 
 The same from the prompt, without a model round-trip:
 
@@ -88,7 +111,9 @@ The same from the prompt, without a model round-trip:
 | `/notebook open <name>` | Switch to an existing notebook by name, filename or path; opens it in the browser when it has no session. |
 | `/notebook close [name]` | Shut down that notebook's kernel session (the browser tab disconnects); it can be reopened any time. |
 
-After a slash-command switch the next message you send carries a one-line notice such as
+A slash-command switch ends with one row, such as `✓ Notebook  q2_churn_review.py · active · open in your
+browser  0.6s`, or `▲ ... no kernel session yet` with the link to open by hand when the tab did not appear
+within 30 seconds. After a slash-command switch the next message you send carries a one-line notice such as
 `[Hailer] The active notebook is now q2_churn_review.py (reopened, 7 cells). Call notebook_cells
 before editing.` so the agent inspects the notebook before touching it. The conversation itself continues;
 use `/new` if you want a clean thread as well.

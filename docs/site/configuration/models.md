@@ -54,7 +54,7 @@ uvx hailer
 ```
 
 Or set `INTERNAL_MODEL_API_KEY` in the terminal instead of logging in; an environment variable always wins
-over the credential store. The startup panel and `status` show the provider with its base URL; `doctor` and
+over the credential store. `/status` and `status` show the provider with its base URL; `doctor` and
 `status` show where the key came from (`from keyring` or `from env`), never the value.
 
 **`wire_api` chooses the protocol the endpoint speaks:**
@@ -78,7 +78,7 @@ Two per-provider switches help with strict endpoints; both default to `true` and
   requests or cannot deliver server-sent events (some gateways and proxies buffer or refuse them). The
   answer then appears when the turn finishes rather than as it is generated. It is also the workaround
   for an endpoint that streams tool calls in a shape the client does not understand. The provider shows
-  as `internal (https://..., chat completions, no streaming)` in the startup panel and `/status`.
+  as `internal (https://..., chat completions, no streaming)` in `/status` and `uvx hailer status`.
 - `stream_options = false` omits the `stream_options` field from streamed requests (some Azure API
   versions and proxies reject it). Token counts are then whatever the final chunk carries, often nothing.
 
