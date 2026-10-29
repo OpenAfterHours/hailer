@@ -155,6 +155,9 @@ def test_names_that_match_as_typed_come_first():
         ("/notebook open sales.py", None), ("/notebook open Sales.py", None), ("/skill report", None),
         ("/prompt first-look", None), ("/model gpt-5.5", None), ("/exec print(1)", None), ("/unknown", None),
         ("a question", None), ("/skill report summarise it", None),
+        # free text: a model name, code, a skill's message, a prompt's arguments, a new notebook's name
+        ("/model gpt-5", None), ("/model ", None), ("/model inter", None), ("/exec pri", None),
+        ("/skill report summarise th", None), ("/prompt first-look cust", None), ("/notebook new sal", None),
     ],
 )
 def test_enter_without_a_choice_completes_a_partial_command_and_sends_a_whole_one(text, picked):
@@ -179,3 +182,4 @@ def test_the_hint_says_what_enter_will_do():
     assert action("/", index=0) == "run", "a chosen /help runs"
     assert action("/", index=3) == "complete", "a chosen /model takes arguments"
     assert action("/prompt first-look") == "send"
+    assert action("/model gpt") == "send", "a model name is free text: sent as typed"

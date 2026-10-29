@@ -1354,18 +1354,32 @@ class ChatUI:
         self._drain_pending()
         if self._writer_error is not None:
             raise self._writer_error
-        if self._writer is None:
-            while not self._queue.empty():
-                callback = self._queue.get_nowait()
-                try:
-                    if callback is not None:
-                        callback()
-                finally:
-                    self._queue.task_done()
-        else:
-            await self._queue.join()
+        writer = self._writer
+        if writer is not None and not writer.done():
+            # Wait for the writer, unless it ends first: cancelled with the rest of a dying loop's
+            # tasks (asyncio.run cancels them all when the coroutine fails), it would never empty the
+            # queue, and shutdown, which refuses cancellation until it is done, would wait forever.
+            joined = asyncio.ensure_future(self._queue.join())
+            try:
+                await asyncio.wait({joined, writer}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                if not joined.done():
+                    joined.cancel()
             if self._writer_error is not None:
                 raise self._writer_error
+            if joined.done() and not joined.cancelled():
+                return
+        self._write_left_over()
+
+    def _write_left_over(self) -> None:
+        """Print what the queue still holds here: before the writer starts, or after it has ended."""
+        while not self._queue.empty():
+            callback = self._queue.get_nowait()
+            try:
+                if callback is not None:
+                    self._print_transcript(callback)
+            finally:
+                self._queue.task_done()
 
     @contextmanager
     def _route_logs(self):
@@ -1427,10 +1441,17 @@ class ChatUI:
         except Exception as exc:
             failure = failure or exc
         finally:
-            if self._writer is not None:
-                if not self._writer.done():
+            writer = self._writer
+            if writer is not None:
+                if not writer.done():
                     self._queue.put_nowait(None)
-                await self._writer
+                try:
+                    await writer
+                except asyncio.CancelledError:
+                    if not writer.cancelled():
+                        raise  # this cleanup itself was cancelled
+                    # The writer was cancelled with a dying loop's tasks: print what it left here.
+                    self._write_left_over()
                 self._writer = None
         if failure is not None:
             raise failure

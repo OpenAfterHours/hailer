@@ -24,6 +24,7 @@ from rich.text import Text
 
 from hailer import notebooks
 from hailer.errors import HailerError, MarimoUnavailableError, NoSessionError
+from hailer.marimo_client import request_deadline
 from hailer.models import CompletionData, ContextBundle, HailerConfig, MarimoSession, ProviderConfig, SessionState, SkillInfo, TurnSummary
 from hailer.session import EXIT_COMMANDS, help_text, load_session, parse_command, save_session
 from hailer.statedir import input_history_path
@@ -33,6 +34,11 @@ from hailer.transcript import session_note, session_row
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
     from hailer.sandbox import MarimoSandbox
+
+#: The command menu's background notebook listing: all its marimo requests together.
+NAMES_DEADLINE_SEC = 10.0
+#: How long the end of a chat waits for that listing before leaving it behind.
+NAMES_SETTLE_SEC = 1.0
 
 
 class _CommandStopped(Exception):
@@ -256,7 +262,7 @@ class ChatController:
         )
 
     def _refresh_names_soon(self) -> None:
-        """List the notebooks for the command menu on a worker thread that nothing waits for (call on
+        """List the notebooks for the command menu in the background, nothing waiting for it (call on
         the UI loop). One listing at a time: a request during one makes it list once more after."""
         if self._names_closed or self.sandbox is None:
             return
@@ -268,10 +274,7 @@ class ChatController:
     async def _list_names(self) -> None:
         while True:
             self._names_again = False
-            try:
-                names: tuple[str, ...] | None = await asyncio.to_thread(self._listed_names)
-            except Exception:  # noqa: BLE001 - the menu keeps its last list
-                names = None
+            names = await self._listing()
             if self._names_closed:
                 return  # the session is over: its kernel may be stopping
             if names is not None:
@@ -279,18 +282,45 @@ class ChatController:
             if not self._names_again:
                 return
 
-    def _listed_names(self) -> tuple[str, ...]:
-        return tuple(info.name for info in self.sandbox.list_notebooks()) if self.sandbox is not None else ()
+    def _listing(self) -> asyncio.Future[tuple[str, ...] | None]:
+        """The sandbox's notebook names (None if they could not be listed), from a daemon thread
+        whose marimo requests all end within NAMES_DEADLINE_SEC (a kernel can trickle a reply).
+        Not the loop's default executor, which asyncio.run waits for at exit (LEARNINGS §4)."""
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[tuple[str, ...] | None] = loop.create_future()
+
+        def deliver(names: tuple[str, ...] | None) -> None:
+            if not future.done():  # cancelled meanwhile: the chat is ending
+                future.set_result(names)
+
+        def work() -> None:
+            names: tuple[str, ...] | None = None
+            try:
+                with request_deadline(NAMES_DEADLINE_SEC):
+                    names = tuple(info.name for info in self.sandbox.list_notebooks()) if self.sandbox is not None else ()
+            except Exception:  # noqa: BLE001 - the menu keeps its last list
+                names = None
+            try:
+                loop.call_soon_threadsafe(deliver, names)
+            except RuntimeError:  # the loop is closed: Hailer is shutting down
+                pass
+
+        threading.Thread(target=work, name="hailer-notebook-names", daemon=True).start()
+        return future
 
     async def _settle_names(self) -> None:
-        """At shutdown, before the kernel stops: no listing is left talking to it, and none starts."""
+        """At shutdown, before the kernel stops: no listing starts, and one still running gets
+        NAMES_SETTLE_SEC to end before it is left behind (its result ignored, its thread a daemon)."""
         self._names_closed = True
         task = self._names_task
-        if task is not None and not task.done():
-            try:
-                await asyncio.wait({task})
-            except asyncio.CancelledError:  # a second interrupt: leave the worker, finish shutting down
-                pass
+        if task is None or task.done():
+            return
+        try:
+            await asyncio.wait({task}, timeout=NAMES_SETTLE_SEC)
+        except asyncio.CancelledError:  # a second interrupt: finish shutting down
+            pass
+        finally:
+            task.cancel()
 
     def _input_history_file(self) -> Path | None:
         """``.hailer/input_history`` while ``[hailer].input_history`` is on (Up recalls earlier

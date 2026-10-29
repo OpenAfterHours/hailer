@@ -32,7 +32,10 @@ def terminal(on_submit, footer=lambda: FOOTER, console=None, **options):
         output = Vt100_Output(screen, lambda: size[0], term="xterm-256color")
         console = console or Console(file=transcript, force_terminal=False, color_system=None, width=90)
         ui = ChatUI(console, on_submit, footer, pt_input=keys, pt_output=output, **options)
-        yield ui, keys, screen, transcript, size
+        try:
+            yield ui, keys, screen, transcript, size
+        finally:
+            ui.exit()  # a failed wait ends the session at once instead of leaving it to time out
 
 
 def summary(text, **kwargs):
@@ -470,6 +473,36 @@ def test_repeated_external_cancellation_finishes_async_turn_cleanup():
             assert PASTE_OFF in screen.getvalue()
 
     asyncio.run(scenario())
+
+
+def test_an_error_escaping_a_running_session_ends_it_instead_of_hanging():
+    """asyncio.run cancels every task when its coroutine fails, the transcript writer among them.
+    Shutdown refuses cancellation until it has settled the session, so it must not wait for a
+    writer that is gone (what it left is printed directly), and the error surfaces."""
+    outcome: list[BaseException] = []
+    transcript = io.StringIO()
+
+    def session() -> None:
+        async def scenario():
+            with create_pipe_input() as keys:
+                output = Vt100_Output(io.StringIO(), lambda: Size(rows=24, columns=100), term="xterm-256color")
+                console = Console(file=transcript, force_terminal=False, color_system=None, width=90)
+                ui = ChatUI(console, lambda _text: asyncio.sleep(0), lambda: FOOTER, pt_input=keys, pt_output=output)
+                asyncio.create_task(ui.run())  # noqa: RUF006 - asyncio.run cancels it, as when a caller fails
+                await until(lambda: ui.application.is_running and ui.application.render_counter > 0)
+                ui.console.print("queued output", markup=False)
+                raise RuntimeError("a failed wait")
+
+        try:
+            asyncio.run(scenario())
+        except BaseException as exc:  # noqa: BLE001 - handed to the test thread
+            outcome.append(exc)
+
+    thread = threading.Thread(target=session, daemon=True)
+    thread.start()
+    thread.join(15)
+    assert not thread.is_alive(), "the session hung after the error"
+    assert [str(exc) for exc in outcome] == ["a failed wait"]
 
 
 def test_idle_exit_write_failure_has_no_unowned_task(monkeypatch):
@@ -1118,7 +1151,7 @@ def test_enter_without_a_choice_completes_and_never_runs_however_the_draft_arriv
             for draft, completed in [
                 ("/n", "/new"), ("/ne", "/new"), ("/exi", "/exit"), ("/cl", "/clear"), ("/", "/help"),
                 ("/no", "/notebook "), ("/notebook ", "/notebook list"), ("/notebook open q", "/notebook open q2-review.py"),
-                ("/mo", "/model "), ("/model ", "/model gpt-5.5"),
+                ("/mo", "/model "),
             ]:
                 if how == "typed":
                     keys.send_text(draft)
@@ -1132,7 +1165,10 @@ def test_enter_without_a_choice_completes_and_never_runs_however_the_draft_arriv
                 await asyncio.sleep(0.05)
                 assert not submissions and ui.application.is_running, f"{draft!r} + Enter ran something"
                 ui.buffer.reset()
-            for typed in ("/model", "/help", "/notebook list", "/skill example-skill", "/prompt first-look", "/unknown", "/path/to/file is odd"):
+            for typed in (
+                "/model", "/model gpt-5", "/help", "/notebook list", "/skill example-skill", "/prompt first-look",
+                "/unknown", "/path/to/file is odd",
+            ):
                 keys.send_text(typed + "\r")  # already whole (or nothing completes it): sent as typed
                 await until(lambda typed=typed: submissions[-1:] == [typed] and not ui.busy)
             ui.exit()
@@ -1322,7 +1358,8 @@ def test_history_persists_across_composers_and_its_suggestion_is_offered(tmp_pat
     async def second():
         with terminal(submit, history_file=path) as (ui, keys, screen, _transcript, _size):
             running = await start(ui)
-            await until(lambda: len(ui.buffer.history.get_strings()) == 2)
+            # What Up recalls: prompt_toolkit's loader copies the history into the buffer after the file is read.
+            await until(lambda: len(ui.buffer._working_lines) == 3)
             keys.send_text("\x1b[A")
             await until(lambda: ui.buffer.text == "line one\nline two")
             keys.send_text("\x1b[B")
